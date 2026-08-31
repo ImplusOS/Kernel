@@ -1,0 +1,5 @@
+# Driver module .ELF basenames that must NOT be preloaded at every boot.
+# They are staged into Kernel/Driver/OnDemand/ and loaded on demand via
+# driver_module_manager_load_from_vfs() (see BusRegistry.c / DriverDB.txt).
+# One basename per line; '#' comments and blank lines are ignored.
+AX900_Driver.ELF

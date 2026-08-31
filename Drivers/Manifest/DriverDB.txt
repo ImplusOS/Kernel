@@ -1,0 +1,21 @@
+# DriverDB.txt -- bus device id -> on-demand driver module manifest.
+# Read at runtime by Kernel/Drivers/Module/DriverDB.c when BusRegistry.c
+# finds no already-loaded module claiming an enumerated device. Hand
+# maintained -- see the comment at the top of DriverDB.c for why, and the
+# format this file follows.
+#
+# Entries below name files staged under Kernel/Driver/OnDemand/ (see the
+# top-level Makefile), never Kernel/Driver/ itself -- that directory is
+# swept by the bootloader's preloader at boot and would defeat the point
+# of loading these only when actually needed.
+
+# UGREEN AX900 (AICSemi AIC8800D80) -- Kernel/Drivers/Wi-Fi/AX900/
+# No pid= filter: real AX900 units enumerate under several different
+# product ids depending on firmware/SKU state (8D80, 8D81, 8D83, 8D84,
+# 8D85, 8D8C all seen in the wild), and AX900.c's own bus_matches[]
+# (Kernel/Drivers/Wi-Fi/AX900/AX900.c) already matches on vendor id
+# + vendor-specific interface class only, never device id -- keep this
+# on-demand manifest consistent with that rather than hardcoding one pid
+# that would miss most real hardware.
+usb:vid=A69C=AX900_Driver.ELF
+usb:vid=368B=AX900_Driver.ELF
