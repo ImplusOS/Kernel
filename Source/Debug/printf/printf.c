@@ -25,7 +25,7 @@
 #define STBTT_ifloor(x) ((int)floor(x))
 #define STBTT_iceil(x)  ((int)ceil(x))
 
-#include "../../../Vendor/Header/stb_truetype.h"
+#include "../../../../Vendor/Header/stb_truetype.h"
 
 #define DEBUG_FONT_HEIGHT 18
 

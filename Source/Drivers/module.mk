@@ -1,4 +1,4 @@
-ROOT_DIR ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+ROOT_DIR ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../..)
 
 ARCH ?= x86_64
 
@@ -17,13 +17,13 @@ DRIVER_ARCH_CFLAGS := -mstrict-align -mno-outline-atomics -DPLATFORM_ARM64
 endif
 
 DRIVER_BASE_CFLAGS := \
-	-I$(ROOT_DIR)/Kernel \
-	-I$(ROOT_DIR)/Kernel/include \
-	-I$(ROOT_DIR)/Kernel/Arch/$(ARCH) \
-	-I$(ROOT_DIR)/Kernel/Core \
-	-I$(ROOT_DIR)/Kernel/Platform \
-	-I$(ROOT_DIR)/Kernel/Drivers \
-	-I$(ROOT_DIR)/Thirdparty -I$(ROOT_DIR)/ThirdParty -I$(ROOT_DIR)/libc/I_libc/include \
+	-I$(ROOT_DIR)/Kernel/Source \
+	-I$(ROOT_DIR)/Kernel/Source/include \
+	-I$(ROOT_DIR)/Kernel/Source/Arch/$(ARCH) \
+	-I$(ROOT_DIR)/Kernel/Source/Core \
+	-I$(ROOT_DIR)/Kernel/Source/Platform \
+	-I$(ROOT_DIR)/Kernel/Source/Drivers \
+	-I$(ROOT_DIR)/Thirdparty -I$(ROOT_DIR)/ThirdParty -I$(ROOT_DIR)/I_libc/Source/include \
 	-ffreestanding -fno-stack-protector -fPIC -fno-builtin \
 	$(DRIVER_ARCH_CFLAGS) -nostdlib -nostartfiles -nodefaultlibs \
 	-Wall -Wextra -Wtype-limits -Wconversion -Wsign-conversion -Wshadow \
