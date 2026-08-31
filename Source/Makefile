@@ -23,14 +23,14 @@ include IPC/Makefile
 include Debug/Makefile
 
 LIBC_SRCS := \
-	$(ROOT_DIR)/I_libc/Source/src/assert.c \
-	$(ROOT_DIR)/I_libc/Source/src/math.c \
-	$(ROOT_DIR)/I_libc/Source/src/stdlib.c \
-	$(ROOT_DIR)/I_libc/Source/src/string.c \
-	$(ROOT_DIR)/I_libc/Source/src/stdio.c \
-	$(ROOT_DIR)/I_libc/Source/src/errno.c
+	$(ROOT_DIR)/libc/I_libc/Source/src/assert.c \
+	$(ROOT_DIR)/libc/I_libc/Source/src/math.c \
+	$(ROOT_DIR)/libc/I_libc/Source/src/stdlib.c \
+	$(ROOT_DIR)/libc/I_libc/Source/src/string.c \
+	$(ROOT_DIR)/libc/I_libc/Source/src/stdio.c \
+	$(ROOT_DIR)/libc/I_libc/Source/src/errno.c
 
-OBJS += $(patsubst $(ROOT_DIR)/I_libc/Source/%.c,$(KERNEL_BUILD)/libc/I_libc/%.o,$(LIBC_SRCS))
+OBJS += $(patsubst $(ROOT_DIR)/libc/I_libc/Source/%.c,$(KERNEL_BUILD)/libc/I_libc/%.o,$(LIBC_SRCS))
 
 LIBRARY_SRCS := $(shell find $(ROOT_DIR)/Library/Source -name "*.c" 2>/dev/null)
 
@@ -56,7 +56,7 @@ $(KERNEL_BUILD)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(KERNEL_BUILD)/libc/I_libc/%.o: $(ROOT_DIR)/I_libc/Source/%.c
+$(KERNEL_BUILD)/libc/I_libc/%.o: $(ROOT_DIR)/libc/I_libc/Source/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 

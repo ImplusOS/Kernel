@@ -23,7 +23,7 @@ DRIVER_BASE_CFLAGS := \
 	-I$(ROOT_DIR)/Kernel/Source/Core \
 	-I$(ROOT_DIR)/Kernel/Source/Platform \
 	-I$(ROOT_DIR)/Kernel/Source/Drivers \
-	-I$(ROOT_DIR)/Thirdparty -I$(ROOT_DIR)/ThirdParty -I$(ROOT_DIR)/I_libc/Source/include \
+	-I$(ROOT_DIR)/Thirdparty -I$(ROOT_DIR)/ThirdParty -I$(ROOT_DIR)/libc/I_libc/Source/include \
 	-ffreestanding -fno-stack-protector -fPIC -fno-builtin \
 	$(DRIVER_ARCH_CFLAGS) -nostdlib -nostartfiles -nodefaultlibs \
 	-Wall -Wextra -Wtype-limits -Wconversion -Wsign-conversion -Wshadow \
