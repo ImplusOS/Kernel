@@ -6,7 +6,21 @@ LD := x86_64-elf-ld
 OBJCOPY := x86_64-elf-objcopy
 NASM := nasm
 ARCH_DIR := Arch/x86_64
-ARCH_CFLAGS := -mcmodel=small -mno-red-zone -DPLATFORM_X86_64
+# -mgeneral-regs-only: kernel code must never touch the FPU/SSE registers.
+#
+# Those registers belong to whichever userland thread was interrupted, and
+# nothing on the kernel entry paths (Syscall_Entry.asm, IDT.asm) saves them --
+# the per-process fxsave only happens later, inside the scheduler, by which
+# point kernel C code has already run. Without this the compiler is free to
+# use %xmm for struct copies and memset, so an interrupt or syscall silently
+# destroys the interrupted thread's vector registers.
+#
+# That is not theoretical: Mesa writes two adjacent dispatch-table entries
+# with one 16-byte SSE store, and a syscall landing inside it left
+# DeleteProgram and DeleteShader NULL in an otherwise fully populated table --
+# which is why Doom jumped to address 0 out of glDeleteShader.
+# See Docs/Others/TODO_Doom_Xorg_MethodA.md M24.
+ARCH_CFLAGS := -mcmodel=small -mno-red-zone -mgeneral-regs-only -DPLATFORM_X86_64
 ARCH_ASM_FORMAT := elf64
 KERNEL_LDSCRIPT := Arch/x86_64/linker/linker.ld
 else ifeq ($(ARCH),arm64)

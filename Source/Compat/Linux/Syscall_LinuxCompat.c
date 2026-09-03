@@ -1246,32 +1246,44 @@ static int linux_path_is_shared_object(const char *path)
     return 0;
 }
 
-static int32_t g_module_map_fds[64];
-static char    g_module_map_names[64][64];
+/* Keyed by (pid, fd): Xorg and the Doom client run at the same time and their
+ * fd numbers collide, so an fd-only table hands out the wrong module name. */
+static int32_t g_module_map_fds[128];
+static int32_t g_module_map_pids[128];
+static char    g_module_map_names[128][64];
 
 static void linux_module_map_note_open(int32_t fd, const char *path)
 {
     if (fd < 0 || !linux_path_is_shared_object(path)) return;
+    int32_t pid = process_get_current_pid();
     uint64_t n = strlen(path);
     uint64_t start = 0;
     for (uint64_t i = 0; i < n; ++i) if (path[i] == '/') start = i + 1u;
-    for (uint32_t i = 0; i < 64u; ++i) {
-        if (g_module_map_fds[i] == 0 || g_module_map_fds[i] == fd + 1) {
-            g_module_map_fds[i] = fd + 1;
-            uint64_t j = 0;
-            for (; j < 63u && path[start + j]; ++j) {
-                g_module_map_names[i][j] = path[start + j];
-            }
-            g_module_map_names[i][j] = '\0';
-            return;
+    uint32_t slot = 128u;
+    for (uint32_t i = 0; i < 128u; ++i) {
+        if (g_module_map_fds[i] == fd + 1 && g_module_map_pids[i] == pid) {
+            slot = i;
+            break;
         }
+        if (slot == 128u && g_module_map_fds[i] == 0) slot = i;
     }
+    if (slot == 128u) return;
+    g_module_map_fds[slot] = fd + 1;
+    g_module_map_pids[slot] = pid;
+    uint64_t j = 0;
+    for (; j < 63u && path[start + j]; ++j) {
+        g_module_map_names[slot][j] = path[start + j];
+    }
+    g_module_map_names[slot][j] = '\0';
 }
 
 static const char *linux_module_map_name(int32_t fd)
 {
-    for (uint32_t i = 0; i < 64u; ++i) {
-        if (g_module_map_fds[i] == fd + 1) return g_module_map_names[i];
+    int32_t pid = process_get_current_pid();
+    for (uint32_t i = 0; i < 128u; ++i) {
+        if (g_module_map_fds[i] == fd + 1 && g_module_map_pids[i] == pid) {
+            return g_module_map_names[i];
+        }
     }
     return NULL;
 }
@@ -1279,9 +1291,18 @@ static const char *linux_module_map_name(int32_t fd)
 static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
                                        uint64_t offset)
 {
+    if (!OS_CONFIG_FOREIGN_TRACE) {
+        (void)base; (void)len; (void)offset;
+        return;
+    }
     const char *name = linux_module_map_name(fd);
     if (name == NULL) return;
-    serial_write_string("[lxmap] ");
+    /* pid= is essential here: Xorg and the Doom client load their modules
+     * concurrently onto the same shared COM1, and a faulting RIP can only be
+     * resolved against the map of the process that faulted. */
+    serial_write_string("[lxmap] pid=");
+    serial_write_uint32((uint32_t)process_get_current_pid());
+    serial_write_char(' ');
     serial_write_string(name);
     serial_write_string(" base=");
     serial_write_uint64(base);
@@ -3867,6 +3888,63 @@ static void linux_trace_exit(uint64_t num, int64_t result)
 #define LINUX_TRACE_EXIT(n, r) ((void)0)
 #endif
 
+/* Progress heartbeat for foreign processes.
+ *
+ * When Xorg goes silent there is no way to tell "still working" from "wedged",
+ * and a full syscall trace drowns the shared COM1. Instead remember the last
+ * syscall each pid entered plus how many it has made, and dump that table
+ * whenever HEARTBEAT_PERIOD_MS has elapsed. Any process that is still running
+ * drives the dump, so a stalled one shows up as a frozen count against the
+ * syscall number it is parked in. */
+#define LX_HEARTBEAT_MAX_PID     64u
+#define LX_HEARTBEAT_PERIOD_MS   5000ull
+
+static uint32_t g_lx_hb_last_num[LX_HEARTBEAT_MAX_PID];
+static uint64_t g_lx_hb_last_arg[LX_HEARTBEAT_MAX_PID];
+static uint64_t g_lx_hb_count[LX_HEARTBEAT_MAX_PID];
+static uint64_t g_lx_hb_next_dump_ns;
+
+static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1)
+{
+    int32_t pid = process_get_current_pid();
+    if (pid >= 0 && (uint32_t)pid < LX_HEARTBEAT_MAX_PID) {
+        g_lx_hb_last_num[pid] = (uint32_t)num;
+        g_lx_hb_last_arg[pid] = arg1;
+        g_lx_hb_count[pid]++;
+    }
+
+    if (!OS_CONFIG_FOREIGN_TRACE) {
+        return;
+    }
+
+    uint64_t now = timer_monotonic_ns();
+    if (g_lx_hb_next_dump_ns == 0u) {
+        g_lx_hb_next_dump_ns = now + LX_HEARTBEAT_PERIOD_MS * 1000000ull;
+        return;
+    }
+    if (now < g_lx_hb_next_dump_ns) {
+        return;
+    }
+    g_lx_hb_next_dump_ns = now + LX_HEARTBEAT_PERIOD_MS * 1000000ull;
+
+    serial_write_string("[hb]");
+    for (uint32_t i = 0; i < LX_HEARTBEAT_MAX_PID; ++i) {
+        if (g_lx_hb_count[i] == 0u) continue;
+        serial_write_string(" p");
+        serial_write_uint32(i);
+        serial_write_string("=#");
+        serial_write_uint32(g_lx_hb_last_num[i]);
+        serial_write_string("/a");
+        serial_write_uint64(g_lx_hb_last_arg[i]);
+        serial_write_string("/n");
+        serial_write_uint64(g_lx_hb_count[i]);
+    }
+    serial_write_char('\n');
+    /* Whose kernel-side reference is keeping a finished child unreapable is
+     * only visible per CPU, so dump that alongside. */
+    process_scheduler_debug_dump_cpus();
+}
+
 /* A blocking AF_UNIX read that found the ring empty. EAGAIN is not a value a
  * blocking recv() may return, and a client that gets one where it expected to
  * wait simply gives up: the X11 handshake died right here, with libxcb's first
@@ -4019,6 +4097,8 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     int64_t result = LINUX_ENOSYS;
     int request_switch = 0;
     int request_restart = 0;
+
+    linux_syscall_heartbeat(num, arg1);
 
     LINUX_TRACE_ENTER(num, arg1, arg2, arg3, arg4, arg5, arg6);
 

@@ -95,6 +95,27 @@ int process_scheduler_pid_in_use_on_any_cpu(int32_t pid)
     return 0;
 }
 
+void process_scheduler_release_stale_pid(int32_t pid)
+{
+    if (pid < 0) {
+        return;
+    }
+    uint32_t self = scheduler_cpu_id();
+    for (uint32_t cpu = 0; cpu < OS_CONFIG_SMP_MAX_CPUS; ++cpu) {
+        if (cpu != self && g_current_pid_per_cpu[cpu] == pid) {
+            /* A process runs on one CPU at a time; if another CPU still names
+             * it as current while it is exiting here, that is a stale pick.
+             * Leaving it set makes process_waitpid() refuse to reap the
+             * zombie forever -- Xorg's Pclose() then polls wait4() until the
+             * heat death of the universe instead of finishing input init. */
+            g_current_pid_per_cpu[cpu] = -1;
+        }
+        if (g_leaving_pid_per_cpu[cpu] == pid) {
+            g_leaving_pid_per_cpu[cpu] = -1;
+        }
+    }
+}
+
 int32_t process_scheduler_current_pid(void)
 {
     return g_current_pid_per_cpu[scheduler_cpu_id()];

@@ -55,6 +55,21 @@ static unix_sock_t *usock_get(int32_t fd) {
     return g_usocks[idx].used ? &g_usocks[idx] : NULL;
 }
 
+/* "Is anyone listening on `path`?" -- a read-only probe with no side effects
+ * on either end, unlike connecting and hanging up, which the server sees as a
+ * client that opened and vanished. */
+int64_t unix_socket_path_listening(const char *path) {
+    if (!g_usock_init_done) unix_socket_init();
+    if (path == NULL) return 0;
+    size_t clen = 0; while (path[clen]) clen++;
+    for (int i = 0; i < UNIX_SOCK_MAX; i++) {
+        if (!g_usocks[i].used || !g_usocks[i].listening) continue;
+        size_t plen = 0; while (g_usocks[i].path[plen]) plen++;
+        if (plen == clen && memcmp(g_usocks[i].path, path, plen) == 0) return 1;
+    }
+    return 0;
+}
+
 static void usock_drain_fd_queue(unix_sock_t *s) {
     while (s->fds_tail != s->fds_head) {
         int32_t h = s->fd_queue[s->fds_tail];

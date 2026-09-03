@@ -15,6 +15,18 @@
 
 #include <stdint.h>
 
+/* FS_BASE is not swapped on a kernel entry, so on the exception path it still
+ * holds the faulting thread's pointer. Read directly: the process table copy
+ * is only refreshed on a context switch. */
+#define IDT_IA32_FS_BASE 0xC0000100U
+static inline uint64_t rdmsr_fs_base_dbg(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(IDT_IA32_FS_BASE));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+
 #define MAX_IRQS 256
 #define PANIC_STACK_DUMP_QWORDS 8
 
@@ -312,21 +324,26 @@ void nmi_handler(uint64_t rip, uint64_t rsp, uint64_t rbp)
     panic_exception("nmi", 2, 0, rip, rsp, rbp, 0);
 }
 
-void general_protection_fault_handler(uint64_t error_code,
+void general_protection_fault_handler(const uint64_t *gpregs,
+                                      uint64_t error_code,
                                       uint64_t rip,
-                                      uint64_t rsp,
+                                      const uint64_t *frame,
                                       uint64_t rbp)
 {
-    /* `rsp` points at the CPU-pushed exception frame: [0]=error_code [1]=rip
-     * [2]=cs [3]=rflags [4]=user_rsp [5]=user_ss. A #GP that came from CPL 3
-     * is the userland process's problem, not the kernel's -- terminate that
-     * process and keep running. Foreign Linux binaries reach here a lot:
-     * Chromium's IMMEDIATE_CRASH()/failed CHECK() is `int3; ud2`, and a
-     * userland `int3` traps the DPL-0 #BP gate as #GP with
-     * error = (3<<3)|2 = 0x1A; privileged instructions and non-canonical
+    /* `frame` points at the CPU-pushed exception frame:
+     * [0]=error_code [1]=rip [2]=cs [3]=rflags [4]=user_rsp [5]=user_ss.
+     * `gpregs`, when non-NULL (fed by isr_general_protection), is the
+     * SAVE_REGS window: [0]=r15 [1]=r14 [2]=r13 [3]=r12 [4]=r11 [5]=r10
+     * [6]=r9 [7]=r8 [8]=rbp [9]=rdi [10]=rsi [11]=rdx [12]=rcx [13]=rbx
+     * [14]=rax.
+     *
+     * A #GP that came from CPL 3 is the userland process's problem, not the
+     * kernel's -- terminate that process and keep running. Foreign Linux
+     * binaries reach here a lot: Chromium's IMMEDIATE_CRASH()/failed CHECK()
+     * is `int3; ud2`, and a userland `int3` traps the DPL-0 #BP gate as #GP
+     * with error = (3<<3)|2 = 0x1A; privileged instructions and non-canonical
      * accesses land here too. */
-    const uint64_t *frame = (const uint64_t *)(uintptr_t)rsp;
-    int from_user = (rsp != 0) && ((frame[2] & 0x3ULL) == 0x3ULL);
+    int from_user = (frame != NULL) && ((frame[2] & 0x3ULL) == 0x3ULL);
     int32_t pid = process_get_current_pid();
 
     if (from_user && pid >= 0) {
@@ -357,18 +374,59 @@ void general_protection_fault_handler(uint64_t error_code,
         serial_write_string(" user_ss=");
         serial_write_uint64(frame[5]);
         serial_write_string("\n");
+        /* The saved GPR window names the faulting operand: JIT'd pixel loops
+         * (llvmpipe swrast) crash as #GP(err=0) on a non-canonical
+         * [base+idx] dereference, and the index registers (r14/r15) are not
+         * in the CPU exception frame. */
+        if (gpregs != NULL) {
+            static const char *const gp_name[] = {
+                "r15", "r14", "r13", "r12", "r11", "r10", "r9",
+                "r8", "rbp", "rdi", "rsi", "rdx", "rcx", "rbx", "rax",
+            };
+            serial_write_string("[OS] [#GP] gpr:");
+            for (int i = 0; i < 15; ++i) {
+                if ((i & 1) == 0) serial_write_string("\n[OS] [#GP]   ");
+                serial_write_string(gp_name[i]);
+                serial_write_string("=");
+                serial_write_uint64(gpregs[i]);
+                serial_write_string(" ");
+            }
+            serial_write_string("\n");
+        }
+        /* The bytes at the faulting rip: a #GP with err=0 in user mode is
+         * almost always either a privileged/undefined instruction or an
+         * unaligned SSE access (movaps/movdqa), and those are only
+         * distinguishable from the opcode. */
+        if (rip >= 0x1000u &&
+            process_user_buffer_is_valid((const void *)(uintptr_t)rip, 16u)) {
+            const uint8_t *code = (const uint8_t *)(uintptr_t)rip;
+            serial_write_string("[OS] [#GP] code:");
+            for (int i = 0; i < 16; ++i) {
+                serial_write_string(" ");
+                serial_write_uint32((uint32_t)code[i]);
+            }
+            serial_write_string("\n");
+        }
         {
+            /* 64 qwords, not PANIC_STACK_DUMP_QWORDS: a #GP raised inside a
+             * callee's own frame (an unaligned movaps in a variadic prologue,
+             * say) puts the return address well above the first 8 slots, and
+             * that return address is the only way to name the caller. */
             uint64_t urs = frame[4];
             if (urs >= 0x1000u && (urs & 7u) == 0u &&
                 process_user_buffer_is_valid((const void *)(uintptr_t)urs,
-                                             8u * PANIC_STACK_DUMP_QWORDS)) {
+                                             8u * 64u)) {
                 const uint64_t *ustack = (const uint64_t *)(uintptr_t)urs;
-                serial_write_string("[OS] [#GP] user stack:");
-                for (int i = 0; i < PANIC_STACK_DUMP_QWORDS; ++i) {
+                for (int i = 0; i < 64; ++i) {
+                    if ((i & 7) == 0) {
+                        serial_write_string("[OS] [#GP] ustack+");
+                        serial_write_uint32((uint32_t)(i * 8));
+                        serial_write_string(":");
+                    }
                     serial_write_string(" ");
                     serial_write_uint64(ustack[i]);
+                    if ((i & 7) == 7) serial_write_string("\n");
                 }
-                serial_write_string("\n");
             }
         }
         process_debug_dump_pid(pid);
@@ -382,7 +440,8 @@ void general_protection_fault_handler(uint64_t error_code,
         return;
     }
 
-    panic_exception("general_protection", 13, error_code, rip, rsp, rbp, 0);
+    panic_exception("general_protection", 13, error_code, rip,
+                    (uint64_t)(uintptr_t)frame, rbp, 0);
 }
 
 void machine_check_handler(uint64_t rip, uint64_t rsp, uint64_t rbp)
@@ -565,7 +624,74 @@ int32_t page_fault_handler(uint64_t error_code,
         return 0;
     }
 
+    /* Snapshot before any serial output: printing a dump line costs ~10 ms at
+     * 115200 baud, which is ample time for a sibling thread to change the
+     * memory we are trying to describe. Read the word the faulting indirect
+     * jump went through first, and report it alongside the later re-read. */
+    uint64_t nullcall_entry_addr = 0;
+    uint64_t nullcall_entry_early = 0;
+    /* Displacement of the indirect jump inside the dispatch trampoline, i.e.
+     * which table slot the call was routed through. Captured with the rest of
+     * the early snapshot so the TLS dump below can probe every candidate
+     * table at the same index. */
+    uint32_t nullcall_disp = 0;
+    if ((error_code & PF_USER) != 0u && (error_code & PF_INSTR) != 0u &&
+        cr2 < 0x1000u && pid >= 0 && user_rsp >= 0x1000u &&
+        (user_rsp & 7u) == 0u &&
+        process_user_buffer_is_valid((const void *)(uintptr_t)user_rsp, 8u)) {
+        const uint64_t *ust0 = (const uint64_t *)(uintptr_t)user_rsp;
+        const uint64_t *kr0 = (const uint64_t *)(uintptr_t)(kernel_rsp + 8u);
+        uint64_t ret0 = ust0[0];
+        const uint32_t win = 40u;
+        uint64_t slot0 = 0;
+        if (ret0 > win &&
+            process_user_buffer_is_valid((const void *)(uintptr_t)(ret0 - win), win)) {
+            const uint8_t *p0 = (const uint8_t *)(uintptr_t)(ret0 - win);
+            for (uint32_t i = 0; i + 7u <= win; ++i) {
+                if ((p0[i] & 0xF8u) != 0x48u || p0[i + 1] != 0x8Bu ||
+                    (p0[i + 2] & 0xC7u) != 0x05u) {
+                    continue;
+                }
+                uint32_t dd = (uint32_t)p0[i + 3] | ((uint32_t)p0[i + 4] << 8) |
+                              ((uint32_t)p0[i + 5] << 16) | ((uint32_t)p0[i + 6] << 24);
+                slot0 = (ret0 - win + i + 7u) + (uint64_t)(int64_t)(int32_t)dd;
+            }
+        }
+        uint64_t tgt0 = (slot0 != 0u &&
+                         process_user_buffer_is_valid((const void *)(uintptr_t)slot0, 8u))
+                            ? *(const uint64_t *)(uintptr_t)slot0 : 0u;
+        if (tgt0 != 0u &&
+            process_user_buffer_is_valid((const void *)(uintptr_t)tgt0, 32u)) {
+            const uint8_t *c0 = (const uint8_t *)(uintptr_t)tgt0;
+            for (uint32_t i = 0; i + 7u <= 32u; ++i) {
+                if (c0[i] != 0x41u || c0[i + 1] != 0xFFu || c0[i + 2] != 0xA3u) {
+                    continue;
+                }
+                uint32_t dd = (uint32_t)c0[i + 3] | ((uint32_t)c0[i + 4] << 8) |
+                              ((uint32_t)c0[i + 5] << 16) | ((uint32_t)c0[i + 6] << 24);
+                nullcall_disp = dd;
+                nullcall_entry_addr = kr0[4 /* r11 */] + (uint64_t)dd;
+                if (process_user_buffer_is_valid(
+                        (const void *)(uintptr_t)nullcall_entry_addr, 8u)) {
+                    nullcall_entry_early =
+                        *(const uint64_t *)(uintptr_t)nullcall_entry_addr;
+                }
+                break;
+            }
+        }
+    }
+
     serial_write_string("[OS] [PF] Page fault\n");
+    /* The address space the fault was taken in, next to the one the process
+     * table says it should be: a mismatch means the CPU was executing user
+     * code against someone else's page tables, and every address in this dump
+     * would then mean something different to the faulting instruction than it
+     * does to us. */
+    serial_write_string("[OS] [PF] cr3=");
+    serial_write_uint64(paging_get_active_cr3());
+    serial_write_string(" proc_cr3=");
+    serial_write_uint64(process_get_current_cr3());
+    serial_write_string("\n");
     serial_write_string("[OS] [PF] CR2: ");
     serial_write_uint64(cr2);
     serial_write_string("\n");
@@ -620,6 +746,289 @@ int32_t page_fault_handler(uint64_t error_code,
                 serial_write_uint64(ustack[i]);
             }
             serial_write_string("\n");
+
+            /* An instruction fetch at (near) address zero is a call through a
+             * NULL function pointer, and the interesting question is always
+             * "which slot of which table, and what do its neighbours hold?" --
+             * one NULL entry in an otherwise populated dispatch table means
+             * something different from a table that is entirely zero. The
+             * pointer was loaded RIP-relative right before the call, so scan
+             * the bytes just below the return address for the last
+             * `mov r64, [rip+disp32]` (REX.W, opcode 8B, mod=00 rm=101) and
+             * dump the memory around the address it names. */
+            if ((error_code & PF_INSTR) != 0u && cr2 < 0x1000u) {
+                /* The register file the ISR pushed, so an indirect jump
+                 * through a table (glvnd's `jmp *disp(%r11)` dispatch stubs,
+                 * say) can be followed to the table itself. Layout matches
+                 * SAVE_REGS in IDT.asm; kernel_rsp points one qword below it. */
+                static const char *const regname[15] = {
+                    "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8",
+                    "rbp", "rdi", "rsi", "rdx", "rcx", "rbx", "rax"
+                };
+                const uint64_t *kregs =
+                    (const uint64_t *)(uintptr_t)(kernel_rsp + 8u);
+                /* The thread pointer and the static-TLS window below it.
+                 * An initial-exec dispatch stub reaches its table with
+                 * `mov tpoff(%rip),%rax; mov %fs:(%rax),%reg`, so when such a
+                 * jump lands on NULL the two questions are "was the tpoff the
+                 * right one for this module?" and "what does the slot it
+                 * actually names hold?". Both are answered by the raw window:
+                 * every loaded module's initial-exec block lives in it, and a
+                 * table pointer sitting at the wrong offset is visible as a
+                 * plausible pointer in a neighbouring slot. */
+                {
+                    uint64_t fsb = rdmsr_fs_base_dbg();
+                    serial_write_string("[OS] [PF] fsbase=");
+                    serial_write_uint64(fsb);
+                    serial_write_string("\n");
+                    /* Only the slots that hold something dereferenceable are
+                     * interesting, and for each the useful follow-up is the
+                     * word the faulting stub would have jumped through: two
+                     * different modules' dispatch tables are told apart by
+                     * what sits at the same index, not by the table address.
+                     * `disp` below is that index's content, decoded from the
+                     * trampoline earlier in this dump. */
+                    if (fsb >= 1024u) {
+                        for (int i = 0; i < 128; ++i) {
+                            uint64_t slot_va = fsb - 1024u + (uint64_t)i * 8u;
+                            if (!process_user_buffer_is_valid(
+                                    (const void *)(uintptr_t)slot_va, 8u)) {
+                                continue;
+                            }
+                            uint64_t v = *(const uint64_t *)(uintptr_t)slot_va;
+                            if (v < 0x1000u) continue;
+                            serial_write_string("[OS] [PF]  tp-");
+                            serial_write_uint32((uint32_t)(1024 - i * 8));
+                            serial_write_string(" = ");
+                            serial_write_uint64(v);
+                            if (nullcall_disp != 0u &&
+                                process_user_buffer_is_valid(
+                                    (const void *)(uintptr_t)(v + nullcall_disp),
+                                    8u)) {
+                                serial_write_string(" disp[");
+                                serial_write_uint32(nullcall_disp);
+                                serial_write_string("]=");
+                                serial_write_uint64(
+                                    *(const uint64_t *)(uintptr_t)(v + nullcall_disp));
+                            }
+                            serial_write_string("\n");
+                        }
+                    }
+                }
+                serial_write_string("[OS] [PF] regs:");
+                for (int i = 0; i < 15; ++i) {
+                    serial_write_string(" ");
+                    serial_write_string(regname[i]);
+                    serial_write_string("=");
+                    serial_write_uint64(kregs[i]);
+                }
+                serial_write_string("\n");
+
+                uint64_t ret = ustack[0];
+                const uint32_t window = 40u;
+                if (ret > window &&
+                    process_user_buffer_is_valid(
+                        (const void *)(uintptr_t)(ret - window), window)) {
+                    const uint8_t *p = (const uint8_t *)(uintptr_t)(ret - window);
+                    uint64_t slot = 0;
+                    for (uint32_t i = 0; i + 7u <= window; ++i) {
+                        if ((p[i] & 0xF8u) != 0x48u) continue; /* REX.W */
+                        if (p[i + 1] != 0x8Bu) continue;       /* mov r64,r/m64 */
+                        if ((p[i + 2] & 0xC7u) != 0x05u) continue; /* [rip+d32] */
+                        uint32_t d = (uint32_t)p[i + 3] |
+                                     ((uint32_t)p[i + 4] << 8) |
+                                     ((uint32_t)p[i + 5] << 16) |
+                                     ((uint32_t)p[i + 6] << 24);
+                        slot = (ret - window + i + 7u) + (uint64_t)(int64_t)(int32_t)d;
+                    }
+                    uint64_t base = slot >= 0x40u ? ((slot - 0x40u) & ~7ULL) : 0u;
+                    if (base != 0u &&
+                        process_user_buffer_is_valid((const void *)(uintptr_t)base,
+                                                     8u * 24u)) {
+                        const uint64_t *tab = (const uint64_t *)(uintptr_t)base;
+                        serial_write_string("[OS] [PF] null-call slot=");
+                        serial_write_uint64(slot);
+                        serial_write_string(" table@");
+                        serial_write_uint64(base);
+                        serial_write_string(":");
+                        for (int i = 0; i < 24; ++i) {
+                            serial_write_string(" ");
+                            serial_write_uint64(tab[i]);
+                        }
+                        serial_write_string("\n");
+                    }
+                    /* One more hop: if the slot holds a trampoline that
+                     * re-dispatches through a table in %r11 (`jmp *d32(%r11)`,
+                     * how libGLdispatch reaches the current GL vendor), the
+                     * NULL is in *that* table, not this one. Decode the
+                     * displacement out of the trampoline and dump around it. */
+                    uint64_t target =
+                        (slot != 0u &&
+                         process_user_buffer_is_valid((const void *)(uintptr_t)slot, 8u))
+                            ? *(const uint64_t *)(uintptr_t)slot : 0u;
+                    if (target != 0u &&
+                        process_user_buffer_is_valid((const void *)(uintptr_t)target, 32u)) {
+                        const uint8_t *c = (const uint8_t *)(uintptr_t)target;
+                        /* The trampoline's own bytes. glvnd rewrites these in
+                         * place at MakeCurrent, so "what the CPU executed" and
+                         * "what the file says" can differ -- and a half-applied
+                         * or reverted rewrite is itself a candidate cause. */
+                        /* The trampoline's own GOTTPOFF operand and its
+                         * neighbours. The word it loads has been seen holding
+                         * another module's TLS offset; whether the words
+                         * around it are also foreign is what separates a
+                         * single stray store from a bulk copy over the .got. */
+                        for (uint32_t i = 0; i + 7u <= 32u; ++i) {
+                            if ((c[i] & 0xF8u) != 0x48u || c[i + 1] != 0x8Bu ||
+                                (c[i + 2] & 0xC7u) != 0x05u) {
+                                continue;
+                            }
+                            uint32_t gd = (uint32_t)c[i + 3] |
+                                          ((uint32_t)c[i + 4] << 8) |
+                                          ((uint32_t)c[i + 5] << 16) |
+                                          ((uint32_t)c[i + 6] << 24);
+                            uint64_t gslot = target + i + 7u +
+                                             (uint64_t)(int64_t)(int32_t)gd;
+                            uint64_t gbase = gslot >= 0x40u ? (gslot - 0x40u) : 0u;
+                            if (gbase != 0u &&
+                                process_user_buffer_is_valid(
+                                    (const void *)(uintptr_t)gbase, 8u * 16u)) {
+                                const uint64_t *g = (const uint64_t *)(uintptr_t)gbase;
+                                serial_write_string("[OS] [PF] tpoff slot=");
+                                serial_write_uint64(gslot);
+                                serial_write_string(" got@");
+                                serial_write_uint64(gbase);
+                                serial_write_string(":");
+                                for (int q = 0; q < 16; ++q) {
+                                    serial_write_string(" ");
+                                    serial_write_uint64(g[q]);
+                                }
+                                serial_write_string("\n");
+                                /* The register holds one value, the memory may
+                                 * hold another. Re-read after dropping this
+                                 * CPU's translation and print the frame the
+                                 * address resolves to: a value that only
+                                 * changes across the invalidation, or a frame
+                                 * that is not the one the loader wrote, means
+                                 * the load was served from a stale mapping
+                                 * rather than the word being corrupt. */
+                                uint64_t gv1 = *(const uint64_t *)(uintptr_t)gslot;
+                                hal_mmu_invalidate_tlb((uintptr_t)gslot);
+                                uint64_t gv2 = *(const uint64_t *)(uintptr_t)gslot;
+                                serial_write_string("[OS] [PF] tpoff pre-invlpg=");
+                                serial_write_uint64(gv1);
+                                serial_write_string(" post=");
+                                serial_write_uint64(gv2);
+                                serial_write_string(" phys=");
+                                serial_write_uint64(paging_virt_to_phys(
+                                    process_get_current_cr3(), gslot));
+                                serial_write_string(" rax=");
+                                serial_write_uint64(kregs[14]);
+                                serial_write_string("\n");
+                            }
+                            break;
+                        }
+                        serial_write_string("[OS] [PF] trampoline@");
+                        serial_write_uint64(target);
+                        serial_write_string(":");
+                        for (int q = 0; q < 32; ++q) {
+                            serial_write_string(" ");
+                            serial_write_uint32((uint32_t)c[q]);
+                        }
+                        serial_write_string("\n");
+                        for (uint32_t i = 0; i + 7u <= 32u; ++i) {
+                            if (c[i] != 0x41u || c[i + 1] != 0xFFu ||
+                                c[i + 2] != 0xA3u) {
+                                continue;
+                            }
+                            uint32_t d = (uint32_t)c[i + 3] |
+                                         ((uint32_t)c[i + 4] << 8) |
+                                         ((uint32_t)c[i + 5] << 16) |
+                                         ((uint32_t)c[i + 6] << 24);
+                            uint64_t tbl = kregs[4 /* r11 */] + (uint64_t)d;
+                            /* Read the entry, drop the translation, read it
+                             * again: a value that changes across the
+                             * invalidation means this CPU was working from a
+                             * stale mapping, which is a very different bug
+                             * from a genuinely empty table slot. */
+                            if (process_user_buffer_is_valid(
+                                    (const void *)(uintptr_t)tbl, 8u)) {
+                                uint64_t v1 = *(const uint64_t *)(uintptr_t)tbl;
+                                hal_mmu_invalidate_tlb((uintptr_t)tbl);
+                                uint64_t v2 = *(const uint64_t *)(uintptr_t)tbl;
+                                serial_write_string("[OS] [PF] entry early=");
+                                serial_write_uint64(nullcall_entry_early);
+                                serial_write_string("@");
+                                serial_write_uint64(nullcall_entry_addr);
+                                serial_write_string(" pre-invlpg=");
+                                serial_write_uint64(v1);
+                                serial_write_string(" post=");
+                                serial_write_uint64(v2);
+                                serial_write_string("\n");
+                                if (v2 != 0u &&
+                                    process_user_buffer_is_valid(
+                                        (const void *)(uintptr_t)v2, 16u)) {
+                                    const uint8_t *tc =
+                                        (const uint8_t *)(uintptr_t)v2;
+                                    serial_write_string("[OS] [PF] entry code:");
+                                    for (int q = 0; q < 16; ++q) {
+                                        serial_write_string(" ");
+                                        serial_write_uint32((uint32_t)tc[q]);
+                                    }
+                                    serial_write_string("\n");
+                                }
+                            }
+                            /* The register file belongs to the LAST stub in
+                             * the chain, not the first: a vendor's own
+                             * entrypoint is itself `mov tpoff,%rax; mov
+                             * %fs:(%rax),%r11; jmp *slot(%r11)`, so %r11 names
+                             * the vendor's table while the displacement
+                             * decoded above came from the caller's. Survey the
+                             * whole table instead -- one NULL in an otherwise
+                             * populated table and a table that is mostly NULL
+                             * are very different bugs. */
+                            {
+                                uint64_t base_t = kregs[4 /* r11 */];
+                                if (base_t >= 0x1000u &&
+                                    process_user_buffer_is_valid(
+                                        (const void *)(uintptr_t)base_t,
+                                        8u * 2048u)) {
+                                    const uint64_t *t =
+                                        (const uint64_t *)(uintptr_t)base_t;
+                                    uint32_t nulls = 0;
+                                    serial_write_string("[OS] [PF] r11 table nulls:");
+                                    for (uint32_t k = 0; k < 2048u; ++k) {
+                                        if (t[k] != 0u) continue;
+                                        if (nulls < 24u) {
+                                            serial_write_string(" ");
+                                            serial_write_uint32(k);
+                                        }
+                                        ++nulls;
+                                    }
+                                    serial_write_string(" total=");
+                                    serial_write_uint32(nulls);
+                                    serial_write_string("/2048\n");
+                                }
+                            }
+                            uint64_t tb = tbl >= 0x20u ? (tbl - 0x20u) : 0u;
+                            if (tb != 0u &&
+                                process_user_buffer_is_valid(
+                                    (const void *)(uintptr_t)tb, 8u * 12u)) {
+                                const uint64_t *t2 = (const uint64_t *)(uintptr_t)tb;
+                                serial_write_string("[OS] [PF] dispatch entry=");
+                                serial_write_uint64(tbl);
+                                serial_write_string(" around:");
+                                for (int k = 0; k < 12; ++k) {
+                                    serial_write_string(" ");
+                                    serial_write_uint64(t2[k]);
+                                }
+                                serial_write_string("\n");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         {

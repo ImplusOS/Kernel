@@ -184,11 +184,18 @@ isr_nmi:
 isr_general_protection:
     cli
     SWAPGS_IF_USER_ENTER 16
-    mov rdi, [rsp]
-    mov rsi,[rsp + 8]
-    mov rdx, rsp
-    mov rcx, rbp
-    and rsp, ~0xF
+    SAVE_REGS
+    sub rsp, 8
+
+    ; gpregs (from rdi): [0]=r15 [1]=r14 ... [14]=rax
+    ; CPU frame follows: [15]=err [16]=rip [17]=cs [18]=rflags
+    ;                    [19]=user_rsp [20]=user_ss
+    mov rdi, rsp
+    add rdi, 8                       ; skip pad -> r15
+    mov rsi, [rsp + 16 * 8]          ; error code
+    mov rdx, [rsp + 17 * 8]          ; rip
+    lea rcx, [rsp + 16 * 8]          ; CPU exception frame ptr
+    mov r8, rbp
     call general_protection_fault_handler
 .gp_hang:
     sti

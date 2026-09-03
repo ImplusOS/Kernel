@@ -1330,9 +1330,10 @@ int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
         }
     }
 
-    if (read_cr3() == cr3) {
-        write_cr3(cr3);
-    }
+    /* Every CPU, not just this one: the frames just freed go back to the
+     * allocator immediately, so any sibling thread still holding a
+     * translation would read and write memory that now belongs elsewhere. */
+    smp_tlb_shootdown_all();
     return 0;
 }
 
@@ -1521,6 +1522,13 @@ int paging_map_user_page(uint64_t cr3,
     }
 
     uint64_t old_pte = pt[i1];
+    /* Replacing a live translation, not filling a hole: every other CPU may
+     * still hold the old one, and the frame under it is freed just below and
+     * handed straight back to the allocator. A thread on another CPU then
+     * keeps reading (and writing) a page that now belongs to something else --
+     * which is how a fully populated GL dispatch table read back as a NULL
+     * entry in one thread while the page tables said otherwise. */
+    int replaced_live_mapping = (old_pte & PAGE_PRESENT) != 0;
     if ((old_pte & PAGE_PRESENT) != 0 && (old_pte & PAGE_USER) != 0) {
         if ((old_pte & PAGE_EXTERNAL) == 0) {
             free_page((void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK));
@@ -1543,6 +1551,9 @@ int paging_map_user_page(uint64_t cr3,
     
     if (cr3 == read_cr3()) {
         invlpg_addr(virt_addr & PAGE_MASK);
+    }
+    if (replaced_live_mapping) {
+        smp_tlb_shootdown_all();
     }
     return 0;
 }
@@ -1595,12 +1606,21 @@ int paging_swap_reclaim_one_page(void)
     return 0;
 }
 
+/* Demand faulting is not per-address-space serialised anywhere else, and two
+ * threads of one process (llvmpipe's worker pool, say) fault on the same page
+ * routinely. Without this lock both allocate a zeroed page and both map it:
+ * the second map overwrites the first one's PTE, so every write the first
+ * thread already made lands in a page nothing points at any more, and the
+ * other CPUs keep a TLB entry for it. That is how a fully populated glvnd GL
+ * dispatch table read back as a NULL entry and Doom jumped to address 0. */
+static spinlock_t g_demand_fault_lock;
+
 int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
 {
     if (cr3 == 0) return 0;
 
     uint64_t virt_addr = fault_addr & PAGE_MASK;
-    
+
     if (!is_user_virtual_address(virt_addr)) {
         return 0;
     }
@@ -1609,9 +1629,29 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
     int leaf_res = resolve_fault_leaf_entry(cr3, virt_addr, &pml4e, &pdpte, &pde, &pte);
 
     if (leaf_res < 0 || pte == NULL || ((*pte & PAGE_PRESENT) == 0 && (*pte & PAGE_SWAP) == 0)) {
-        
+        uint64_t dz_irq = irq_save_disable();
+        spinlock_lock(&g_demand_fault_lock);
+
+        /* Re-walk under the lock: another CPU may have filled this page in
+         * while we were on our way here, in which case there is nothing to do
+         * but drop our own stale translation. */
+        pml4e = pdpte = pde = pte = NULL;
+        leaf_res = resolve_fault_leaf_entry(cr3, virt_addr, &pml4e, &pdpte,
+                                            &pde, &pte);
+        if (leaf_res >= 0 && pte != NULL &&
+            ((*pte & PAGE_PRESENT) != 0 || (*pte & PAGE_SWAP) != 0)) {
+            spinlock_unlock(&g_demand_fault_lock);
+            irq_restore(dz_irq);
+            if (cr3 == read_cr3()) {
+                invlpg_addr(virt_addr);
+            }
+            return 1;
+        }
+
         void *phys_page = alloc_page();
         if (phys_page == NULL) {
+            spinlock_unlock(&g_demand_fault_lock);
+            irq_restore(dz_irq);
             serial_write_string("[PF] demand-zero: alloc_page failed (PMM OOM) va=");
             serial_write_uint64(virt_addr);
             serial_write_string("\n");
@@ -1622,16 +1662,21 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
 
         if (paging_map_user_page(cr3, virt_addr, (uint64_t)(uintptr_t)phys_page, PAGE_RW) < 0) {
             free_page(phys_page);
+            spinlock_unlock(&g_demand_fault_lock);
+            irq_restore(dz_irq);
             serial_write_string("[PF] demand-zero: map_user_page failed (page-table OOM) va=");
             serial_write_uint64(virt_addr);
             serial_write_string("\n");
             return 0;
         }
 
+        spinlock_unlock(&g_demand_fault_lock);
+        irq_restore(dz_irq);
+
         if (cr3 == read_cr3()) {
             invlpg_addr(virt_addr);
         }
-        
+
         return 1;
     }
 

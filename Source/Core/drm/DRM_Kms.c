@@ -294,12 +294,119 @@ static drm_fb_t *fb_by_id(uint32_t id)
     return NULL;
 }
 
-/* Blit a dumb buffer to the hardware framebuffer (XRGB8888, 32bpp assumed). */
+/* ---- Scanout redirection ------------------------------------------------
+ *
+ * The destination is described by its physical pages, not by a virtual
+ * address: the blit runs in whatever process happened to issue the flip
+ * ioctl (Xorg), while the buffer belongs to the launcher, and the two do not
+ * share an address space. The pages come from a shared-memory object whose
+ * frames are allocated once and never moved, so caching them is sound.
+ * alloc_page() hands back kernel-usable pointers that double as physical
+ * addresses, which is what makes the plain memcpy below legal. */
+#define DRM_MIRROR_MAX_PAGES 2048u   /* 8 MiB: 1600x1200x4 with room over */
+
+static uint64_t g_mirror_pages[DRM_MIRROR_MAX_PAGES];
+static uint32_t g_mirror_page_count;
+static uint32_t g_mirror_w, g_mirror_h;
+static volatile uint32_t g_mirror_dirty;
+/* Owner of the surface. The frames belong to a shared-memory object the
+ * window manager frees when the window goes away, so a mirror that outlived
+ * its client would have the next flip memcpy into pages that now belong to
+ * something else. */
+static int32_t  g_mirror_pid = -1;
+
+int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
+{
+    if (pixels == 0u) {
+        g_mirror_page_count = 0u;
+        g_mirror_w = g_mirror_h = 0u;
+        g_mirror_pid = -1;
+        return 0;
+    }
+    if (width == 0u || height == 0u) return E_INVAL;
+    if ((pixels & (PAGE_SIZE - 1u)) != 0u) return E_INVAL;
+
+    uint64_t bytes = (uint64_t)width * (uint64_t)height * 4u;
+    uint64_t pages = (bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+    if (pages > DRM_MIRROR_MAX_PAGES) return E_NOMEM;
+
+    uint64_t cr3 = process_get_current_cr3();
+    if (cr3 == 0u) return E_INVAL;
+
+    /* Resolve every page up front. A partially resolved mirror is worse than
+     * none: the blit would write the rows it can and leave the rest holding
+     * an older frame, which reads as corruption rather than as a failure. */
+    for (uint64_t i = 0; i < pages; ++i) {
+        uint64_t phys = paging_virt_to_phys(cr3, pixels + i * PAGE_SIZE);
+        if (phys == 0u) {
+            g_mirror_page_count = 0u;
+            return E_FAULT;
+        }
+        g_mirror_pages[i] = phys & ~((uint64_t)PAGE_SIZE - 1u);
+    }
+    g_mirror_w = width;
+    g_mirror_h = height;
+    g_mirror_pid = process_get_current_pid();
+    g_mirror_page_count = (uint32_t)pages;
+    return 0;
+}
+
+void drm_kms_notify_process_exit(int32_t pid)
+{
+    if (pid >= 0 && pid == g_mirror_pid) {
+        g_mirror_page_count = 0u;
+        g_mirror_w = g_mirror_h = 0u;
+        g_mirror_pid = -1;
+    }
+}
+
+int drm_kms_mirror_take_dirty(void)
+{
+    uint32_t d = g_mirror_dirty;
+    g_mirror_dirty = 0u;
+    return d != 0u;
+}
+
+/* memcpy into the page-scattered mirror at a byte offset. */
+static void mirror_write(uint64_t offset, const uint8_t *src, uint32_t len)
+{
+    while (len > 0u) {
+        uint32_t page = (uint32_t)(offset / PAGE_SIZE);
+        if (page >= g_mirror_page_count) return;
+        uint32_t in_page = (uint32_t)(offset % PAGE_SIZE);
+        uint32_t chunk = (uint32_t)PAGE_SIZE - in_page;
+        if (chunk > len) chunk = len;
+        memcpy((uint8_t *)(uintptr_t)g_mirror_pages[page] + in_page, src, chunk);
+        offset += chunk;
+        src += chunk;
+        len -= chunk;
+    }
+}
+
+/* Blit a dumb buffer to the hardware framebuffer (XRGB8888, 32bpp assumed),
+ * or into the redirection surface when one is registered. */
 static void blit_fb_to_display(drm_fb_t *fb)
 {
     if (!fb) return;
     drm_dumb_t *bo = dumb_by_handle(fb->handle);
     if (!bo || !bo->kva) return;
+    uint32_t src_pitch = fb->pitch ? fb->pitch : (bo->pitch ? bo->pitch : fb->width * 4u);
+
+    if (g_mirror_page_count != 0u) {
+        uint32_t cw = (fb->width  < g_mirror_w) ? fb->width  : g_mirror_w;
+        uint32_t ch = (fb->height < g_mirror_h) ? fb->height : g_mirror_h;
+        uint32_t dst_pitch = g_mirror_w * 4u;
+        for (uint32_t y = 0; y < ch; y++) {
+            mirror_write((uint64_t)y * dst_pitch,
+                         (const uint8_t *)bo->kva + (size_t)y * src_pitch,
+                         cw * 4u);
+        }
+        g_mirror_dirty = 1u;
+        /* No display_present(): the window manager owns the panel now and
+         * will composite this surface on its own schedule. */
+        return;
+    }
+
     void *hw = display_get_framebuffer();
     if (!hw) return;
     uint32_t hw_w = display_width();
@@ -307,7 +414,6 @@ static void blit_fb_to_display(drm_fb_t *fb)
     uint32_t hw_pitch = hw_w * 4u;
     uint32_t cw = (fb->width  < hw_w) ? fb->width  : hw_w;
     uint32_t ch = (fb->height < hw_h) ? fb->height : hw_h;
-    uint32_t src_pitch = fb->pitch ? fb->pitch : (bo->pitch ? bo->pitch : fb->width * 4u);
     for (uint32_t y = 0; y < ch; y++) {
         memcpy((uint8_t *)hw + (size_t)y * hw_pitch,
                (uint8_t *)bo->kva + (size_t)y * src_pitch,
@@ -351,11 +457,24 @@ static void append_u32(char *buf, int *pos, uint32_t v)
     }
 }
 
+/* The size the server should drive. With scanout redirected this is the
+ * client surface, not the panel: X reads the connector's mode once at
+ * startup, so advertising the window size here is what makes it render at
+ * exactly that size instead of full-screen and clipped. */
+static uint32_t mode_width(void)
+{
+    return g_mirror_page_count != 0u ? g_mirror_w : display_width();
+}
+static uint32_t mode_height(void)
+{
+    return g_mirror_page_count != 0u ? g_mirror_h : display_height();
+}
+
 /* Fill a single 60Hz mode sized to the current display. */
 static void fill_mode(struct drm_mode_modeinfo *m)
 {
-    uint32_t w = display_width();
-    uint32_t h = display_height();
+    uint32_t w = mode_width();
+    uint32_t h = mode_height();
     if (w == 0u) {
         w = 1024u;
     }

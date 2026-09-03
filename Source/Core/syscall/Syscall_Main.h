@@ -200,6 +200,15 @@
  * os_shared_memory_map(). */
 #define SYSCALL_MEMFD_SHM_HANDLE       269
 
+/* Is anything bound+listening on this AF_UNIX path? Lets a native launcher
+ * wait for a foreign server (Xorg's /tmp/.X11-unix/X0) to reach its accept
+ * loop instead of sleeping a fixed, guessed interval. */
+#define SYSCALL_UNIX_LISTENING         270
+/* Redirect KMS scanout into a caller-owned surface -- see DRM_Kms.h. */
+#define SYSCALL_DISPLAY_KMS_MIRROR     271
+/* Non-zero (and clears) once the mirror has taken a new frame. */
+#define SYSCALL_DISPLAY_KMS_MIRROR_DIRTY 272
+
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241
 #define SYSCALL_KVM_CLOSE         242

@@ -33,3 +33,29 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
                      uint64_t flags);
 
 void    drm_kms_close(void);
+
+/* ---- Scanout redirection ("mirror") -------------------------------------
+ *
+ * By default a flip is blitted straight to display_get_framebuffer(), i.e.
+ * Xorg owns the panel. That cannot coexist with the ImplusOS window manager,
+ * which owns the same framebuffer: whoever presented last wins and the screen
+ * tears between two unrelated desktops.
+ *
+ * A native client (the Doom launcher) instead creates an ordinary WM window,
+ * hands the pixels of its backing store here, and X scans out into that
+ * surface; the compositor then draws it like any other window. `pixels` is a
+ * user VA in the CALLING process -- its physical pages are resolved once and
+ * pinned by the shared-memory object behind them, so the blit works from any
+ * process's context (Xorg's, when its ioctl runs).
+ *
+ * Passing pixels == NULL clears the redirection and restores direct scanout.
+ * Returns 0 on success, -errno otherwise. */
+int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height);
+
+/* Non-zero once at least one flip/dirty has been blitted into the mirror, so
+ * the client knows there is something to damage. Clears the flag. */
+int drm_kms_mirror_take_dirty(void);
+
+/* Called when a process goes away: drops the redirection if that process owned
+ * it, so scanout returns to the panel instead of writing into freed pages. */
+void drm_kms_notify_process_exit(int32_t pid);

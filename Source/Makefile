@@ -48,6 +48,24 @@ $(KERNEL_BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+# The two on-screen text renderers draw through stb_truetype, which is float
+# code, so they cannot be built with the kernel-wide -mgeneral-regs-only.
+# That is safe for these two and nowhere else, because neither runs while a
+# userland thread is suspended holding live vector registers:
+#   Debug/panic/Panic.c    kernel_panic_init() at boot; kernel_panic(), after
+#                          which nothing is resumed.
+#   Debug/printf/printf.c  the boot-time console mirror, which kernel_main()
+#                          detaches with serial_set_screen_mirror(NULL) before
+#                          handing control to userland.
+# Every other kernel translation unit must stay clear of the FPU/SSE
+# registers -- see Kernel/Source/config/arch.mk for why.
+KERNEL_FP_SOURCES := Debug/panic/Panic.c Debug/printf/printf.c
+KERNEL_FP_OBJS := $(KERNEL_FP_SOURCES:%.c=$(KERNEL_BUILD)/%.o)
+
+$(KERNEL_FP_OBJS): $(KERNEL_BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mgeneral-regs-only,$(KERNEL_CFLAGS)) -c $< -o $@
+
 $(KERNEL_BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f $(ARCH_ASM_FORMAT) $< -o $@
@@ -59,6 +77,14 @@ $(KERNEL_BUILD)/%.o: %.S
 $(KERNEL_BUILD)/libc/I_libc/%.o: $(ROOT_DIR)/libc/I_libc/Source/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# libm is float by definition. In the kernel it exists only to satisfy
+# stb_truetype, which is reached exclusively from the two boot/panic text
+# renderers above, so the same argument applies: nothing calls it while a
+# userland thread's vector registers are live.
+$(KERNEL_BUILD)/libc/I_libc/src/math.o: $(ROOT_DIR)/libc/I_libc/Source/src/math.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -mgeneral-regs-only,$(KERNEL_CFLAGS)) -c $< -o $@
 
 $(KERNEL_BUILD)/Library/%.o: $(ROOT_DIR)/Library/Source/%.c
 	@mkdir -p $(dir $@)

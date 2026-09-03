@@ -6,7 +6,10 @@ ifeq ($(ARCH),x86_64)
 CC := x86_64-elf-gcc
 LD := x86_64-elf-ld
 OBJCOPY := x86_64-elf-objcopy
-DRIVER_ARCH_CFLAGS := -mno-red-zone -DPLATFORM_X86_64
+# -mgeneral-regs-only for the same reason as the kernel proper (see
+# Kernel/Source/config/arch.mk): a driver module runs in kernel context on the
+# interrupted thread's FPU/SSE registers, and nothing saves them on entry.
+DRIVER_ARCH_CFLAGS := -mno-red-zone -mgeneral-regs-only -DPLATFORM_X86_64
 endif
 
 ifeq ($(ARCH),arm64)

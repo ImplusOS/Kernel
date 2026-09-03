@@ -54,6 +54,7 @@ typedef struct __attribute__((packed)) {
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "Core/drm/DRM_Kms.h"
 
 #define SYSCALL_MAX_PATH_LEN    512U
 #define SYSCALL_MAX_PUTS_LEN    1024U
@@ -2152,6 +2153,33 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             set_syscall_result(saved_rsp, (uint64_t)unix_socket_bind((int32_t)arg1, kpath));
+            break;
+        }
+        case SYSCALL_UNIX_LISTENING: {
+            extern int64_t unix_socket_path_listening(const char*);
+            char kpath[108];
+            if (arg1 == 0 || copy_user_cstring(kpath, sizeof(kpath),
+                                               (const char*)(uintptr_t)arg1) != 0) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_unix_listening_path");
+                break;
+            }
+            set_syscall_result(saved_rsp,
+                               (uint64_t)unix_socket_path_listening(kpath));
+            break;
+        }
+        case SYSCALL_DISPLAY_KMS_MIRROR: {
+            /* The buffer is only ever the caller's own WM backing store, and
+             * drm_kms_set_mirror() resolves it against the caller's page
+             * tables, so a bad pointer fails there rather than here. */
+            set_syscall_result(saved_rsp,
+                               (uint64_t)(int64_t)drm_kms_set_mirror(
+                                   arg1, (uint32_t)arg2, (uint32_t)arg3));
+            break;
+        }
+        case SYSCALL_DISPLAY_KMS_MIRROR_DIRTY: {
+            set_syscall_result(saved_rsp,
+                               (uint64_t)(int64_t)drm_kms_mirror_take_dirty());
             break;
         }
         case SYSCALL_UNIX_LISTEN: {

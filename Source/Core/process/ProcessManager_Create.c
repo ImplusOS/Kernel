@@ -31,6 +31,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "Core/drm/DRM_Kms.h"
 
 #define PROCESS_RFLAGS_DEFAULT 0x202ULL
 #define PROCESS_GUARD_PAGE_SIZE PAGE_SIZE
@@ -179,6 +180,85 @@ static inline void current_pid_set(int32_t pid)
     process_scheduler_set_current_pid(pid);
 }
 
+
+/* ---- Parked kernel stacks ------------------------------------------------
+ *
+ * A CPU that has just run a process off the end of exit_group() is still
+ * standing on that process's kernel stack, and it keeps naming the process as
+ * its current pid until it finds something else to run. process_waitpid()
+ * refuses to reap a zombie any CPU still names, so if nothing else is
+ * runnable on this CPU -- the common case with 16 CPUs and three processes --
+ * the parent's wait4() waits forever on a child that has already exited. That
+ * is what stalled Xorg after every xkbcomp run.
+ *
+ * Dropping the reference alone is not enough: the reap then frees the very
+ * stack this CPU is executing on. So take the stack away from the dying
+ * process first and park it against this CPU. The reaper frees everything
+ * else; the stack itself is released the next time this CPU is demonstrably
+ * running on some other stack. */
+typedef struct {
+    void    *base;
+    uint64_t top;
+} parked_stack_t;
+
+static parked_stack_t g_parked_stack[OS_CONFIG_SMP_MAX_CPUS];
+
+static void process_release_parked_stack(void)
+{
+    uint32_t cpu = smp_get_current_cpu_id();
+    if (cpu >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        return;
+    }
+    void *base = g_parked_stack[cpu].base;
+    if (base == NULL) {
+        return;
+    }
+    /* An interrupt taken while this CPU idles on the parked stack re-enters
+     * the scheduler on that same stack, so prove we have left it before
+     * handing it back to the heap. */
+    uint64_t here = (uint64_t)(uintptr_t)&base;
+    if (here >= (uint64_t)(uintptr_t)base && here < g_parked_stack[cpu].top) {
+        return;
+    }
+    g_parked_stack[cpu].base = NULL;
+    g_parked_stack[cpu].top = 0;
+    free(base);
+}
+
+static int is_valid_pid(int32_t pid);
+
+/* Caller holds g_process_table_lock. If this CPU's current process is already
+ * dead, park its kernel stack here and stop naming it, so waitpid() can reap.
+ * No-op for a live process. */
+static void process_detach_dead_current_locked(void)
+{
+    int32_t pid = current_pid_get();
+    if (!is_valid_pid(pid)) {
+        return;
+    }
+    process_t *proc = &g_processes[pid];
+    if (proc->state != PROCESS_STATE_ZOMBIE &&
+        proc->state != PROCESS_STATE_DEAD &&
+        proc->state != PROCESS_STATE_UNUSED) {
+        return;
+    }
+
+    uint32_t cpu = smp_get_current_cpu_id();
+    if (cpu < (uint32_t)OS_CONFIG_SMP_MAX_CPUS &&
+        proc->kernel_stack_base != NULL && g_parked_stack[cpu].base == NULL) {
+        g_parked_stack[cpu].base = proc->kernel_stack_base;
+        g_parked_stack[cpu].top = proc->kernel_stack_top;
+        proc->kernel_stack_base = NULL; /* the reaper must not free it */
+    }
+    /* This CPU is also still running on the dying process's page tables, and
+     * the reap tears those down (paging_destroy_process_space). Get onto the
+     * kernel's own CR3 first, or the next instruction faults with no page
+     * tables to fault into -- an instant triple fault and reboot. */
+    if (proc->cr3 != 0u && paging_get_active_cr3() == proc->cr3) {
+        paging_switch_cr3(paging_get_kernel_cr3());
+    }
+    current_pid_set(-1);
+}
 
 static void halt_forever(void)
 {
@@ -820,6 +900,16 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
 {
     if (proc == NULL || signum <= 0 || signum >= PROCESS_SIGNAL_MAX) {
         return -1;
+    }
+
+    if (OS_CONFIG_FOREIGN_TRACE) {
+    serial_write_string("[sig] push pid=");
+    serial_write_uint32((uint32_t)(int32_t)(proc - g_processes));
+    serial_write_string(" sig=");
+    serial_write_uint32((uint32_t)signum);
+    serial_write_string(" handler=");
+    serial_write_uint64(proc->signal_handlers[(uint32_t)signum]);
+    serial_write_char('\n');
     }
 
     uint64_t handler = proc->signal_handlers[(uint32_t)signum];
@@ -2578,6 +2668,10 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
                "No drivers available"). Preload libgbm.so.1 so its symbols sit
                in the global scope before modesetting_drv.so is dlopen()ed.
                TODO_Doom_Xorg_MethodA.md M6 (7th boot). */
+            /* NOTE: if you ever add another preload here, append it to this
+               entry with a colon. glibc's ld.so keeps only the LAST LD_PRELOAD
+               it sees, so a second line silently drops libgbm and Xorg dies
+               with "undefined symbol: gbm_bo_get_plane_count". */
             "LD_PRELOAD=libgbm.so.1",
             /* Bind every relocation at load time. Two reasons:
                (1) boot 7 proved libglx.so resolves cleanly under eager
@@ -2635,14 +2729,28 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
             "DISPLAY=:0",
             "LIBGL_ALWAYS_SOFTWARE=1",
             "GALLIUM_DRIVER=llvmpipe",
-            /* Force indirect GLX: GL commands go over the X protocol and the
-               server renders them (it reports "GLX: Initialized DRISWRAST GL
-               provider" with +iglx). The client's own direct path cannot work
-               here -- trixie ships every *_dri.so as the thin libdril shim,
-               which has no usable software screen -- so glXCreateContext()
-               returned NULL and the following glXMakeCurrent() drew a GLX
-               BadMatch. See TODO_Doom_Xorg_MethodA.md M23. */
-            "LIBGL_ALWAYS_INDIRECT=1",
+            /* llvmpipe's scene/command-handoff worker threads race the main
+             * thread's JIT'd raster kernel under our SMP scheduler; the torn
+             * read showed up as a #GP er lang user-mode deref of garbage rax
+             * at the first frame (M24). Force one raster thread for now. TODO:
+             * find the real thread-handoff bug. */
+            "LP_NUM_THREADS=1",
+            /* NOTE: a second "GALLIUM_DRIVER=softpipe" used to sit here. It
+               never took effect -- getenv() returns the first match and
+               llvmpipe is above -- so it only read as if softpipe had been
+               tried and ruled out. Change the line above to switch drivers.
+               LIBGL_DEBUG=verbose was dropped with it: it is worth several
+               seconds of COM1 time on every boot and says nothing once direct
+               rendering is confirmed working. */
+            /* NOTE: LIBGL_ALWAYS_INDIRECT was removed. Indirect GLX makes the
+               *server* own the GL context, and its DoMakeCurrent() then dies
+               calling a NULL __GLXcontext::makeCurrent (M23). Direct rendering
+               keeps GL entirely inside the client: libGLX_mesa dlopens
+               swrast_dri.so -> libgallium (llvmpipe) and pushes finished frames
+               to X with PutImage, so nothing server-side has to render. The
+               old "the client's direct path cannot work" note was written while
+               libGLX_mesa.so.0 was still missing from the stage; it is staged
+               now, and the client does load libgallium + LLVM. */
             "XKB_CONFIG_ROOT=/usr/share/X11/xkb",
             /* Doom pulls libopenal (+ SDL2 via libfluidsynth). ImplusOS has no
                PipeWire/PulseAudio/ALSA device; letting OpenAL-soft probe them
@@ -2800,7 +2908,7 @@ static int process_clone_address_space(process_t *child, process_t *parent)
     }
 
 done:
-    {
+    if (OS_CONFIG_FOREIGN_TRACE) {
         uint64_t elapsed_ms =
             (process_perf_now_ns() - clone_start_ns) / 1000000ULL;
         serial_write_string("[fork] clone_address_space rc=");
@@ -3196,6 +3304,7 @@ int32_t process_execve(const char *path, const char *const *argv,
      */
     syscall_file_close_cloexec_for_pid(proc_pid);
     shared_memory_cleanup_process(proc_pid);
+    drm_kms_notify_process_exit(proc_pid);
 
     /* POSIX: execve resets every caught signal to SIG_DFL. The new image has
      * none of the old one's code, so keeping the handlers meant a process that
@@ -3430,6 +3539,19 @@ int32_t process_execve(const char *path, const char *const *argv,
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
+    /* Successful exec, not just the failures: X shells out to xkbcomp through
+     * /bin/sh, and telling "the shell never ran" apart from "xkbcomp ran and
+     * hung" needs the successful hop logged too. */
+    if (OS_CONFIG_FOREIGN_TRACE) {
+    serial_write_string("[execve-ok] pid=");
+    serial_write_uint32((uint32_t)(int32_t)(proc - g_processes));
+    serial_write_string(" path=");
+    serial_write_string(path_buf); /* NOT `path`: that user pointer lives in
+                                    * the address space this exec just tore
+                                    * down. */
+    serial_write_char('\n');
+    }
+
     return 0;
 }
 
@@ -3626,8 +3748,17 @@ void process_exit_current(void)
         return;
     }
     int32_t pid_to_exit = (int32_t)(owner - g_processes);
+    int32_t exit_status_log = owner->exit_status;
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+
+    if (OS_CONFIG_FOREIGN_TRACE) {
+        serial_write_string("[exit] pid=");
+        serial_write_uint32((uint32_t)pid_to_exit);
+        serial_write_string(" status=");
+        serial_write_uint32((uint32_t)exit_status_log);
+        serial_write_char('\n');
+    }
 
     uint32_t closed_fds = 0;
     uint32_t closed_dirs = 0;
@@ -3635,6 +3766,7 @@ void process_exit_current(void)
     syscall_socket_close_all_for_pid(pid_to_exit);
     unix_socket_close_all_for_pid(pid_to_exit);
     shared_memory_cleanup_process(pid_to_exit);
+    drm_kms_notify_process_exit(pid_to_exit);
     filemap_release_pid(pid_to_exit);
 
     irq_flags = irq_save_disable();
@@ -3648,6 +3780,7 @@ void process_exit_current(void)
         }
     }
     process_notify_parent_sigchld_locked(&g_processes[pid_to_exit]);
+    process_scheduler_release_stale_pid(pid_to_exit);
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
@@ -4150,6 +4283,8 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
         *next_user_rsp_out = current_user_rsp;
     }
 
+    process_release_parked_stack();
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
     process_scheduler_clear_leaving_pid();
@@ -4227,6 +4362,11 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
         }
         return return_saved_rsp;
     }
+
+    /* exit_group() lands here on the dying process's own kernel stack, and the
+     * idle loop below can sit on it indefinitely. Hand the stack to this CPU
+     * and stop naming the corpse, so the parent's wait4() can reap it. */
+    process_detach_dead_current_locked();
 
     int32_t next_pid = process_scheduler_pick_next(g_processes,
                                                    g_process_capacity,
@@ -4380,6 +4520,8 @@ int process_run_next_on_current_cpu(void)
         return 0;
     }
 
+    process_release_parked_stack();
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
     process_scheduler_clear_leaving_pid();
@@ -4391,6 +4533,10 @@ int process_run_next_on_current_cpu(void)
                                                    g_process_capacity,
                                                    current_pid);
     if (next_pid < 0) {
+        /* Nothing to dispatch: this CPU is going idle. Let go of the process
+         * it still names if that process is already dead -- see
+         * process_detach_dead_current_locked(). */
+        process_detach_dead_current_locked();
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
         return 0;
@@ -5133,8 +5279,29 @@ int process_signal_maybe_self_terminate(int32_t signum)
     return 1;
 }
 
+/* Every signal that reaches a foreign (Linux-ABI) process is worth a serial
+ * line: X's OsSigHandler reports "Received signal N sent by process 0" for
+ * anything with si_code == SI_USER, which hides who actually sent it. */
+static void signal_trace(const char *what, int32_t target, int32_t signum)
+{
+    if (!OS_CONFIG_FOREIGN_TRACE) {
+        (void)what; (void)target; (void)signum;
+        return;
+    }
+    serial_write_string("[sig] ");
+    serial_write_string(what);
+    serial_write_string(" from=");
+    serial_write_uint32((uint32_t)current_pid_get());
+    serial_write_string(" to=");
+    serial_write_uint32((uint32_t)target);
+    serial_write_string(" sig=");
+    serial_write_uint32((uint32_t)signum);
+    serial_write_char('\n');
+}
+
 int process_signal_deliver(int32_t pid, int32_t signum)
 {
+    signal_trace("deliver", pid, signum);
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -5197,6 +5364,7 @@ int process_signal_validate_group(int32_t tgid, int32_t tid)
 
 int process_signal_deliver_group(int32_t pid, int32_t signum)
 {
+    signal_trace("group", pid, signum);
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 

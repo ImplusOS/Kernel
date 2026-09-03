@@ -147,6 +147,18 @@
 #define OS_CONFIG_BOOT_FADE 0
 #endif
 
+/* Per-event tracing of the foreign (Linux-ABI) runtime: every shared-object
+ * mmap, every AF_UNIX packet, every signal/exec/exit, and the periodic
+ * syscall heartbeat. Invaluable while bringing a binary up, but it is written
+ * to COM1 one character at a time from inside the syscall path, so an X
+ * server plus a GL client -- which between them mmap ~400 segments and
+ * exchange thousands of small packets before the first frame -- spend a large
+ * part of their startup inside serial_write_string(). Off by default; set to
+ * 1 for a bring-up boot.  See Docs/Others/TODO_Doom_Xorg_MethodA.md. */
+#ifndef OS_CONFIG_FOREIGN_TRACE
+#define OS_CONFIG_FOREIGN_TRACE 0
+#endif
+
 #ifndef OS_CONFIG_DEBUG_PAGE_FAULT_DUMP
 #define OS_CONFIG_DEBUG_PAGE_FAULT_DUMP 0
 #endif

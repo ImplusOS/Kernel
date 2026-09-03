@@ -1009,7 +1009,12 @@ static kernel_pipe_t *find_pipe_for_fd(int32_t fd, int *is_read_end)
 /* Longest a blocking pipe read waits for a writer before giving up. Only a
  * backstop against wedging the caller forever if the writer dies without
  * closing; real transfers complete in milliseconds. */
-#define PIPE_READ_WAIT_MAX_MS 30000u
+/* Deadlock escape hatch only -- a blocking pipe end has no business timing
+ * out, and EAGAIN on a blocking fd is a lie every caller mishandles. It has to
+ * outlast the slowest legitimate peer: under TCG, xkbcomp spends ~20-30 s just
+ * dynamic-linking before it reads its first byte of the keymap Xorg is feeding
+ * it through a 4 KiB pipe, and 30 s was close enough to that to trip. */
+#define PIPE_READ_WAIT_MAX_MS 180000u
 
 static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
 {

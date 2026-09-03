@@ -37,6 +37,10 @@ typedef struct {
 
 static filemap_t  g_filemaps[FILEMAP_MAX];
 static spinlock_t g_filemap_lock;
+/* Serialises the page-table installation at the end of filemap_handle_fault();
+ * separate from g_filemap_lock, which only guards the registration table and
+ * must not be held across the file read. */
+static spinlock_t g_filemap_fault_lock;
 static uint8_t    g_filemap_ready;
 static uint64_t   g_filemap_seq;
 
@@ -197,24 +201,38 @@ int filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr)
         return 0;
     }
 
+    /* The presence check above happened before the (slow, blocking) file read,
+     * so another thread of this process may have faulted any of these pages in
+     * meanwhile -- and written to it. Mapping our fresh frame over the top
+     * would strand those writes on a page nothing points at any more while
+     * other CPUs keep a translation to it, which reads back as zeroes long
+     * after the fact. Re-check every page under the lock and yield to whoever
+     * got there first. */
+    uint64_t map_irq = irq_save_disable();
+    spinlock_lock(&g_filemap_fault_lock);
+    int serviced = 0;
     for (uint64_t i = 0; i < pages; ++i) {
         uint64_t va = page + i * PAGE_SIZE;
-        uint64_t pa = (uint64_t)(uintptr_t)(frames + i * PAGE_SIZE);
-        if (paging_map_user_page(cr3, va, pa, page_flags) < 0) {
-            if (i == 0u) {
-                pmm_free_pages(frames, (size_t)pages);
-                return 0;
-            }
-            /* The faulting page is mapped, so the access can be retried;
-             * hand back the frames of the run that went unused. */
-            pmm_free_pages(frames + i * PAGE_SIZE, (size_t)(pages - i));
+        uint8_t *frame = frames + i * PAGE_SIZE;
+        if (paging_virt_to_phys(cr3, va) != 0u) {
+            pmm_free_pages(frame, 1);
+            if (i == 0u) serviced = 1; /* already present: the retry will hit */
+            continue;
+        }
+        if (paging_map_user_page(cr3, va, (uint64_t)(uintptr_t)frame,
+                                 page_flags) < 0) {
+            /* Hand back the frames of the run that went unused. */
+            pmm_free_pages(frame, (size_t)(pages - i));
             break;
         }
         /* The faulting access is about to be retried; drop any stale
          * translation for this page first, matching the demand-zero path. */
         hal_mmu_invalidate_tlb((uintptr_t)va);
+        if (i == 0u) serviced = 1;
     }
-    return 1;
+    spinlock_unlock(&g_filemap_fault_lock);
+    irq_restore(map_irq);
+    return serviced;
 }
 
 void filemap_unregister_range(int32_t pid, uint64_t start, uint64_t length)
