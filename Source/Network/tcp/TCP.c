@@ -1,4 +1,5 @@
 #include "TCP.h"
+#include "Core/syscall/Poll_Wait.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -536,6 +537,10 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
 
     spinlock_unlock(&g_tcp_lock);
     irq_restore(irq_flags);
+
+    /* A segment landed: whatever is parked in poll()/select() on this
+     * socket should see it now rather than at the end of its slice. */
+    poll_wait_notify();
 }
 
 void tcp_init(void)

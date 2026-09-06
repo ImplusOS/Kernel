@@ -5,6 +5,7 @@
 #include "Core/process/ProcessManager.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/timer/Timer.h"
+#include "Poll_Wait.h"
 #include "IPC/UnixSocket.h"
 #include "interfaces/hal_cpu.h"
 
@@ -39,6 +40,12 @@
  * real epoll_wait() can already return early due to EINTR and all
  * production callers already loop on their own deadline rather than
  * trusting a single call to sleep the exact requested duration.
+ *
+ * That slice is a *ceiling*, not a fixed cost: the sleep is registered with
+ * Core/syscall/Poll_Wait.h, so anything that makes an fd ready cuts it short
+ * immediately. Without that the slice was a hard latency floor under every
+ * readiness event in the system and X11 round trips cost ~16 ms each no
+ * matter how fast the machine was.
  */
 
 #define EPOLL_MAX_INSTANCES   16
@@ -332,6 +339,10 @@ int32_t syscall_epoll_wait_ex(int32_t epfd, epoll_event_t *events,
         return -22;
     }
 
+    /* Taken before the readiness scan so a wakeup that lands during the scan
+     * is not lost -- see Poll_Wait.h. */
+    uint64_t generation = poll_wait_generation();
+
     int32_t n = epoll_check_once(epfd, events, maxevents);
     if (n != 0) {
         return n; /* Ready (n>0) or an error (n<0): return immediately. */
@@ -344,7 +355,7 @@ int32_t syscall_epoll_wait_ex(int32_t epfd, epoll_event_t *events,
     if (timeout_ms > 0 && (uint32_t)timeout_ms < slice_ms) {
         slice_ms = (uint32_t)timeout_ms;
     }
-    if (process_sleep_current_ms(slice_ms) == 0) {
+    if (poll_wait_park(generation, slice_ms) != 0) {
         *should_switch_out = 1;
     }
     return 0;
@@ -437,6 +448,9 @@ int64_t syscall_eventfd_write(int32_t fd, const uint8_t *buffer, uint64_t len)
     }
     e->counter = new_counter;
     spinlock_unlock(&g_eventfd_lock);
+    /* An eventfd write is the entire point of an eventfd: it exists to break
+     * somebody out of an epoll_wait(). */
+    poll_wait_notify();
     return (int64_t)sizeof(value);
 }
 

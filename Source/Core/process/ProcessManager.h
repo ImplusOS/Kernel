@@ -156,6 +156,8 @@ int64_t process_get_main_image_info(uint64_t *phdr_vaddr,
                                     uint64_t *phent,
                                     uint64_t *phnum);
 int process_set_clear_child_tid(uint64_t address);
+int process_set_clear_child_tid_for(int32_t pid, uint64_t address);
+int32_t process_memory_owner_pid_of(int32_t pid);
 int process_set_robust_list(uint64_t head, uint64_t length);
 int process_rseq_register(uint64_t area, uint32_t sig);
 int process_rseq_unregister(void);
@@ -250,9 +252,14 @@ void process_debug_dump_current(void);
 void process_debug_dump_pid(int32_t pid);
 int32_t current_pid_get(void);
 int process_is_alive(int32_t pid);
+/* Blocks the caller for `ms`, or until process_wake_pid() cuts it short.
+ * Returns 0 when the caller is now BLOCKED (the caller should let the
+ * scheduler switch away) and -1 on error. Unlike process_block_current() it
+ * does not consume a wake_pending credit -- see the definition. */
 int process_sleep_current_ms(uint64_t ms);
 int process_block_current(void);
 int process_wake_pid(int32_t pid);
+
 int32_t process_terminate(int32_t pid);
 int32_t process_get_full_info(int32_t pid, void *info_out);
 int32_t process_get_perf_info(int32_t pid, process_perf_info_t *info_out);

@@ -6,6 +6,14 @@
 void syscall_file_init(void);
 int32_t syscall_file_open(const char *path, uint64_t flags);
 int32_t syscall_file_creat(const char *path);
+
+/* creat() the file, then open it with `flags` -- the create half of
+ * open(path, ...|O_CREAT) on a path that does not exist yet. */
+int32_t syscall_file_creat_ex(const char *path, uint64_t flags);
+
+/* fcntl(F_ADD_SEALS) / fcntl(F_GET_SEALS) on a memfd. */
+int32_t syscall_memfd_add_seals(int32_t fd, uint32_t seals);
+int32_t syscall_memfd_get_seals(int32_t fd);
 int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len);
 int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence);
@@ -28,7 +36,21 @@ int32_t syscall_file_pipe(int32_t fds_out[2]);
 int32_t syscall_file_dup(int32_t oldfd);
 int32_t syscall_file_dup2(int32_t oldfd, int32_t newfd);
 int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd);
+
+/* Reopen an existing descriptor under a new fd with `flags` as its access
+ * mode -- the meaning of open() on /proc/self/fd/<n>. See the definition. */
+int32_t syscall_file_reopen_fd(int32_t oldfd, uint64_t flags);
 int32_t syscall_file_truncate(int32_t fd, uint64_t length);
+/* True for either end of a pipe (see syscall_file_pipe()). The Linux compat
+ * layer needs it to tell a pipe's EAGAIN -- which a blocking fd must never
+ * see -- apart from a socket's. */
+int syscall_file_is_pipe(int32_t fd);
+/* True when `fd` is one end of a pseudo-terminal (/dev/ptmx or /dev/pts/N).
+ * The Linux compat layer routes terminal ioctls on such an fd to the pty
+ * instead of answering ENOTTY for everything. */
+int32_t syscall_file_is_pty(int32_t fd);
+/* Bitmask of which syscall_file_is_pty() checks passed; see the definition. */
+uint32_t syscall_file_pty_debug(int32_t fd);
 int32_t syscall_file_get_status_flags(int32_t fd);
 int32_t syscall_file_set_status_flags(int32_t fd, uint32_t flags);
 int32_t syscall_file_get_descriptor_flags(int32_t fd);
@@ -37,6 +59,9 @@ int64_t syscall_file_available(int32_t fd);
 uint32_t syscall_file_poll(int32_t fd, uint32_t events);
 int32_t syscall_file_register_dir(const char *path);
 int32_t syscall_file_get_dir_dirent(int32_t fd, vfs_dirent_t *out_entry);
+/* The path a directory fd was opened on, so the Linux compat layer can turn
+ * openat(dirfd, "relative", ...) into an absolute path. 0 on success. */
+int32_t syscall_file_get_dir_path(int32_t fd, char *out, uint32_t size);
 int32_t syscall_file_get_file_info(int32_t fd, vfs_file_t *file_out,
                                    uint32_t *writable_out);
 int32_t syscall_file_create_timerfd(void);
@@ -56,6 +81,12 @@ int32_t syscall_memfd_shm_handle(int32_t fd);
 /* Install a memfd fd in the current process wrapping an existing shared
  * memory handle (adopts one reference). Returns fd or negative os_status_t. */
 int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags);
+/* Install a memfd fd wrapping a shared-memory object the caller already
+ * owns, taking a reference of its own. This is the send-side counterpart of
+ * syscall_memfd_shm_handle(): a native process that has no memfd_create()
+ * needs a memfd to hand a shared buffer to a foreign client over SCM_RIGHTS
+ * (the Wayland compositor's wl_keyboard.keymap). Returns fd or negative. */
+int32_t syscall_memfd_from_shm(int32_t handle);
 int32_t syscall_file_create_signalfd(uint64_t mask);
 int32_t syscall_file_signalfd_set_mask(int32_t fd, uint64_t mask);
 int64_t syscall_timerfd_read(int32_t fd, uint8_t *buffer, uint64_t len);

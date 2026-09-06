@@ -1,4 +1,5 @@
 #include "UDP.h"
+#include "Core/syscall/Poll_Wait.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -164,6 +165,10 @@ static void udp_on_ipv4(uint32_t src_ipv4_addr,
     if (handler != NULL) {
         handler(src_ipv4_addr, src_port, dst_ipv4_addr, dst_port, udp_payload, udp_payload_len);
     }
+
+    /* A segment landed: whatever is parked in poll()/select() on this
+     * socket should see it now rather than at the end of its slice. */
+    poll_wait_notify();
 }
 
 void udp_init(void)

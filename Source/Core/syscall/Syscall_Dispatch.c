@@ -2033,6 +2033,13 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
         case SYSCALL_MEMFD_SHM_HANDLE:
             set_syscall_i32(saved_rsp, syscall_memfd_shm_handle((int32_t)arg1));
             break;
+        case SYSCALL_MEMFD_FROM_SHM:
+            set_syscall_i32(saved_rsp, syscall_memfd_from_shm((int32_t)arg1));
+            break;
+        case SYSCALL_SHARED_MEMORY_SIZE:
+            set_syscall_result(saved_rsp,
+                               (uint64_t)shared_memory_size((int32_t)arg1));
+            break;
         case SYSCALL_GET_MAIN_IMAGE_INFO: {
             struct {
                 uint64_t phdr_vaddr;

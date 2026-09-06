@@ -5,9 +5,12 @@
 #include <assert.h>
 
 #include "Syscall_File.h"
+#include "Poll_Wait.h"
 
 #include "kernel/status.h"
 #include "Core/vfs/VFS.h"
+#include "Core/vfs/DevFS.h"
+#include "Core/vfs/ProcFS.h"
 #include "kernel/config.h"
 #include "Core/process/ProcessManager.h"
 #include "Core/sync/Spinlock.h"
@@ -32,6 +35,15 @@ enum {
 #define FILE_O_TRUNC         0x0200u
 #define FILE_O_APPEND        0x0400u
 #define FILE_O_NONBLOCK      0x0800u
+#define FILE_O_CLOEXEC       0x80000u
+
+/* memfd seals (linux/fcntl.h). */
+#define FILE_SEAL_SEAL         0x0001u
+#define FILE_SEAL_SHRINK       0x0002u
+#define FILE_SEAL_GROW         0x0004u
+#define FILE_SEAL_WRITE        0x0008u
+#define FILE_SEAL_FUTURE_WRITE 0x0010u
+#define FILE_SEAL_ALL          0x001Fu
 #define FILE_FD_CLOEXEC      0x0001u
 
 #define PIPE_MAX_COUNT       16
@@ -71,10 +83,17 @@ typedef struct {
     uint8_t cache_data[FILE_READ_CACHE_SIZE];
 } kernel_open_file_t;
 
+#define FILE_DIR_PATH_MAX 256u
+
 typedef struct {
     uint8_t used;
     int32_t owner_pid;
     int32_t vfs_handle;
+    /* The directory this handle was opened on. Kept so the Linux compat layer
+     * can resolve a relative path against a real dirfd -- openat/unlinkat/
+     * fstatat with anything other than AT_FDCWD had to answer ENOTSUP without
+     * it, which is how base::DeleteFile's directory walk failed in Chromium. */
+    char path[FILE_DIR_PATH_MAX];
 } kernel_dir_t;
 
 typedef struct {
@@ -120,6 +139,12 @@ typedef struct {
      * the object holds one shared_memory reference (create/addref on dup,
      * release on close). */
     int32_t shm_handle;
+    /* F_ADD_SEALS state (F_SEAL_SEAL/SHRINK/GROW/WRITE/FUTURE_WRITE). Chromium
+     * seals every shared-memory region right after ftruncate() and treats a
+     * failure as "this kernel has no usable memfd", falling back to a temp
+     * file. Only SEAL_SEAL and SHRINK/GROW are enforced here; the WRITE seals
+     * are recorded and reported so callers see what they set. */
+    uint32_t seals;
 } kernel_memfd_t;
 
 typedef struct {
@@ -127,6 +152,29 @@ typedef struct {
     int32_t owner_pid;
     uint64_t mask;
 } kernel_signalfd_t;
+
+/* Which of fds 0/1/2 a process has explicitly close()d, one bit each.
+ *
+ * This table has no entries for the standard descriptors: an unallocated 0/1/2
+ * means "the console" (write() falls back to the serial port), which is what
+ * every process starts with. That convention collides with POSIX in exactly
+ * one place, and it is the place a terminal emulator lives in: the child of a
+ * fork does
+ *
+ *     for (i = 0; i <= 2; i++) { close(i); dup(ttyfd); }
+ *
+ * to put the tty on its stdin/stdout/stderr, and that only works because dup()
+ * returns the LOWEST free descriptor. Allocating from 3 unconditionally handed
+ * the child fds 3,4,5 instead and left its stdio pointing at the console, so
+ * the shell xterm started wrote its prompt to the serial port and read EOF
+ * immediately (see Docs/Others/TODO_Terminal_xterm.md).
+ *
+ * Handing out 0/1/2 to any dup() would be worse -- every process has them
+ * "free" by that test. So a standard descriptor becomes allocatable only for
+ * the process that closed it, which is precisely the POSIX rule. Inherited
+ * across fork and exec (close-on-exec is about open descriptors, not closed
+ * ones), cleared when the process exits or the descriptor is bound again. */
+static uint8_t g_std_closed[OS_CONFIG_PROCESS_MAX_COUNT];
 
 static kernel_file_t g_files[FILE_MAX_FD];
 static kernel_open_file_t g_open_files[FILE_MAX_FD];
@@ -216,6 +264,72 @@ static int open_file_cache_refill(kernel_open_file_t *file, uint32_t offset)
     file->cache_offset = offset;
     file->cache_size = to_cache;
     return 1;
+}
+
+/* Bring-up trace for the standard descriptors, capped so it cannot flood COM1.
+ * The sequence "close(0); dup(tty)" is how every terminal emulator wires up
+ * the shell it forks, and when it goes wrong the only symptom is a shell that
+ * decides it is not interactive -- no error, no output, nothing to grep for. */
+#define STD_FD_TRACE_MAX 16u
+
+static void std_fd_trace(const char *what, int32_t a, int32_t b, int32_t pid)
+{
+    static uint32_t emitted;
+    if (!OS_CONFIG_FOREIGN_TRACE || emitted >= STD_FD_TRACE_MAX) {
+        return;
+    }
+    emitted += 1u;
+    serial_write_string("[fd] ");
+    serial_write_string(what);
+    serial_write_string(" ");
+    serial_write_uint32((uint32_t)a);
+    serial_write_string("->");
+    serial_write_uint32((uint32_t)b);
+    serial_write_string(" pid=");
+    serial_write_uint32((uint32_t)pid);
+    serial_write_char('\n');
+}
+
+static int std_fd_is_closed_by(int32_t fd, int32_t pid)
+{
+    if (fd < 0 || fd > 2 || pid < 0 || pid >= OS_CONFIG_PROCESS_MAX_COUNT) {
+        return 0;
+    }
+    return (g_std_closed[pid] & (uint8_t)(1u << (uint32_t)fd)) != 0u;
+}
+
+static void std_fd_mark_closed(int32_t fd, int32_t pid)
+{
+    if (fd >= 0 && fd <= 2 && pid >= 0 && pid < OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_std_closed[pid] |= (uint8_t)(1u << (uint32_t)fd);
+    }
+}
+
+static void std_fd_mark_open(int32_t fd, int32_t pid)
+{
+    if (fd >= 0 && fd <= 2 && pid >= 0 && pid < OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_std_closed[pid] &= (uint8_t)~(1u << (uint32_t)fd);
+    }
+}
+
+/* Lowest free descriptor at or above `minimum` that `pid` may be given. Only
+ * that process's own closed standard descriptors are candidates below 3.
+ * Caller holds g_file_table_lock. */
+static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
+{
+    if (minimum < 0) {
+        minimum = 0;
+    }
+    for (int32_t fd = minimum; fd < FILE_MAX_FD; ++fd) {
+        if (g_files[fd].used != 0) {
+            continue;
+        }
+        if (fd <= 2 && !std_fd_is_closed_by(fd, pid)) {
+            continue;
+        }
+        return fd;
+    }
+    return -1;
 }
 
 static kernel_open_file_t *fd_open_file(int32_t fd)
@@ -384,6 +498,96 @@ void syscall_file_init(void)
     }
 }
 
+/*
+ * Reopen a descriptor this process already holds under a fresh fd, which is
+ * what open() on /proc/self/fd/<n> means on Linux.
+ *
+ * Chromium's shared memory needs exactly this and nothing else works: a region
+ * is a memfd, created O_RDWR, and the read-only half of a
+ * ReadOnlySharedMemoryRegion is open("/proc/self/fd/<n>", O_RDONLY|O_CLOEXEC)
+ * on that same memfd (base::subtle::CreateAnonymousRegion). The two fds have
+ * to name one object -- a copy would leave the reader looking at a snapshot --
+ * and PlatformSharedMemoryRegion::TakeOrFail() then checks the reopened one
+ * with fcntl(F_GETFL) and CHECK-fails the browser if it does not read back as
+ * O_RDONLY. So: alias the same object, record the caller's access mode.
+ *
+ * Unlike Linux this shares the open file description with the source fd rather
+ * than making a new one, so the two fds share a file offset. That is invisible
+ * for the memfd case (mapping goes through the shm handle, not the offset) and
+ * keeps the single owner of the underlying vfs_file_t, so there is no
+ * double-close to get wrong. `writable` also stays as the description has it:
+ * a read-only reopen is reported as read-only but not enforced on write().
+ */
+int32_t syscall_file_reopen_fd(int32_t oldfd, uint64_t flags)
+{
+    if (oldfd < 0 || oldfd >= FILE_MAX_FD) {
+        return (int32_t)OS_STATUS_NOT_FOUND;
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+
+    if (g_files[oldfd].used == 0 || g_files[oldfd].used == FILE_USED_DIR ||
+        !fd_is_owned_by_current_process(oldfd)) {
+        spinlock_unlock(&g_file_table_lock);
+        irq_restore(irq_flags);
+        return (int32_t)OS_STATUS_NOT_FOUND;
+    }
+
+    kernel_open_file_t *open_file = NULL;
+    if (g_files[oldfd].used == FILE_USED_FILE) {
+        open_file = fd_open_file(oldfd);
+        if (open_file == NULL) {
+            spinlock_unlock(&g_file_table_lock);
+            irq_restore(irq_flags);
+            return (int32_t)OS_STATUS_NOT_FOUND;
+        }
+    }
+
+    int32_t self_pid = process_get_current_pid();
+    int32_t newfd = allocate_fd_locked(0, self_pid);
+    if (newfd < 0) {
+        spinlock_unlock(&g_file_table_lock);
+        irq_restore(irq_flags);
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
+
+    memcpy(&g_files[newfd], &g_files[oldfd], sizeof(g_files[newfd]));
+    g_files[newfd].owner_pid = self_pid;
+    memset(g_files[newfd].extra_owners, 0, sizeof(g_files[newfd].extra_owners));
+    /* A reopen is an open(): the caller's flags decide the access mode and
+     * whether the descriptor is close-on-exec, not the source fd's. */
+    g_files[newfd].status_flags = (uint32_t)flags;
+    g_files[newfd].descriptor_flags =
+        ((flags & FILE_O_CLOEXEC) != 0u) ? FILE_FD_CLOEXEC : 0u;
+    std_fd_mark_open(newfd, self_pid);
+
+    if (g_files[newfd].used == FILE_USED_TIMERFD) {
+        g_timerfds[newfd] = g_timerfds[oldfd];
+    } else if (g_files[newfd].used == FILE_USED_MEMFD) {
+        g_memfds[newfd] = g_memfds[oldfd];
+        if (g_memfds[newfd].shm_handle >= 0) {
+            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
+        }
+    } else if (g_files[newfd].used == FILE_USED_SIGNALFD) {
+        g_signalfds[newfd] = g_signalfds[oldfd];
+    }
+
+    if (open_file != NULL) {
+        open_file->refcount++;
+    } else {
+        kernel_pipe_t *pipe = find_pipe_for_fd(newfd, NULL);
+        if (pipe != NULL) {
+            if (g_files[newfd].used == FILE_USED_PIPE_R) ++pipe->reader_count;
+            else ++pipe->writer_count;
+        }
+    }
+
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    return newfd;
+}
+
 int32_t syscall_file_open(const char *path, uint64_t flags)
 {
     vfs_file_t file;
@@ -393,19 +597,38 @@ int32_t syscall_file_open(const char *path, uint64_t flags)
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
 
+    /* /proc/self/fd/<n> is a descriptor, not a file: reopen rather than read.
+     * Ahead of the VFS lookup because procfs generates its files at open()
+     * time and has no content to generate for one of these. */
+    {
+        int32_t procfs_fd = procfs_parse_fd_path(path);
+        if (procfs_fd >= 0) {
+            return syscall_file_reopen_fd(procfs_fd, flags);
+        }
+    }
+
     if (!vfs_find_file(path, &file)) {
         return (int32_t)OS_STATUS_NOT_FOUND;
+    }
+    /* Deliberately before the table lock: a driver's open hook may allocate
+     * (a pty pair does) and must not run with interrupts off. Everything that
+     * fails after this point has to vfs_close_file() to unwind it. */
+    if (!vfs_open_file(&file, flags)) {
+        return (int32_t)OS_STATUS_IO_ERROR;
     }
 
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
-    /* fd 0/1/2 are implicitly reserved as console fds; allocate from 3. */
-    for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+    /* fd 0/1/2 are console fds unless this process closed them; see
+     * g_std_closed. Everything else allocates from 3 as before. */
+    {
+        int32_t fd = allocate_fd_locked(0, current_pid);
+        if (fd >= 0) {
             int32_t open_index = allocate_open_file_locked();
             if (open_index < 0) {
                 spinlock_unlock(&g_file_table_lock);
                 irq_restore(irq_flags);
+                (void)vfs_close_file(&file);
                 return (int32_t)OS_STATUS_LIMIT_REACHED;
             }
 
@@ -423,6 +646,7 @@ int32_t syscall_file_open(const char *path, uint64_t flags)
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = open_index;
             g_files[fd].status_flags = (uint32_t)flags;
+            std_fd_mark_open(fd, current_pid);
             int do_truncate = ((flags & FILE_O_TRUNC) != 0u &&
                                g_open_files[open_index].writable != 0u &&
                                g_open_files[open_index].file.size != 0u);
@@ -443,10 +667,11 @@ int32_t syscall_file_open(const char *path, uint64_t flags)
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
+    (void)vfs_close_file(&file);
     return (int32_t)OS_STATUS_LIMIT_REACHED;
 }
 
-int32_t syscall_file_creat(const char *path)
+int32_t syscall_file_creat_ex(const char *path, uint64_t flags)
 {
     if (path == NULL || path[0] == '\0' || process_get_current_pid() < 0) {
         return (int32_t)OS_STATUS_INVALID_ARG;
@@ -454,7 +679,19 @@ int32_t syscall_file_creat(const char *path)
     if (!vfs_creat(path)) {
         return (int32_t)OS_STATUS_IO_ERROR;
     }
-    return syscall_file_open(path, 1ULL);
+    /* Open with the flags the caller asked for, not a hardcoded O_WRONLY.
+     * open(path, O_RDWR|O_CREAT) that happened to create the file used to come
+     * back reporting O_WRONLY, and Chromium CHECK-fails the browser over
+     * exactly that: PlatformSharedMemoryRegion::TakeOrFail() reads the access
+     * mode back with fcntl(F_GETFL) and requires O_RDWR on a writable shared
+     * memory region. */
+    return syscall_file_open(path, flags);
+}
+
+int32_t syscall_file_creat(const char *path)
+{
+    /* POSIX creat(): open(path, O_WRONLY|O_CREAT|O_TRUNC). */
+    return syscall_file_creat_ex(path, 1ULL);
 }
 
 int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len)
@@ -589,6 +826,15 @@ int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
     if (len == 0) {
         return 0;
     }
+
+    /* Character devices with their own write path (a pty) take short writes
+     * and manage their own back-pressure; the offset/size model below does not
+     * apply to them. */
+    if (vfs_file_has_dev_write(&file->file)) {
+        uint32_t nonblock =
+            (g_files[fd].status_flags & FILE_O_NONBLOCK) ? 1u : 0u;
+        return vfs_dev_write(&file->file, buffer, len, nonblock);
+    }
     if ((g_files[fd].status_flags & FILE_O_APPEND) != 0u) {
         file->offset = file->file.size;
     }
@@ -682,7 +928,19 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
 
 int32_t syscall_file_close(int32_t fd)
 {
-    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used == 0) {
+    if (fd < 0 || fd >= FILE_MAX_FD) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    if (g_files[fd].used == 0) {
+        /* Closing a standard descriptor that has no table entry is closing the
+         * console, and it has to succeed: the caller is about to dup() a tty
+         * onto it. Remembering it is what makes that dup() land on fd 0. */
+        if (fd <= 2) {
+            int32_t pid = process_get_current_pid();
+            std_fd_mark_closed(fd, pid);
+            std_fd_trace("close std", fd, fd, pid);
+            return 0;
+        }
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
     if (!fd_is_owned_by_current_process(fd)) {
@@ -848,6 +1106,9 @@ int32_t syscall_file_link(const char *old_path, const char *new_path)
 
 void syscall_file_close_all_for_pid(int32_t pid, uint32_t *closed_fds_out, uint32_t *closed_dirs_out)
 {
+    if (pid >= 0 && pid < OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_std_closed[pid] = 0u; /* the pid is about to be reused */
+    }
     if (closed_fds_out != NULL) {
         *closed_fds_out = 0;
     }
@@ -1024,6 +1285,9 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
 
     uint64_t waited_ms = 0;
     for (;;) {
+        /* Read before looking at the ring, so a write that lands during this
+         * iteration cancels the sleep below rather than being missed. */
+        uint64_t generation = poll_wait_generation();
         uint64_t irq_flags = irq_save_disable();
         spinlock_lock(&pipe->lock);
 
@@ -1039,6 +1303,8 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
         irq_restore(irq_flags);
 
         if (bytes_read > 0u) {
+            /* Draining makes the write end writable again. */
+            poll_wait_notify();
             return (int64_t)bytes_read;
         }
         /* An empty pipe is only end-of-file once every writer has closed.
@@ -1055,7 +1321,11 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
         if (waited_ms >= PIPE_READ_WAIT_MAX_MS) {
             return -11;
         }
-        (void)process_sleep_current_ms(1);
+        /* Cut short by syscall_pipe_write()'s poll_wait_notify(), so the 1 ms
+         * is a ceiling rather than a per-round-trip cost. Xorg pipes a whole
+         * keymap (tens of KB) to xkbcomp through a 4 KiB pipe, which is
+         * hundreds of round trips for one keyboard. */
+        (void)poll_wait_park(generation, 1u);
         waited_ms += 1u;
     }
 }
@@ -1075,7 +1345,11 @@ static int64_t syscall_pipe_write_wait(int32_t fd, kernel_pipe_t *pipe,
         if (waited_ms >= PIPE_READ_WAIT_MAX_MS) {
             return -11; /* EAGAIN */
         }
-        (void)process_sleep_current_ms(1);
+        /* Cut short by the reader's poll_wait_notify() the moment it drains a
+         * byte: for a 4 KiB pipe carrying tens of KB this is the difference
+         * between one round trip per millisecond and one per read. */
+        uint64_t generation = poll_wait_generation();
+        (void)poll_wait_park(generation, 1u);
         waited_ms += 1u;
 
         uint64_t irq_flags = irq_save_disable();
@@ -1141,6 +1415,8 @@ static int64_t syscall_pipe_write(int32_t fd, const uint8_t *buffer, uint64_t le
     irq_restore(irq_flags);
 
     if (bytes_written > 0u) {
+        /* The read end is now readable: cancel the reader's poll sleep. */
+        poll_wait_notify();
         return (int64_t)bytes_written;
     }
 
@@ -1359,13 +1635,8 @@ int32_t syscall_file_dup(int32_t oldfd)
         return (int32_t)OS_STATUS_FAULT;
     }
 
-    int32_t newfd = -1;
-    for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
-            newfd = fd;
-            break;
-        }
-    }
+    int32_t self_pid = process_get_current_pid();
+    int32_t newfd = allocate_fd_locked(0, self_pid);
 
     if (newfd < 0) {
         spinlock_unlock(&g_file_table_lock);
@@ -1379,8 +1650,13 @@ int32_t syscall_file_dup(int32_t oldfd)
      * leave the copy attributed to whoever else held the original -- after
      * which the caller's own close could not release it, and the next process
      * to want the slot would be refused it. */
-    g_files[newfd].owner_pid = process_get_current_pid();
+    g_files[newfd].owner_pid = self_pid;
     memset(g_files[newfd].extra_owners, 0, sizeof(g_files[newfd].extra_owners));
+    /* POSIX: the copy never inherits FD_CLOEXEC. Carrying it over is how a
+     * child that dup()s a close-on-exec fd onto its stdio loses that stdio at
+     * the exec it was setting it up for. */
+    g_files[newfd].descriptor_flags &= ~(uint32_t)FILE_FD_CLOEXEC;
+    std_fd_mark_open(newfd, self_pid);
     if (g_files[newfd].used == 5) g_timerfds[newfd] = g_timerfds[oldfd];
     else if (g_files[newfd].used == 6) {
         g_memfds[newfd] = g_memfds[oldfd];
@@ -1402,6 +1678,9 @@ int32_t syscall_file_dup(int32_t oldfd)
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
 
+    if (newfd <= 2) {
+        std_fd_trace("dup", oldfd, newfd, self_pid);
+    }
     return newfd;
 }
 
@@ -1470,6 +1749,9 @@ int32_t syscall_file_dup2(int32_t oldfd, int32_t newfd)
     g_files[newfd].owner_pid = self_pid;
     memcpy(g_files[newfd].extra_owners, inherited_owners,
            sizeof(g_files[newfd].extra_owners));
+    /* POSIX: dup2() clears FD_CLOEXEC on the target. */
+    g_files[newfd].descriptor_flags &= ~(uint32_t)FILE_FD_CLOEXEC;
+    std_fd_mark_open(newfd, self_pid);
     fd_extra_owner_clear(&g_files[newfd], self_pid);
     if (inherited_primary >= 0 && inherited_primary != self_pid) {
         fd_extra_owner_set(&g_files[newfd], inherited_primary);
@@ -1513,13 +1795,16 @@ int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd)
         return (int32_t)OS_STATUS_FAULT;
     }
 
-    int32_t newfd = -1;
-    for (int32_t fd = minimum_fd; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
-            newfd = fd;
-            break;
-        }
-    }
+    /* Descriptors 0/1/2 are stdin/stdout/stderr and are handled outside this
+     * table, so its first three slots look free -- but handing one out to a
+     * process that never closed them is wrong, and a foreign program has no
+     * way to know. libwayland asks for fcntl(fd, F_DUPFD_CLOEXEC, 0) before
+     * passing a wl_shm pool over SCM_RIGHTS; getting 0 back, it sent the
+     * compositor "fd 0" and every pool arrived without a file at all. That is
+     * exactly the case allocate_fd_locked() excludes: only a standard
+     * descriptor this process closed itself is a candidate. */
+    int32_t self_pid = process_get_current_pid();
+    int32_t newfd = allocate_fd_locked(minimum_fd, self_pid);
     if (newfd < 0) {
         spinlock_unlock(&g_file_table_lock);
         irq_restore(irq_flags);
@@ -1532,8 +1817,12 @@ int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd)
      * leave the copy attributed to whoever else held the original -- after
      * which the caller's own close could not release it, and the next process
      * to want the slot would be refused it. */
-    g_files[newfd].owner_pid = process_get_current_pid();
+    g_files[newfd].owner_pid = self_pid;
     memset(g_files[newfd].extra_owners, 0, sizeof(g_files[newfd].extra_owners));
+    /* POSIX: F_DUPFD clears FD_CLOEXEC on the copy. F_DUPFD_CLOEXEC sets it
+     * again in the compat layer. */
+    g_files[newfd].descriptor_flags &= ~(uint32_t)FILE_FD_CLOEXEC;
+    std_fd_mark_open(newfd, self_pid);
     if (g_files[newfd].used == 1) {
         kernel_open_file_t *open_file = fd_open_file(newfd);
         if (open_file == NULL) {
@@ -1544,6 +1833,18 @@ int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd)
             return (int32_t)OS_STATUS_FAULT;
         }
         ++open_file->refcount;
+    } else if (g_files[newfd].used == FILE_USED_MEMFD) {
+        /* A memfd keeps its state in a parallel table, so the copy above
+         * duplicated the descriptor and left the duplicate with no file
+         * behind it. Carry the memfd over and take a reference on its
+         * shared-memory object, since either descriptor's close() releases
+         * one. Without this the dup that libwayland passes over SCM_RIGHTS
+         * was not recognisable as shm-backed at the far end. */
+        memcpy(&g_memfds[newfd], &g_memfds[oldfd], sizeof(g_memfds[newfd]));
+        g_memfds[newfd].owner_pid = process_get_current_pid();
+        if (g_memfds[newfd].shm_handle >= 0) {
+            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
+        }
     } else {
         kernel_pipe_t *pipe = find_pipe_for_fd(newfd, NULL);
         if (pipe != NULL) {
@@ -1566,15 +1867,34 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
     if (g_files[fd].used == 6) {
         kernel_memfd_t *memfd = &g_memfds[fd];
         uint32_t new_size = (uint32_t)length;
+        if ((new_size < memfd->size && (memfd->seals & FILE_SEAL_SHRINK) != 0u) ||
+            (new_size > memfd->size && (memfd->seals & FILE_SEAL_GROW) != 0u)) {
+            return (int32_t)OS_STATUS_ACCESS_DENIED; /* EPERM in Linux terms */
+        }
         if (memfd->shm_handle >= 0) {
-            /* Backed by a shared-memory object, which has no resize. Grow is
-             * rejected (the Wayland client must recreate the pool); shrink /
-             * same is a no-op. */
-            if (new_size > memfd->size) {
-                serial_write_string(
-                    "[memfd] ftruncate grow on shm-backed memfd unsupported\n");
+            /* Backed by a shared-memory object. The object itself cannot be
+             * resized once other processes may have it mapped, so growth is
+             * served out of the headroom reserved when the memfd was promoted
+             * (see below). Within that, growing is just a bookkeeping change:
+             * the pages are already there and every existing mapping already
+             * covers them. Beyond it there is nothing honest to do.
+             *
+             * A wl_shm pool is grown, not recreated: libwayland-cursor and
+             * GDK both call posix_fallocate() on the same fd and then send
+             * wl_shm_pool.resize, so refusing to grow left every Wayland
+             * client without buffers. */
+            uint32_t capacity = shared_memory_size(memfd->shm_handle);
+            if (new_size > capacity) {
+                serial_write_string("[memfd] grow past reservation fd=");
+                serial_write_uint64((uint64_t)(uint32_t)fd);
+                serial_write_string(" cap=");
+                serial_write_uint64((uint64_t)capacity);
+                serial_write_string(" want=");
+                serial_write_uint64((uint64_t)new_size);
+                serial_write_char('\n');
                 return (int32_t)OS_STATUS_NOT_SUPPORTED;
             }
+            memfd->size = new_size;
             return 0;
         }
         if (new_size == 0u) {
@@ -1583,8 +1903,18 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
             return 0;
         }
         /* First non-zero size: promote to a shared-memory backing so the
-         * mapping is cross-process coherent and the fd is SCM_RIGHTS-able. */
-        int32_t handle = shared_memory_create(new_size);
+         * mapping is cross-process coherent and the fd is SCM_RIGHTS-able.
+         * Reserve headroom while we still can -- the object is unmapped and
+         * unshared at this instant, and it is the last moment at which its
+         * size can change (see the grow path above). Round up to a power of
+         * two, at least 1 MiB: a wl_shm pool starts at one buffer and grows
+         * as the surface does, and every doubling then costs nothing. */
+        uint32_t reservation = 1u << 20;
+        while (reservation < new_size) {
+            if (reservation > (UINT32_MAX >> 1)) { reservation = new_size; break; }
+            reservation <<= 1;
+        }
+        int32_t handle = shared_memory_create(reservation);
         if (handle < 0) {
             return (int32_t)OS_STATUS_LIMIT_REACHED;
         }
@@ -1612,6 +1942,41 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
     if (file->offset > file->file.size) file->offset = file->file.size;
     open_file_cache_invalidate(file);
     return 0;
+}
+
+/* fcntl(F_ADD_SEALS). Seals only exist on memfds; everything else is EINVAL,
+ * which is what Linux says too. Adding to an already-F_SEAL_SEAL'd memfd is
+ * refused. Returns 0, or a negative os_status_t. */
+int32_t syscall_memfd_add_seals(int32_t fd, uint32_t seals)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_MEMFD ||
+        !fd_is_owned_by_current_process(fd)) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    if ((seals & ~FILE_SEAL_ALL) != 0u) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+    int32_t rc = 0;
+    if ((g_memfds[fd].seals & FILE_SEAL_SEAL) != 0u) {
+        rc = (int32_t)OS_STATUS_ACCESS_DENIED;
+    } else {
+        g_memfds[fd].seals |= seals;
+    }
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    return rc;
+}
+
+/* fcntl(F_GET_SEALS). Returns the seal mask, or a negative os_status_t. */
+int32_t syscall_memfd_get_seals(int32_t fd)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_MEMFD ||
+        !fd_is_owned_by_current_process(fd)) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    return (int32_t)g_memfds[fd].seals;
 }
 
 int32_t syscall_file_get_status_flags(int32_t fd)
@@ -1837,6 +2202,8 @@ int32_t syscall_file_register_dir(const char *path)
                 g_dirs[i].used = 1;
                 g_dirs[i].owner_pid = current_pid;
                 g_dirs[i].vfs_handle = vfs_handle;
+                strncpy(g_dirs[i].path, path, FILE_DIR_PATH_MAX - 1u);
+                g_dirs[i].path[FILE_DIR_PATH_MAX - 1u] = '\0';
                 spinlock_lock(&g_file_table_lock);
                 g_files[result].open_index = i;
                 spinlock_unlock(&g_file_table_lock);
@@ -1855,6 +2222,27 @@ int32_t syscall_file_register_dir(const char *path)
         (void)vfs_closedir(vfs_handle);
     }
     return result;
+}
+
+int32_t syscall_file_get_dir_path(int32_t fd, char *out, uint32_t size)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || out == NULL || size == 0u ||
+        g_files[fd].used != FILE_USED_DIR ||
+        !fd_is_owned_by_current_process(fd)) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    int32_t dir_index = g_files[fd].open_index;
+    if (dir_index < 0 || dir_index >= FILE_MAX_DIR_HANDLE ||
+        g_dirs[dir_index].used == 0 || g_dirs[dir_index].path[0] == '\0') {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_dir_table_lock);
+    strncpy(out, g_dirs[dir_index].path, size - 1u);
+    out[size - 1u] = '\0';
+    spinlock_unlock(&g_dir_table_lock);
+    irq_restore(irq_flags);
+    return 0;
 }
 
 int32_t syscall_file_get_dir_dirent(int32_t fd, vfs_dirent_t *out_entry)
@@ -2009,8 +2397,13 @@ int32_t syscall_memfd_shm_handle(int32_t fd)
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
     int32_t handle = -1;
+    /* Ownership has to be the same test every other fd operation uses: a
+     * descriptor belongs to a process, and this kernel gives each thread its
+     * own pid, so a raw owner_pid comparison refused the very handoff this
+     * function exists for -- GTK creates the wl_shm memfd on one thread and
+     * passes it over AF_UNIX from another. */
     if (g_files[fd].used == FILE_USED_MEMFD &&
-        g_files[fd].owner_pid == process_get_current_pid()) {
+        fd_is_owned_by_current_process(fd)) {
         handle = g_memfds[fd].shm_handle;
     }
     spinlock_unlock(&g_file_table_lock);
@@ -2050,6 +2443,25 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
     return result;
 }
 
+/* Send-side counterpart of syscall_memfd_shm_handle(): wrap a shared-memory
+ * object the caller owns in a fresh memfd so it can be passed to another
+ * process over SCM_RIGHTS. Takes its own reference, so closing the fd (or the
+ * process dying) leaves the caller's original handle intact. */
+int32_t syscall_memfd_from_shm(int32_t handle)
+{
+    if (handle < 0 || shared_memory_size(handle) == 0u) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    if (shared_memory_addref(handle) != 0) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    int32_t fd = syscall_memfd_install_shm(handle, FILE_O_RDWR);
+    if (fd < 0) {
+        (void)shared_memory_release(handle);
+    }
+    return fd;
+}
+
 int32_t syscall_file_create_signalfd(uint64_t mask)
 {
     int32_t current_pid = process_get_current_pid();
@@ -2087,6 +2499,37 @@ int32_t syscall_file_signalfd_set_mask(int32_t fd, uint64_t mask)
 }
 
 /* ---- character-device fds (/dev/dri/card0, /dev/input/event*) ------------ */
+
+/* A pty fd has to be recognised before the Linux compat layer's blanket
+ * "no fd here is a real tty" answer for TCGETS/TIOCGWINSZ/... -- that answer
+ * is right for a serial console fd and wrong for the one thing in the system
+ * that IS a terminal. */
+int32_t syscall_file_is_pty(int32_t fd)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != 1 ||
+        !fd_is_owned_by_current_process(fd)) {
+        return 0;
+    }
+    kernel_open_file_t *file = fd_open_file(fd);
+    return (file != NULL && devfs_file_is_pty(&file->file)) ? 1 : 0;
+}
+
+/* Why syscall_file_is_pty() said no, for the bring-up trace: bit 0 = in range,
+ * 1 = table slot in use as a file, 2 = owned by the caller, 3 = the open file
+ * resolved, 4 = the node is a pty. */
+uint32_t syscall_file_pty_debug(int32_t fd)
+{
+    uint32_t bits = 0u;
+    if (fd < 0 || fd >= FILE_MAX_FD) return bits;
+    bits |= 1u;
+    if (g_files[fd].used == 1) bits |= 2u;
+    if (fd_is_owned_by_current_process(fd)) bits |= 4u;
+    kernel_open_file_t *file = fd_open_file(fd);
+    if (file != NULL) bits |= 8u;
+    if (file != NULL && devfs_file_is_pty(&file->file)) bits |= 16u;
+    if (file != NULL && vfs_file_is_chardev(&file->file)) bits |= 32u;
+    return bits;
+}
 
 int32_t syscall_file_is_chardev(int32_t fd)
 {
@@ -2139,6 +2582,13 @@ void syscall_file_fork_inherit(int32_t parent_pid, int32_t child_pid)
             continue;
         }
         fd_extra_owner_set(&g_files[fd], child_pid);
+    }
+    /* A closed descriptor stays closed across fork, like an open one stays
+     * open: the child of xterm's fork closes 0/1/2 *after* forking, but a
+     * child that inherits an already-closed stdio must see it closed too. */
+    if (parent_pid < OS_CONFIG_PROCESS_MAX_COUNT &&
+        child_pid < OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_std_closed[child_pid] = g_std_closed[parent_pid];
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);

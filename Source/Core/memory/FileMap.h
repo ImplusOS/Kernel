@@ -52,6 +52,13 @@ int  filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr);
 /* munmap(): drops records wholly contained in [start, start+length). */
 void filemap_unregister_range(int32_t pid, uint64_t start, uint64_t length);
 
+/* 1 if `addr` falls in a mapping whose pages come from a file rather than from
+ * the demand-zero path. madvise(MADV_DONTNEED) needs this: on Linux the range
+ * reads back as zeroes only for private anonymous memory -- a file-backed or
+ * shared mapping re-reads the underlying data instead -- so zeroing one of
+ * those in place destroys it. */
+int  filemap_addr_is_file_backed(int32_t pid, uint64_t addr);
+
 /* execve()/exit(): drops every record owned by `pid`. */
 void filemap_release_pid(int32_t pid);
 

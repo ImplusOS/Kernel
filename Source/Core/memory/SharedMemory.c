@@ -20,6 +20,13 @@ typedef struct {
     int32_t pid;
     uint64_t address;
     void *allocation_base;
+    /* How many times this address space has mapped the object. A second
+     * mmap() of the same object aliases the first mapping rather than making
+     * a new one, so the range must survive until the last unmap: Chromium
+     * holds a writable and a read-only descriptor for one shared-memory
+     * region in the same process and maps both, and freeing the range on the
+     * first munmap() handed live memory back to the user allocator. */
+    uint32_t map_refs;
 } shared_mapping_t;
 
 typedef struct {
@@ -81,6 +88,24 @@ static void shared_memory_destroy_locked(shared_object_t *object)
     object->generation = generation;
 }
 
+/* Shared memory belongs to an address space, not to a thread. Every thread
+ * has its own pid here, so comparing raw pids refused a handoff the moment a
+ * process did it from a worker thread -- which is exactly what GTK3 does:
+ * the wl_shm memfd is created on one thread and passed over AF_UNIX from
+ * another, and shared_memory_grant() answered ACCESS_DENIED, leaving the
+ * compositor with "create_pool without an fd" and the client with no
+ * buffers at all. Normalise every identity to the address-space owner. */
+static int32_t shm_asid(int32_t pid)
+{
+    int32_t owner = process_memory_owner_pid_of(pid);
+    return (owner >= 0) ? owner : pid;
+}
+
+static int32_t shm_current_asid(void)
+{
+    return shm_asid(process_get_current_pid());
+}
+
 int32_t shared_memory_create(uint32_t size)
 {
     if (size == 0u || size > SHARED_MEMORY_MAX_BYTES) {
@@ -104,7 +129,7 @@ int32_t shared_memory_create(uint32_t size)
         memset(pages[i], 0, PAGE_SIZE);
     }
 
-    int32_t owner_pid = process_get_current_pid();
+    int32_t owner_pid = shm_current_asid();
     if (owner_pid < 0) {
         for (uint32_t i = 0u; i < page_count; ++i) free_page(pages[i]);
         free(pages);
@@ -140,7 +165,7 @@ int32_t shared_memory_create(uint32_t size)
 
 int32_t shared_memory_grant(int32_t handle, int32_t pid)
 {
-    int32_t caller = process_get_current_pid();
+    int32_t caller = shm_current_asid();
     if (pid <= 0 || caller < 0) return (int32_t)OS_STATUS_INVALID_ARG;
 
     shared_memory_init_once();
@@ -150,14 +175,14 @@ int32_t shared_memory_grant(int32_t handle, int32_t pid)
         spinlock_unlock(&g_shared_memory_lock);
         return (int32_t)OS_STATUS_ACCESS_DENIED;
     }
-    object->granted_pid = pid;
+    object->granted_pid = shm_asid(pid);
     spinlock_unlock(&g_shared_memory_lock);
     return 0;
 }
 
 void *shared_memory_map(int32_t handle)
 {
-    int32_t caller = process_get_current_pid();
+    int32_t caller = shm_current_asid();
     if (caller < 0) return NULL;
 
     shared_memory_init_once();
@@ -171,6 +196,13 @@ void *shared_memory_map(int32_t handle)
     }
     for (uint32_t i = 0u; i < object->mapping_count; ++i) {
         if (object->mappings[i].pid == caller) {
+            /* Alias the existing mapping, but count it: every successful
+             * shared_memory_map() is matched by one shared_memory_unmap(),
+             * and each of those drops an object reference. Returning early
+             * without taking one used to let the second unmap destroy an
+             * object the first mapping was still using. */
+            ++object->mappings[i].map_refs;
+            ++object->references;
             void *address = (void *)(uintptr_t)object->mappings[i].address;
             spinlock_unlock(&g_shared_memory_lock);
             return address;
@@ -240,13 +272,14 @@ void *shared_memory_map(int32_t handle)
     mapping->pid = caller;
     mapping->address = address;
     mapping->allocation_base = allocation_base;
+    mapping->map_refs = 1u;
     spinlock_unlock(&g_shared_memory_lock);
     return (void *)(uintptr_t)address;
 }
 
 int32_t shared_memory_unmap(int32_t handle, void *address)
 {
-    int32_t caller = process_get_current_pid();
+    int32_t caller = shm_current_asid();
     if (caller < 0 || address == NULL) {
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
@@ -260,6 +293,7 @@ int32_t shared_memory_unmap(int32_t handle, void *address)
     }
 
     void *allocation_base = NULL;
+    int found = 0;
     uint32_t generation = object->generation;
     for (uint32_t i = 0u; i < object->mapping_count; ++i) {
         shared_mapping_t *mapping = &object->mappings[i];
@@ -267,14 +301,22 @@ int32_t shared_memory_unmap(int32_t handle, void *address)
             mapping->address != (uint64_t)(uintptr_t)address) {
             continue;
         }
-        allocation_base = mapping->allocation_base;
-        object->mappings[i] = object->mappings[--object->mapping_count];
+        found = 1;
+        /* Only the last unmap of an aliased mapping releases the range. */
+        if (mapping->map_refs > 1u) {
+            --mapping->map_refs;
+        } else {
+            allocation_base = mapping->allocation_base;
+            object->mappings[i] = object->mappings[--object->mapping_count];
+        }
         break;
     }
     spinlock_unlock(&g_shared_memory_lock);
-    if (!allocation_base) return (int32_t)OS_STATUS_NOT_FOUND;
+    if (!found) return (int32_t)OS_STATUS_NOT_FOUND;
 
-    (void)process_user_free(allocation_base);
+    if (allocation_base != NULL) {
+        (void)process_user_free(allocation_base);
+    }
 
     spinlock_lock(&g_shared_memory_lock);
     object = shared_memory_find_locked(handle, NULL);
@@ -286,9 +328,99 @@ int32_t shared_memory_unmap(int32_t handle, void *address)
     return 0;
 }
 
+int shared_memory_unmap_any(void *address)
+{
+    int32_t caller = shm_current_asid();
+    if (caller < 0 || address == NULL) {
+        return 0;
+    }
+
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+
+    shared_object_t *object = NULL;
+    void *allocation_base = NULL;
+    uint32_t generation = 0u;
+    int found = 0;
+
+    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX && !found; ++o) {
+        shared_object_t *candidate = &g_shared_objects[o];
+        if (!candidate->used) {
+            continue;
+        }
+        for (uint32_t i = 0u; i < candidate->mapping_count; ++i) {
+            shared_mapping_t *mapping = &candidate->mappings[i];
+            if (mapping->pid != caller ||
+                mapping->address != (uint64_t)(uintptr_t)address) {
+                continue;
+            }
+            found = 1;
+            object = candidate;
+            generation = candidate->generation;
+            if (mapping->map_refs > 1u) {
+                --mapping->map_refs;
+            } else {
+                allocation_base = mapping->allocation_base;
+                candidate->mappings[i] =
+                    candidate->mappings[--candidate->mapping_count];
+            }
+            break;
+        }
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+
+    if (!found) {
+        return 0;
+    }
+
+    if (allocation_base != NULL) {
+        (void)process_user_free(allocation_base);
+    }
+
+    spinlock_lock(&g_shared_memory_lock);
+    /* Re-find by generation: the table may have moved under us. */
+    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX; ++o) {
+        if (&g_shared_objects[o] == object &&
+            g_shared_objects[o].used &&
+            g_shared_objects[o].generation == generation) {
+            --g_shared_objects[o].references;
+            shared_memory_destroy_locked(&g_shared_objects[o]);
+            break;
+        }
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+    return 1;
+}
+
+int shared_memory_addr_is_mapped(uint64_t addr)
+{
+    int32_t caller = shm_current_asid();
+    if (caller < 0) {
+        return 0;
+    }
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    int hit = 0;
+    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX && !hit; ++o) {
+        const shared_object_t *object = &g_shared_objects[o];
+        if (!object->used) continue;
+        for (uint32_t i = 0u; i < object->mapping_count; ++i) {
+            const shared_mapping_t *mapping = &object->mappings[i];
+            if (mapping->pid != caller) continue;
+            if (addr >= mapping->address &&
+                addr < mapping->address + (uint64_t)object->size) {
+                hit = 1;
+                break;
+            }
+        }
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+    return hit;
+}
+
 int32_t shared_memory_close(int32_t handle)
 {
-    int32_t caller = process_get_current_pid();
+    int32_t caller = shm_current_asid();
     shared_memory_init_once();
     spinlock_lock(&g_shared_memory_lock);
     shared_object_t *object = shared_memory_find_locked(handle, NULL);
@@ -327,7 +459,7 @@ int32_t shared_memory_release(int32_t handle)
         spinlock_unlock(&g_shared_memory_lock);
         return (int32_t)OS_STATUS_NOT_FOUND;
     }
-    int32_t caller = process_get_current_pid();
+    int32_t caller = shm_current_asid();
     if (object->granted_pid == caller) {
         object->granted_pid = -1;
     }

@@ -11,6 +11,7 @@
 #include "Core/syscall/Syscall_Epoll.h"
 #include "Core/syscall/Syscall_Clock.h"
 #include "Core/syscall/Syscall_Futex.h"
+#include "Core/syscall/Poll_Wait.h"
 #include "Core/syscall/Syscall_VM.h"
 #include "Core/syscall/Syscall_Main.h"
 #include "Core/memory/SharedMemory.h"
@@ -32,6 +33,28 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #include "MemoryManagement/Memory_Main.h"
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
+
+#ifndef CHROME_SHM_TRACE
+#define CHROME_SHM_TRACE 0
+#endif
+#if CHROME_SHM_TRACE
+/* Temporary bring-up trace for Chromium's shared-memory handshake (memfd ->
+ * /proc/self/fd reopen -> fcntl(F_GETFL) access-mode check). Capped so a
+ * stuck loop cannot bury the rest of the serial log. */
+static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
+                              uint64_t bv, const char *c, uint64_t cv)
+{
+    static uint32_t budget = 400u;
+    if (budget == 0u) return;
+    --budget;
+    serial_write_string("[shmtr] ");
+    serial_write_string(a); serial_write_uint64(av);
+    if (b[0]) { serial_write_string(b); serial_write_uint64(bv); }
+    if (c[0]) { serial_write_string(c); serial_write_uint64(cv); }
+    serial_write_string("\n");
+}
+#endif
+
 
 #define LINUX_EBADF  (-9LL)
 #define LINUX_EFAULT (-14LL)
@@ -64,6 +87,8 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #define LINUX_F_GETFD  1
 #define LINUX_F_SETFD  2
 #define LINUX_F_GETFL  3
+#define LINUX_F_ADD_SEALS 1033
+#define LINUX_F_GET_SEALS 1034
 #define LINUX_F_SETFL  4
 #define LINUX_F_DUPFD_CLOEXEC 1030
 #define LINUX_FD_CLOEXEC 1u
@@ -250,6 +275,14 @@ int64_t syscall_readv(int32_t fd, uint64_t iov, int32_t iovcnt)
         }
         return (int64_t)total;
     }
+    /* Same rule write() uses: a standard descriptor is the console only while
+     * nothing is bound to it. Treating every fd <= 2 as the console is wrong
+     * the moment a process puts a real file there, which is exactly what a
+     * terminal's child does with its pty -- readv() on such a stdin has to
+     * read the terminal, not report end-of-file. */
+    int stdio_is_console = (fd <= 2) &&
+                           (syscall_file_get_file_info(fd, NULL, NULL) != 0);
+
     for (int32_t index = 0; index < iovcnt; ++index) {
         linux_iovec_t vector;
         if (copy_from_user(&vector,
@@ -266,8 +299,8 @@ int64_t syscall_readv(int32_t fd, uint64_t iov, int32_t iovcnt)
         while (offset < vector.length) {
             uint64_t want = vector.length - offset;
             if (want > sizeof(chunk)) want = sizeof(chunk);
-            if (fd <= 2) {
-                return (int64_t)total;
+            if (stdio_is_console) {
+                return (int64_t)total; /* console input is not readable here */
             }
             int64_t count = syscall_file_read(fd, chunk, want);
             if (count < 0) return total != 0u ? (int64_t)total : count;
@@ -286,6 +319,14 @@ int64_t syscall_readv(int32_t fd, uint64_t iov, int32_t iovcnt)
 
 int64_t syscall_writev(int32_t fd, uint64_t iov, int32_t iovcnt)
 {
+    /* See the same test in syscall_readv(): a standard descriptor is only the
+     * console while nothing is bound to it. Sending every fd <= 2 to the
+     * serial port regardless is why the shell xterm started printed its prompt
+     * onto COM1 instead of into the window -- busybox's line editor writes
+     * through writev, so write()'s equivalent check never saw it. */
+    int stdio_is_console = (fd <= 2) &&
+                           (syscall_file_get_file_info(fd, NULL, NULL) != 0);
+
     if (iovcnt < 0 || iovcnt > 1024 || (iovcnt != 0 && iov == 0u)) {
         return LINUX_EINVAL;
     }
@@ -339,7 +380,7 @@ int64_t syscall_writev(int32_t fd, uint64_t iov, int32_t iovcnt)
                 return total != 0u ? (int64_t)total : LINUX_EFAULT;
             }
             int64_t count;
-            if (fd <= 2) {
+            if (stdio_is_console) {
                 for (uint64_t i = 0; i < want; ++i) {
                     serial_write_char((char)chunk[i]);
                 }
@@ -362,9 +403,47 @@ int64_t syscall_ftruncate(int32_t fd, int64_t length)
     return syscall_file_truncate(fd, (uint64_t)length);
 }
 
-/* Terminal ioctls (TODO_Chromium_LinuxABI.md section 4). None of the fds
- * exposed here are real ttys, so TCGETS/TCSETS* must report ENOTTY - that
- * is exactly the signal isatty()/Chromium's base::IsTerminal() look for.
+/* fallocate(2), enough of it for posix_fallocate(3).
+ *
+ * libwayland's os_create_anonymous_file() sizes every wl_shm pool this way:
+ * memfd_create() gives a zero-length object and posix_fallocate() is what
+ * makes it `size` bytes. glibc's userspace fallback for a missing fallocate
+ * writes the file out by hand, which a zero-length memfd will not accept, so
+ * an ENOSYS here failed every buffer allocation -- and a Wayland client with
+ * no buffers draws nothing. GDK hit it first on the cursor theme
+ * (wl_cursor_theme_load() returns NULL when it cannot allocate a single
+ * cursor) and then aborted on the NULL theme name.
+ *
+ * Only the default mode is meaningful for the objects that reach us: they
+ * have no holes to punch and no way to be sparse, so "make sure the file is
+ * at least offset+len long" is the whole of it. */
+#define LINUX_FALLOC_FL_KEEP_SIZE 0x01u
+
+static int64_t linux_fallocate(int32_t fd, uint32_t mode, int64_t offset,
+                               int64_t len)
+{
+    if (offset < 0 || len <= 0) return LINUX_EINVAL;
+    if ((mode & ~LINUX_FALLOC_FL_KEEP_SIZE) != 0u) return LINUX_ENOTSUP;
+
+    uint64_t need = (uint64_t)offset + (uint64_t)len;
+
+    /* Growing is the only thing to do, so never shrink: find the current end
+     * with lseek() and leave the file alone when it is already big enough. */
+    int64_t saved = syscall_file_seek(fd, 0, 1 /* SEEK_CUR */);
+    if (saved < 0) return saved;
+    int64_t end = syscall_file_seek(fd, 0, 2 /* SEEK_END */);
+    (void)syscall_file_seek(fd, saved, 0 /* SEEK_SET */);
+    if (end < 0) return end;
+    if ((uint64_t)end >= need) return 0;
+
+    int32_t rc = syscall_file_truncate(fd, need);
+    return (rc < 0) ? (int64_t)rc : 0;
+}
+
+/* Terminal ioctls (TODO_Chromium_LinuxABI.md section 4) for everything that is
+ * NOT a pseudo-terminal -- syscall_ioctl_ex() peels those off first. None of
+ * the fds that reach here are real ttys, so TCGETS/TCSETS* must report ENOTTY
+ * - that is exactly the signal isatty()/Chromium's base::IsTerminal() look for.
  * TIOCGWINSZ still hands back a plausible 80x24 for the std fds so code
  * that wants a size (progress bars, `--columns` autodetect) gets one. */
 #define LINUX_TCGETS     0x5401u
@@ -431,6 +510,30 @@ static int64_t linux_ioctl_tty(int32_t fd, uint64_t request, uint64_t arg)
 
 int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
 {
+    /* A pseudo-terminal answers the terminal ioctls for real -- termios, the
+     * window size, the foreground process group, TIOCGPTN/TIOCSPTLCK. It has
+     * to be tested before linux_ioctl_tty() below, whose blanket ENOTTY is
+     * only correct for the fds that are not terminals. */
+    if (syscall_file_is_pty(fd)) {
+        return syscall_file_ioctl(fd, request, arg);
+    }
+    if (OS_CONFIG_FOREIGN_TRACE &&
+        ((uint32_t)request == LINUX_TIOCGPTN ||
+         (uint32_t)request == LINUX_TIOCSPTLCK)) {
+        /* A pty-only ioctl on an fd the file layer does not consider a pty.
+         * Left in permanently: it is the difference between "the pty layer
+         * refused" and "the fd never became a pty", and nothing else in the
+         * system can tell those apart from userland. */
+        serial_write_string("[pty] pty ioctl on non-pty fd=");
+        serial_write_uint32((uint32_t)fd);
+        serial_write_string(" req=");
+        serial_write_uint64(request);
+        serial_write_string(" checks=");
+        serial_write_uint32(syscall_file_pty_debug(fd));
+        serial_write_string(" pid=");
+        serial_write_uint32((uint32_t)process_get_current_pid());
+        serial_write_char('\n');
+    }
     int64_t tty_rc = linux_ioctl_tty(fd, request, arg);
     if (tty_rc != LINUX_ENOTSUP) {
         return tty_rc;
@@ -504,6 +607,20 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
                 return r < 0 ? 0 : r;
             }
         case LINUX_F_GETFL:
+#if CHROME_SHM_TRACE
+            {
+                int64_t tr;
+                if (syscall_socket_fd_in_range(fd)) {
+                    int32_t sf = syscall_socket_get_status_flags(fd);
+                    tr = (sf < 0) ? sf : (0x0002 | sf);
+                } else if (unix_socket_fd_in_range(fd)) {
+                    tr = 0x0002 | (unix_socket_is_nonblock(fd) ? 0x0800 : 0);
+                } else {
+                    tr = syscall_file_get_status_flags(fd);
+                }
+                chrome_shm_trace3("F_GETFL fd=", (uint64_t)fd, " -> ", (uint64_t)tr, "", 0);
+            }
+#endif
             /* Socket fds are outside the generic file table; O_NONBLOCK for
              * them is tracked in the socket layer. Report O_RDWR|<nonblock>. */
             if (syscall_socket_fd_in_range(fd)) {
@@ -515,6 +632,19 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
                 return 0x0002 | (unix_socket_is_nonblock(fd) ? 0x0800 : 0);
             }
             return syscall_file_get_status_flags(fd);
+        case LINUX_F_ADD_SEALS: {
+            /* memfd sealing. Chromium seals every shared-memory region right
+             * after ftruncate() and, if the call fails, gives up on memfd and
+             * falls back to a temp file -- a path that then trips its own
+             * fcntl(F_GETFL) access-mode CHECK. So this has to work. */
+            int32_t rc = syscall_memfd_add_seals(fd, (uint32_t)arg);
+            if (rc == (int32_t)OS_STATUS_ACCESS_DENIED) return -1LL; /* EPERM */
+            return (rc < 0) ? LINUX_EINVAL : 0;
+        }
+        case LINUX_F_GET_SEALS: {
+            int32_t seals = syscall_memfd_get_seals(fd);
+            return (seals < 0) ? LINUX_EINVAL : seals;
+        }
         case LINUX_F_SETFL:
             if (syscall_socket_fd_in_range(fd)) {
                 return syscall_socket_set_nonblocking(
@@ -757,6 +887,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_UNAME         63u
 #define LINUX_SYS_FCNTL         72u
 #define LINUX_SYS_FTRUNCATE     77u
+#define LINUX_SYS_FALLOCATE     285u
 #define LINUX_SYS_GETCWD        79u
 #define LINUX_SYS_CHDIR         80u
 #define LINUX_SYS_RENAME        82u
@@ -766,6 +897,8 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_LINK          86u
 #define LINUX_SYS_UNLINK        87u
 #define LINUX_SYS_READLINK      89u
+#define LINUX_SYS_SYMLINK       88u
+#define LINUX_SYS_SYMLINKAT    266u
 #define LINUX_SYS_LINKAT       265u
 #define LINUX_SYS_GETTIMEOFDAY  96u
 #define LINUX_SYS_GETRLIMIT     97u
@@ -896,6 +1029,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 
 #define LINUX_EPERM   (-1LL)
 #define LINUX_ECHILD  (-10LL)
+#define LINUX_EEXIST  (-17LL)
 #define LINUX_ERANGE  (-34LL)
 
 #define LINUX_SYS_SOCKET        41u
@@ -953,7 +1087,14 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_PR_GET_NAME      16u
 
 #define LINUX_CLONE_VM              0x00000100u
-#define LINUX_CLONE_PARENT_SETTID   0x00008000u
+/* 0x00008000 is CLONE_PARENT ("share my parent"), not CLONE_PARENT_SETTID.
+ * With the wrong value every pthread_create() looked like it had not asked
+ * for the child's TID to be stored, so glibc's `pd->tid` stayed 0 in every
+ * thread but the first. glibc's rwlocks compare that field against the
+ * lock's __cur_writer to detect self-deadlock, and a zeroed tid matches the
+ * zero of an unheld lock, so g_rw_lock_reader_lock() failed with EDEADLK on
+ * every GObject type lookup made off the main thread. */
+#define LINUX_CLONE_PARENT_SETTID   0x00100000u
 #define LINUX_CLONE_CHILD_CLEARTID  0x00200000u
 #define LINUX_CLONE_THREAD          0x00010000u
 #define LINUX_CLONE_CHILD_SETTID    0x01000000u
@@ -1049,6 +1190,17 @@ static int64_t linux_copy_cstring(char *out, uint64_t capacity,
     if (copy_from_user_trusted(out, user_ptr, len + 1u) != 0u) {
         return LINUX_EFAULT;
     }
+#ifdef LINUX_SYSCALL_TRACE
+    /* Every path-taking syscall funnels through here, so this is the one place
+     * that can name the file a traced syscall is about. Without it a trace is
+     * a list of pointers and a bring-up boot cannot tell which path failed.
+     * Silent until the trace arms, for the reason given at linux_trace_gate(). */
+    extern bool linux_trace_is_armed(void);
+    if (!linux_trace_is_armed()) return 0;
+    serial_write_string("[lxstr] '");
+    serial_write_string(out);
+    serial_write_string("'\n");
+#endif
     return 0;
 }
 
@@ -1291,7 +1443,7 @@ static const char *linux_module_map_name(int32_t fd)
 static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
                                        uint64_t offset)
 {
-    if (!OS_CONFIG_FOREIGN_TRACE) {
+    if (!OS_CONFIG_FOREIGN_TRACE && !CHROME_SHM_TRACE) {
         (void)base; (void)len; (void)offset;
         return;
     }
@@ -1603,9 +1755,13 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
         slice_ms = (uint32_t)timeout_ms;
     }
 
+    /* Taken before the readiness scan below so an event that lands during the
+     * scan cancels the sleep instead of being missed -- see Poll_Wait.h. */
+    uint64_t generation = poll_wait_generation();
+
     if (nfds == 0u) {
         if (timeout_ms != 0 &&
-            process_sleep_current_ms(slice_ms) == 0 &&
+            poll_wait_park(generation, slice_ms) != 0 &&
             should_switch_out != NULL) {
             *should_switch_out = 1;
         }
@@ -1658,7 +1814,7 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     if (ready_count > 0 || timeout_ms == 0) {
         return ready_count;
     }
-    if (process_sleep_current_ms(slice_ms) == 0 && should_switch_out != NULL) {
+    if (poll_wait_park(generation, slice_ms) != 0 && should_switch_out != NULL) {
         *should_switch_out = 1;
     }
     if (timeout_ms < 0 && restart_out != NULL) {
@@ -1925,7 +2081,8 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         }
     }
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0u && child_tid != 0u) {
-        (void)process_set_clear_child_tid(child_tid);
+        /* On the new thread, not on us: see process_set_clear_child_tid_for(). */
+        (void)process_set_clear_child_tid_for(tid, child_tid);
     }
     return (int64_t)tid;
 }
@@ -1965,6 +2122,49 @@ static int64_t linux_read(uint64_t fd, uint64_t buf, uint64_t count)
                                       (uint8_t *)(uintptr_t)buf, count);
 }
 
+/* Resolve `path` the way the *at() syscalls do: absolute paths are taken as
+ * they are, AT_FDCWD resolves against the process cwd, and anything else
+ * resolves against the directory `dirfd` was opened on. Every *at() call used
+ * to answer ENOTSUP for a real dirfd, which is a gap ordinary Linux code walks
+ * into constantly -- base::DeleteFile() in Chromium opens a directory and then
+ * unlinkat()s its entries, and openat(dirfd, name) is how glibc's ftw/nftw and
+ * fts walk a tree. Declared before linux_resolve_path() defines it. */
+static int64_t linux_resolve_path(char *path, uint64_t capacity);
+
+static int64_t linux_resolve_at(uint64_t dirfd, char *path, uint64_t capacity)
+{
+    if (path[0] == '/') {
+        return 0;
+    }
+    if ((int64_t)dirfd == LINUX_AT_FDCWD) {
+        return linux_resolve_path(path, capacity);
+    }
+    char dir[256];
+    if (syscall_file_get_dir_path((int32_t)dirfd, dir, sizeof(dir)) != 0) {
+        return LINUX_EBADF;
+    }
+    uint64_t dir_len = strlen(dir);
+    while (dir_len > 1u && dir[dir_len - 1u] == '/') {
+        dir[--dir_len] = '\0';
+    }
+    uint64_t path_len = strlen(path);
+    /* "." means the directory itself. */
+    if (path_len == 1u && path[0] == '.') {
+        if (dir_len + 1u > capacity) {
+            return LINUX_ENAMETOOLONG;
+        }
+        memcpy(path, dir, dir_len + 1u);
+        return 0;
+    }
+    if (dir_len + 1u + path_len + 1u > capacity) {
+        return LINUX_ENAMETOOLONG;
+    }
+    memmove(path + dir_len + 1u, path, path_len + 1u);
+    memcpy(path, dir, dir_len);
+    path[dir_len] = '/';
+    return 0;
+}
+
 static int64_t linux_resolve_path(char *path, uint64_t capacity)
 {
     if (path[0] == '/') {
@@ -1998,6 +2198,8 @@ static int64_t linux_resolve_path(char *path, uint64_t capacity)
     return 0;
 }
 
+static int64_t linux_open_resolved(char *path, uint64_t flags);
+
 static int64_t linux_open_path(uint64_t path_ptr, uint64_t flags)
 {
     char path[256];
@@ -2010,13 +2212,34 @@ static int64_t linux_open_path(uint64_t path_ptr, uint64_t flags)
     if (rc < 0) {
         return rc;
     }
+    return linux_open_resolved(path, flags);
+}
+
+/* open(2)/openat(2) on a path the caller has already made absolute. Split out
+ * so openat() can resolve against a real dirfd first. */
+static int64_t linux_open_resolved(char *path, uint64_t flags)
+{
     int64_t result;
     if ((flags & LINUX_O_DIRECTORY) != 0u) {
         result = (int64_t)syscall_file_register_dir(path);
     } else {
         result = (int64_t)syscall_file_open(path, flags);
+#if CHROME_SHM_TRACE
+        if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
+            path[3] == 'o' && path[4] == 'c') {
+            serial_write_string("[shmtr] open '");
+            serial_write_string(path);
+            serial_write_string("' flags=");
+            serial_write_uint64(flags);
+            serial_write_string(" -> ");
+            serial_write_uint64((uint64_t)result);
+            serial_write_string("\n");
+        }
+#endif
         if (result == LINUX_ENOENT && (flags & LINUX_O_CREAT) != 0u) {
-            result = (int64_t)syscall_file_creat(path);
+            /* Create it, then open it with the caller's flags: the access mode
+             * open() reports back has to be the one that was asked for. */
+            result = (int64_t)syscall_file_creat_ex(path, flags);
         }
 #if LINUX_MODULE_MAP_TRACE
         if (result >= 0) {
@@ -2161,7 +2384,9 @@ static int64_t linux_stat_path(const char *path, uint64_t statbuf_ptr)
             st.st_size = 0;
             st.st_rdev = 0x0105u; /* arbitrary but stable device number */
         } else {
-            st.st_mode = LINUX_S_IFREG | 0x1A4u;
+            int32_t stored = vfs_get_mode(path);
+            st.st_mode = LINUX_S_IFREG |
+                         (uint32_t)(stored >= 0 ? stored : 0x1A4);
         }
     } else {
         int32_t dir_handle = vfs_opendir(path);
@@ -2170,7 +2395,11 @@ static int64_t linux_stat_path(const char *path, uint64_t statbuf_ptr)
         }
         (void)vfs_closedir(dir_handle);
         linux_stat_fill_common(&st, 0);
-        st.st_mode = LINUX_S_IFDIR | 0x1EDu;
+        /* The stored mode matters: mkdtemp() makes its directory 0700 and
+           Chromium's ProcessSingleton CHECK()s that stat() says 0700 --
+           reporting a fixed 0755 aborted the browser. */
+        int32_t stored = vfs_get_mode(path);
+        st.st_mode = LINUX_S_IFDIR | (uint32_t)(stored >= 0 ? stored : 0x1ED);
     }
     if (copy_to_user_trusted((void *)(uintptr_t)statbuf_ptr, &st, sizeof(st)) != 0u) {
         return LINUX_EFAULT;
@@ -2311,11 +2540,25 @@ static int64_t linux_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     (void)arg5;
     switch (option) {
         case LINUX_PR_SET_NAME: {
+            /* Linux truncates at 16 bytes (15 + NUL) and never fails on a
+             * long name. linux_copy_cstring() reports "no NUL within the
+             * buffer" as EFAULT, which turned every Chromium thread name
+             * longer than 15 characters ("ThreadPoolForegroundWorker", ...)
+             * into a failed prctl. Copy byte by byte and stop at the cap. */
             char name[16];
-            if (linux_copy_cstring(name, sizeof(name),
-                                   (const char *)(uintptr_t)arg2) < 0) {
-                return LINUX_EFAULT;
+            uint64_t i = 0;
+            for (; i < sizeof(name) - 1u; ++i) {
+                char ch = '\0';
+                if (copy_from_user(&ch, (const char *)(uintptr_t)arg2 + i,
+                                   1u) != 0u) {
+                    return (i == 0u) ? LINUX_EFAULT : 0;
+                }
+                if (ch == '\0') {
+                    break;
+                }
+                name[i] = ch;
             }
+            name[i] = '\0';
             return (int64_t)process_set_current_name(name, 15u);
         }
         case LINUX_PR_GET_NAME: {
@@ -2948,6 +3191,23 @@ static int64_t linux_socket_getsockopt(uint64_t fd, uint64_t level,
 /* (TODO_Chromium_LinuxABI.md section 3.9)                            */
 /* ------------------------------------------------------------------ */
 
+/* Does `path` name anything at all -- file, device or directory? stat() has
+ * always answered this by falling back to opendir(), because the pseudo
+ * filesystems have no lookup that spans both. */
+static bool linux_path_exists(const char *path)
+{
+    vfs_file_t vf;
+    if (vfs_find_file(path, &vf)) {
+        return true;
+    }
+    int32_t dir_handle = vfs_opendir(path);
+    if (dir_handle < 0) {
+        return false;
+    }
+    (void)vfs_closedir(dir_handle);
+    return true;
+}
+
 static int64_t linux_readlink_common(const char *path, uint64_t buf,
                                      uint64_t bufsiz)
 {
@@ -2958,10 +3218,27 @@ static int64_t linux_readlink_common(const char *path, uint64_t buf,
         return LINUX_EFAULT;
     }
     char target[256];
-    if (procfs_readlink(path, target, sizeof(target)) < 0) {
-        return LINUX_ENOENT;
+    uint64_t len = 0u;
+    if (procfs_readlink(path, target, sizeof(target)) >= 0) {
+        len = strlen(target);
+    } else {
+        /* Not a procfs link: ask the filesystems. Distinguishing the two
+         * failure modes matters -- Chromium's ProcessSingleton reads
+         * <user-data-dir>/SingletonLock and treats ENOENT as "no other
+         * instance" (the normal first-run path) but any other errno as a
+         * hard failure. */
+        int32_t rc = vfs_readlink(path, target, (uint32_t)sizeof(target));
+        if (rc < 0) {
+            /* EINVAL ("exists, but is not a symlink") vs ENOENT is not a
+             * detail: glibc's realpath() readlink()s every component of a
+             * path and only tolerates EINVAL. Answering ENOENT for the
+             * directory /tmp made realpath("/tmp/chromium") fail outright,
+             * so Chromium decided --user-data-dir was unusable and fell back
+             * to the default profile ("Failed To Create Data Directory"). */
+            return linux_path_exists(path) ? LINUX_EINVAL : LINUX_ENOENT;
+        }
+        len = (uint64_t)rc;
     }
-    uint64_t len = strlen(target);
     if (len > bufsiz) {
         len = bufsiz;
     }
@@ -2969,6 +3246,53 @@ static int64_t linux_readlink_common(const char *path, uint64_t buf,
         return LINUX_EFAULT;
     }
     return (int64_t)len; /* readlink() does NOT NUL-terminate the buffer. */
+}
+
+/* unlink(2)/unlinkat(2) on an absolute path. syscall_file_unlink() reports
+ * every failure as EIO, including "there was nothing there" -- and callers do
+ * read the errno: Chromium's ProcessSingleton removes stale lock files before
+ * creating its own and logs anything but ENOENT as an error. */
+static int64_t linux_unlink_resolved(const char *path)
+{
+    if (!linux_path_exists(path)) {
+        return LINUX_ENOENT;
+    }
+    return (int64_t)syscall_file_unlink(path);
+}
+
+/* mkdir(2)/open(O_CREAT) carry a mode the VFS create hooks cannot take, so it
+ * is applied to the finished node here. Filesystems without per-node modes
+ * just report false and keep their fixed defaults. */
+static void linux_apply_create_mode(const char *path, uint64_t mode)
+{
+    (void)vfs_set_mode(path, (uint32_t)(mode & 07777u));
+}
+
+/* symlink(2) / symlinkat(2). Only the writable tmpfs trees can hold links;
+ * everywhere else this reports EPERM, which is what Linux returns for a
+ * filesystem that does not support them. */
+static int64_t linux_symlink_at(uint64_t target_ptr, uint64_t dirfd,
+                                uint64_t linkpath_ptr)
+{
+    char target[256];
+    char linkpath[256];
+    int64_t rc = linux_copy_cstring(target, sizeof(target),
+                                    (const char *)(uintptr_t)target_ptr);
+    if (rc < 0) return rc;
+    rc = linux_copy_cstring(linkpath, sizeof(linkpath),
+                            (const char *)(uintptr_t)linkpath_ptr);
+    if (rc < 0) return rc;
+    rc = linux_resolve_at(dirfd, linkpath, sizeof(linkpath));
+    if (rc < 0) return rc;
+
+    vfs_file_t vf;
+    if (vfs_find_file(linkpath, &vf)) {
+        return LINUX_EEXIST;
+    }
+    if (!vfs_symlink(target, linkpath)) {
+        return LINUX_EPERM;
+    }
+    return 0;
 }
 
 static int64_t linux_readlink(uint64_t path_ptr, uint64_t buf, uint64_t bufsiz)
@@ -2985,10 +3309,13 @@ static int64_t linux_readlink(uint64_t path_ptr, uint64_t buf, uint64_t bufsiz)
 static int64_t linux_readlinkat(uint64_t dirfd, uint64_t path_ptr,
                                 uint64_t buf, uint64_t bufsiz)
 {
-    if ((int64_t)dirfd != LINUX_AT_FDCWD) {
-        return LINUX_ENOTSUP;
-    }
-    return linux_readlink(path_ptr, buf, bufsiz);
+    char path[256];
+    int64_t rc = linux_copy_cstring(path, sizeof(path),
+                                    (const char *)(uintptr_t)path_ptr);
+    if (rc < 0) return rc;
+    rc = linux_resolve_at(dirfd, path, sizeof(path));
+    if (rc < 0) return rc;
+    return linux_readlink_common(path, buf, bufsiz);
 }
 
 /* struct statx / struct statx_timestamp, matching the Linux uapi layout
@@ -3053,12 +3380,11 @@ static int64_t linux_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
             return LINUX_ENOTSUP;
         }
     } else {
-        if ((int64_t)dirfd != LINUX_AT_FDCWD) {
-            return LINUX_ENOTSUP;
-        }
         char path[256];
         int64_t rc = linux_copy_cstring(path, sizeof(path),
                                         (const char *)(uintptr_t)path_ptr);
+        if (rc < 0) return rc;
+        rc = linux_resolve_at(dirfd, path, sizeof(path));
         if (rc < 0) return rc;
         rc = linux_resolve_path(path, sizeof(path));
         if (rc < 0) return rc;
@@ -3244,15 +3570,80 @@ static int64_t linux_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
     return 0;
 }
 
+#define LINUX_MADV_DONTNEED 4u
+#define LINUX_MADV_REMOVE    9u
+#define LINUX_MADV_FREE      8u
+
+/* A page of zeroes to copy out of. Static rather than a stack buffer: it is
+ * read-only, so it is safe to share across CPUs, and 4 KiB is far too much
+ * kernel stack. */
+static const uint8_t g_zero_page[PAGE_SIZE];
+
 static int64_t linux_madvise(uint64_t addr, uint64_t length, uint64_t advice)
 {
-    (void)addr;
-    (void)length;
-    /* No swap/reclaim subsystem to act on MADV_DONTNEED/MADV_FREE/etc; a
-     * successful no-op is enough for glibc's malloc_trim()/PartitionAlloc
-     * decommit hints to keep working correctly (they treat madvise purely
-     * as an optimization). MADV_NORMAL/WILLNEED/... are all no-ops too. */
-    (void)advice;
+    /* MADV_NORMAL/WILLNEED/RANDOM/... really are hints: nothing to do.
+     *
+     * MADV_DONTNEED / MADV_FREE / MADV_REMOVE are not. On Linux the range
+     * reads back as zeroes afterwards, and callers rely on that rather than
+     * zeroing it themselves: PartitionAlloc decommits a span with madvise and
+     * then treats the memory as already-zeroed on recommit
+     * (DecommittedMemoryIsAlwaysZeroed() is true on Linux), so calloc() hands
+     * out whatever was left behind. That is how a no-op madvise turned into
+     * libxcb receiving a xcb_connection_t with a garbage ->setup pointer and
+     * free()ing it.
+     *
+     * There is no reclaim subsystem here, so the pages are kept and zeroed in
+     * place: the memory is not given back, but what the caller reads next is
+     * what Linux would have given it. Pages not currently present are left
+     * alone -- they already fault in as zero. A file-backed mapping should
+     * re-read from the file instead of zeroing, but no caller in this
+     * runtime madvises one. */
+    if (advice != LINUX_MADV_DONTNEED && advice != LINUX_MADV_FREE &&
+        advice != LINUX_MADV_REMOVE) {
+        (void)addr; (void)length;
+        return 0;
+    }
+    if (length == 0u) {
+        return 0;
+    }
+    if ((addr & (PAGE_SIZE - 1u)) != 0u) {
+        return LINUX_EINVAL;
+    }
+
+    uint64_t cr3 = process_get_current_cr3();
+    int32_t self = process_get_current_pid();
+    if (cr3 == 0u || self < 0) {
+        return 0;
+    }
+    uint64_t end = addr + ((length + PAGE_SIZE - 1u) & ~(uint64_t)(PAGE_SIZE - 1u));
+    if (end <= addr) {
+        return LINUX_EINVAL;
+    }
+    /* Only the mmap arena. That is where the mappings whose zeroing actually
+     * matters live -- PartitionAlloc's pools and glibc's thread stacks both
+     * come from mmap() -- and staying out of the code/heap/stack windows keeps
+     * this away from eagerly-mapped library images, which carry no filemap
+     * record to recognise them by and must not be blanked. Outside the arena
+     * the call stays the hint it always was. */
+    if (addr < USER_MMAP_BASE || end > USER_MMAP_LIMIT) {
+        return 0;
+    }
+    for (uint64_t page = addr; page < end; page += PAGE_SIZE) {
+        if (paging_virt_to_phys(cr3, page) == 0u) {
+            continue; /* not present: already demand-zero */
+        }
+        /* Private anonymous pages only. A file-backed or shared page keeps its
+         * contents on Linux -- MADV_DONTNEED just drops the cached copy and
+         * the next access reads the file (or the shared object) again. Zeroing
+         * one of those in place ate Chromium's mapped .pak/ICU data and its
+         * shared-memory regions. */
+        if (filemap_addr_is_file_backed(self, page) ||
+            shared_memory_addr_is_mapped(page)) {
+            continue;
+        }
+        (void)copy_to_user_trusted((void *)(uintptr_t)page, g_zero_page,
+                                   PAGE_SIZE);
+    }
     return 0;
 }
 
@@ -3498,14 +3889,11 @@ static int64_t linux_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode,
                                uint64_t flags)
 {
     (void)flags;
-    if ((int64_t)dirfd != LINUX_AT_FDCWD) {
-        return LINUX_ENOTSUP;
-    }
     char path[256];
     int64_t rc = linux_copy_cstring(path, sizeof(path),
                                     (const char *)(uintptr_t)path_ptr);
     if (rc < 0) return rc;
-    rc = linux_resolve_path(path, sizeof(path));
+    rc = linux_resolve_at(dirfd, path, sizeof(path));
     if (rc < 0) return rc;
     return syscall_access(path, (int32_t)mode);
 }
@@ -3856,28 +4244,89 @@ static int64_t linux_prctl_ext(uint64_t option, uint64_t arg2, uint64_t arg3,
  * when the macro is undefined. Kept deliberately allocation-free and
  * lock-free so it is safe to call from the raw syscall path. */
 #ifdef LINUX_SYSCALL_TRACE
+/* Compact hex: serial_write_uint64() always emits 16 digits, and a full
+ * trace of a Chromium startup is ~15k syscalls -- the leading zeros alone
+ * are megabytes of COM1 time. */
+static void linux_trace_hex(uint64_t v)
+{
+    char buf[17];
+    int i = 16;
+    buf[16] = '\0';
+    if (v == 0u) {
+        serial_write_char('0');
+        return;
+    }
+    while (v != 0u && i > 0) {
+        uint8_t d = (uint8_t)(v & 0xFu);
+        buf[--i] = (char)(d < 10u ? (uint8_t)('0' + d)
+                                  : (uint8_t)('a' + (d - 10u)));
+        v >>= 4;
+    }
+    serial_write_string(&buf[i]);
+}
+
+/* A trace that starts at exec() is almost all dynamic linker: ~40k syscalls
+ * of open/mmap before the program's own first instruction, and on COM1 that
+ * costs minutes and changes the timing of whatever is being chased. So hold
+ * the trace off until the process touches an AF_UNIX socket -- the display
+ * connection is the point every graphical bring-up question is downstream
+ * of -- and then stop again after LINUX_TRACE_MAX lines. */
+#ifndef LINUX_TRACE_MAX
+#define LINUX_TRACE_MAX 6000u
+#endif
+static bool     g_lx_trace_armed;
+static uint32_t g_lx_trace_left = LINUX_TRACE_MAX;
+
+bool linux_trace_is_armed(void) { return g_lx_trace_armed; }
+
+static bool linux_trace_gate(uint64_t a1)
+{
+    if (!g_lx_trace_armed) {
+        if (!unix_socket_fd_in_range((int32_t)a1)) return false;
+        g_lx_trace_armed = true;
+        serial_write_string("[lx] trace armed\n");
+    }
+    if (g_lx_trace_left == 0u) return false;
+    if (--g_lx_trace_left == 0u) {
+        serial_write_string("[lx] trace cap reached\n");
+        return false;
+    }
+    return true;
+}
+
 static void linux_trace_enter(uint64_t num, uint64_t a1, uint64_t a2,
                               uint64_t a3, uint64_t a4, uint64_t a5,
                               uint64_t a6)
 {
-    serial_write_string("[lx] #");
-    serial_write_uint64(num);
-    serial_write_string(" (");
-    serial_write_uint64(a1); serial_write_char(',');
-    serial_write_uint64(a2); serial_write_char(',');
-    serial_write_uint64(a3); serial_write_char(',');
-    serial_write_uint64(a4); serial_write_char(',');
-    serial_write_uint64(a5); serial_write_char(',');
-    serial_write_uint64(a6);
+    if (!linux_trace_gate(a1)) return;
+    serial_write_string("[lx]p");
+    linux_trace_hex((uint64_t)(uint32_t)process_get_current_pid());
+    serial_write_string(" #");
+    linux_trace_hex(num);
+    serial_write_char('(');
+    linux_trace_hex(a1); serial_write_char(',');
+    linux_trace_hex(a2); serial_write_char(',');
+    linux_trace_hex(a3); serial_write_char(',');
+    linux_trace_hex(a4); serial_write_char(',');
+    linux_trace_hex(a5); serial_write_char(',');
+    linux_trace_hex(a6);
     serial_write_string(")\n");
 }
 
 static void linux_trace_exit(uint64_t num, int64_t result)
 {
-    serial_write_string("[lx] #");
-    serial_write_uint64(num);
-    serial_write_string(" = ");
-    serial_write_uint64((uint64_t)result);
+    if (!g_lx_trace_armed || g_lx_trace_left == 0u) return;
+    serial_write_string("[lx]p");
+    linux_trace_hex((uint64_t)(uint32_t)process_get_current_pid());
+    serial_write_string(" #");
+    linux_trace_hex(num);
+    serial_write_string("=");
+    if (result < 0) {
+        serial_write_char('-');
+        linux_trace_hex((uint64_t)(-result));
+    } else {
+        linux_trace_hex((uint64_t)result);
+    }
     serial_write_char('\n');
 }
 #define LINUX_TRACE_ENTER(n, a1, a2, a3, a4, a5, a6) \
@@ -3950,18 +4399,48 @@ static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1)
  * wait simply gives up: the X11 handshake died right here, with libxcb's first
  * read of the server's setup reply. Park the caller for a slice and run the
  * syscall again (same mechanism as linux_wait4/linux_epoll_wait). */
+/* recv/send flags. Only MSG_DONTWAIT changes what the kernel must do here:
+ * it makes a single call non-blocking regardless of the fd's O_NONBLOCK, so
+ * EAGAIN is the answer the caller asked for and must not be turned into a
+ * wait. libwayland reads the display socket with
+ * MSG_DONTWAIT | MSG_CMSG_CLOEXEC on a *blocking* fd and relies on exactly
+ * that: blocking there instead wedges the client the moment its event queue
+ * runs dry -- which is one dispatch after the registry, so a GTK3 client
+ * connected, received every global, and then never spoke again. */
+#define LINUX_MSG_DONTWAIT 0x40u
+
 static void linux_unix_block_retry(int32_t fd, int64_t *result,
                                    int *should_switch, int *restart_out)
 {
-    if (*result != LINUX_EAGAIN || !unix_socket_fd_in_range(fd)) {
+    if (*result != LINUX_EAGAIN) {
         return;
     }
-    if (unix_socket_is_nonblock(fd)) {
-        /* Bring-up trace: the caller asked for a non-blocking read, so EAGAIN
-         * is the right answer and it is on the caller to wait. Printed because
-         * "the client gave up after one EAGAIN" looks identical whether the
-         * socket really was non-blocking or we simply failed to block. */
-        unix_socket_trace_note("rx-NB", fd);
+    if (unix_socket_fd_in_range(fd)) {
+        if (unix_socket_is_nonblock(fd)) {
+            /* Bring-up trace: the caller asked for a non-blocking read, so
+             * EAGAIN is the right answer and it is on the caller to wait.
+             * Printed because "the client gave up after one EAGAIN" looks
+             * identical whether the socket really was non-blocking or we
+             * simply failed to block. */
+            unix_socket_trace_note("rx-NB", fd);
+            return;
+        }
+    } else if (syscall_file_is_pipe(fd)) {
+        /* A blocking read()/write() on a pipe must never come back EAGAIN:
+         * syscall_pipe_read() waits inside the kernel but gives up after
+         * PIPE_READ_WAIT_MAX_MS and reports EAGAIN even for a blocking fd,
+         * and a reader that legitimately waits forever then sees an error
+         * that cannot happen on Linux. Chromium's CrShutdownDetector thread
+         * blocks on exactly such a pipe for the life of the browser and
+         * turned the EAGAIN into "NOTREACHED hit. Unexpected error: Resource
+         * temporarily unavailable" (shutdown_signal_handlers_posix.cc:137),
+         * killing the process. Restart the syscall instead -- the same way
+         * poll/epoll_wait/wait4 turn "no deadline" into a re-entry. */
+        int32_t flags = syscall_file_get_status_flags(fd);
+        if (flags < 0 || ((uint32_t)flags & LINUX_O_NONBLOCK) != 0u) {
+            return;
+        }
+    } else {
         return;
     }
     if (process_sleep_current_ms(LINUX_WAIT_POLL_SLICE_MS) == 0 &&
@@ -3992,6 +4471,8 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
     if ((int64_t)nfds < 0 || nfds > LINUX_SELECT_MAX_FDS) {
         return LINUX_EINVAL;
     }
+    /* Before the readiness scan, so a wakeup during it is not lost. */
+    uint64_t generation = poll_wait_generation();
     uint64_t bytes = (nfds + 7u) / 8u;
     uint8_t rd[LINUX_SELECT_MAX_FDS / 8];
     uint8_t wr[LINUX_SELECT_MAX_FDS / 8];
@@ -4050,7 +4531,7 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
         if (timeout_ms > 0 && (uint64_t)timeout_ms < slice_ms) {
             slice_ms = (uint32_t)timeout_ms;
         }
-        if (process_sleep_current_ms(slice_ms) == 0 &&
+        if (poll_wait_park(generation, slice_ms) != 0 &&
             should_switch_out != NULL) {
             *should_switch_out = 1;
         }
@@ -4114,10 +4595,19 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
         }
 
-        case LINUX_SYS_WRITE:
+        case LINUX_SYS_WRITE: {
+            int should_switch = 0;
             result = write((int32_t)arg1, (const void *)(uintptr_t)arg2,
                            arg3);
+            /* Same rule as read(): a blocking write to a full pipe waits, it
+             * does not report EAGAIN. */
+            linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
+                                   &request_restart);
+            if (should_switch) {
+                request_switch = 1;
+            }
             break;
+        }
 
         case LINUX_SYS_OPEN:
             result = linux_open_path(arg1, arg2);
@@ -4180,18 +4670,13 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 result = linux_stat_fd((int32_t)arg1, arg3);
                 break;
             }
-            if (first != '/' && (int64_t)arg1 != LINUX_AT_FDCWD) {
-                /* relative path against a non-CWD dirfd: not supported yet */
-                result = LINUX_ENOTSUP;
-                break;
-            }
             int64_t rc = linux_copy_cstring(path, sizeof(path),
                                             (const char *)(uintptr_t)arg2);
             if (rc < 0) {
                 result = rc;
                 break;
             }
-            rc = linux_resolve_path(path, sizeof(path));
+            rc = linux_resolve_at(arg1, path, sizeof(path));
             if (rc < 0) {
                 result = rc;
                 break;
@@ -4222,6 +4707,15 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 /* ...and release any demand-paged file mapping it covers, so
                  * the reference on the open file description goes away. */
                 filemap_unregister_range(self, arg1, arg2);
+            }
+            /* A mapping of a shared-memory object (mmap of a memfd) is owned
+             * by the shared-memory layer, which has to release it itself: the
+             * pages are shared and the range has to leave the object's
+             * mapping table, or a later map of the same object returns this
+             * address after the allocator has reused it. */
+            if (shared_memory_unmap_any((void *)(uintptr_t)arg1)) {
+                result = 0;
+                break;
             }
             result = (int64_t)process_user_munmap((void *)(uintptr_t)arg1,
                                                   arg2);
@@ -4441,6 +4935,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = syscall_ftruncate((int32_t)arg1, (int64_t)arg2);
             break;
 
+        case LINUX_SYS_FALLOCATE:
+            result = linux_fallocate((int32_t)arg1, (uint32_t)arg2,
+                                     (int64_t)arg3, (int64_t)arg4);
+            break;
+
         case LINUX_SYS_GETCWD:
             result = linux_getcwd(arg1, arg2);
             break;
@@ -4490,6 +4989,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             result = (int64_t)syscall_file_mkdir(path);
+            if (result == 0) {
+                linux_apply_create_mode(path, arg2);
+            }
             break;
         }
 
@@ -4568,12 +5070,21 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 result = rc;
                 break;
             }
-            result = (int64_t)syscall_file_unlink(path);
+            result = linux_unlink_resolved(path);
             break;
         }
 
         case LINUX_SYS_READLINK:
             result = linux_readlink(arg1, arg2, arg3);
+            break;
+
+        case LINUX_SYS_SYMLINK:
+            result = linux_symlink_at(arg1, (uint64_t)LINUX_AT_FDCWD, arg2);
+            break;
+
+        case LINUX_SYS_SYMLINKAT:
+            /* symlinkat(target, newdirfd, linkpath) */
+            result = linux_symlink_at(arg1, arg2, arg3);
             break;
 
         case LINUX_SYS_GETTIMEOFDAY:
@@ -4724,17 +5235,16 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         }
 
         case LINUX_SYS_OPENAT: {
-            /* dirfd is ignored for an absolute pathname (POSIX); only a
-             * relative path needs dirfd == AT_FDCWD here. */
-            char oa_first = '\0';
-            if (arg2 != 0u) {
-                (void)copy_from_user(&oa_first, (const void *)(uintptr_t)arg2, 1u);
-            }
-            if (oa_first != '/' && (int64_t)arg1 != LINUX_AT_FDCWD) {
-                result = LINUX_ENOTSUP;
-                break;
-            }
-            result = linux_open_path(arg2, arg3);
+            /* dirfd is ignored for an absolute pathname (POSIX); a relative
+             * one resolves against the cwd (AT_FDCWD) or the directory the
+             * dirfd was opened on. */
+            char oa_path[256];
+            int64_t rc = linux_copy_cstring(oa_path, sizeof(oa_path),
+                                            (const char *)(uintptr_t)arg2);
+            if (rc < 0) { result = rc; break; }
+            rc = linux_resolve_at(arg1, oa_path, sizeof(oa_path));
+            if (rc < 0) { result = rc; break; }
+            result = linux_open_resolved(oa_path, arg3);
             break;
         }
 
@@ -4830,6 +5340,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_MEMFD_CREATE:
             result = (int64_t)syscall_file_create_memfd(
                 (const char *)(uintptr_t)arg1);
+#if CHROME_SHM_TRACE
+            chrome_shm_trace3("memfd_create flags=", arg2, " -> ", (uint64_t)result, "", 0);
+#endif
             break;
 
         case LINUX_SYS_STATX:
@@ -4903,8 +5416,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_RECVFROM: {
             int should_switch = 0;
             result = linux_socket_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6);
-            linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
-                                   &request_restart);
+            if ((arg4 & LINUX_MSG_DONTWAIT) == 0u) {
+                linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
+                                       &request_restart);
+            }
             if (should_switch) {
                 request_switch = 1;
             }
@@ -4937,8 +5452,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 result = LINUX_EFAULT;
             } else {
                 result = unix_socket_recvmsg((int32_t)arg1, arg2);
-                linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
-                                       &request_restart);
+                if ((arg3 & LINUX_MSG_DONTWAIT) == 0u) {
+                    linux_unix_block_retry((int32_t)arg1, &result,
+                                           &should_switch, &request_restart);
+                }
             }
             if (should_switch) {
                 request_switch = 1;
@@ -5184,9 +5701,24 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_MUNLOCKALL:
         case LINUX_SYS_MLOCK2:
         case LINUX_SYS_UTIMENSAT:
-        case LINUX_SYS_FCHMOD:
-        case LINUX_SYS_FCHMODAT:
+        /* chmod(2)/fchmodat(2): store the bits on a filesystem that keeps
+           them (tmpfs) and otherwise accept-and-ignore as before. fchmod(2)
+           still has nothing to key on, so it stays a no-op success. */
         case LINUX_SYS_CHMOD:
+        case LINUX_SYS_FCHMODAT: {
+            uint64_t path_arg = (num == LINUX_SYS_CHMOD) ? arg1 : arg2;
+            uint64_t mode_arg = (num == LINUX_SYS_CHMOD) ? arg2 : arg3;
+            char path[256];
+            int64_t rc = linux_copy_cstring(path, sizeof(path),
+                                            (const char *)(uintptr_t)path_arg);
+            if (rc == 0 && linux_resolve_path(path, sizeof(path)) >= 0) {
+                (void)vfs_set_mode(path, (uint32_t)(mode_arg & 07777u));
+            }
+            result = 0;
+            break;
+        }
+
+        case LINUX_SYS_FCHMOD:
         case LINUX_SYS_FCHOWN:
         case LINUX_SYS_CHOWN:
         case LINUX_SYS_LCHOWN:
@@ -5304,42 +5836,32 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_MKDIRAT: {
-            if ((int64_t)arg1 != LINUX_AT_FDCWD) {
-                result = LINUX_ENOTSUP;
-                break;
-            }
             char path[256];
             int64_t rc = linux_copy_cstring(path, sizeof(path),
                                             (const char *)(uintptr_t)arg2);
             if (rc < 0) { result = rc; break; }
-            rc = linux_resolve_path(path, sizeof(path));
+            rc = linux_resolve_at(arg1, path, sizeof(path));
             if (rc < 0) { result = rc; break; }
             result = (int64_t)syscall_file_mkdir(path);
+            if (result == 0) {
+                linux_apply_create_mode(path, arg3);
+            }
             break;
         }
 
         case LINUX_SYS_UNLINKAT: {
-            if ((int64_t)arg1 != LINUX_AT_FDCWD) {
-                result = LINUX_ENOTSUP;
-                break;
-            }
             char path[256];
             int64_t rc = linux_copy_cstring(path, sizeof(path),
                                             (const char *)(uintptr_t)arg2);
             if (rc < 0) { result = rc; break; }
-            rc = linux_resolve_path(path, sizeof(path));
+            rc = linux_resolve_at(arg1, path, sizeof(path));
             if (rc < 0) { result = rc; break; }
-            result = (int64_t)syscall_file_unlink(path);
+            result = linux_unlink_resolved(path);
             break;
         }
 
         case LINUX_SYS_RENAMEAT:
         case LINUX_SYS_RENAMEAT2: {
-            if ((int64_t)arg1 != LINUX_AT_FDCWD ||
-                (int64_t)arg3 != LINUX_AT_FDCWD) {
-                result = LINUX_ENOTSUP;
-                break;
-            }
             char old_path[256];
             char new_path[256];
             int64_t rc = linux_copy_cstring(old_path, sizeof(old_path),
@@ -5348,8 +5870,8 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             rc = linux_copy_cstring(new_path, sizeof(new_path),
                                     (const char *)(uintptr_t)arg4);
             if (rc < 0) { result = rc; break; }
-            rc = linux_resolve_path(old_path, sizeof(old_path));
-            if (rc >= 0) rc = linux_resolve_path(new_path, sizeof(new_path));
+            rc = linux_resolve_at(arg1, old_path, sizeof(old_path));
+            if (rc >= 0) rc = linux_resolve_at(arg3, new_path, sizeof(new_path));
             if (rc < 0) { result = rc; break; }
             result = (int64_t)syscall_file_rename(old_path, new_path);
             break;
@@ -5358,6 +5880,37 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         default:
             result = LINUX_ENOSYS;
             break;
+    }
+
+    /* Name every syscall this layer does not implement, once each. An
+     * external Linux binary that dies for want of a syscall otherwise says
+     * nothing useful: glibc turns ENOSYS into an ordinary errno and the
+     * caller reports its own high-level failure (or none at all). One bit
+     * per number keeps this allocation-free and silent after the first hit,
+     * so it can stay on outside bring-up boots. Numbers above the bitmap are
+     * rare enough to report every time. */
+    if (result == LINUX_ENOSYS) {
+        static uint8_t reported[512u / 8u];
+        bool first = true;
+        if (num < 512u) {
+            uint8_t bit = (uint8_t)(1u << (num & 7u));
+            if ((reported[num >> 3u] & bit) != 0u) {
+                first = false;
+            } else {
+                reported[num >> 3u] |= bit;
+            }
+        }
+        if (first) {
+            serial_write_string("[lxsys] ENOSYS #");
+            serial_write_uint64(num);
+            serial_write_string(" (");
+            serial_write_uint64(arg1);
+            serial_write_string(",");
+            serial_write_uint64(arg2);
+            serial_write_string(",");
+            serial_write_uint64(arg3);
+            serial_write_string(")\n");
+        }
     }
 
     /* Bring-up trace (TODO_Doom_Xorg_MethodA.md M8). Xorg can only run

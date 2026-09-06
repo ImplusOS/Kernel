@@ -681,7 +681,9 @@ int32_t page_fault_handler(uint64_t error_code,
         }
     }
 
-    serial_write_string("[OS] [PF] Page fault\n");
+    serial_write_string("[OS] [PF] Page fault pid=");
+    serial_write_uint64((uint64_t)(uint32_t)pid);
+    serial_write_string("\n");
     /* The address space the fault was taken in, next to the one the process
      * table says it should be: a mismatch means the CPU was executing user
      * code against someone else's page tables, and every address in this dump
@@ -697,6 +699,12 @@ int32_t page_fault_handler(uint64_t error_code,
     serial_write_string("\n");
     serial_write_string("[OS] [PF] RIP: ");
     serial_write_uint64(rip);
+    /* The kernel is PIE and the boot manager slides it, so a raw RIP names
+     * nothing on its own. Print the runtime address of a symbol from this
+     * same image alongside it: the difference is the slide, and RIP minus the
+     * slide is an address that `nm Kernel_Main.ELF.tmp` can resolve. */
+    serial_write_string(" ref(serial_write_string)=");
+    serial_write_uint64((uint64_t)(uintptr_t)&serial_write_string);
     serial_write_string("\n");
     serial_write_string("[OS] [PF] UserRSP: ");
     serial_write_uint64(user_rsp);

@@ -4,6 +4,8 @@
 #include "Core/memory/SharedMemory.h"
 #include "Core/syscall/Syscall_File.h"
 #include "Debug/serial/Serial.h"
+#include "Core/syscall/Poll_Wait.h"
+#include "kernel/config.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -111,9 +113,11 @@ int64_t unix_socket_listen(int32_t fd, int32_t backlog) {
     s->listening = 1;
     /* Bring-up trace: one line per listening socket, so a client that cannot
      * find the server has something concrete to be compared against. */
-    serial_write_string("[usock] listen '");
-    serial_write_string(s->path);
-    serial_write_string("'\n");
+    if (OS_CONFIG_FOREIGN_TRACE) {
+        serial_write_string("[usock] listen '");
+        serial_write_string(s->path);
+        serial_write_string("'\n");
+    }
     return 0;
 }
 
@@ -122,11 +126,31 @@ int64_t unix_socket_listen(int32_t fd, int32_t backlog) {
  * like an authorization refusal and exactly like a lost reply, so log the
  * connect/accept pairing and the first few payload sizes. Hard-capped so it
  * cannot flood the console. */
-#define USOCK_TRACE_MAX 48
+#define USOCK_TRACE_MAX 512
+/* Distinct connect failures reported before going quiet; see below. */
+#define USOCK_CONNECT_FAIL_MAX 8u
 static uint32_t g_usock_trace_count;
 
+/* "nothing buffered yet" is the overwhelming majority of the traffic on a
+ * non-blocking socket -- a poll loop produces thousands of them a second --
+ * and tracing it used up the whole budget before the first real byte moved.
+ * Skip it: an EAGAIN is the absence of an event, and what a stalled
+ * connection needs is the presence or absence of the tx/rx around it. */
 static void usock_trace2(const char *tag, int32_t a, int64_t b)
 {
+    /* Off with the rest of the foreign trace. This is one COM1 line per
+     * AF_UNIX packet and AF_UNIX *is* the X11 transport, so leaving it on put
+     * hundreds of lines -- seconds of 115200 baud -- into the middle of every
+     * client handshake. Worse, once a terminal streams the kernel log back
+     * into a window, each line drawn produces more X traffic and so more
+     * lines: a feedback loop with the console as the amplifier. */
+    if (!OS_CONFIG_FOREIGN_TRACE) {
+        return;
+    }
+    if (tag[0] == 'r' && tag[1] == 'x' && tag[2] == '-' && tag[3] == 'E' &&
+        tag[4] == 'A') {
+        return;
+    }
     if (g_usock_trace_count >= USOCK_TRACE_MAX) return;
     ++g_usock_trace_count;
     serial_write_string("[usock] ");
@@ -193,15 +217,34 @@ int64_t unix_socket_connect(int32_t fd, const char *path) {
                 s->connected = 1;
                 s->peer_fd = UNIX_SOCK_FD_BASE + i;
                 usock_trace2("conn-ok", fd, UNIX_SOCK_FD_BASE + i);
+                /* The listening socket is now readable: wake whoever is
+                 * parked in accept()'s poll. */
+                poll_wait_notify();
                 return 0;
             }
         }
     }
-    /* Bring-up trace: only on failure. ECONNREFUSED here is what an X client
-     * sees as "Couldn't connect to display!", with no further detail. */
-    serial_write_string("[usock] connect FAILED '");
-    serial_write_string(path);
-    serial_write_string("'\n");
+    /* Only on failure, and capped. ECONNREFUSED here is what an X client sees
+     * as "Couldn't connect to display!", with no further detail, so the first
+     * few are worth having even in a quiet boot. The cap matters because a
+     * failing connect is often on a retry timer that never gives up: Xorg's
+     * dbus-core re-tries /run/dbus/system_bus_socket every 10 seconds for the
+     * life of the server, and on a machine with no dbus that is two COM1
+     * lines every 10 seconds forever. */
+    {
+        static uint32_t failed_reported;
+        if (OS_CONFIG_FOREIGN_TRACE || failed_reported < USOCK_CONNECT_FAIL_MAX) {
+            ++failed_reported;
+            serial_write_string("[usock] connect FAILED '");
+            serial_write_string(path);
+            serial_write_string("'\n");
+            if (!OS_CONFIG_FOREIGN_TRACE &&
+                failed_reported == USOCK_CONNECT_FAIL_MAX) {
+                serial_write_string("[usock] (further connect failures "
+                                    "silenced)\n");
+            }
+        }
+    }
     return -111;
 }
 
@@ -231,6 +274,10 @@ int64_t unix_socket_send(int32_t fd, const void *buf, uint64_t len) {
         return -11; /* EAGAIN: ring full */
     }
     usock_trace2("tx", fd, (int64_t)written);
+    /* The peer is now readable. Cut short any poll()/select()/epoll_wait()
+     * that is parked waiting for exactly this -- an X11 round trip crosses
+     * that wait twice, so leaving it to time out cost ~16 ms per request. */
+    poll_wait_notify();
     return (int64_t)written;
 }
 
@@ -258,6 +305,8 @@ int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
         return is_eof ? 0 : -11; /* 0 = EOF, -11 = EAGAIN */
     }
     usock_trace2("rx", fd, (int64_t)rd);
+    /* Draining the ring makes the peer writable again. */
+    poll_wait_notify();
     return (int64_t)rd;
 }
 
@@ -396,6 +445,20 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
 int64_t unix_socket_close(int32_t fd) {
     unix_sock_t *s = usock_get(fd);
     if (!s) return -9;
+    /* AF_UNIX descriptors live in one table shared by every process, so a
+     * close() here destroys the socket for its owner too -- there is no
+     * per-process descriptor table to drop a reference in. A forked child
+     * inherits nothing it may destroy: glibc's closefrom() fallback (taken
+     * whenever close_range(2) is missing, which is every posix_spawn on this
+     * kernel) walks every descriptor number up to RLIMIT_NOFILE and closes
+     * it, so one at-spi or dbus-launch spawn out of a GTK client used to take
+     * the compositor's listening and accepted sockets down with it. Only the
+     * owner may close. */
+    int32_t caller = process_get_current_pid();
+    if (s->owner_pid != caller) {
+        usock_trace2("close-NOTOWNER", fd, (int64_t)s->owner_pid);
+        return 0;      /* the caller's own descriptor is simply not this one */
+    }
     spinlock_lock(&s->lock);
     usock_drain_fd_queue(s);
     spinlock_unlock(&s->lock);

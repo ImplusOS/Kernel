@@ -25,3 +25,9 @@ const vfs_driver_t *procfs_vfs_get_driver(void);
  * synthetic readlink() target. Returns 0 on success (writing a NUL
  * terminated string into `out`), <0 if `path` is not a procfs symlink. */
 int procfs_readlink(const char *path, char *out, uint32_t capacity);
+
+/* Descriptor number a /proc/self/fd/<n> (or /proc/<own-pid>/fd/<n>) path names,
+ * or -1 if `path` is not one. Opening such a path has to reopen the descriptor
+ * it points at rather than read a generated file, so the fd layer asks this
+ * before it consults the VFS. */
+int32_t procfs_parse_fd_path(const char *path);

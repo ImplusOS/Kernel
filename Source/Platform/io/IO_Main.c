@@ -1,4 +1,5 @@
 #include "IO_Main.h"
+#include "Block_Cache.h"
 #include "Protocol/ATA/Protocol_ATA.h"
 #include "Protocol/USB_MassStorage/Protocol_USB_MassStorage.h"
 #include "Drivers/Module/BlockManager.h"
@@ -514,6 +515,7 @@ bool disk_io_init(uint64_t partition_lba, uint32_t boot_drive_type) {
     g_current_device_index = 0;
     g_disk_scan_done       = false;
     spinlock_init(&g_disk_lock);
+    block_cache_init();
 
     io_protocol_type_t requested_protocol = IO_PROTOCOL_TYPE_NONE;
     if      (boot_drive_type == BOOT_DRIVE_TYPE_IDE)
@@ -545,16 +547,36 @@ bool disk_io_init(uint64_t partition_lba, uint32_t boot_drive_type) {
 }
 
 
+/* Cache key for a (device, unit) pair. The per-protocol unit index alone is
+ * not enough -- AHCI unit 0 and USB unit 0 are both index 0, and handing one
+ * device's sectors to the other is silent filesystem corruption -- so the
+ * block_device_t pointer, which is a distinct static per transport, goes in
+ * the high bits. */
+static uint64_t disk_cache_key(const block_device_t *device, uint32_t index)
+{
+    return ((uint64_t)(uintptr_t)device << 8) | (uint64_t)(index & 0xFFu);
+}
+
+/* Reaches the medium. Only ever called with g_disk_lock held and the device
+ * already selected, which is what lets Block_Cache.c share one staging
+ * buffer. */
+static bool disk_read_raw(uint64_t lba, uint8_t *buffer, uint32_t sectors)
+{
+    if (!g_current_block_device || !g_current_block_device->read) {
+        return false;
+    }
+    return g_current_block_device->read(lba, buffer, sectors);
+}
+
 bool disk_read(uint64_t lba, uint8_t *buffer, uint32_t sectors)
 {
     if (!g_current_block_device) return false;
     spinlock_lock(&g_disk_lock);
     if (g_current_block_device->select_device)
         g_current_block_device->select_device(g_current_device_index);
-    bool ok = false;
-    if (g_current_block_device->read) {
-        ok = g_current_block_device->read(lba, buffer, sectors);
-    }
+    bool ok = block_cache_read(
+        disk_cache_key(g_current_block_device, g_current_device_index),
+        lba, buffer, sectors, disk_read_raw);
     spinlock_unlock(&g_disk_lock);
     return ok;
 }
@@ -567,6 +589,10 @@ bool disk_write(uint64_t lba, const uint8_t *buffer, uint32_t sectors) {
         g_current_block_device->select_device(g_current_device_index);
     if (g_current_block_device->write)
         ok = g_current_block_device->write(lba, buffer, sectors);
+    /* Unconditional: a failed write may still have landed partially. */
+    block_cache_invalidate(
+        disk_cache_key(g_current_block_device, g_current_device_index),
+        lba, sectors);
     spinlock_unlock(&g_disk_lock);
     return ok;
 }
@@ -710,7 +736,17 @@ static bool disk_raw_io(uint32_t       index,
     bool already_up = device->is_working && device->is_working();
     if (already_up || (device->init && device->init(0))) {
         if (read_buffer  && device->read)  ok = device->read (lba, read_buffer,  sectors);
-        else if (write_buffer && device->write) ok = device->write(lba, write_buffer, sectors);
+        else if (write_buffer && device->write) {
+            ok = device->write(lba, write_buffer, sectors);
+            /* This path reaches a device directly rather than through
+             * disk_write(), so it has to drop the cached copy itself --
+             * otherwise writing the install target and then reading it back
+             * (which the installer does to verify) returns pre-write data.
+             * Unconditional: a failed write may still have landed
+             * partially. */
+            block_cache_invalidate(disk_cache_key(device, dev_idx),
+                                   lba, sectors);
+        }
     }
 
     if (saved_device) {

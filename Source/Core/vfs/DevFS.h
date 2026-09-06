@@ -21,3 +21,7 @@ const vfs_driver_t *devfs_vfs_get_driver(void);
  * (used by stat()/fstat() in the Linux ABI layer to report S_IFCHR
  * instead of the generic S_IFREG mode). */
 bool devfs_path_is_device(const char *path);
+
+/* True if `file` is one end of a pseudo-terminal (/dev/ptmx or /dev/pts/N).
+ * The fd layer needs it to route terminal ioctls (see syscall_file_is_pty). */
+bool devfs_file_is_pty(const vfs_file_t *file);

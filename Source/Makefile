@@ -42,7 +42,7 @@ $(KERNEL_ELF): $(OBJS)
 	@mkdir -p $(dir $@)
 	$(LD) $(KERNEL_LDFLAGS) $^ -o $@.tmp
 	$(OBJCOPY) --strip-all -R .note -R .comment $@.tmp $@
-	@rm -f $@.tmp
+	@mv -f $@.tmp $@.sym
 
 $(KERNEL_BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)

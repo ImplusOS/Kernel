@@ -543,6 +543,39 @@ const vfs_driver_t *procfs_vfs_get_driver(void)
     return &g_procfs_vfs_driver;
 }
 
+/* Shared by procfs_readlink() and procfs_parse_fd_path(): decode the "<n>"
+ * of an "fd/<n>" suffix. Returns -1 unless the whole suffix is that. */
+static int32_t procfs_fd_suffix_to_fd(const char *suffix)
+{
+    if (suffix == NULL || strncmp(suffix, "fd/", 3) != 0) {
+        return -1;
+    }
+    const char *num = suffix + 3;
+    int32_t fd = 0;
+    int had_digit = 0;
+    while (*num >= '0' && *num <= '9') {
+        fd = fd * 10 + (*num - '0');
+        ++num;
+        had_digit = 1;
+    }
+    if (!had_digit || *num != '\0') {
+        return -1;
+    }
+    return fd;
+}
+
+int32_t procfs_parse_fd_path(const char *path)
+{
+    if (path == NULL) {
+        return -1;
+    }
+    const char *suffix = NULL;
+    if (procfs_resolve_pid(path, &suffix) < 0 || suffix == NULL) {
+        return -1;
+    }
+    return procfs_fd_suffix_to_fd(suffix);
+}
+
 int procfs_readlink(const char *path, char *out, uint32_t capacity)
 {
     const char *suffix = NULL;
@@ -567,16 +600,9 @@ int procfs_readlink(const char *path, char *out, uint32_t capacity)
         out[capacity - 1u] = '\0';
         return 0;
     }
-    if (strncmp(suffix, "fd/", 3) == 0) {
-        const char *num = suffix + 3;
-        int32_t fd = 0;
-        int had_digit = 0;
-        while (*num >= '0' && *num <= '9') {
-            fd = fd * 10 + (*num - '0');
-            ++num;
-            had_digit = 1;
-        }
-        if (!had_digit || *num != '\0') {
+    {
+        int32_t fd = procfs_fd_suffix_to_fd(suffix);
+        if (fd < 0) {
             return -1;
         }
         vfs_file_t vf;
@@ -590,5 +616,4 @@ int procfs_readlink(const char *path, char *out, uint32_t capacity)
         }
         return -1;
     }
-    return -1;
 }

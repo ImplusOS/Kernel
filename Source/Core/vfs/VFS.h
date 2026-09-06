@@ -44,6 +44,13 @@ int64_t  vfs_dev_read(vfs_file_t *file, uint8_t *buffer, uint64_t length,
 uint32_t vfs_dev_poll(vfs_file_t *file, uint32_t events);
 int64_t  vfs_dev_mmap(vfs_file_t *file, uint64_t offset, uint64_t length,
                       uint64_t prot, uint64_t flags);
+int64_t  vfs_dev_write(vfs_file_t *file, const uint8_t *buffer,
+                       uint64_t length, uint32_t nonblock);
+bool     vfs_file_has_dev_write(const vfs_file_t *file);
+/* Second half of an open(2): run the driver's open_file hook, if it has one.
+ * True (and a no-op) for every driver without one. Paired with
+ * vfs_close_file() -- see the hook's comment in vfs_types.h. */
+bool     vfs_open_file(vfs_file_t *file, uint64_t flags);
 bool vfs_truncate(vfs_file_t *file, uint32_t new_size);
 uint32_t vfs_get_file_size(vfs_file_t *file);
 bool vfs_close_file(vfs_file_t *file);
@@ -60,6 +67,18 @@ bool vfs_dir_is_writable(const char *path);
 int32_t vfs_readdir(int32_t handle, vfs_dirent_t *out_entry);
 int32_t vfs_closedir(int32_t handle);
 bool vfs_unlink(const char *path);
+/* Symbolic links, on the filesystems that have them (tmpfs today: /tmp, /run,
+ * /var, /dev/shm). vfs_symlink() returns false when the link already exists or
+ * no mounted filesystem under `linkpath` can hold links; vfs_readlink() fills
+ * `buf` WITHOUT a NUL and returns the byte count, or -1 when `path` is not a
+ * symlink. */
+bool vfs_symlink(const char *target, const char *linkpath);
+int32_t vfs_readlink(const char *path, char *buf, uint32_t size);
+/* POSIX permission bits, on the filesystems that keep them (tmpfs today).
+ * vfs_get_mode() returns -1 when nothing stores a mode for `path`, and the
+ * caller should then use its own default. */
+bool vfs_set_mode(const char *path, uint32_t mode);
+int32_t vfs_get_mode(const char *path);
 bool vfs_rename(const char *old_path, const char *new_path);
 void vfs_set_case_sensitive(bool enabled);
 bool vfs_get_case_sensitive(void);

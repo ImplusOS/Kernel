@@ -209,6 +209,18 @@
 /* Non-zero (and clears) once the mirror has taken a new frame. */
 #define SYSCALL_DISPLAY_KMS_MIRROR_DIRTY 272
 
+/* Wrap a shared-memory handle the caller owns in a memfd fd, so a native
+ * process (which has no memfd_create) can pass the buffer to a foreign
+ * client over SCM_RIGHTS -- the Wayland compositor's wl_keyboard.keymap.
+ * Inverse of SYSCALL_MEMFD_SHM_HANDLE. */
+#define SYSCALL_MEMFD_FROM_SHM         273
+
+/* Bytes actually reserved for a shared-memory object. A wl_shm pool is grown
+ * by its client (posix_fallocate + wl_shm_pool.resize), so a compositor that
+ * has the pool mapped needs to know how far the mapping really reaches
+ * before it believes a resize request. */
+#define SYSCALL_SHARED_MEMORY_SIZE     274
+
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241
 #define SYSCALL_KVM_CLOSE         242

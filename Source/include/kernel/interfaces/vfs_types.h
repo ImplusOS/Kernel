@@ -72,4 +72,47 @@ typedef struct vfs_driver {
     uint32_t (*dev_poll)(vfs_file_t *file, uint32_t events);
     int64_t (*dev_mmap)(vfs_file_t *file, uint64_t offset, uint64_t length,
                         uint64_t prot, uint64_t flags);
+    /*   dev_write : like write(2); returns byte count or -errno. Unlike
+     *               dev_read's user pointer, `buffer` is KERNEL memory --
+     *               syscall_file_write() stages the user bytes first, the
+     *               same contract write_at has. A device that can accept a
+     *               short write (a pty whose output ring is full) needs this
+     *               instead of write_at, which is all-or-nothing. */
+    int64_t (*dev_write)(vfs_file_t *file, const uint8_t *buffer,
+                         uint64_t length, uint32_t nonblock);
+
+    /* Optional. Called by the fd layer once find_file() has been accepted for
+     * a real open(2), and paired with close_file(). Filesystems whose nodes
+     * are stateless do not need it; /dev/ptmx does, because "look this path
+     * up" (stat, access, a path-exists probe -- none of which close what they
+     * find) must not be what allocates a pseudo-terminal.
+     *   flags : the open(2) flags, so a device can honour O_NOCTTY.
+     *   false : refuse the open; close_file() is NOT called. */
+    bool (*open_file)(vfs_file_t *file, uint64_t flags);
+
+    /* Optional symbolic links (both NULL for a filesystem without them, which
+     * is how the read-only boot media and the generated pseudo-filesystems
+     * answer). Only tmpfs implements these today, which is enough for the
+     * writable trees (/tmp, /run, /var) real Linux programs put links in --
+     * Chromium's ProcessSingleton refuses to start a browser when it cannot
+     * create <user-data-dir>/SingletonLock.
+     *   symlink  : create `linkpath` pointing at `target`; false if it exists
+     *              or the path is not ours.
+     *   readlink : copy the target into `buf` (NOT NUL-terminated, same as
+     *              readlink(2)); returns the byte count, or -1 when `path` is
+     *              not a symlink on this filesystem. */
+    bool (*symlink)(const char *target, const char *linkpath);
+    int32_t (*readlink)(const char *path, char *buf, uint32_t size);
+
+    /* Optional POSIX permission bits (both NULL for a filesystem that has no
+     * per-node mode, which is every read-only and generated one here). The
+     * VFS mkdir/creat hooks take no mode, so the syscall layer applies the
+     * caller's mode with set_mode() right after creating the node.
+     *   set_mode : store `mode` (the low 12 bits) for an existing node.
+     *   get_mode : the stored bits, or <0 when this filesystem has no node
+     *              there -- the caller then falls back to its default.
+     * Chromium needs this: mkdtemp() creates its ProcessSingleton socket
+     * directory 0700 and then CHECK()s that stat() reports exactly 0700. */
+    bool (*set_mode)(const char *path, uint32_t mode);
+    int32_t (*get_mode)(const char *path);
 } vfs_driver_t;

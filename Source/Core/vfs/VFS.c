@@ -300,6 +300,22 @@ int64_t vfs_dev_mmap(vfs_file_t *file, uint64_t offset, uint64_t length,
     return file->fs_driver->dev_mmap(file, offset, length, prot, flags);
 }
 
+bool vfs_file_has_dev_write(const vfs_file_t *file) {
+    return file && file->fs_driver && file->fs_driver->dev_write;
+}
+
+int64_t vfs_dev_write(vfs_file_t *file, const uint8_t *buffer, uint64_t length,
+                      uint32_t nonblock) {
+    if (!file || !file->fs_driver || !file->fs_driver->dev_write) return -25;
+    return file->fs_driver->dev_write(file, buffer, length, nonblock);
+}
+
+bool vfs_open_file(vfs_file_t *file, uint64_t flags) {
+    if (!file || !file->fs_driver) return false;
+    if (!file->fs_driver->open_file) return true;
+    return file->fs_driver->open_file(file, flags);
+}
+
 bool vfs_write_at(vfs_file_t *file, uint32_t offset, const uint8_t *buffer, uint32_t size) {
     if (!file || !file->fs_driver) return false;
     return file->fs_driver->write_at(file, offset, buffer, size);
@@ -439,6 +455,88 @@ bool vfs_unlink(const char *path) {
         if (candidates[i]->unlink && candidates[i]->unlink(path)) return true;
     }
     return false;
+}
+
+/* Symbolic links (vfs_driver_t::symlink / ::readlink). Only filesystems that
+ * can hold them answer -- the read-only boot media and the generated
+ * pseudo-filesystems leave both hooks NULL and are skipped, so the first
+ * candidate that says yes wins, exactly like creat()/unlink(). */
+bool vfs_symlink(const char *target, const char *linkpath)
+{
+    if (target == NULL || linkpath == NULL || linkpath[0] == '\0') {
+        return false;
+    }
+    char norm[VFS_PATH_MAX];
+    linkpath = vfs_normalize_path(linkpath, norm, sizeof(norm));
+    const vfs_driver_t *candidates[VFS_MAX_CANDIDATES];
+    int n = vfs_resolve_candidates(linkpath, candidates);
+    for (int i = 0; i < n; i++) {
+        if (candidates[i]->symlink && candidates[i]->symlink(target, linkpath)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t vfs_readlink(const char *path, char *buf, uint32_t size)
+{
+    if (path == NULL || buf == NULL || size == 0u) {
+        return -1;
+    }
+    char norm[VFS_PATH_MAX];
+    path = vfs_normalize_path(path, norm, sizeof(norm));
+    const vfs_driver_t *candidates[VFS_MAX_CANDIDATES];
+    int n = vfs_resolve_candidates(path, candidates);
+    for (int i = 0; i < n; i++) {
+        if (candidates[i]->readlink == NULL) {
+            continue;
+        }
+        int32_t rc = candidates[i]->readlink(path, buf, size);
+        if (rc >= 0) {
+            return rc;
+        }
+    }
+    return -1;
+}
+
+/* POSIX permission bits, on the filesystems that keep them
+ * (vfs_driver_t::set_mode / ::get_mode). */
+bool vfs_set_mode(const char *path, uint32_t mode)
+{
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+    char norm[VFS_PATH_MAX];
+    path = vfs_normalize_path(path, norm, sizeof(norm));
+    const vfs_driver_t *candidates[VFS_MAX_CANDIDATES];
+    int n = vfs_resolve_candidates(path, candidates);
+    for (int i = 0; i < n; i++) {
+        if (candidates[i]->set_mode && candidates[i]->set_mode(path, mode)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int32_t vfs_get_mode(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    char norm[VFS_PATH_MAX];
+    path = vfs_normalize_path(path, norm, sizeof(norm));
+    const vfs_driver_t *candidates[VFS_MAX_CANDIDATES];
+    int n = vfs_resolve_candidates(path, candidates);
+    for (int i = 0; i < n; i++) {
+        if (candidates[i]->get_mode == NULL) {
+            continue;
+        }
+        int32_t mode = candidates[i]->get_mode(path);
+        if (mode >= 0) {
+            return mode;
+        }
+    }
+    return -1;
 }
 
 bool vfs_rename(const char *old_path, const char *new_path)

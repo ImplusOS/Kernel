@@ -2,6 +2,7 @@
 #include "Core/sync/Spinlock.h"
 #include "Core/timer/Timer.h"
 #include "Core/usercopy/Usercopy.h"
+#include "Core/syscall/Poll_Wait.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -43,6 +44,9 @@ static void evdev_push(evdev_device_t *dev, uint16_t type, uint16_t code, int32_
         dev->head = next;
     }
     spinlock_unlock(&dev->lock);
+    /* /dev/input/eventN is now readable: an X server parked in select() on
+     * it should see the keystroke now, not up to a slice later. */
+    poll_wait_notify();
 }
 
 void evdev_push_key_event(uint16_t code, int32_t value) {

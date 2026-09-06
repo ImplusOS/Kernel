@@ -88,6 +88,7 @@ static uint8_t       g_controller_function = 0;
 
 
 static uint32_t g_cached_block = 0xFFFFFFFFu;
+static uint32_t g_cached_count = 0u;
 
 static void ahci_free_dma_buffers(void) {
     if (s_clb)  { dma_free(s_clb,  AHCI_CLB_BYTES); s_clb = NULL; }
@@ -177,9 +178,27 @@ static void port_setup(int p) {
 }
 
 
-static bool atapi_read_one(uint32_t lba2048) {
-    if (lba2048 == g_cached_block) return true;
-    
+/* Largest ATAPI READ(10) this can do in one command: the DMA window is
+ * AHCI_DMA_BYTES and an optical block is 2048 bytes. */
+#define ATAPI_BLOCK_BYTES  2048u
+#define ATAPI_MAX_BLOCKS   (AHCI_DMA_BYTES / ATAPI_BLOCK_BYTES)
+
+/* Reads `blocks` consecutive 2048-byte blocks into s_dma.
+ *
+ * This used to be atapi_read_one(), fixed at a single block per command with
+ * a one-block cache in front of it, and ahci_read() drove it one 512-byte
+ * sector at a time. A 64 KiB read -- what the demand-paging read-ahead in
+ * Core/memory/FileMap.c asks for on every shared-object page fault -- was
+ * therefore 32 separate SCSI commands, each preceded by two full
+ * busy-wait loops on the task file and command-issue registers. The transfer
+ * itself was never the cost; the per-command turnaround was. */
+static bool atapi_read_blocks(uint32_t lba2048, uint32_t blocks) {
+    if (blocks == 0u || blocks > ATAPI_MAX_BLOCKS) return false;
+    if (blocks == g_cached_count && lba2048 == g_cached_block) return true;
+
+    g_cached_block = 0xFFFFFFFFu;
+    g_cached_count = 0u;
+
     for (uint32_t t = 1000000u; t; --t) {
         uint32_t tfd = port_rd(g_port, P_TFD);
         if (!((tfd & 0x80u) || (tfd & 0x08u))) break;
@@ -194,7 +213,8 @@ static bool atapi_read_one(uint32_t lba2048) {
     port_wr(g_port, P_SERR, port_rd(g_port, P_SERR));
     port_wr(g_port, P_IS,   port_rd(g_port, P_IS));
 
-    memset(s_dma, 0, 2048u);
+    uint32_t bytes = blocks * ATAPI_BLOCK_BYTES;
+    memset(s_dma, 0, bytes);
     s_clb[0].flags =
     (5u & 0x1Fu) |
     (1u << 5);
@@ -207,8 +227,8 @@ static bool atapi_read_one(uint32_t lba2048) {
     s_ctbl->cfis[1] = 0x80u;
     s_ctbl->cfis[2] = 0xA0u;
     s_ctbl->cfis[3] = 0x01u;
-    s_ctbl->cfis[5] = 0x00u;
-    s_ctbl->cfis[6] = 0x08u;
+    s_ctbl->cfis[5] = (uint8_t)(bytes & 0xFFu);
+    s_ctbl->cfis[6] = (uint8_t)((bytes >> 8) & 0xFFu);
     s_ctbl->cfis[7] = 0xA0u;
 
     s_ctbl->acmd[0] = 0x28u;
@@ -216,12 +236,12 @@ static bool atapi_read_one(uint32_t lba2048) {
     s_ctbl->acmd[3] = (uint8_t)((lba2048 >> 16) & 0xFFu);
     s_ctbl->acmd[4] = (uint8_t)((lba2048 >>  8) & 0xFFu);
     s_ctbl->acmd[5] = (uint8_t)( lba2048        & 0xFFu);
-    s_ctbl->acmd[7] = 0x00u;
-    s_ctbl->acmd[8] = 0x01u;
+    s_ctbl->acmd[7] = (uint8_t)((blocks >> 8) & 0xFFu);
+    s_ctbl->acmd[8] = (uint8_t)( blocks       & 0xFFu);
 
     s_ctbl->prdt[0].dba  = (uint32_t)s_dma_phys;
     s_ctbl->prdt[0].dbau = (uint32_t)(s_dma_phys >> 32);
-    s_ctbl->prdt[0].dbc  = (2048u - 1u) | (1u << 31);
+    s_ctbl->prdt[0].dbc  = (bytes - 1u) | (1u << 31);
 
     __sync_synchronize();
     port_wr(g_port, P_CI, 1u);
@@ -229,10 +249,11 @@ static bool atapi_read_one(uint32_t lba2048) {
     for (uint32_t t = 10000000u; t; --t) {
         if (!(port_rd(g_port, P_CI) & 1u)) {
             __sync_synchronize();
-            if (s_clb[0].prdbc < 2048u) {
+            if (s_clb[0].prdbc < bytes) {
                 return false;
             }
             g_cached_block = lba2048;
+            g_cached_count = blocks;
             return true;
         }
         uint32_t is = port_rd(g_port, P_IS);
@@ -241,7 +262,7 @@ static bool atapi_read_one(uint32_t lba2048) {
             return false;
         }
     }
-    return false;  
+    return false;
 }
 
 static bool sata_dma_rw(uint64_t lba, uint32_t sectors, bool write) {
@@ -469,15 +490,34 @@ bool ahci_read(uint64_t lba_512, uint8_t *buffer, uint32_t sectors_512) {
         return true;
     }
 
-    for (uint32_t s = 0; s < sectors_512; ++s) {
-        uint64_t byte_off = (lba_512 + s) * 512u;
-        uint64_t block_2048 = byte_off / 2048u;
-        uint32_t off_in_block = (uint32_t)(byte_off % 2048u);
+    /* Optical media is addressed in 2048-byte blocks, so the request is
+     * rounded out to a block span and served in ATAPI_MAX_BLOCKS commands. */
+    uint64_t first_byte = lba_512 * 512u;
+    uint64_t end_byte   = first_byte + (uint64_t)sectors_512 * 512u;
+    uint64_t first_block = first_byte / ATAPI_BLOCK_BYTES;
+    uint64_t last_block  = (end_byte - 1u) / ATAPI_BLOCK_BYTES;
+    if (last_block > UINT32_MAX) return false;
 
-        if (block_2048 > UINT32_MAX ||
-            !atapi_read_one((uint32_t)block_2048)) return false;
+    uint64_t block = first_block;
+    while (block <= last_block) {
+        uint64_t remaining = last_block - block + 1u;
+        uint32_t chunk = (remaining > ATAPI_MAX_BLOCKS)
+                             ? ATAPI_MAX_BLOCKS : (uint32_t)remaining;
 
-        memcpy(buffer + s * 512u, s_dma + off_in_block, 512u);
+        if (!atapi_read_blocks((uint32_t)block, chunk)) return false;
+
+        /* Intersect [block, block+chunk) with the requested byte range. */
+        uint64_t chunk_start = block * ATAPI_BLOCK_BYTES;
+        uint64_t chunk_end   = chunk_start + (uint64_t)chunk * ATAPI_BLOCK_BYTES;
+        uint64_t copy_start  = (chunk_start > first_byte) ? chunk_start : first_byte;
+        uint64_t copy_end    = (chunk_end   < end_byte)   ? chunk_end   : end_byte;
+        if (copy_end > copy_start) {
+            memcpy(buffer + (copy_start - first_byte),
+                   s_dma + (copy_start - chunk_start),
+                   (size_t)(copy_end - copy_start));
+        }
+
+        block += chunk;
     }
 
     g_working = true;
@@ -541,6 +581,7 @@ bool ahci_select_device(uint32_t index) {
     g_port = g_devices[index].port;
     g_atapi = g_devices[index].atapi;
     g_cached_block = 0xFFFFFFFFu;
+    g_cached_count = 0u;
     return true;
 }
 
@@ -567,6 +608,7 @@ bool ahci_init(uint64_t partition_lba) {
     g_device_count = 0;
     g_current_device = 0;
     g_cached_block = 0xFFFFFFFFu;
+    g_cached_count = 0u;
     memset(g_devices, 0, sizeof(g_devices));
 
     if (!ahci_ensure_dma_buffers()) {
@@ -649,7 +691,7 @@ bool ahci_init(uint64_t partition_lba) {
                     g_atapi = true;
                     uint64_t total_bytes = 0;
                     (void)atapi_read_capacity(&total_bytes);
-                    if (!atapi_read_one(0u)) {
+                    if (!atapi_read_blocks(0u, 1u)) {
                         port_stop(p);
                         g_port = -1;
                         g_atapi = false;

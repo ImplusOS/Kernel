@@ -19,7 +19,18 @@
  * couple of dozen are large enough to qualify, so a shared pool this size has
  * ample headroom without giving every process a multi-kilobyte table.
  */
-#define FILEMAP_MAX 256
+/* One entry per file-backed mapping, for every process at once. A single
+ * dynamically linked GTK3 client registers ~290 of them (about 60 shared
+ * objects, each contributing the loader's whole-object reservation plus one
+ * record per PT_LOAD segment plus a zero-fill record for its .bss), and the
+ * compositor and window manager hold entries at the same time. At 256 the
+ * table filled part-way through gtk3-demo's startup and every later mapping
+ * was dropped without a word -- those pages then fell through to the
+ * demand-zero path, so a library's data read back as zeros. That is silent,
+ * and it surfaces far away: GTK found its icons in libgtk-3.so's embedded
+ * GResource but the bytes were zeros, and it aborted with "Unrecognized
+ * image file format". */
+#define FILEMAP_MAX 1024
 
 /* Pages faulted in per file-backed fault. See filemap_handle_fault(). */
 #define FILEMAP_READAHEAD_PAGES 16
@@ -80,6 +91,13 @@ int filemap_register(int32_t pid, uint64_t start, uint64_t length,
     }
     spinlock_unlock(&g_filemap_lock);
     irq_restore(irq);
+    if (result != 0) {
+        /* Never fail this quietly again: the caller has no way to report it
+         * and the damage only shows up as zero-filled pages much later. */
+        serial_write_string("[filemap] table full, mapping dropped for pid ");
+        serial_write_uint32((uint32_t)pid);
+        serial_write_char('\n');
+    }
     return result;
 }
 
@@ -106,6 +124,31 @@ int filemap_register_zero(int32_t pid, uint64_t start, uint64_t length)
         return 0;
     }
     return filemap_register(pid, start, length, -1, 0u, 0u);
+}
+
+int filemap_addr_is_file_backed(int32_t pid, uint64_t addr)
+{
+    if (g_filemap_ready == 0u) {
+        return 0;
+    }
+    int file_backed = 0;
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_filemap_lock);
+    for (uint32_t i = 0; i < FILEMAP_MAX; ++i) {
+        const filemap_t *m = &g_filemaps[i];
+        if (m->used == 0u || m->owner_pid != pid) continue;
+        if (addr < m->start || addr >= m->start + m->length) continue;
+        if (m->file_handle < 0) {
+            /* A zero-fill hole punched over a file mapping wins: those pages
+             * really are anonymous. */
+            file_backed = 0;
+            break;
+        }
+        file_backed = 1;
+    }
+    spinlock_unlock(&g_filemap_lock);
+    irq_restore(irq);
+    return file_backed;
 }
 
 int filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr)
@@ -196,6 +239,19 @@ int filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr)
 
     int64_t got = syscall_file_mmap_read(handle, file_offset, frames,
                                          (uint32_t)(pages * PAGE_SIZE));
+    if (got >= 0 && (uint64_t)got < pages * PAGE_SIZE) {
+        static uint32_t warned;
+        if (warned < 16u) {
+            ++warned;
+            serial_write_string("[filemap] short read off=");
+            serial_write_uint64(file_offset);
+            serial_write_string(" want=");
+            serial_write_uint64(pages * PAGE_SIZE);
+            serial_write_string(" got=");
+            serial_write_uint64((uint64_t)got);
+            serial_write_char('\n');
+        }
+    }
     if (got < 0) {
         pmm_free_pages(frames, (size_t)pages);
         return 0;

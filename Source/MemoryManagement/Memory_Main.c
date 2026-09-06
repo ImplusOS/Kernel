@@ -489,9 +489,28 @@ void *realloc(void *ptr, uint64_t new_size) {
         return ptr;
     }
     if (block->next != NULL && block->next->is_free && block->size + sizeof(memory_block_t) + block->next->size >= new_size) {
-        uint64_t added = sizeof(memory_block_t) + block->next->size;
+        /* Absorb the free neighbour. Unlinking it means fixing BOTH ends of
+         * the splice: leaving the following block's prev pointing at the
+         * absorbed header left a pointer into what is now payload, and the
+         * first free() that tried to coalesce backwards through it wrote a
+         * block address into user data -- or, when the stale pointer was
+         * itself read out of payload, into an arbitrary address (a kernel
+         * #PF in free()). free() below gets this right; this path did not.
+         * A grow-in-place is exactly what a repeatedly extended tmpfs file
+         * does, so building a fontconfig cache under /tmp was enough to
+         * corrupt the kernel heap. */
+        memory_block_t *absorbed = block->next;
+        uint64_t added = sizeof(memory_block_t) + absorbed->size;
         block->size += added;
-        block->next  = block->next->next;
+        block->next  = absorbed->next;
+        if (block->next != NULL) {
+            block->next->prev = block;
+        }
+        /* The allocator's rotating start point must not be left inside the
+         * block that just stopped existing. */
+        if (heap_search_hint == absorbed) {
+            heap_search_hint = block;
+        }
         used_memory += added;
         split_block_if_needed(block, new_size);
         spinlock_unlock(&heap_lock);

@@ -3,11 +3,22 @@
 #include "Core/usercopy/Usercopy.h"
 #include "Core/timer/Timer.h"
 #include "Core/sync/Spinlock.h"
+#include "kernel/config.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define FUTEX_WAIT_QUEUE_SIZE  128
+/* One entry per task that can be blocked on a futex at once. A thread is a
+ * task here, so the process table is the real ceiling -- 128 was well under it
+ * and Chromium ran the table dry. */
+#define FUTEX_WAIT_QUEUE_SIZE  OS_CONFIG_PROCESS_MAX_COUNT
+
+/* FUTEX_WAIT may only fail the ways Linux documents: glibc's futex_wait()
+ * accepts 0, EAGAIN and EINTR and calls futex_fatal_error() ("The futex
+ * facility returned an unexpected error code") on anything else, which kills
+ * the process. So an internal shortfall is reported as EINTR and the caller
+ * retries, never as ENOMEM/ESRCH. */
+#define FUTEX_EINTR       (-4LL)
 
 #define FUTEX_WAIT        0
 #define FUTEX_WAKE        1
@@ -58,6 +69,28 @@ typedef struct {
 
 static futex_waiter_t g_futex_waiters[FUTEX_WAIT_QUEUE_SIZE];
 static spinlock_t     g_futex_lock;
+
+/* g_futex_lock is taken from process context (the futex syscalls) *and* from
+ * interrupt context (syscall_futex_on_timer_tick(), called out of the timer
+ * IRQ), so every acquisition has to mask interrupts. Without that, a timer
+ * tick landing on a CPU that already holds the lock deadlocks that CPU
+ * against itself, and on SMP the other CPU wedges on the same lock as soon as
+ * it touches a futex -- the machine stops with every core spinning and no
+ * further output. Chromium reached this on its first FUTEX_WAKE storm during
+ * browser startup: the kernel entered futex(FUTEX_WAKE) and never returned. */
+static inline uint64_t futex_lock_irq(void)
+{
+    uint64_t flags = irq_save_disable();
+    spinlock_lock(&g_futex_lock);
+    return flags;
+}
+
+static inline void futex_unlock_irq(uint64_t flags)
+{
+    spinlock_unlock(&g_futex_lock);
+    irq_restore(flags);
+}
+
 static int            g_futex_initialized = 0;
 
 static void futex_ensure_init(void)
@@ -78,9 +111,25 @@ static uint64_t futex_uptime_ms(void)
     return (timer_ticks() * 1000ULL) / hz;
 }
 
+/* Reclaim entries whose waiter no longer exists. Nothing hooks thread teardown
+ * to drop a queued wait, so a thread killed (or exited) while blocked used to
+ * hold its slot for the life of the boot; a churn of short-lived pool threads
+ * then drained the table and every later FUTEX_WAIT failed. Recycling here
+ * also stops a stale entry from aiming a wake at a reused tid.
+ * Caller holds g_futex_lock. */
+static void futex_gc_locked(void)
+{
+    for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+        if (g_futex_waiters[i].used && !process_is_alive(g_futex_waiters[i].tid)) {
+            g_futex_waiters[i].used = 0;
+        }
+    }
+}
+
 int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
                            uint64_t timeout_ns, uint32_t bitset)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
 
     if (uaddr == 0) {
@@ -104,7 +153,7 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
     int32_t tid = process_get_current_tid();
     int32_t owner_pid = process_get_current_pid();
     if (tid < 0 || owner_pid < 0) {
-        return -3;
+        return FUTEX_EINTR;
     }
 
     uint64_t deadline = 0;
@@ -113,14 +162,14 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
         deadline = futex_uptime_ms() + timeout_ms;
     }
 
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     current_value = 0;
     if (copy_from_user_trusted(&current_value, ptr, sizeof(current_value)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     if (current_value != expected) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -11;
     }
     int slot = -1;
@@ -131,8 +180,17 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
         }
     }
     if (slot < 0) {
-        spinlock_unlock(&g_futex_lock);
-        return -12;
+        futex_gc_locked();
+        for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+            if (!g_futex_waiters[i].used) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        futex_unlock_irq(futex_flags);
+        return FUTEX_EINTR; /* never ENOMEM: see FUTEX_EINTR above */
     }
     g_futex_waiters[slot].used        = 1;
     g_futex_waiters[slot].tid         = tid;
@@ -140,18 +198,19 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
     g_futex_waiters[slot].uaddr       = uaddr;
     g_futex_waiters[slot].bitset      = bitset ? bitset : 0xFFFFFFFFu;
     g_futex_waiters[slot].deadline_ms = deadline;
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
     if (process_block_current() < 0) {
-        spinlock_lock(&g_futex_lock);
+        futex_flags = futex_lock_irq();
         g_futex_waiters[slot].used = 0;
-        spinlock_unlock(&g_futex_lock);
-        return -3;
+        futex_unlock_irq(futex_flags);
+        return FUTEX_EINTR;
     }
     return 0;
 }
 
 int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
 
     if (count <= 0) {
@@ -168,7 +227,7 @@ int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
     int32_t owner_pid = process_get_current_pid();
     int32_t tids[FUTEX_WAIT_QUEUE_SIZE];
     int32_t woken = 0;
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE && woken < count; ++i) {
         if (g_futex_waiters[i].used &&
             g_futex_waiters[i].owner_pid == owner_pid &&
@@ -179,7 +238,7 @@ int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
             ++woken;
         }
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
     for (int32_t i = 0; i < woken; ++i) {
         (void)process_wake_pid(tids[i]);
     }
@@ -188,6 +247,7 @@ int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
 
 void syscall_futex_on_timer_tick(void)
 {
+    uint64_t futex_flags = 0;
     if (!g_futex_initialized) {
         return;
     }
@@ -196,7 +256,7 @@ void syscall_futex_on_timer_tick(void)
     int32_t tids[FUTEX_WAIT_QUEUE_SIZE];
     int32_t count = 0;
 
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
         if (g_futex_waiters[i].used &&
             g_futex_waiters[i].deadline_ms != 0 &&
@@ -205,7 +265,7 @@ void syscall_futex_on_timer_tick(void)
             g_futex_waiters[i].used = 0;
         }
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
 
     for (int32_t i = 0; i < count; ++i) {
         (void)process_wake_pid(tids[i]);
@@ -224,6 +284,7 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
                                      int32_t nr_requeue, uint64_t uaddr2,
                                      const int32_t *expected)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
     if (!process_user_buffer_is_valid((const void *)(uintptr_t)uaddr,
                                       sizeof(int32_t))) {
@@ -235,17 +296,17 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
     int32_t woken = 0;
     int32_t moved = 0;
 
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     if (expected != NULL) {
         int32_t current_value = 0;
         if (copy_from_user_trusted(&current_value,
                                    (const void *)(uintptr_t)uaddr,
                                    sizeof(current_value)) != 0u) {
-            spinlock_unlock(&g_futex_lock);
+            futex_unlock_irq(futex_flags);
             return -14;
         }
         if (current_value != *expected) {
-            spinlock_unlock(&g_futex_lock);
+            futex_unlock_irq(futex_flags);
             return -11;
         }
     }
@@ -266,7 +327,7 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
             ++moved;
         }
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
 
     for (int32_t i = 0; i < woken; ++i) {
         (void)process_wake_pid(tids[i]);
@@ -282,6 +343,7 @@ static int64_t syscall_futex_wake_op(uint64_t uaddr, int32_t nr_wake,
                                      int32_t nr_wake2, uint64_t uaddr2,
                                      uint32_t val3)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
 
     int32_t op = (int32_t)((val3 >> 28) & 0xFu);
@@ -302,10 +364,10 @@ static int64_t syscall_futex_wake_op(uint64_t uaddr, int32_t nr_wake,
     }
 
     int32_t *ptr2 = (int32_t *)(uintptr_t)uaddr2;
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     int32_t oldval = 0;
     if (copy_from_user_trusted(&oldval, ptr2, sizeof(oldval)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     int32_t arg = use_shift ? (int32_t)(1 << oparg) : oparg;
@@ -319,10 +381,10 @@ static int64_t syscall_futex_wake_op(uint64_t uaddr, int32_t nr_wake,
         default:             newval = oldval; break;
     }
     if (copy_to_user_trusted(ptr2, &newval, sizeof(newval)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
 
     int cmp_result;
     switch (cmp) {
@@ -382,6 +444,7 @@ static int futex_uaddr_has_waiter_locked(int32_t owner_pid, uint64_t uaddr,
 
 static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
 
     int32_t *ptr = (int32_t *)(uintptr_t)uaddr;
@@ -394,10 +457,10 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
         return -3;
     }
 
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     uint32_t word = 0;
     if (copy_from_user_trusted(&word, ptr, sizeof(word)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     uint32_t cur_owner = word & FUTEX_TID_MASK;
@@ -409,22 +472,22 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
         }
         int rc = (copy_to_user_trusted(ptr, &newword, sizeof(newword)) != 0u);
         int died = (word & FUTEX_OWNER_DIED) != 0u;
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         if (rc) return -14;
         return died ? FUTEX_EOWNERDEAD : 0;
     }
     if (cur_owner == (uint32_t)tid) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return FUTEX_EDEADLK;
     }
     if (try_only) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return FUTEX_EAGAIN_;
     }
 
     uint32_t newword = word | FUTEX_WAITERS;
     if (copy_to_user_trusted(ptr, &newword, sizeof(newword)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     int slot = -1;
@@ -432,8 +495,16 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
         if (!g_futex_waiters[i].used) { slot = i; break; }
     }
     if (slot < 0) {
-        spinlock_unlock(&g_futex_lock);
-        return -12;
+        futex_gc_locked();
+        for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+            if (!g_futex_waiters[i].used) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        futex_unlock_irq(futex_flags);
+        /* EAGAIN, not ENOMEM: glibc retries the LOCK_PI syscall on EAGAIN,
+         * and treats an undocumented errno as fatal. */
+        return FUTEX_EAGAIN_;
     }
     g_futex_waiters[slot].used        = 1;
     g_futex_waiters[slot].tid         = tid;
@@ -441,28 +512,28 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
     g_futex_waiters[slot].uaddr       = uaddr;
     g_futex_waiters[slot].bitset      = 0xFFFFFFFFu;
     g_futex_waiters[slot].deadline_ms = 0;
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
 
     if (process_block_current() < 0) {
-        spinlock_lock(&g_futex_lock);
+        futex_flags = futex_lock_irq();
         g_futex_waiters[slot].used = 0;
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -3;
     }
 
     /* Woken. UNLOCK_PI hands ownership to us before the wake, so normally
      * the word already holds our TID. If not (spurious wake / a racing
      * take), report EAGAIN so glibc retries the syscall. */
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     g_futex_waiters[slot].used = 0;
     word = 0;
     if (copy_from_user_trusted(&word, ptr, sizeof(word)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     int owned = ((word & FUTEX_TID_MASK) == (uint32_t)tid);
     int died = (word & FUTEX_OWNER_DIED) != 0u;
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
     if (owned) {
         return died ? FUTEX_EOWNERDEAD : 0;
     }
@@ -471,6 +542,7 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
 
 static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
 {
+    uint64_t futex_flags = 0;
     futex_ensure_init();
 
     int32_t *ptr = (int32_t *)(uintptr_t)uaddr;
@@ -483,14 +555,14 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
         return -3;
     }
 
-    spinlock_lock(&g_futex_lock);
+    futex_flags = futex_lock_irq();
     uint32_t word = 0;
     if (copy_from_user_trusted(&word, ptr, sizeof(word)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
     if ((word & FUTEX_TID_MASK) != (uint32_t)tid) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return FUTEX_EPERM;
     }
 
@@ -517,10 +589,10 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
         }
     }
     if (copy_to_user_trusted(ptr, &newword, sizeof(newword)) != 0u) {
-        spinlock_unlock(&g_futex_lock);
+        futex_unlock_irq(futex_flags);
         return -14;
     }
-    spinlock_unlock(&g_futex_lock);
+    futex_unlock_irq(futex_flags);
 
     if (wake_tid >= 0) {
         (void)process_wake_pid(wake_tid);

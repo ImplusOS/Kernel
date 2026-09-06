@@ -13,6 +13,7 @@
 #include "mmu/Paging_Main.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/syscall/Syscall_File.h"
+#include "Core/syscall/Poll_Wait.h"
 #include "Core/syscall/Syscall_Socket.h"
 #include "Core/syscall/Syscall_Main.h"
 #include "Core/syscall/Syscall_Futex.h"
@@ -32,6 +33,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "Core/drm/DRM_Kms.h"
+#include "Core/tty/Pty.h"
 
 #define PROCESS_RFLAGS_DEFAULT 0x202ULL
 #define PROCESS_GUARD_PAGE_SIZE PAGE_SIZE
@@ -374,6 +376,127 @@ static uint64_t process_perf_now_ns(void)
 {
     return timer_monotonic_ns();
 }
+
+/* ---- Foreign (Linux-ABI) program launch log -------------------------------
+ *
+ * OS_CONFIG_FOREIGN_TRACE is the bring-up firehose and is off in a normal
+ * boot, but "which Linux program started, when, and how it ended" is worth
+ * having in every boot: it is a handful of lines per program rather than
+ * thousands, and it is the first thing anyone asks when an app seems slow to
+ * come up.
+ *
+ * Each line is assembled in full and written once. Piecewise
+ * serial_write_string() calls from several CPUs interleave character by
+ * character -- an Xorg boot log is full of lines spliced into each other --
+ * and a half-line is worse than no line. One write also lets the UART FIFO
+ * batching in uart_hal.c do its job.
+ *
+ * Lines go to COM1 and to the small ring behind /dev/applog, which is what a
+ * terminal on the desktop reads. Deliberately *not* the whole kernel log:
+ * a window streaming that feeds back on itself, because drawing a line is X
+ * traffic and X traffic is logged.
+ */
+static uint64_t g_launch_start_ns[PROCESS_MAX_COUNT_CONFIG];
+
+#define FOREIGN_LOG_LINE_MAX 256u
+
+typedef struct {
+    char     buf[FOREIGN_LOG_LINE_MAX];
+    uint32_t len;
+} foreign_log_line_t;
+
+static void foreign_log_str(foreign_log_line_t *line, const char *text)
+{
+    if (text == NULL) {
+        text = "(null)";
+    }
+    while (*text != '\0' && line->len + 1u < FOREIGN_LOG_LINE_MAX) {
+        line->buf[line->len++] = *text++;
+    }
+    line->buf[line->len] = '\0';
+}
+
+static void foreign_log_dec(foreign_log_line_t *line, uint64_t value)
+{
+    char digits[24];
+    uint32_t n = 0;
+    do {
+        digits[n++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0u && n < sizeof(digits));
+    while (n != 0u && line->len + 1u < FOREIGN_LOG_LINE_MAX) {
+        line->buf[line->len++] = digits[--n];
+    }
+    line->buf[line->len] = '\0';
+}
+
+static void foreign_log_emit(foreign_log_line_t *line)
+{
+    foreign_log_str(line, "\n");
+    serial_write_string(line->buf);
+    serial_applog_write(line->buf);
+}
+
+static void foreign_launch_log_start(int32_t pid, const char *what,
+                                     const char *path, const char *arg,
+                                     uint8_t linux_abi)
+{
+    uint64_t now_ns = process_perf_now_ns();
+    if (pid >= 0 && pid < PROCESS_MAX_COUNT_CONFIG) {
+        g_launch_start_ns[pid] = now_ns;
+    }
+    if (!OS_CONFIG_FOREIGN_LAUNCH_LOG || !linux_abi) {
+        return;
+    }
+
+    foreign_log_line_t line = { {0}, 0u };
+    foreign_log_str(&line, "[app] ");
+    foreign_log_str(&line, what);
+    foreign_log_str(&line, " pid=");
+    foreign_log_dec(&line, (uint64_t)(uint32_t)pid);
+    foreign_log_str(&line, " path=");
+    foreign_log_str(&line, path);
+    if (arg != NULL && arg[0] != '\0') {
+        foreign_log_str(&line, " args='");
+        foreign_log_str(&line, arg);
+        foreign_log_str(&line, "'");
+    }
+    foreign_log_str(&line, " at=");
+    foreign_log_dec(&line, now_ns / 1000000ULL);
+    foreign_log_str(&line, "ms");
+    foreign_log_emit(&line);
+}
+
+static void foreign_launch_log_exit(int32_t pid, int32_t status,
+                                    uint8_t linux_abi)
+{
+    /* Cleared for every process, not just the logged ones: pid slots are
+     * reused, and a stale start time left behind by a native process would
+     * make the next Linux program to land on that slot report a lifetime
+     * measured from someone else's launch. */
+    uint64_t started_ns = 0u;
+    if (pid >= 0 && pid < PROCESS_MAX_COUNT_CONFIG) {
+        started_ns = g_launch_start_ns[pid];
+        g_launch_start_ns[pid] = 0u;
+    }
+
+    if (!OS_CONFIG_FOREIGN_LAUNCH_LOG || !linux_abi) {
+        return;
+    }
+
+    foreign_log_line_t line = { {0}, 0u };
+    foreign_log_str(&line, "[app] exit pid=");
+    foreign_log_dec(&line, (uint64_t)(uint32_t)pid);
+    foreign_log_str(&line, " status=");
+    foreign_log_dec(&line, (uint64_t)(uint32_t)status);
+    if (started_ns != 0u) {
+        foreign_log_str(&line, " lived=");
+        foreign_log_dec(&line, (process_perf_now_ns() - started_ns) / 1000000ULL);
+        foreign_log_str(&line, "ms");
+    }
+    foreign_log_emit(&line);
+}
+
 
 static void process_perf_reset(process_t *proc)
 {
@@ -2103,6 +2226,57 @@ int process_set_clear_child_tid(uint64_t address)
     return 0;
 }
 
+/* clone(2)'s CLONE_CHILD_CLEARTID names a word in the *child's* TCB that the
+ * kernel must zero (and futex-wake) when that child exits -- it is how
+ * pthread_join() learns the thread is gone. It is requested by the creating
+ * thread, so it cannot be installed with process_set_clear_child_tid(), which
+ * always targets the caller: doing that pointed the *creator's* clear-tid at
+ * the new thread's TCB, and the creator's own exit then zeroed a live
+ * thread's glibc `pd->tid`. glibc's rwlock reads that field to decide whether
+ * it is the writer, so the victim thread saw `__cur_writer == tid == 0` and
+ * every g_rw_lock_reader_lock() after that failed with EDEADLK -- GObject's
+ * type lock stopped working and GTK3 spun re-initialising GSettings forever.
+ * Docs/Others/TODO_GTK3_Wayland_LinuxABI.md G5 (W2'). */
+int process_set_clear_child_tid_for(int32_t pid, uint64_t address)
+{
+    if (address != 0u &&
+        !process_user_buffer_is_valid((void *)(uintptr_t)address,
+                                      sizeof(uint32_t))) {
+        return -14;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    if (!is_valid_pid(pid)) {
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return -3;
+    }
+    g_processes[pid].clear_child_tid = address;
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return 0;
+}
+
+/* The pid that owns `pid`'s address space -- itself for a process, the
+ * creating process for a thread. Threads get their own pid in this kernel,
+ * so anything scoped to an address space (shared memory, above all) has to
+ * compare this rather than raw pids. */
+int32_t process_memory_owner_pid_of(int32_t pid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t owner = -1;
+    if (is_valid_pid(pid)) {
+        owner = g_processes[pid].is_thread &&
+                        is_valid_pid(g_processes[pid].memory_owner_pid)
+                    ? g_processes[pid].memory_owner_pid
+                    : pid;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return owner;
+}
+
 int process_set_robust_list(uint64_t head, uint64_t length)
 {
     if (length != 24u || head == 0u ||
@@ -2609,6 +2783,8 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
     proc->main_phdr_vaddr = image_info.phdr_vaddr;
     proc->main_phent = image_info.phent;
     proc->main_phnum = image_info.phnum;
+    foreign_launch_log_start((int32_t)(proc - g_processes), "spawn", name_ptr,
+                             launch_argument, image_info.linux_abi);
     if (proc->abi_mode == PROCESS_ABI_LINUX) {
         /* Split launch_argument on whitespace into argv[1..]. A caller that
          * needs to pass several flags to a Linux binary (e.g. Chromium's
@@ -2713,8 +2889,33 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
             "GDK_BACKEND=wayland,x11",
             "GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas",
             "GSETTINGS_BACKEND=memory",
+            /* There is no D-Bus on ImplusOS, and saying so is not optional.
+               With the variable unset, GDBus treats a session bus as merely
+               "not started yet" and autolaunches one: it reads
+               /etc/machine-id and posix_spawn()s dbus-launch, which is not on
+               the image. GTK3's startup reaches that path twice (GApplication
+               registration, then the atk-bridge a11y module) and a GTK3 client
+               got as far as binding every Wayland global and then stopped
+               dead, never creating a window. An address that cannot be
+               connected to makes the same call fail immediately instead, which
+               GApplication and atk-bridge both handle. NO_AT_BRIDGE keeps
+               atk-bridge out of the process altogether, so it never asks.
+               Docs/Others/TODO_GTK3_Wayland_LinuxABI.md G5 (W2'). */
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent",
+            "NO_AT_BRIDGE=1",
             "FONTCONFIG_PATH=/etc/fonts",
             "FONTCONFIG_FILE=/etc/fonts/fonts.conf",
+            /* gdk-pixbuf finds its loaders through a cache file whose path is
+               compiled into the library. Name it (and the loader directory)
+               explicitly, the same way the GSettings and fontconfig lookups
+               above are named, so the image's layout is what is used rather
+               than whatever the library was built against. Without a usable
+               cache GTK3 has no image loaders at all and aborts on the first
+               icon it draws:
+                 Gtk:ERROR:gtkiconhelper.c:495: Failed to load
+                 .../image-missing.png: Unrecognized image file format */
+            "GDK_PIXBUF_MODULE_FILE=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache",
+            "GDK_PIXBUF_MODULEDIR=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders",
             /* Doom (Method A: TODO_Doom_Xorg_MethodA.md). The Xorg we spawn
                runs modesetting on /dev/dri/card0 (kernel KMS shim); Mesa must
                use the software rasteriser (llvmpipe) since there is no real
@@ -2752,6 +2953,17 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
                libGLX_mesa.so.0 was still missing from the stage; it is staged
                now, and the client does load libgallium + LLVM. */
             "XKB_CONFIG_ROOT=/usr/share/X11/xkb",
+            /* Terminal emulator (Userland/Application/Terminal). xterm asks
+               $SHELL first and only falls back to getpwuid()'s shell field,
+               and it will not run a shell whose path is not absolute -- with
+               neither set it exits with "No absolute path found for shell".
+               TERM is what xterm hands its child; setting it here as well
+               covers a program started outside xterm that still expects the
+               variable to exist. XFILESEARCHPATH is where Xt looks for the
+               app-defaults resource files stage-xterm.sh installs. */
+            "SHELL=/bin/sh",
+            "TERM=xterm",
+            "XFILESEARCHPATH=/etc/X11/app-defaults/%N:/usr/share/X11/app-defaults/%N",
             /* Doom pulls libopenal (+ SDL2 via libfluidsynth). ImplusOS has no
                PipeWire/PulseAudio/ALSA device; letting OpenAL-soft probe them
                makes libpulse's pa_make_fd_cloexec() abort the process. Force
@@ -3478,6 +3690,8 @@ int32_t process_execve(const char *path, const char *const *argv,
     proc->main_phdr_vaddr = image_info.phdr_vaddr;
     proc->main_phent = image_info.phent;
     proc->main_phnum = image_info.phnum;
+    foreign_launch_log_start((int32_t)(proc - g_processes), "exec", path_buf,
+                             NULL, image_info.linux_abi);
 
     if (initialize_elf_user_stack_ex(proc, &image_info, path_buf,
                                       argc, (const char *const *)argv_ptrs,
@@ -3749,6 +3963,7 @@ void process_exit_current(void)
     }
     int32_t pid_to_exit = (int32_t)(owner - g_processes);
     int32_t exit_status_log = owner->exit_status;
+    uint8_t abi_mode_log = (owner->abi_mode == PROCESS_ABI_LINUX) ? 1u : 0u;
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
@@ -3759,6 +3974,7 @@ void process_exit_current(void)
         serial_write_uint32((uint32_t)exit_status_log);
         serial_write_char('\n');
     }
+    foreign_launch_log_exit(pid_to_exit, exit_status_log, abi_mode_log);
 
     uint32_t closed_fds = 0;
     uint32_t closed_dirs = 0;
@@ -3768,6 +3984,10 @@ void process_exit_current(void)
     shared_memory_cleanup_process(pid_to_exit);
     drm_kms_notify_process_exit(pid_to_exit);
     filemap_release_pid(pid_to_exit);
+    /* After the fds: closing the last slave fd is what tells the terminal
+     * emulator the session ended, and this only drops the controlling-terminal
+     * binding the pid leaves behind. */
+    pty_forget_process(pid_to_exit);
 
     irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
@@ -3792,6 +4012,14 @@ void process_exit_current(void)
      * were already flushed by munmap/msync). */
     extern void linux_compat_mshared_release_pid(int32_t pid);
     linux_compat_mshared_release_pid(pid_to_exit);
+
+    /* A child becoming a zombie is what a parent parked in wait4() is waiting
+     * for, and closing this process's fds has just made the other end of every
+     * pipe and socket it held readable (EOF). Both of those are readiness
+     * events, so cut short whoever is sleeping on them rather than making them
+     * serve out the slice: Xorg's Pclose() waits for xkbcomp this way, twice,
+     * for every keyboard it configures. */
+    poll_wait_notify();
 }
 
 void process_exit_current_signaled(int32_t signum)
@@ -4591,6 +4819,17 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len)
     uint64_t stack_top      = proc->user_stack_top;
     uint64_t process_cr3    = proc->cr3;
     uint8_t  abi_mode       = proc->abi_mode;
+    /* A thread has its own process_t (and its own stack window carved out of
+     * the owner's heap area) but shares the owner's address space, so a
+     * pointer into the *creator's* stack is perfectly valid from a thread.
+     * Remember the owner's stack window so the checks below accept it. */
+    uint64_t owner_stack_base = stack_base;
+    uint64_t owner_stack_top  = stack_top;
+    if (proc->is_thread && is_valid_pid(proc->memory_owner_pid)) {
+        const process_t *owner = &g_processes[proc->memory_owner_pid];
+        owner_stack_base = owner->user_stack_base;
+        owner_stack_top  = owner->user_stack_top;
+    }
     irq_restore(irq_flags);
 
     /* The lazily-committed mmap arena is valid as a syscall buffer even when
@@ -4606,10 +4845,15 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len)
         if (addr < 0x1000) {
             return 0;
         }
-        if (range_within(addr, len, 0x1000, USER_STACK_BASE)) {
-            return paging_is_user_range_mapped(process_cr3, addr, len);
-        }
-        if (range_within(addr, len, stack_base, stack_top)) {
+        /* One window over everything below the top of the stack area rather
+         * than "code/heap" plus "this thread's own stack": the page table is
+         * the real authority, and splitting it that way rejected any pointer
+         * into another thread's stack. Chromium hit this on its first
+         * pthread_create -- the new thread's FUTEX_WAKE and prctl(PR_SET_NAME)
+         * both address the creator's stack, both came back EFAULT, and the
+         * browser then sat in poll(-1) forever waiting for a thread that had
+         * failed to hand itself over. */
+        if (range_within(addr, len, 0x1000, USER_STACK_TOP)) {
             return paging_is_user_range_mapped(process_cr3, addr, len);
         }
         return 0;
@@ -4622,6 +4866,10 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len)
         return paging_is_user_range_mapped(process_cr3, addr, len);
     }
     if (range_within(addr, len, stack_base, stack_top)) {
+        return paging_is_user_range_mapped(process_cr3, addr, len);
+    }
+    if (owner_stack_top != stack_top &&
+        range_within(addr, len, owner_stack_base, owner_stack_top)) {
         return paging_is_user_range_mapped(process_cr3, addr, len);
     }
     return 0;
@@ -5585,6 +5833,21 @@ int process_sleep_current_ms(uint64_t ms)
         return -1;
     }
 
+    /* Deliberately does NOT consume the wake_pending credit that
+     * process_block_current() consumes.
+     *
+     * The credit belongs to that call: a futex waiter checks its word, finds
+     * it unchanged, and races towards process_block_current(), and a
+     * FUTEX_WAKE landing in that window leaves a credit so the block is
+     * skipped. Spending those credits here too was tried and was a mistake in
+     * two directions -- it stole wakes the futex path was waiting for, and it
+     * let futex traffic (which glibc generates constantly) short-circuit
+     * unrelated sleeps, so a pipe or poll loop whose every sleep returned
+     * immediately spun a CPU at 100%. A timed sleep has its own deadline and
+     * does not need the credit; the waiters that want early wakeups register
+     * with Core/syscall/Poll_Wait.h, which closes its own race without
+     * touching this one.
+     */
     uint64_t now_ns = process_perf_now_ns();
     g_sleep_deadline_ns[pid] = process_deadline_after_ns(now_ns, delay_ns);
     g_processes[pid].state = PROCESS_STATE_BLOCKED;
@@ -5672,11 +5935,16 @@ int process_wake_pid(int32_t pid)
         /* Target has not reached process_block_current() yet (it is still
          * racing towards it after failing its lock-free condition check).
          * Leave a credit so the upcoming block call short-circuits instead
-         * of sleeping through this wake. Saturate rather than overflow --
-         * callers only ever need to know "at least one wake happened". */
-        if (proc->wake_pending < UINT32_MAX) {
-            proc->wake_pending++;
-        }
+         * of sleeping through this wake.
+         *
+         * Deliberately a flag rather than a counter. Callers only ever need
+         * to know "at least one wake happened", and a counter is dangerous:
+         * a wake aimed at a process that is awake (a stale poll registration,
+         * a broadcast wake) banks a credit that is never spent, and a process
+         * that has banked thousands consumes one per sleep and so stops
+         * sleeping altogether -- a 100% CPU spin whose cause is nowhere near
+         * where it shows up. */
+        proc->wake_pending = 1u;
     }
 
     spinlock_unlock(&g_process_table_lock);

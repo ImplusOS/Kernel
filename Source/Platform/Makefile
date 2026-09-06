@@ -1,4 +1,6 @@
-PLATFORM_SRCS := $(shell find Platform -type f -name '*.c' -print | sort)
+# Tests/ holds host-side harnesses (built by their own run.sh with host stubs
+# on the include path); they must never enter the kernel link.
+PLATFORM_SRCS := $(shell find Platform -type d -name Tests -prune -o -type f -name '*.c' -print | sort)
 ifeq ($(ARCH),arm64)
 PLATFORM_SRCS := $(filter-out \
 	Platform/interrupt/Interrupts.c \

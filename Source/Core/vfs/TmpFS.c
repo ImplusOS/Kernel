@@ -42,8 +42,24 @@ static bool tmpfs_path_ok(const char *path)
     return false;
 }
 
+/* Default permission bits, matching what the syscall layer reported before
+ * tmpfs kept modes of its own. */
+#define TMPFS_MODE_FILE 0644u
+#define TMPFS_MODE_DIR  0755u
+
 typedef struct {
     uint8_t in_use;
+    /* A symlink is an ordinary slot whose content is the target path. Kept in
+     * the same table (rather than a second one) so unlink/readdir/find_file
+     * need no special case, and so a link and a file can never share a name. */
+    uint8_t is_symlink;
+    /* mkdir() records the directory rather than succeeding blindly, because a
+     * mode has to live somewhere: mkdtemp() creates 0700 and Chromium then
+     * CHECK()s stat() reports 0700. Lookups stay independent of this -- a path
+     * under a tmpfs prefix is still a valid directory whether or not anybody
+     * mkdir'ed it -- so this only adds modes and readdir visibility. */
+    uint8_t is_dir;
+    uint32_t mode;
     char path[TMPFS_PATH_MAX];
     uint8_t *data;
     uint32_t size;
@@ -72,8 +88,8 @@ static bool tmpfs_vfs_find_file(const char *path, vfs_file_t *out_file)
     spinlock_lock(&g_tmpfs_lock);
     tmpfs_slot_t *slot = tmpfs_find_locked(path);
     spinlock_unlock(&g_tmpfs_lock);
-    if (slot == NULL) {
-        return false;
+    if (slot == NULL || slot->is_dir) {
+        return false; /* a directory is not openable as a file */
     }
     out_file->internal_id = (uint64_t)(uintptr_t)slot;
     out_file->size = slot->size;
@@ -191,6 +207,7 @@ static bool tmpfs_vfs_creat(const char *path)
         if (!g_tmpfs_slots[i].in_use) {
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
+            g_tmpfs_slots[i].mode = TMPFS_MODE_FILE;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
             spinlock_unlock(&g_tmpfs_lock);
             return true;
@@ -202,10 +219,59 @@ static bool tmpfs_vfs_creat(const char *path)
 
 static bool tmpfs_vfs_mkdir(const char *path)
 {
-    /* Flat namespace: directories are implicit. Report success for any path
-     * under a tmpfs mount so X's mkdir("/tmp/.X11-unix", 01777) etc. do not
-     * abort. A caller that then opendir()s it just gets an empty listing. */
-    return tmpfs_path_ok(path);
+    /* Flat namespace: lookups treat directories as implicit, so success here
+     * never depended on a node existing -- X's mkdir("/tmp/.X11-unix", 01777)
+     * and friends must not abort. A node is still recorded when there is room,
+     * so the directory has somewhere to keep its mode and shows up in a
+     * readdir() of its parent; running out of slots degrades to the old
+     * behaviour rather than failing the call. */
+    if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
+        return false;
+    }
+    spinlock_lock(&g_tmpfs_lock);
+    if (tmpfs_find_locked(path) == NULL) {
+        for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
+            if (g_tmpfs_slots[i].in_use) {
+                continue;
+            }
+            memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
+            g_tmpfs_slots[i].in_use = 1;
+            g_tmpfs_slots[i].is_dir = 1;
+            g_tmpfs_slots[i].mode = TMPFS_MODE_DIR;
+            strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
+            break;
+        }
+    }
+    spinlock_unlock(&g_tmpfs_lock);
+    return true;
+}
+
+/* chmod(2), and the mode mkdir(2)/open(O_CREAT) asked for -- the VFS create
+ * hooks carry no mode, so the syscall layer applies it here afterwards. */
+static bool tmpfs_vfs_set_mode(const char *path, uint32_t mode)
+{
+    if (!tmpfs_path_ok(path)) {
+        return false;
+    }
+    spinlock_lock(&g_tmpfs_lock);
+    tmpfs_slot_t *slot = tmpfs_find_locked(path);
+    if (slot != NULL) {
+        slot->mode = mode & 07777u;
+    }
+    spinlock_unlock(&g_tmpfs_lock);
+    return slot != NULL;
+}
+
+static int32_t tmpfs_vfs_get_mode(const char *path)
+{
+    if (!tmpfs_path_ok(path)) {
+        return -1;
+    }
+    spinlock_lock(&g_tmpfs_lock);
+    tmpfs_slot_t *slot = tmpfs_find_locked(path);
+    int32_t mode = slot != NULL ? (int32_t)slot->mode : -1;
+    spinlock_unlock(&g_tmpfs_lock);
+    return mode;
 }
 
 #define TMPFS_DIR_HANDLE_MAX 8u
@@ -213,12 +279,55 @@ static uint8_t g_tmpfs_dir_in_use[TMPFS_DIR_HANDLE_MAX];
 static uint32_t g_tmpfs_dir_cursor[TMPFS_DIR_HANDLE_MAX];
 static char g_tmpfs_dir_path[TMPFS_DIR_HANDLE_MAX][TMPFS_PATH_MAX];
 
+/* Is `path` a directory in this flat namespace? One of the mount roots, a
+ * node mkdir() recorded, or an ancestor of something that exists (a file can
+ * be created at /tmp/a/b without anyone mkdir'ing /tmp/a).
+ *
+ * Answering "yes" for every path under a tmpfs prefix -- which is what this
+ * used to do -- is not a harmless simplification: opendir() is how the syscall
+ * layer decides a path exists at all when find_file() misses, so stat() of any
+ * absent /tmp path reported a directory, readlink() of a missing SingletonLock
+ * reported EINVAL instead of ENOENT, and unlink() of one reported EIO. */
+static bool tmpfs_is_dir_locked(const char *path)
+{
+    size_t len = strlen(path);
+    while (len > 1u && path[len - 1u] == '/') {
+        --len;
+    }
+    for (uint32_t i = 0; i < sizeof(TMPFS_PREFIXES) / sizeof(TMPFS_PREFIXES[0]); ++i) {
+        size_t plen = strlen(TMPFS_PREFIXES[i]);
+        if (plen == len && strncmp(path, TMPFS_PREFIXES[i], plen) == 0) {
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
+        if (!g_tmpfs_slots[i].in_use) {
+            continue;
+        }
+        const char *p = g_tmpfs_slots[i].path;
+        if (strncmp(p, path, len) != 0) {
+            continue;
+        }
+        if (p[len] == '\0') {
+            return g_tmpfs_slots[i].is_dir != 0u; /* the node itself */
+        }
+        if (p[len] == '/') {
+            return true; /* something lives under it */
+        }
+    }
+    return false;
+}
+
 static int32_t tmpfs_vfs_opendir(const char *path)
 {
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return -1;
     }
     spinlock_lock(&g_tmpfs_lock);
+    if (!tmpfs_is_dir_locked(path)) {
+        spinlock_unlock(&g_tmpfs_lock);
+        return -1;
+    }
     for (uint32_t i = 0; i < TMPFS_DIR_HANDLE_MAX; ++i) {
         if (!g_tmpfs_dir_in_use[i]) {
             g_tmpfs_dir_in_use[i] = 1;
@@ -267,7 +376,7 @@ static int32_t tmpfs_vfs_readdir(int32_t handle, vfs_dirent_t *out_entry)
         strncpy(out_entry->name, base_name, sizeof(out_entry->name) - 1u);
         out_entry->name[sizeof(out_entry->name) - 1u] = '\0';
         out_entry->size = g_tmpfs_slots[cursor].size;
-        out_entry->is_directory = false;
+        out_entry->is_directory = g_tmpfs_slots[cursor].is_dir != 0u;
         g_tmpfs_dir_cursor[handle] = cursor + 1u;
         spinlock_unlock(&g_tmpfs_lock);
         return 1;
@@ -310,6 +419,68 @@ static bool tmpfs_vfs_unlink(const char *path)
     return true;
 }
 
+/* symlink(2). Chromium's ProcessSingleton creates <user-data-dir>/SingletonLock
+ * (-> "hostname-pid"), SingletonCookie and SingletonSocket with symlink() and
+ * aborts the whole browser when that fails, so the writable tmpfs trees have
+ * to carry real links rather than pretend. */
+static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
+{
+    if (target == NULL || linkpath == NULL ||
+        !tmpfs_path_ok(linkpath) || strlen(linkpath) >= TMPFS_PATH_MAX) {
+        return false;
+    }
+    size_t target_len = strlen(target);
+    if (target_len == 0u || target_len >= TMPFS_PATH_MAX) {
+        return false;
+    }
+    spinlock_lock(&g_tmpfs_lock);
+    if (tmpfs_find_locked(linkpath) != NULL) {
+        spinlock_unlock(&g_tmpfs_lock); /* EEXIST -- symlink(2) never replaces */
+        return false;
+    }
+    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
+        if (g_tmpfs_slots[i].in_use) {
+            continue;
+        }
+        memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
+        if (!tmpfs_ensure_capacity_locked(&g_tmpfs_slots[i],
+                                          (uint32_t)target_len)) {
+            spinlock_unlock(&g_tmpfs_lock);
+            return false;
+        }
+        g_tmpfs_slots[i].in_use = 1;
+        g_tmpfs_slots[i].is_symlink = 1;
+        g_tmpfs_slots[i].mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
+        strncpy(g_tmpfs_slots[i].path, linkpath, TMPFS_PATH_MAX - 1u);
+        memcpy(g_tmpfs_slots[i].data, target, target_len);
+        g_tmpfs_slots[i].size = (uint32_t)target_len;
+        spinlock_unlock(&g_tmpfs_lock);
+        return true;
+    }
+    spinlock_unlock(&g_tmpfs_lock);
+    return false;
+}
+
+/* readlink(2): the target is NOT NUL-terminated and the count is the return
+ * value. -1 means "not a symlink here", which lets the VFS try the next
+ * candidate driver rather than reporting EINVAL for someone else's path. */
+static int32_t tmpfs_vfs_readlink(const char *path, char *buf, uint32_t size)
+{
+    if (path == NULL || buf == NULL || size == 0u || !tmpfs_path_ok(path)) {
+        return -1;
+    }
+    spinlock_lock(&g_tmpfs_lock);
+    tmpfs_slot_t *slot = tmpfs_find_locked(path);
+    if (slot == NULL || !slot->is_symlink) {
+        spinlock_unlock(&g_tmpfs_lock);
+        return -1;
+    }
+    uint32_t n = slot->size < size ? slot->size : size;
+    memcpy(buf, slot->data, n);
+    spinlock_unlock(&g_tmpfs_lock);
+    return (int32_t)n;
+}
+
 static void tmpfs_vfs_list_root(void)
 {
 }
@@ -345,6 +516,24 @@ static const vfs_driver_t g_tmpfs_vfs_driver = {
     .list_root = tmpfs_vfs_list_root,
     .set_case_sensitive = tmpfs_vfs_set_case_sensitive,
     .get_case_sensitive = tmpfs_vfs_get_case_sensitive,
+    .symlink = tmpfs_vfs_symlink,
+    .readlink = tmpfs_vfs_readlink,
+    .set_mode = tmpfs_vfs_set_mode,
+    .get_mode = tmpfs_vfs_get_mode,
+};
+
+/* Directories that have to be there before anyone creates anything in them.
+ * The mount roots themselves are handled by tmpfs_is_dir_locked(); these are
+ * the deeper ones a program probes rather than creates -- Xorg picks its
+ * compiled-keymap output directory with access("/var/lib/xkb", W_OK|X_OK) and
+ * cannot run xkbcomp without one, which is a fatal "Failed to activate virtual
+ * core keyboard". */
+static const char *const TMPFS_SEED_DIRS[] = {
+    "/tmp/.X11-unix",
+    "/var/lib",
+    "/var/lib/xkb",
+    "/var/tmp",
+    "/run/user",
 };
 
 void tmpfs_init(void)
@@ -354,6 +543,10 @@ void tmpfs_init(void)
     memset(g_tmpfs_dir_in_use, 0, sizeof(g_tmpfs_dir_in_use));
     memset(g_tmpfs_dir_cursor, 0, sizeof(g_tmpfs_dir_cursor));
     memset(g_tmpfs_dir_path, 0, sizeof(g_tmpfs_dir_path));
+    for (uint32_t i = 0;
+         i < sizeof(TMPFS_SEED_DIRS) / sizeof(TMPFS_SEED_DIRS[0]); ++i) {
+        (void)tmpfs_vfs_mkdir(TMPFS_SEED_DIRS[i]);
+    }
 }
 
 const vfs_driver_t *tmpfs_vfs_get_driver(void)

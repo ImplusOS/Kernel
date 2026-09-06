@@ -153,10 +153,42 @@
  * to COM1 one character at a time from inside the syscall path, so an X
  * server plus a GL client -- which between them mmap ~400 segments and
  * exchange thousands of small packets before the first frame -- spend a large
- * part of their startup inside serial_write_string(). Off by default; set to
- * 1 for a bring-up boot.  See Docs/Others/TODO_Doom_Xorg_MethodA.md. */
+ * part of their startup inside serial_write_string() -- at 115200 baud every
+ * traced byte is ~87us of busy-wait, which no amount of KVM or faster silicon
+ * makes cheaper. Off by default; set to 1 for a bring-up boot.
+ * See Docs/Others/TODO_Doom_Xorg_MethodA.md. */
 #ifndef OS_CONFIG_FOREIGN_TRACE
 #define OS_CONFIG_FOREIGN_TRACE 0
+#endif
+
+/* Always-on, one-line-per-event log of foreign (Linux-ABI) program launches:
+ * exec, the interpreter that will run it, and the exit status. This is what
+ * OS_CONFIG_FOREIGN_TRACE's per-syscall firehose is not -- a handful of lines
+ * per program rather than thousands, cheap enough to leave on in a release
+ * boot, and enough to see *that* an app started and how long it took. Read it
+ * from inside the OS at /dev/kmsg (Core/vfs/DevFS.c). */
+#ifndef OS_CONFIG_FOREIGN_LAUNCH_LOG
+#define OS_CONFIG_FOREIGN_LAUNCH_LOG 1
+#endif
+
+/* Early wakeups for poll(2)/select(2)/epoll_wait(2) and the pipe/pty waits
+ * (Core/syscall/Poll_Wait.c). With this off, those waits serve out their full
+ * sleep slice exactly as they did before the mechanism existed -- slower to
+ * react, but with no wakeup bookkeeping at all. It is a switch rather than a
+ * constant because the bookkeeping is subtle (see
+ * Docs/Others/TODO_Performance_LinuxApps.md section 9): getting it wrong
+ * costs a CPU spin, and being able to rule it out in one build is worth more
+ * than the latency it buys. */
+#ifndef OS_CONFIG_POLL_WAIT_WAKEUPS
+#define OS_CONFIG_POLL_WAIT_WAKEUPS 1
+#endif
+
+/* Read cache in front of the block layer (Platform/io/Block_Cache.c). Set to
+ * 0 to send every disk_read() straight at the medium again, which is useful
+ * for measuring what the cache is worth on a given machine and for ruling it
+ * out when chasing a filesystem bug. */
+#ifndef OS_CONFIG_BLOCK_CACHE
+#define OS_CONFIG_BLOCK_CACHE 1
 #endif
 
 #ifndef OS_CONFIG_DEBUG_PAGE_FAULT_DUMP
