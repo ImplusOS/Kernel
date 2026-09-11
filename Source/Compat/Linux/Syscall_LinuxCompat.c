@@ -15,6 +15,7 @@
 #include "Core/syscall/Syscall_VM.h"
 #include "Core/syscall/Syscall_Main.h"
 #include "Core/memory/SharedMemory.h"
+#include "Core/debug/FlightRec.h"
 #include "Core/memory/FileMap.h"
 #include "Core/timer/Timer.h"
 #include "Core/usercopy/Usercopy.h"
@@ -33,6 +34,47 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #include "MemoryManagement/Memory_Main.h"
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
+
+#ifndef LINUX_SYSCALL_PROFILE
+#define LINUX_SYSCALL_PROFILE 0
+#endif
+#if LINUX_SYSCALL_PROFILE
+/* Which Linux syscalls a foreign program actually spends its life in. Counts
+ * only -- the point is to find a syscall being re-run in a loop, and a loop
+ * shows up in the count. Dumped over serial every PROFILE_DUMP_EVERY calls,
+ * busiest first (and cleared as it prints, so each line is a fresh window). */
+#define PROFILE_MAX_NR      512u
+#define PROFILE_DUMP_EVERY  100000u
+static volatile uint32_t g_prof_count[PROFILE_MAX_NR];
+static volatile uint32_t g_prof_total;
+
+static void linux_syscall_profile(uint64_t nr)
+{
+    if (nr < PROFILE_MAX_NR) {
+        __atomic_fetch_add(&g_prof_count[nr], 1u, __ATOMIC_RELAXED);
+    }
+    uint32_t total = __atomic_add_fetch(&g_prof_total, 1u, __ATOMIC_RELAXED);
+    if (total % PROFILE_DUMP_EVERY != 0u) {
+        return;
+    }
+    serial_write_string("[sysprof] total=");
+    serial_write_uint64((uint64_t)total);
+    for (int rank = 0; rank < 8; ++rank) {
+        uint32_t best = 0, best_nr = 0;
+        for (uint32_t i = 0; i < PROFILE_MAX_NR; ++i) {
+            uint32_t v = __atomic_load_n(&g_prof_count[i], __ATOMIC_RELAXED);
+            if (v > best) { best = v; best_nr = i; }
+        }
+        if (best == 0u) break;
+        serial_write_string(" #");
+        serial_write_uint64((uint64_t)best_nr);
+        serial_write_string("=");
+        serial_write_uint64((uint64_t)best);
+        __atomic_store_n(&g_prof_count[best_nr], 0u, __ATOMIC_RELAXED);
+    }
+    serial_write_string("\n");
+}
+#endif
 
 #ifndef CHROME_SHM_TRACE
 #define CHROME_SHM_TRACE 0
@@ -197,7 +239,14 @@ int64_t syscall_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limit, u
             return LINUX_ENOTSUP;
     }
     if (old_limit != 0u &&
+        !process_user_buffer_is_writable((void *)(uintptr_t)old_limit,
+                                         sizeof(limit)) ||
         copy_to_user((void *)(uintptr_t)old_limit, &limit, sizeof(limit)) != 0u) {
+        /* The writability test is not redundant: the kernel can write through
+         * a read-only user mapping, and Chromium uses exactly this call to
+         * prove that it cannot. base::internal::CheckMemoryReadOnly() passes a
+         * page it has just mprotect()ed PROT_READ as the output buffer and
+         * CHECK-fails the process unless getrlimit() returns EFAULT. */
         return LINUX_EFAULT;
     }
     return 0;
@@ -1466,9 +1515,40 @@ static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
 }
 #endif
 
+#ifndef PAGING_LOST_MAPPING_TRACE
+#define PAGING_LOST_MAPPING_TRACE 0
+#endif
+#if PAGING_LOST_MAPPING_TRACE
+/* Anything that touches the window the main executable is mapped into is
+ * suspect while chasing pages of that image reverting to demand-zero. */
+static void lostmap_note(const char *what, uint64_t addr, uint64_t len,
+                         uint64_t extra)
+{
+    if (addr + len <= 0x4000000000ULL || addr >= 0x4080000000ULL) {
+        return;
+    }
+    static volatile uint32_t seen;
+    if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) >= 32u) {
+        return;
+    }
+    serial_write_string("[lostmap] ");
+    serial_write_string(what);
+    serial_write_string(" addr=");
+    serial_write_uint64(addr);
+    serial_write_string(" len=");
+    serial_write_uint64(len);
+    serial_write_string(" x=");
+    serial_write_uint64(extra);
+    serial_write_string("\n");
+}
+#endif
+
 static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                           uint64_t flags, uint64_t fd, uint64_t offset)
 {
+#if PAGING_LOST_MAPPING_TRACE
+    lostmap_note("mmap", addr, length, flags);
+#endif
     (void)prot;
     if (length == 0u) {
         return LINUX_EINVAL;
@@ -1527,7 +1607,9 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if (offset != 0u) {
                 return LINUX_EINVAL;
             }
-            void *p = shared_memory_map(shm_handle);
+            /* A fresh mapping per mmap(): Chromium keys its shared-memory
+             * bookkeeping on the returned address. */
+            void *p = shared_memory_map_new(shm_handle);
             if (p == NULL) {
                 return LINUX_ENOMEM;
             }
@@ -2095,7 +2177,9 @@ static int64_t linux_read(uint64_t fd, uint64_t buf, uint64_t count)
     if (count > LINUX_MAX_IO_BYTES) {
         count = LINUX_MAX_IO_BYTES;
     }
-    if (!process_user_buffer_is_valid((const void *)(uintptr_t)buf, count)) {
+    /* read(2) writes into `buf`: a read-only destination is EFAULT, and
+     * Chromium's protected-memory self-check depends on it being so. */
+    if (!process_user_buffer_is_writable((const void *)(uintptr_t)buf, count)) {
         return LINUX_EFAULT;
     }
     if (syscall_eventfd_is_valid((int32_t)fd)) {
@@ -4353,6 +4437,14 @@ static uint64_t g_lx_hb_last_arg[LX_HEARTBEAT_MAX_PID];
 static uint64_t g_lx_hb_count[LX_HEARTBEAT_MAX_PID];
 static uint64_t g_lx_hb_next_dump_ns;
 
+/* Read-only views of the per-pid heartbeat, for the timer-driven stall dump in
+ * ProcessManager_Create.c. That dump has to be driven by the timer rather than
+ * by the syscall path: the case it exists to diagnose is "every thread is
+ * blocked and no syscalls are happening at all", which the syscall-driven
+ * heartbeat below can never report. */
+uint32_t linux_heartbeat_last_num(int32_t pid);
+uint64_t linux_heartbeat_count(int32_t pid);
+
 static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1)
 {
     int32_t pid = process_get_current_pid();
@@ -4579,7 +4671,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     int request_switch = 0;
     int request_restart = 0;
 
+    flight_rec(FR_TAG_SYSCALL, num, (uint64_t)(uint32_t)process_get_current_pid());
     linux_syscall_heartbeat(num, arg1);
+#if LINUX_SYSCALL_PROFILE
+    linux_syscall_profile(num);
+#endif
 
     LINUX_TRACE_ENTER(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
@@ -4696,10 +4792,16 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_MPROTECT:
+#if PAGING_LOST_MAPPING_TRACE
+            lostmap_note("mprotect", arg1, arg2, arg3);
+#endif
             result = syscall_vm_mprotect(arg1, arg2, arg3);
             break;
 
         case LINUX_SYS_MUNMAP: {
+#if PAGING_LOST_MAPPING_TRACE
+            lostmap_note("munmap", arg1, arg2, 0);
+#endif
             int32_t self = process_get_current_pid();
             if (self >= 0 && arg2 != 0u) {
                 /* Flush + drop any MAP_SHARED file mapping in this range. */
@@ -4933,6 +5035,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
         case LINUX_SYS_FTRUNCATE:
             result = syscall_ftruncate((int32_t)arg1, (int64_t)arg2);
+            /* A memfd seal refuses the resize with EPERM on Linux, not EACCES,
+             * and Mojo's seal self-check only accepts EINVAL/ENOSYS/EPERM. */
+            if (result == (int64_t)OS_STATUS_ACCESS_DENIED) {
+                result = -1; /* EPERM */
+            }
             break;
 
         case LINUX_SYS_FALLOCATE:
@@ -5337,9 +5444,25 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
         }
 
-        case LINUX_SYS_MEMFD_CREATE:
+        case LINUX_SYS_MEMFD_CREATE: {
+            /* MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL
+             * | MFD_EXEC. Unknown bits are EINVAL, and that has to be real:
+             * Mojo probes the kernel by calling memfd_create() with every flag
+             * bit set and CHECK-fails the process if it succeeds
+             * (ChannelLinux::KernelSupportsUpgradeRequirements(),
+             * channel_linux.cc:947). */
+            const uint64_t mfd_known = 0x1u | 0x2u | 0x4u | 0x8u | 0x10u;
+            if ((arg2 & ~mfd_known) != 0u) {
+                result = LINUX_EINVAL;
+                break;
+            }
             result = (int64_t)syscall_file_create_memfd(
                 (const char *)(uintptr_t)arg1);
+            if (result >= 0 && (arg2 & 0x1u) != 0u) {
+                (void)syscall_file_set_descriptor_flags((int32_t)result,
+                                                        LINUX_FD_CLOEXEC);
+            }
+        }
 #if CHROME_SHM_TRACE
             chrome_shm_trace3("memfd_create flags=", arg2, " -> ", (uint64_t)result, "", 0);
 #endif
@@ -5357,9 +5480,18 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = (int64_t)syscall_eventfd(arg1, 0u);
             break;
 
-        case LINUX_SYS_EVENTFD2:
+        case LINUX_SYS_EVENTFD2: {
+            /* EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC. As with
+             * memfd_create() above, Mojo calls this with every bit set and
+             * requires it to fail. */
+            const uint64_t efd_known = 0x1u | 0x800u | 0x80000u;
+            if ((arg2 & ~efd_known) != 0u) {
+                result = LINUX_EINVAL;
+                break;
+            }
             result = (int64_t)syscall_eventfd(arg1, arg2);
             break;
+        }
 
         case LINUX_SYS_EPOLL_CREATE1:
             result = (int64_t)syscall_epoll_create(arg1);
@@ -5962,4 +6094,16 @@ static const compat_layer_t g_linux_compat_layer = {
 void linux_compat_layer_register(void)
 {
     (void)compat_registry_register(&g_linux_compat_layer);
+}
+
+uint32_t linux_heartbeat_last_num(int32_t pid)
+{
+    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0xFFFFFFFFu;
+    return g_lx_hb_last_num[pid];
+}
+
+uint64_t linux_heartbeat_count(int32_t pid)
+{
+    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
+    return g_lx_hb_count[pid];
 }

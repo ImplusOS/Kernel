@@ -1,4 +1,8 @@
 #include "IDT_Main.h"
+
+#ifndef LINUX_SYSCALL_PROFILE
+#define LINUX_SYSCALL_PROFILE 0
+#endif
 #include "interfaces/hal_cpu.h"
 #include "kernel/config.h"
 
@@ -10,6 +14,7 @@
 #include "Platform/interrupt/Interrupts.h"
 #include "smp/SMP_Main.h"
 #include "Debug/serial/Serial.h"
+#include "Core/debug/FlightRec.h"
 #include "Debug/panic/Panic.h"
 #include "Drivers/Module/InterruptManager.h"
 
@@ -525,6 +530,7 @@ int32_t page_fault_handler(uint64_t error_code,
                            uint64_t cr2,
                            uint64_t rbp)
 {
+    flight_rec(FR_TAG_PF, cr2, rip);
     const uint64_t PF_WRITE = (1ULL << 1);
     const uint64_t PF_USER  = (1ULL << 2);
     const uint64_t PF_RSVD  = (1ULL << 3);
@@ -581,6 +587,19 @@ int32_t page_fault_handler(uint64_t error_code,
      * panic the kernel. paging_handle_swap_fault()/cow_fault() self-gate to
      * canonical user addresses, so a genuine kernel wild pointer still falls
      * through to the panic path below. */
+#if LINUX_SYSCALL_PROFILE
+    /* Page faults are not syscalls, so the syscall profile cannot see them --
+     * and a demand-paged program spends its life here, not in syscalls. */
+    {
+        static volatile uint32_t pf_total;
+        uint32_t n = __atomic_add_fetch(&pf_total, 1u, __ATOMIC_RELAXED);
+        if ((n % 100000u) == 0u) {
+            serial_write_string("[pfprof] faults=");
+            serial_write_uint64((uint64_t)n);
+            serial_write_string("\n");
+        }
+    }
+#endif
     int pf_serviced = 0;
     if (pid >= 0 && !pf_reentrant) {
         uint64_t cr3 = process_get_current_cr3();
@@ -602,6 +621,16 @@ int32_t page_fault_handler(uint64_t error_code,
             if (filemap_handle_fault(pid, cr3, cr2) > 0) {
                 pf_serviced = 1;
             }
+        }
+        /* Ahead of the demand-paging handlers: if the tables already allow
+         * this access, another CPU mapped (or widened) the page while this one
+         * still held the old translation. Nothing to fill in -- drop the stale
+         * entry and resume the instruction. See
+         * paging_access_is_now_permitted(). */
+        if (!pf_serviced &&
+            paging_access_is_now_permitted(cr3, cr2, error_code)) {
+            paging_invalidate_page(cr2);
+            pf_serviced = 1;
         }
         if (!pf_serviced && paging_handle_swap_fault(cr3, cr2) > 0) {
             extern void process_record_page_fault(int32_t pid, uint64_t fault_addr,

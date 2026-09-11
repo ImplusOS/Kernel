@@ -176,6 +176,11 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
                                      uint64_t *next_user_rsp_out);
 uint64_t process_schedule_after_exit(uint64_t *next_user_rsp_out);
 int process_user_buffer_is_valid(const void *ptr, uint64_t len);
+
+/* As above, and additionally that a user-mode write would be permitted. Use
+ * for the destination of a read()-style syscall, which Linux fails with EFAULT
+ * when the target is read-only. */
+int process_user_buffer_is_writable(const void *ptr, uint64_t len);
 int process_user_cstring_length(const char *str, uint64_t max_len, uint64_t *len_out);
 void *process_user_alloc(uint64_t size);
 uint64_t process_get_heap_cursor(void);

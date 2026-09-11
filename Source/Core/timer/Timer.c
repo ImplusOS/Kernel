@@ -120,6 +120,12 @@ static void timer_core_handler(void) {
 
     if (__atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) != 0u) {
         process_on_timer_tick();
+#if PROCESS_STALL_DUMP
+        {
+            extern void process_stall_dump_tick(void);
+            process_stall_dump_tick();
+        }
+#endif
     }
 
     g_tick_count++;

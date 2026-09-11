@@ -69,4 +69,18 @@ uint64_t get_phys_base(void);
 uint64_t get_virt_base(void);
 uint64_t paging_virt_to_phys(uint64_t cr3, uint64_t virt_addr);
 
+/* 1 if a user-mode write to every page of [start, start+len) is allowed by the
+ * current tables (absent pages pass: they fault in writable). See the
+ * definition for why the kernel has to ask. */
+int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len);
+
+/* Drop this CPU's TLB entry for the page containing `vaddr`. */
+void paging_invalidate_page(uint64_t vaddr);
+
+/* 1 if the page tables already permit the access described by `error_code` at
+ * `vaddr` -- i.e. the #PF was spurious (a stale TLB entry on another CPU).
+ * See the definition: on SMP the OS has to tolerate these. */
+int paging_access_is_now_permitted(uint64_t cr3, uint64_t vaddr,
+                                   uint64_t error_code);
+
 #endif

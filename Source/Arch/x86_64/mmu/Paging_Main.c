@@ -98,10 +98,6 @@ static inline void invlpg_addr(uint64_t addr)
 
 #include "smp/SMP_Main.h"
 
-static void tlb_shootdown_all(uint64_t vaddr, uint64_t pages)
-{
-    smp_tlb_shootdown(vaddr, pages);
-}
 
 static void copy_page_entries(uint64_t *dst, const uint64_t *src)
 {
@@ -116,6 +112,30 @@ static void copy_page_bytes(uint8_t *dst, const uint8_t *src)
         dst[i] = src[i];
     }
 }
+
+/*
+ * Serialises structural changes to a page table: installing a PDPT/PD/PT,
+ * freeing one, splitting a huge page, and writing leaf entries.
+ *
+ * Every demand fault ends up here, and the two fault paths that lead to it --
+ * filemap_handle_fault() and the demand-zero branch of
+ * paging_handle_swap_fault() -- hold different locks from each other, so they
+ * were free to walk and edit the same tables at the same time. Two CPUs
+ * finding the same PML4 slot empty would each allocate a PDPT and each store
+ * it; the loser's table, and every mapping already installed through it, just
+ * disappeared. What the process saw afterwards was memory that had quietly
+ * reverted to demand-zero -- pointers reading back as NULL, structures full of
+ * zeroes -- which is the shape of the corruption Chromium died of under
+ * `-smp >1`.
+ *
+ * Taken with interrupts off, and never while holding it is anything else
+ * acquired, so it cannot deadlock against the fault locks above it.
+ */
+#ifndef PAGING_LOST_MAPPING_TRACE
+#define PAGING_LOST_MAPPING_TRACE 0
+#endif
+
+static spinlock_t g_page_table_lock;
 
 static uint64_t *alloc_zeroed_page_table(void)
 {
@@ -182,56 +202,65 @@ static int pd_table_has_user_pages(const uint64_t *pd_table)
     return 0;
 }
 
-static int update_pdpt_user_flag(uint64_t cr3,
-                                 uint64_t pdpt_index,
-                                 uint64_t *pd_table)
+
+
+/*
+ * The page directory that maps `virt_addr` in `cr3`, read out of the live
+ * tables.
+ *
+ * This replaces a version that indexed a per-address-space cache
+ * (paging_space_t::pd_tables) with bits 30-38 of the address alone, which
+ * quietly folded every PML4 slot onto one 512-entry array. That was survivable while every user mapping lived below
+ * 512 GiB, and stopped being survivable when the mmap arena moved to
+ * USER_MMAP_BASE (1 TiB, PML4 slot 2): an arena address resolved to the page
+ * directory of an unrelated address in PML4 slot 0. munmap() in the arena then
+ * walked that directory instead -- freeing the frames the executable had
+ * mapped there, and finally clearing the PD entry outright, which is why 2 MiB
+ * of Chromium's image would disappear and fault back in as demand-zero pages.
+ * PartitionAlloc unmaps from the arena continuously, so the damage tracked how
+ * far the browser got rather than anything about the addresses involved.
+ */
+static uint64_t *walk_pd_table(uint64_t cr3, uint64_t virt_addr)
 {
-    if (pdpt_index >= MAX_PDPT_ENTRIES || pd_table == NULL) {
+    if (cr3 == 0) {
+        return NULL;
+    }
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    uint64_t e4 = pml4[PML4_INDEX(virt_addr)];
+    if ((e4 & PAGE_PRESENT) == 0) {
+        return NULL;
+    }
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
+    uint64_t e3 = pdpt[PDPT_INDEX(virt_addr)];
+    if ((e3 & PAGE_PRESENT) == 0 || (e3 & PAGE_PS) != 0) {
+        return NULL;
+    }
+    return (uint64_t *)(uintptr_t)(e3 & PAGE_FRAME_MASK);
+}
+
+/* Rewrite the PDPT entry covering `virt_addr` to point at `pd_table`, with the
+ * user bit set only if the directory still has user pages under it. The
+ * Addressed by virtual address rather than by a bits-30-38 index, for the
+ * reason spelled out on walk_pd_table(). */
+static int refresh_pdpt_entry(uint64_t cr3, uint64_t virt_addr,
+                              uint64_t *pd_table)
+{
+    if (cr3 == 0 || pd_table == NULL) {
         return -1;
     }
-
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    uint64_t e4 = pml4[PML4_INDEX(virt_addr)];
+    if ((e4 & PAGE_PRESENT) == 0) {
+        return -1;
+    }
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
     uint64_t flags = PAGE_PRESENT | PAGE_RW;
     if (pd_table_has_user_pages(pd_table)) {
         flags |= PAGE_USER;
     }
-
-    if (cr3 == (uint64_t)g_kernel_pml4) {
-        g_kernel_pdpt[pdpt_index] = ((uint64_t)pd_table) | flags;
-        return 0;
-    }
-
-    paging_space_t *space = find_space_by_cr3(cr3);
-    if (space == NULL) {
-        return -1;
-    }
-    space->pdpt[pdpt_index] = ((uint64_t)pd_table) | flags;
+    pdpt[PDPT_INDEX(virt_addr)] =
+        ((uint64_t)(uintptr_t)pd_table) | flags;
     return 0;
-}
-
-static uint64_t *resolve_pd_table(uint64_t cr3, uint64_t pdpt_index)
-{
-    if (pdpt_index >= MAX_PDPT_ENTRIES) {
-        return NULL;
-    }
-
-    if (cr3 == (uint64_t)g_kernel_pml4) {
-        if (ensure_kernel_pdpt_entry(pdpt_index) < 0) {
-            return NULL;
-        }
-        return g_kernel_pd[pdpt_index];
-    }
-
-    paging_space_t *space = find_space_by_cr3(cr3);
-    if (space == NULL) {
-        return NULL;
-    }
-
-    if (space->pd_tables[pdpt_index] == NULL &&
-        (space->pdpt[pdpt_index] & PAGE_PRESENT) != 0) {
-        space->pd_tables[pdpt_index] =
-            (uint64_t *)(uintptr_t)(space->pdpt[pdpt_index] & PAGE_FRAME_MASK);
-    }
-    return space->pd_tables[pdpt_index];
 }
 
 static int is_kernel_table(const void *table)
@@ -539,11 +568,9 @@ int paging_cow_clone_user_range(uint64_t child_cr3, uint64_t parent_cr3,
     }
 
     /* The parent may be running threads on other CPUs with stale writable
-     * TLB entries for the pages just downgraded - flush everyone. */
-    smp_tlb_shootdown_all();
-    if (parent_cr3 == read_cr3()) {
-        write_cr3(read_cr3());
-    }
+     * TLB entries for the pages just downgraded - flush every CPU that is on
+     * the parent's address space, and wait for them. */
+    smp_tlb_shootdown_cr3(parent_cr3, 0u, 0u);
     return 0;
 }
 
@@ -810,6 +837,7 @@ void init_paging(void)
     memset(g_swap_slots, 0, sizeof(g_swap_slots));
     memset(g_swap_tracks, 0, sizeof(g_swap_tracks));
     spinlock_init(&g_paging_space_lock);
+    spinlock_init(&g_page_table_lock);
     spinlock_init(&g_swap_lock);
 
     for (uint32_t i = 0; i < g_process_spaces_capacity; ++i) {
@@ -858,6 +886,121 @@ uint64_t paging_get_kernel_cr3(void)
 uint64_t paging_get_active_cr3(void)
 {
     return read_cr3();
+}
+
+/*
+ * 1 if the page tables, as they stand right now, already allow the access that
+ * just faulted -- in other words the fault was spurious.
+ *
+ * This is required on SMP, not a nicety. When one CPU makes a page present (or
+ * widens its permissions), the other CPUs may still hold a stale TLB entry for
+ * that address and fault on it; x86 permits that and expects the OS to notice
+ * and resume. Chromium is where it shows: dozens of threads share one address
+ * space and hammer the same freshly-mapped PartitionAlloc slots, so what looks
+ * like a wild pointer is often a translation from a moment ago. Terminating on
+ * one of these is why the browser died only under -smp >1.
+ *
+ * `error_code` is the #PF error code: bit0 present, bit1 write, bit2 user,
+ * bit4 instruction fetch.
+ */
+/*
+ * 1 if a user-mode write to every page of [start, start+len) would be allowed
+ * by the current tables.
+ *
+ * Pages that are not present pass: they fault in writable through the
+ * demand-zero path, so refusing them would break every write into a
+ * lazily-committed buffer. Present pages must carry PAGE_RW | PAGE_USER.
+ *
+ * The kernel needs this because it can write through a read-only user mapping
+ * without trapping, and Linux does not: read(2) into a PROT_READ page returns
+ * EFAULT. Chromium checks exactly that -- base/memory/protected_memory_posix.cc
+ * reads /dev/zero into memory it has just mprotect()ed read-only and CHECKs
+ * that the call fails with EFAULT -- and takes the process down when it does
+ * not.
+ */
+int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len)
+{
+    if (cr3 == 0 || len == 0) {
+        return 1;
+    }
+    uint64_t first = start & PAGE_MASK;
+    uint64_t last  = (start + len - 1ULL) & PAGE_MASK;
+
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    for (uint64_t page = first; ; page += PAGE_SIZE_BYTES) {
+        uint64_t e = pml4[PML4_INDEX(page)];
+        if ((e & PAGE_PRESENT) != 0) {
+            uint64_t *pdpt = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+            e = pdpt[PDPT_INDEX(page)];
+            if ((e & PAGE_PRESENT) != 0 && (e & PAGE_PS) == 0) {
+                uint64_t *pd = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+                e = pd[PD_INDEX(page)];
+                if ((e & PAGE_PRESENT) != 0 && (e & PAGE_PS) == 0) {
+                    uint64_t *pt = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+                    uint64_t pte = pt[PT_INDEX(page)];
+                    /* Only the leaf, and only its write bit. The upper levels
+                     * carry a user bit this kernel installs lazily (the fault
+                     * handlers repair it on the way past), so folding those in
+                     * would reject writes that are perfectly legal. */
+                    if ((pte & PAGE_PRESENT) != 0 && (pte & PAGE_RW) == 0) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        if (page == last) {
+            break;
+        }
+    }
+    return 1;
+}
+
+/* Drop this CPU's TLB entry for one page. */
+void paging_invalidate_page(uint64_t vaddr)
+{
+    invlpg_addr(vaddr & PAGE_MASK);
+}
+
+int paging_access_is_now_permitted(uint64_t cr3, uint64_t vaddr,
+                                   uint64_t error_code)
+{
+    if (cr3 == 0) {
+        return 0;
+    }
+
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    uint64_t entry = pml4[PML4_INDEX(vaddr)];
+    if ((entry & PAGE_PRESENT) == 0) return 0;
+    uint64_t path = entry;
+
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)(entry & PAGE_FRAME_MASK);
+    entry = pdpt[PDPT_INDEX(vaddr)];
+    if ((entry & PAGE_PRESENT) == 0) return 0;
+    path &= entry;
+
+    if ((entry & PAGE_PS) == 0) {
+        uint64_t *pd = (uint64_t *)(uintptr_t)(entry & PAGE_FRAME_MASK);
+        entry = pd[PD_INDEX(vaddr)];
+        if ((entry & PAGE_PRESENT) == 0) return 0;
+        path &= entry;
+
+        if ((entry & PAGE_PS) == 0) {
+            uint64_t *pt = (uint64_t *)(uintptr_t)(entry & PAGE_FRAME_MASK);
+            entry = pt[PT_INDEX(vaddr)];
+            if ((entry & PAGE_PRESENT) == 0) return 0;
+            path &= entry;
+        }
+    }
+
+    /* Permission bits are the AND down the walk, except NX which is the OR. */
+    if ((error_code & 0x2ULL) != 0u && (path & PAGE_RW) == 0) return 0;
+    if ((error_code & 0x4ULL) != 0u && (path & PAGE_USER) == 0) return 0;
+    if ((error_code & 0x10ULL) != 0u && (entry & PAGE_NX) != 0) return 0;
+    /* A copy-on-write page still owes the write a private copy; that is the COW
+     * handler's job, not a stale translation. */
+    if ((error_code & 0x2ULL) != 0u && (entry & PAGE_COW) != 0) return 0;
+
+    return 1;
 }
 
 uint64_t paging_virt_to_phys(uint64_t cr3, uint64_t virt_addr)
@@ -909,6 +1052,9 @@ void paging_switch_cr3(uint64_t cr3)
         return;
     }
     write_cr3(cr3);
+    /* Tell the shootdown code which address space this CPU is on, so a
+     * shootdown for any other one need not wait for it. */
+    smp_note_cr3(cr3);
 }
 
 uint64_t paging_create_process_space(void)
@@ -979,9 +1125,12 @@ void paging_destroy_process_space(uint64_t cr3)
 
     if (read_cr3() == cr3) {
         write_cr3((uint64_t)g_kernel_pml4);
+        smp_note_cr3((uint64_t)g_kernel_pml4);
     }
-    
-    smp_tlb_shootdown_all();
+
+    /* The page tables below are about to be freed. Anyone still on this
+     * address space has to have dropped its translations first. */
+    smp_tlb_shootdown_cr3(cr3, 0u, 0u);
 
     for (uint64_t i = 0; i < MAX_PDPT_ENTRIES; ++i) {
         if (space_copy.pd_tables[i] == NULL) {
@@ -1063,7 +1212,7 @@ int paging_set_user_access(uint64_t cr3,
             pml4[pml4_index] |= PAGE_USER;
         }
 
-        uint64_t *pd_table = resolve_pd_table(cr3, pdpt_index);
+        uint64_t *pd_table = walk_pd_table(cr3, addr);
         if (pd_table == NULL) {
             if (cr3 == (uint64_t)g_kernel_pml4) {
                 if (ensure_kernel_pdpt_entry(pdpt_index) < 0) {
@@ -1085,10 +1234,31 @@ int paging_set_user_access(uint64_t cr3,
                     irq_restore(irq_f);
                     return -1;
                 }
-                space->pd_tables[pdpt_index] = pd_table;
-                space->pdpt[pdpt_index] = ((uint64_t)pd_table) | PAGE_PRESENT | PAGE_RW;
-                if (enable_user) {
-                    space->pdpt[pdpt_index] |= PAGE_USER;
+                /* Install into the live tables, addressed properly. The
+                 * cache below is only meaningful for PML4 slot 0, which is
+                 * what paging_destroy_process_space() walks. */
+                {
+                    uint64_t *live_pml4 =
+                        (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+                    uint64_t e4 = live_pml4[PML4_INDEX(addr)];
+                    if ((e4 & PAGE_PRESENT) == 0) {
+                        free_page(pd_table);
+                        spinlock_unlock(&g_paging_space_lock);
+                        irq_restore(irq_f);
+                        return -1;
+                    }
+                    uint64_t *live_pdpt =
+                        (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
+                    uint64_t ent = ((uint64_t)(uintptr_t)pd_table) |
+                                   PAGE_PRESENT | PAGE_RW;
+                    if (enable_user) {
+                        ent |= PAGE_USER;
+                    }
+                    live_pdpt[PDPT_INDEX(addr)] = ent;
+                    if (PML4_INDEX(addr) == 0u &&
+                        pdpt_index < MAX_PDPT_ENTRIES) {
+                        space->pd_tables[pdpt_index] = pd_table;
+                    }
                 }
                 spinlock_unlock(&g_paging_space_lock);
                 irq_restore(irq_f);
@@ -1104,7 +1274,7 @@ int paging_set_user_access(uint64_t cr3,
 
         if ((pd_table[pd_index] & PAGE_PRESENT) == 0) {
             if (!enable_user) {
-                if (update_pdpt_user_flag(cr3, pdpt_index, pd_table) < 0) {
+                if (refresh_pdpt_entry(cr3, addr, pd_table) < 0) {
                     return -1;
                 }
                 continue;
@@ -1178,7 +1348,7 @@ int paging_set_user_access(uint64_t cr3,
             }
         }
 
-        if (update_pdpt_user_flag(cr3, pdpt_index, pd_table) < 0) {
+        if (refresh_pdpt_entry(cr3, addr, pd_table) < 0) {
             return -1;
         }
     }
@@ -1189,8 +1359,10 @@ int paging_set_user_access(uint64_t cr3,
     return 0;
 }
 
-int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
-                              uint64_t flags)
+static int paging_protect_user_range_locked(uint64_t cr3, uint64_t start,
+                                           uint64_t size, uint64_t flags,
+                                           uint64_t *shoot_start,
+                                           uint64_t *shoot_end)
 {
     if (cr3 == 0 || size == 0 || (start & (PAGE_SIZE_BYTES - 1ULL)) != 0)
         return -1;
@@ -1204,6 +1376,7 @@ int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
      * fault, which always brings the page in RW. Skip absent pages for user
      * addresses; a genuinely bogus (non-user) address still errors. */
     const int lenient = is_user_virtual_address(start);
+    uint64_t narrowed_start = 0, narrowed_end = 0;
     uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
     for (uint64_t address = start; address < end; address += PAGE_SIZE_BYTES) {
         uint64_t i4 = PML4_INDEX(address);
@@ -1231,6 +1404,7 @@ int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
         uint64_t *pt = (uint64_t *)(uintptr_t)(pd[i2] & PAGE_FRAME_MASK);
         uint64_t entry = pt[i1];
         if ((entry & PAGE_PRESENT) == 0) { if (lenient) continue; return -1; }
+        uint64_t old_entry = entry;
         uint64_t keep_cow = entry & PAGE_COW;
         uint64_t new_flags = flags & (PAGE_RW | PAGE_USER | PAGE_NX);
         /* A still-shared copy-on-write page must stay read-only even when the
@@ -1249,16 +1423,65 @@ int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
             pdpt[i3] |= PAGE_USER | PAGE_RW;
             pd[i2] |= PAGE_USER | PAGE_RW;
         }
-        tlb_shootdown_all(address, 1ULL);
+        invlpg_addr(address);
+        if (entry != old_entry) {
+            if (narrowed_start == 0u || address < narrowed_start) {
+                narrowed_start = address;
+            }
+            if (address + PAGE_SIZE_BYTES > narrowed_end) {
+                narrowed_end = address + PAGE_SIZE_BYTES;
+            }
+        }
     }
+
+    *shoot_start = narrowed_start;
+    *shoot_end = narrowed_end;
     return 0;
 }
 
-int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
+int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
+                              uint64_t flags)
+{
+    uint64_t shoot_start = 0, shoot_end = 0;
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_page_table_lock);
+    int rc = paging_protect_user_range_locked(cr3, start, size, flags,
+                                              &shoot_start, &shoot_end);
+    spinlock_unlock(&g_page_table_lock);
+    irq_restore(irq);
+
+    /* One shootdown for the whole changed span rather than one per page, and
+     * outside the lock. A PartitionAlloc decommit mprotects megabytes at a
+     * time, and a synchronous IPI round trip per 4 KiB page is enough on its
+     * own to stop a browser from making progress. */
+    if (shoot_end > shoot_start) {
+        uint64_t pages = (shoot_end - shoot_start) / PAGE_SIZE_BYTES;
+        /* Past a certain size, telling each CPU to drop everything beats
+         * walking it through hundreds of individual invalidations. */
+        smp_tlb_shootdown_cr3(cr3, shoot_start, pages > 64u ? 0u : pages);
+    }
+    return rc;
+}
+
+static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size)
 {
     if (cr3 == 0 || size == 0) {
         return -1;
     }
+#if PAGING_LOST_MAPPING_TRACE
+    if (start < 0x4080000000ULL && start + size > 0x4000000000ULL) {
+        static volatile uint32_t seen;
+        if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) < 16u) {
+            serial_write_string("[lostmap] unmap_range start=");
+            serial_write_uint64(start);
+            serial_write_string(" size=");
+            serial_write_uint64(size);
+            serial_write_string(" cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string("\n");
+        }
+    }
+#endif
 
     uint64_t end = start + size;
     if (end <= start) {
@@ -1274,7 +1497,7 @@ int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
         uint64_t pd_index = (addr >> 21) & 0x1FFULL;
         uint64_t pt_index = (addr >> 12) & 0x1FFULL;
 
-        uint64_t *pd_table = resolve_pd_table(cr3, pdpt_index);
+        uint64_t *pd_table = walk_pd_table(cr3, addr);
         if (pd_table == NULL) {
             /* Whole 1 GiB not mapped (unmap of a lazily-reserved mmap arena
              * range that was never touched). Jump to the next 1 GiB boundary
@@ -1322,19 +1545,52 @@ int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
         }
 
         if (!any_present) {
+#if PAGING_LOST_MAPPING_TRACE
+            /* Clearing a PD entry drops 2 MiB of mappings at once. Record the
+             * address that asked for it and the table it landed in: if the
+             * table is shared with another address space, this is where the
+             * other one's memory disappears. */
+            {
+                static volatile uint32_t seen;
+                if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) < 24u) {
+                    serial_write_string("[lostmap] clear pde addr=");
+                    serial_write_uint64(addr);
+                    serial_write_string(" cr3=");
+                    serial_write_uint64(cr3);
+                    serial_write_string(" pd=");
+                    serial_write_uint64((uint64_t)(uintptr_t)pd_table);
+                    serial_write_string(" idx=");
+                    serial_write_uint64(pd_index);
+                    serial_write_string("\n");
+                }
+            }
+#endif
             free_page(pt);
             pd_table[pd_index] = 0;
         }
-        if (update_pdpt_user_flag(cr3, pdpt_index, pd_table) < 0) {
+        if (refresh_pdpt_entry(cr3, addr, pd_table) < 0) {
             return -1;
         }
     }
 
-    /* Every CPU, not just this one: the frames just freed go back to the
-     * allocator immediately, so any sibling thread still holding a
-     * translation would read and write memory that now belongs elsewhere. */
-    smp_tlb_shootdown_all();
     return 0;
+}
+
+int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
+{
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_page_table_lock);
+    int rc = paging_unmap_range_locked(cr3, start, size);
+    spinlock_unlock(&g_page_table_lock);
+    irq_restore(irq);
+
+    /* Every CPU on this address space, not just this one, and not until they
+     * have actually done it: the frames just freed go back to the allocator
+     * immediately, so a sibling thread still holding a translation would read
+     * and write memory that now belongs to somebody else. Done outside the
+     * lock, since the CPUs being waited on may want it themselves. */
+    smp_tlb_shootdown_cr3(cr3, 0u, 0u);
+    return rc;
 }
 
 int paging_is_user_range_mapped(uint64_t cr3, uint64_t start, uint64_t size)
@@ -1412,14 +1668,16 @@ void *pmm_alloc_pages(size_t num_pages)
     return alloc_contiguous_pages(num_pages, 1);
 }
 
-int paging_map_user_page(uint64_t cr3,
-                         uint64_t virt_addr,
-                         uint64_t phys_addr,
-                         uint64_t flags)
+static int paging_map_user_page_locked(uint64_t cr3,
+                                      uint64_t virt_addr,
+                                      uint64_t phys_addr,
+                                      uint64_t flags,
+                                      int *replaced_out)
 {
     if (cr3 == 0) {
         return -1;
     }
+    *replaced_out = 0;
 
     uint64_t saved_cr3 = read_cr3();
     uint64_t kernel_cr3 = paging_get_kernel_cr3();
@@ -1552,10 +1810,105 @@ int paging_map_user_page(uint64_t cr3,
     if (cr3 == read_cr3()) {
         invlpg_addr(virt_addr & PAGE_MASK);
     }
-    if (replaced_live_mapping) {
-        smp_tlb_shootdown_all();
-    }
+    *replaced_out = replaced_live_mapping;
     return 0;
+}
+
+/* 1 if every level above the leaf already exists and belongs to this address
+ * space, so mapping the page is a single store into an existing table.
+ * `out_pt` receives the leaf table. */
+static int paging_leaf_table_ready(uint64_t cr3, uint64_t virt_addr,
+                                   uint64_t **out_pt)
+{
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    /* PAGE_RW as well as PAGE_USER at every level: the CPU ANDs the write bit
+     * down the walk, so a leaf marked writable under a read-only directory
+     * still faults -- forever, since nothing in the fast path repairs it. */
+    uint64_t e4 = pml4[PML4_INDEX(virt_addr)];
+    if ((e4 & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
+        (PAGE_PRESENT | PAGE_USER | PAGE_RW)) return 0;
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
+    if (is_kernel_table(pdpt)) return 0;
+
+    uint64_t e3 = pdpt[PDPT_INDEX(virt_addr)];
+    if ((e3 & PAGE_PS) != 0 ||
+        (e3 & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
+        (PAGE_PRESENT | PAGE_USER | PAGE_RW)) return 0;
+    uint64_t *pd = (uint64_t *)(uintptr_t)(e3 & PAGE_FRAME_MASK);
+    if (is_kernel_table(pd)) return 0;
+
+    uint64_t e2 = pd[PD_INDEX(virt_addr)];
+    if ((e2 & PAGE_PS) != 0 ||
+        (e2 & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
+        (PAGE_PRESENT | PAGE_USER | PAGE_RW)) return 0;
+    uint64_t *pt = (uint64_t *)(uintptr_t)(e2 & PAGE_FRAME_MASK);
+    if (is_kernel_table(pt)) return 0;
+
+    *out_pt = pt;
+    return 1;
+}
+
+int paging_map_user_page(uint64_t cr3,
+                         uint64_t virt_addr,
+                         uint64_t phys_addr,
+                         uint64_t flags)
+{
+    if (cr3 == 0) {
+        return -1;
+    }
+
+    /* Fast path: nothing structural to change, so the whole operation is one
+     * aligned 64-bit store into a table that already exists and cannot be
+     * replaced under us. Taking the global page-table lock here instead put
+     * every demand fault in the system through one lock with interrupts off,
+     * and Chromium faults from four CPUs continuously -- it cost roughly five
+     * times the throughput. Concurrent maps of the *same* page are still
+     * settled by the callers, which re-check presence under their own lock
+     * (filemap_handle_fault(), the demand-zero branch of
+     * paging_handle_swap_fault()). */
+#ifndef PAGING_LEAF_FASTPATH
+#define PAGING_LEAF_FASTPATH 1
+#endif
+#if PAGING_LEAF_FASTPATH
+    {
+        uint64_t *pt = NULL;
+        if (paging_leaf_table_ready(cr3, virt_addr, &pt)) {
+            uint64_t i1 = PT_INDEX(virt_addr);
+            uint64_t old = pt[i1];
+            if ((old & PAGE_PRESENT) == 0) {
+                pt[i1] = (phys_addr & PAGE_FRAME_MASK) | PAGE_PRESENT |
+                         PAGE_USER |
+                         (flags & (PAGE_RW | PAGE_PWT | PAGE_PCD |
+                                   PAGE_EXTERNAL | PAGE_NX | PAGE_COW));
+                swap_track_page(cr3, virt_addr);
+                if (cr3 == read_cr3()) {
+                    invlpg_addr(virt_addr & PAGE_MASK);
+                }
+                return 0;
+            }
+            /* Replacing a live mapping frees a frame: that needs the lock and
+             * the shootdown, so fall through to the slow path. */
+        }
+    }
+#endif
+
+    int replaced = 0;
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_page_table_lock);
+    int rc = paging_map_user_page_locked(cr3, virt_addr, phys_addr, flags,
+                                         &replaced);
+    spinlock_unlock(&g_page_table_lock);
+    irq_restore(irq);
+
+    /* Outside the lock: the shootdown waits for other CPUs, and one of them
+     * may be waiting for this very lock to service its own fault. */
+    if (rc == 0 && replaced) {
+        /* The frame that was here may go straight back to the allocator, so
+         * the other CPUs running this address space have to drop it before we
+         * return -- but only this page, not their whole TLB. */
+        smp_tlb_shootdown_cr3(cr3, virt_addr & PAGE_MASK, 1ULL);
+    }
+    return rc;
 }
 
 int paging_map_user_range_alloc(uint64_t cr3,
@@ -1648,6 +2001,60 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
             return 1;
         }
 
+#if PAGING_LOST_MAPPING_TRACE
+        /* The main executable's PT_LOADs are mapped eagerly by the ELF loader,
+         * so nothing in the code window should ever reach demand-zero. If it
+         * does, a mapping that existed has gone missing -- which is the
+         * signature of the SMP corruption being chased. Rate limited. */
+        if (virt_addr >= 0x4000000000ULL && virt_addr < 0x4080000000ULL) {
+            static volatile uint32_t lost_reported;
+            if (__atomic_fetch_add(&lost_reported, 1u, __ATOMIC_RELAXED) < 16u) {
+                /* Walk it by hand: whether the leaf table is gone or merely
+                 * has a hole says whether a page table was reused or a single
+                 * entry was cleared. */
+                uint64_t *l4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+                uint64_t e4 = l4[PML4_INDEX(virt_addr)];
+                uint64_t e3 = 0, e2 = 0;
+                uint32_t present_in_pt = 0xFFFFFFFFu;
+                if ((e4 & PAGE_PRESENT) != 0) {
+                    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
+                    e3 = l3[PDPT_INDEX(virt_addr)];
+                    if ((e3 & PAGE_PRESENT) != 0 && (e3 & PAGE_PS) == 0) {
+                        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PAGE_FRAME_MASK);
+                        e2 = l2[PD_INDEX(virt_addr)];
+                        if ((e2 & PAGE_PRESENT) != 0 && (e2 & PAGE_PS) == 0) {
+                            uint64_t *l1 =
+                                (uint64_t *)(uintptr_t)(e2 & PAGE_FRAME_MASK);
+                            present_in_pt = 0u;
+                            for (uint32_t k = 0; k < 512u; ++k) {
+                                if ((l1[k] & PAGE_PRESENT) != 0) ++present_in_pt;
+                            }
+                        }
+                    }
+                }
+                serial_write_string("[lostmap] demand-zero code va=");
+                serial_write_uint64(virt_addr);
+                serial_write_string(" pml4e=");
+                serial_write_uint64(e4);
+                serial_write_string(" pdpte=");
+                serial_write_uint64(e3);
+                serial_write_string(" pde=");
+                serial_write_uint64(e2);
+                serial_write_string(" ptes_present=");
+                serial_write_uint64((uint64_t)present_in_pt);
+                /* Are the tables themselves still owned? A "free" here means
+                 * the frame was handed back to the allocator while the level
+                 * above still pointed at it. */
+                serial_write_string(" pdpt_alloc=");
+                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(
+                    e4 & PAGE_FRAME_MASK));
+                serial_write_string(" pd_alloc=");
+                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(
+                    e3 & PAGE_FRAME_MASK));
+                serial_write_string("\n");
+            }
+        }
+#endif
         void *phys_page = alloc_page();
         if (phys_page == NULL) {
             spinlock_unlock(&g_demand_fault_lock);
@@ -1740,7 +2147,12 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
     }
     spinlock_unlock(&g_swap_lock);
 
-    tlb_shootdown_all(virt_addr, 1ULL);
+    /* The page just became present: no other CPU can hold a translation that
+     * is now wrong, only one that says "not present", and that costs at most a
+     * spurious fault. A local invalidation is all this needs. */
+    if (cr3 == read_cr3()) {
+        invlpg_addr(virt_addr);
+    }
     return 1;
 }
 

@@ -11,7 +11,7 @@
 #include <string.h>
 
 #define SHARED_MEMORY_OBJECT_MAX 256u
-#define SHARED_MEMORY_MAPPING_MAX 16u
+#define SHARED_MEMORY_MAPPING_MAX 32u
 #define SHARED_MEMORY_MAX_BYTES (64u * 1024u * 1024u)
 #define SHARED_MEMORY_HANDLE_INDEX_BITS 8u
 #define SHARED_MEMORY_HANDLE_INDEX_MASK 0xffu
@@ -180,7 +180,20 @@ int32_t shared_memory_grant(int32_t handle, int32_t pid)
     return 0;
 }
 
-void *shared_memory_map(int32_t handle)
+/*
+ * `allow_alias` decides what a second map of the same object from the same
+ * address space gets.
+ *
+ * The native SYS_SHM_MAP contract is idempotent -- map twice, get the same
+ * pointer -- and the compositor relies on it. mmap(2) is not: each call is a
+ * separate mapping at its own address, and callers key off that address.
+ * Chromium's base::SharedMemoryTracker records every mapping in a map keyed by
+ * address and CHECKs the entry back out on unmap, so handing it the same
+ * pointer twice takes the process down at
+ * shared_memory_tracker.cc:62. The Linux path therefore asks for a fresh
+ * mapping of the same physical pages.
+ */
+static void *shared_memory_map_ex(int32_t handle, int allow_alias)
 {
     int32_t caller = shm_current_asid();
     if (caller < 0) return NULL;
@@ -194,7 +207,7 @@ void *shared_memory_map(int32_t handle)
         spinlock_unlock(&g_shared_memory_lock);
         return NULL;
     }
-    for (uint32_t i = 0u; i < object->mapping_count; ++i) {
+    for (uint32_t i = 0u; allow_alias && i < object->mapping_count; ++i) {
         if (object->mappings[i].pid == caller) {
             /* Alias the existing mapping, but count it: every successful
              * shared_memory_map() is matched by one shared_memory_unmap(),
@@ -275,6 +288,16 @@ void *shared_memory_map(int32_t handle)
     mapping->map_refs = 1u;
     spinlock_unlock(&g_shared_memory_lock);
     return (void *)(uintptr_t)address;
+}
+
+void *shared_memory_map(int32_t handle)
+{
+    return shared_memory_map_ex(handle, 1);
+}
+
+void *shared_memory_map_new(int32_t handle)
+{
+    return shared_memory_map_ex(handle, 0);
 }
 
 int32_t shared_memory_unmap(int32_t handle, void *address)

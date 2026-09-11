@@ -103,6 +103,22 @@ static inline void page_bitmap_set(uint64_t page_index, uint8_t used)
     }
 }
 
+/* 1 if the allocator still considers `phys` handed out, 0 if it is on the
+ * free list, -1 if the address is outside the managed range. Diagnostic only:
+ * a page table whose frame reads back as free has been freed while something
+ * still points at it. */
+int pmm_page_is_allocated(uint64_t phys)
+{
+    if (g_page_bitmap == NULL) {
+        return -1;
+    }
+    uint64_t page_index = phys / PAGE_SIZE;
+    if (page_index >= g_max_pages) {
+        return -1;
+    }
+    return page_bitmap_get(page_index) ? 1 : 0;
+}
+
 /* Physical pages currently free. */
 uint64_t memory_free_pages(void)
 {

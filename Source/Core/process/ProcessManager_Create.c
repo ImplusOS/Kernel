@@ -245,13 +245,10 @@ static void process_detach_dead_current_locked(void)
         return;
     }
 
-    uint32_t cpu = smp_get_current_cpu_id();
-    if (cpu < (uint32_t)OS_CONFIG_SMP_MAX_CPUS &&
-        proc->kernel_stack_base != NULL && g_parked_stack[cpu].base == NULL) {
-        g_parked_stack[cpu].base = proc->kernel_stack_base;
-        g_parked_stack[cpu].top = proc->kernel_stack_top;
-        proc->kernel_stack_base = NULL; /* the reaper must not free it */
-    }
+    /* No stack parking any more: the reaper no longer frees kernel stacks, so
+     * there is nothing to rescue. The old scheme could only hold one stack per
+     * CPU, and a second death before the first was released left that one
+     * unprotected -- which is the case that actually bit. */
     /* This CPU is also still running on the dying process's page tables, and
      * the reap tears those down (paging_destroy_process_space). Get onto the
      * kernel's own CR3 first, or the next instruction faults with no page
@@ -643,8 +640,9 @@ static void reset_process_slot(process_t *proc)
     proc->gs_base = 0;
 
     proc->cr3 = 0;
-    proc->kernel_stack_base = NULL;
-    proc->kernel_stack_top = 0;
+    /* kernel_stack_base / kernel_stack_top are deliberately NOT cleared: the
+     * stack belongs to the slot, not to the process that last used it. See
+     * the allocation site. */
     proc->user_code_base = 0;
     proc->user_code_limit = 0;
     proc->user_heap_base = 0;
@@ -711,14 +709,17 @@ static void release_thread_resources(process_t *proc, int unmap_user_stack)
                                  proc->thread_stack_region_base,
                                  proc->thread_stack_region_size);
     }
-    if (proc->kernel_stack_base != NULL) {
-        free(proc->kernel_stack_base);
-        proc->kernel_stack_base = NULL;
-    }
+    /* The kernel stack stays with the slot. Freeing it here raced with the
+     * CPU that was still running on it: a thread is torn down from whichever
+     * CPU reaps it, while the CPU that was executing the thread may not have
+     * left its stack yet, and the heap would hand those pages straight to
+     * somebody else. That is a reboot with nothing on the serial line, and
+     * Chromium -- which creates and destroys threads continuously -- hit it
+     * within a minute under -smp 4. Keeping it costs one 128 KiB stack per
+     * occupied process slot and removes the window entirely. */
     proc->cr3 = 0;
     proc->thread_stack_region_base = 0;
     proc->thread_stack_region_size = 0;
-    proc->kernel_stack_top = 0;
 }
 
 static void release_process_resources(process_t *proc)
@@ -738,6 +739,7 @@ static void release_process_resources(process_t *proc)
         owner_pid = (int32_t)(proc - g_processes);
     }
 
+    int threads_still_running = 0;
     if (owner_pid >= 0) {
         for (int32_t i = 1; i < g_process_capacity; ++i) {
             process_t *thread = &g_processes[i];
@@ -745,6 +747,7 @@ static void release_process_resources(process_t *proc)
                 thread->memory_owner_pid == owner_pid &&
                 thread->state != PROCESS_STATE_UNUSED) {
                 if (process_scheduler_pid_in_use_on_any_cpu(i)) {
+                    threads_still_running = 1;
                     continue;
                 }
                 release_thread_resources(thread, 0);
@@ -753,15 +756,32 @@ static void release_process_resources(process_t *proc)
         }
     }
 
+    /*
+     * Only tear the address space down once nothing is executing in it.
+     *
+     * The loop above deliberately skips threads another CPU is still running,
+     * and destroying the page tables anyway pulls them out from under that
+     * CPU -- which does not fault, it triple-faults, and the machine resets
+     * with nothing on the serial line. Chromium reaches this every run: it
+     * exits with dozens of threads live across four CPUs.
+     *
+     * When that happens the page tables are left behind rather than freed. It
+     * leaks a few pages per such exit, which is the cheap side of this trade.
+     */
     if (proc->cr3 != 0) {
-        paging_destroy_process_space(proc->cr3);
+        if (threads_still_running) {
+            static uint32_t warned;
+            if (warned < 8u) {
+                ++warned;
+                serial_write_string("[proc] address space kept: threads still "
+                                    "running on other CPUs\n");
+            }
+        } else {
+            paging_destroy_process_space(proc->cr3);
+        }
         proc->cr3 = 0;
     }
-    if (proc->kernel_stack_base != NULL) {
-        free(proc->kernel_stack_base);
-        proc->kernel_stack_base = NULL;
-    }
-    proc->kernel_stack_top = 0;
+    /* Kept, not freed -- see the note in the thread teardown above. */
     proc->capability_mask = 0;
     proc->user_code_base = 0;
     proc->user_code_limit = 0;
@@ -1723,11 +1743,19 @@ static int initialize_process_memory(process_t *proc,
         return -1;
     }
 
-    proc->kernel_stack_base = malloc(PROCESS_KERNEL_STACK_SIZE);
-    if (!proc->kernel_stack_base) {
-        return -1;
+    /* One kernel stack per process slot, allocated on first use and kept for
+     * the life of the boot. Reusing it is what makes teardown safe (nothing is
+     * ever handed back to the heap while a CPU might still be standing on it)
+     * and it also takes a 128 KiB allocation out of every thread creation. */
+    if (proc->kernel_stack_base == NULL) {
+        proc->kernel_stack_base = malloc(PROCESS_KERNEL_STACK_SIZE);
+        if (!proc->kernel_stack_base) {
+            return -1;
+        }
+        proc->kernel_stack_top =
+            ((uint64_t)(uintptr_t)(proc->kernel_stack_base +
+                                   PROCESS_KERNEL_STACK_SIZE)) & ~0xFULL;
     }
-    proc->kernel_stack_top = ((uint64_t)(uintptr_t)(proc->kernel_stack_base + PROCESS_KERNEL_STACK_SIZE)) & ~0xFULL;
     process_kstack_arm(proc);
 
     proc->cr3 = paging_create_process_space();
@@ -2675,6 +2703,7 @@ int32_t process_create_thread_ex(uint64_t entry,
          * fs_base afterwards would race against the thread's own first
          * instructions observing the wrong TLS base. */
         thread->fs_base = tls_fs_base;
+
     }
     thread->state = PROCESS_STATE_READY;
     process_perf_mark_ready_locked(thread, process_perf_now_ns());
@@ -4194,6 +4223,56 @@ static int process_group_has_living_member_locked(int32_t leader_pid)
     return 0;
 }
 
+/*
+ * Timer-driven snapshot of every live task: state, and the last Linux syscall
+ * it made. Enabled with -DPROCESS_STALL_DUMP=1.
+ *
+ * The syscall-driven heartbeat in Syscall_LinuxCompat.c cannot report the one
+ * situation worth reporting -- every thread blocked, no syscalls at all -- so
+ * this is hung off the timer instead. State codes are PROCESS_STATE_*: 1 READY,
+ * 2 RUNNING, 3 BLOCKED, 5 ZOMBIE.
+ */
+#ifndef PROCESS_STALL_DUMP
+#define PROCESS_STALL_DUMP 0
+#endif
+#if PROCESS_STALL_DUMP
+#ifndef PROCESS_STALL_DUMP_MS
+#define PROCESS_STALL_DUMP_MS 10000u
+#endif
+extern uint32_t linux_heartbeat_last_num(int32_t pid);
+extern uint64_t linux_heartbeat_count(int32_t pid);
+
+void process_stall_dump_tick(void)
+{
+    static uint64_t next_ns;
+    uint64_t now = timer_monotonic_ns();
+    if (next_ns == 0u) {
+        next_ns = now + (uint64_t)PROCESS_STALL_DUMP_MS * 1000000ull;
+        return;
+    }
+    if (now < next_ns) {
+        return;
+    }
+    next_ns = now + (uint64_t)PROCESS_STALL_DUMP_MS * 1000000ull;
+
+    serial_write_string("[stall] free=");
+    serial_write_uint64(memory_free_pages());
+    for (int32_t i = 0; i < g_process_capacity; ++i) {
+        const process_t *p = &g_processes[i];
+        if (p->state == PROCESS_STATE_UNUSED) continue;
+        serial_write_string(" ");
+        serial_write_uint32((uint32_t)i);
+        serial_write_string(":s");
+        serial_write_uint32((uint32_t)p->state);
+        serial_write_string(":#");
+        serial_write_uint32(linux_heartbeat_last_num(i));
+        serial_write_string(":n");
+        serial_write_uint64(linux_heartbeat_count(i));
+    }
+    serial_write_char('\n');
+}
+#endif
+
 int32_t process_get_current_pid(void)
 {
     uint64_t irq_flags = irq_save_disable();
@@ -4794,6 +4873,26 @@ int process_run_next_on_current_cpu(void)
         ops->enter_user_mode(next_saved_rsp, next_user_rsp, next_cr3);
     }
     return 0;
+}
+
+/* process_user_buffer_is_valid() plus "and a user-mode write to it would be
+ * allowed". Destinations of read(2)-like syscalls need this: the kernel can
+ * write through a read-only user mapping without trapping, so without the
+ * check a read into PROT_READ memory silently succeeds where Linux returns
+ * EFAULT. See paging_user_range_is_writable(). */
+int process_user_buffer_is_writable(const void *ptr, uint64_t len)
+{
+    if (len == 0) {
+        return 1;
+    }
+    if (!process_user_buffer_is_valid(ptr, len)) {
+        return 0;
+    }
+    uint64_t cr3 = process_get_current_cr3();
+    if (cr3 == 0) {
+        return 1;
+    }
+    return paging_user_range_is_writable(cr3, (uint64_t)(uintptr_t)ptr, len);
 }
 
 int process_user_buffer_is_valid(const void *ptr, uint64_t len)

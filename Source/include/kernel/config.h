@@ -40,6 +40,22 @@
 #define KERNEL_COW_FORK 0
 #endif
 
+/*
+ * TLB shootdown is synchronous: smp_tlb_shootdown_cr3() does not return until
+ * every CPU that could hold a stale translation has invalidated it. There is
+ * no switch for it because there is no safe setting other than on -- a
+ * fire-and-forget shootdown lets the sender free a page, narrow its protection
+ * or hand its address range back to the allocator while another CPU is still
+ * writing through the old translation, which is what made headless Chromium
+ * die of memory corruption within a minute under `-smp >1` while surviving
+ * indefinitely under `-smp 1`.
+ *
+ * What makes the wait affordable is that the request names an address space:
+ * without PCID an x86 CR3 load flushes the whole TLB, so only the CPUs
+ * currently running that CR3 have to answer. See
+ * Arch/x86_64/smp/SMP_Main.c.
+ */
+
 #ifndef OS_CONFIG_PROCESS_MAX_COUNT
 #ifdef PROCESS_MAX_COUNT_CONFIG
 #define OS_CONFIG_PROCESS_MAX_COUNT PROCESS_MAX_COUNT_CONFIG
@@ -143,8 +159,23 @@
 #define OS_CONFIG_LOG_FILE_MAX_BYTES (512 * 1024)
 #endif
 
+/* Boot hand-off animation. With this set, the last thing the kernel does to
+ * the boot screen is freeze it, scale it to 150% and dissolve it to black on
+ * an ease-in-out curve (Kernel/Source/Boot/BootAnim.c); the init process then
+ * brings its own first screen back in from 50% (Userland/Source/Userland.c).
+ * Set to 0 for a boot that hands over on the bare boot screen -- the two
+ * halves are independent, so the kernel half can be dropped on its own.
+ * Costs OS_CONFIG_BOOT_FADE_MS of wall time plus one full-screen snapshot on
+ * the kernel heap, both released before userland starts. */
 #ifndef OS_CONFIG_BOOT_FADE
-#define OS_CONFIG_BOOT_FADE 0
+#define OS_CONFIG_BOOT_FADE 1
+#endif
+
+/* Wall-clock length of the kernel half of that transition, in milliseconds.
+ * The loop is time-driven, so this is what the animation actually takes: a
+ * panel too large to blit at 60 Hz loses frames, not time. */
+#ifndef OS_CONFIG_BOOT_FADE_MS
+#define OS_CONFIG_BOOT_FADE_MS 420u
 #endif
 
 /* Per-event tracing of the foreign (Linux-ABI) runtime: every shared-object

@@ -9,6 +9,16 @@
 
 const driver_binary_t *g_api = NULL;
 
+/* A lock that sleeps rather than spins, spelled locally because this file is
+ * built both into the kernel and as a position-independent driver module, and
+ * the module has only the driver_binary_t vtable to link against.
+ *
+ * It has to sleep. A USB command polls for completion through
+ * xhci_delay_ms() -> timer_msleep(), which yields to the scheduler, so the
+ * holder can be switched away mid-transfer. A spinning waiter would then hold
+ * its CPU against the very task it is waiting for. */
+typedef struct { volatile uint32_t value; } sleeplock_t;
+
 uint8_t  g_mass_storage_addr      = 0;
 uint8_t  g_mass_storage_ep_in     = 0;
 uint8_t  g_mass_storage_ep_out    = 0;
@@ -1369,45 +1379,96 @@ static bool usb_storage_get_info(uint32_t device_index,
     return true;
 }
 
+/*
+ * One transfer at a time on the Bulk-Only Transport.
+ *
+ * MassStorage.c drives the device through state every command shares: a single
+ * bounce buffer, the CBW tag counter, and the selected device index. It also
+ * runs a three-step CBW -> data -> CSW sequence per command. Two CPUs issuing
+ * commands at once therefore interleave the sequences and read each other's
+ * bytes out of the same bounce buffer.
+ *
+ * Nothing made that happen until demand paging did. filemap_handle_fault()
+ * drops its lock before reading, precisely so the block driver can block, so a
+ * multi-threaded program faulting on pages of a large mapping has several CPUs
+ * in here at once. Chromium is 465 MiB of it: pages came back holding another
+ * fault's data, which is why the browser died of memory corruption within a
+ * minute under `-smp >1` and ran for as long as you liked under `-smp 1`.
+ *
+ * The lock covers device selection as well as the transfer, since selecting is
+ * itself a write to that shared state.
+ */
+static sleeplock_t g_usb_storage_lock;
+
+static void usb_storage_lock(void)
+{
+    while (__sync_lock_test_and_set(&g_usb_storage_lock.value, 1u)) {
+        /* Spin briefly first. A transfer that is already near its end is
+         * handed over in far less than the 1 ms the sleep below costs, and at
+         * demand-paging rates that difference is the whole budget. */
+        uint32_t spins = 0u;
+        while (g_usb_storage_lock.value != 0u && spins < 200000u) {
+            __asm__ volatile("pause" ::: "memory");
+            ++spins;
+        }
+        if (g_usb_storage_lock.value != 0u &&
+            g_api != NULL && g_api->timer_msleep != NULL) {
+            g_api->timer_msleep(1u);
+        }
+    }
+}
+
+static void usb_storage_unlock(void)
+{
+    __sync_lock_release(&g_usb_storage_lock.value);
+}
+
 static bool usb_storage_read(uint32_t device_index, uint64_t lba,
                              void *buffer, uint32_t block_count)
 {
-    if (!bot_select_device(device_index)) {
-        return false;
+    usb_storage_lock();
+    bool ok = false;
+    if (bot_select_device(device_index)) {
+        uint32_t block_size = bot_get_block_size();
+        uint64_t factor = block_size / 512u;
+        uint64_t sector_lba = lba * factor;
+        uint64_t sectors = (uint64_t)block_count * factor;
+        if (factor != 0u && sector_lba <= UINT32_MAX && sectors <= UINT32_MAX &&
+            sector_lba + sectors <= (uint64_t)UINT32_MAX + 1u) {
+            ok = bot_read_sectors((uint32_t)sector_lba, (uint8_t *)buffer,
+                                  (uint32_t)sectors);
+        }
     }
-    uint32_t block_size = bot_get_block_size();
-    uint64_t factor = block_size / 512u;
-    uint64_t sector_lba = lba * factor;
-    uint64_t sectors = (uint64_t)block_count * factor;
-    if (factor == 0u || sector_lba > UINT32_MAX || sectors > UINT32_MAX ||
-        sector_lba + sectors > (uint64_t)UINT32_MAX + 1u) {
-        return false;
-    }
-    return bot_read_sectors((uint32_t)sector_lba, (uint8_t *)buffer,
-                            (uint32_t)sectors);
+    usb_storage_unlock();
+    return ok;
 }
 
 static bool usb_storage_write(uint32_t device_index, uint64_t lba,
                               const void *buffer, uint32_t block_count)
 {
-    if (!bot_select_device(device_index)) {
-        return false;
+    usb_storage_lock();
+    bool ok = false;
+    if (bot_select_device(device_index)) {
+        uint32_t block_size = bot_get_block_size();
+        uint64_t factor = block_size / 512u;
+        uint64_t sector_lba = lba * factor;
+        uint64_t sectors = (uint64_t)block_count * factor;
+        if (factor != 0u && sector_lba <= UINT32_MAX && sectors <= UINT32_MAX &&
+            sector_lba + sectors <= (uint64_t)UINT32_MAX + 1u) {
+            ok = bot_write_sectors((uint32_t)sector_lba,
+                                   (const uint8_t *)buffer, (uint32_t)sectors);
+        }
     }
-    uint32_t block_size = bot_get_block_size();
-    uint64_t factor = block_size / 512u;
-    uint64_t sector_lba = lba * factor;
-    uint64_t sectors = (uint64_t)block_count * factor;
-    if (factor == 0u || sector_lba > UINT32_MAX || sectors > UINT32_MAX ||
-        sector_lba + sectors > (uint64_t)UINT32_MAX + 1u) {
-        return false;
-    }
-    return bot_write_sectors((uint32_t)sector_lba,
-                             (const uint8_t *)buffer, (uint32_t)sectors);
+    usb_storage_unlock();
+    return ok;
 }
 
 static bool usb_storage_flush(uint32_t device_index)
 {
-    return bot_select_device(device_index) && bot_flush();
+    usb_storage_lock();
+    bool ok = bot_select_device(device_index) && bot_flush();
+    usb_storage_unlock();
+    return ok;
 }
 
 static const usb_master_vtable_t g_usb_vtable = {

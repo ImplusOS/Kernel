@@ -56,11 +56,67 @@ static uint8_t  g_cpu_apic_ids[ACPI_MAX_CPUS];
 static uint32_t g_cpu_apic_count = 0;
 static int32_t  g_current_pid_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
 
-volatile struct {
+/*
+ * TLB shootdown: one request slot per CPU, plus an acknowledgement matrix.
+ *
+ * The previous version had a single shared slot and never waited for anyone to
+ * act on it. Both halves of that were wrong. Not waiting means the initiator
+ * carries on -- freeing the page, narrowing its permissions, handing the
+ * address range back to the allocator -- while other CPUs still hold the old
+ * translation and keep writing through it. Sharing one unlocked slot means two
+ * CPUs shooting down at the same time overwrite each other's request, so one
+ * of the two flushes never happens at all. With a few dozen Chromium threads
+ * calling mmap/mprotect/munmap across four CPUs, both happen constantly, and
+ * the result is memory that changes under the process: the browser died within
+ * a minute under -smp >1 and ran indefinitely under -smp 1.
+ *
+ * Each CPU now owns g_tlb_slot[cpu] and bumps its `seq` to publish a request.
+ * A responder services every slot it has not caught up with and records the
+ * sequence it serviced in g_tlb_seen[responder][requester]. The initiator waits
+ * until every online CPU has recorded its sequence -- and services other CPUs'
+ * slots while it waits, so two CPUs shooting down simultaneously unblock each
+ * other instead of deadlocking. A slot stays stable while its request is
+ * outstanding because its owner is blocked in that wait.
+ */
+typedef struct {
+    volatile uint64_t cr3;     /* 0 = concerns every address space */
     volatile uint64_t vaddr;
-    volatile uint64_t pages;
-    volatile uint32_t ack_count;
-} g_tlb_req;
+    volatile uint64_t pages;   /* 0 = flush everything */
+    volatile uint32_t seq;
+} tlb_request_t;
+
+/* The address space each CPU currently has loaded, published by
+ * smp_note_cr3(). Without PCID a CR3 load flushes the whole TLB, so a CPU that
+ * is not running an address space cannot hold a stale translation for it --
+ * which is what lets a shootdown skip it instead of waiting. */
+static volatile uint64_t g_cpu_cr3[OS_CONFIG_SMP_MAX_CPUS];
+
+static tlb_request_t g_tlb_slot[OS_CONFIG_SMP_MAX_CPUS];
+static volatile uint32_t
+    g_tlb_seen[OS_CONFIG_SMP_MAX_CPUS][OS_CONFIG_SMP_MAX_CPUS];
+
+/* Bounded so a CPU that is wedged (or was never really brought up) degrades to
+ * the old best-effort behaviour instead of hanging the machine. Sized to be
+ * far longer than any legitimate IPI turnaround. */
+#define TLB_ACK_SPIN_LIMIT 20000000u
+
+/* Non-zero while at least one shootdown is waiting for acknowledgements. Lets
+ * smp_tlb_poll() -- called from every contended spinlock -- cost a single
+ * relaxed load in the common case instead of an APIC read. */
+static volatile uint32_t g_tlb_inflight;
+
+/* Bring-up instrumentation for the shootdown cost. Enabled with
+ * -DTLB_STATS=1; the counters are relaxed atomics and the dump is rate
+ * limited, so it costs nothing measurable. */
+#ifndef TLB_STATS
+#define TLB_STATS 0
+#endif
+#if TLB_STATS
+static volatile uint64_t g_tlb_calls;   /* requests made */
+static volatile uint64_t g_tlb_ipis;    /* of those, ones that needed an IPI */
+static volatile uint64_t g_tlb_spins;   /* total spin iterations waiting */
+static volatile uint64_t g_tlb_maxspin; /* worst single wait */
+#endif
 
 extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
@@ -326,55 +382,209 @@ void smp_set_current_pid(int32_t pid)
     g_current_pid_per_cpu[cpu] = pid;
 }
 
-void smp_tlb_shootdown(uint64_t vaddr, uint64_t pages)
+/* Act on every other CPU's outstanding request that this CPU has not yet
+ * caught up with. Safe to call from the shootdown IPI handler and from inside
+ * the initiator's own wait loop.
+ *
+ * The acknowledgement is unconditional: a CPU that is not running the address
+ * space the request names has nothing to invalidate (its last CR3 load already
+ * flushed everything), but it still has to say so, or the sender waits for it.
+ */
+static void tlb_service_peers(uint32_t me)
 {
-    if (__atomic_load_n(&g_cpu_online, __ATOMIC_ACQUIRE) <= 1) {
-        for (uint64_t i = 0; i < pages; i++) {
+    uint32_t count = __atomic_load_n(&g_cpu_online, __ATOMIC_ACQUIRE);
+    if (count > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        count = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
+    }
+    uint64_t mine = paging_get_active_cr3();
+    for (uint32_t r = 0; r < count; ++r) {
+        if (r == me) {
+            continue;
+        }
+        uint32_t seq = __atomic_load_n(&g_tlb_slot[r].seq, __ATOMIC_ACQUIRE);
+        if (seq == __atomic_load_n(&g_tlb_seen[me][r], __ATOMIC_RELAXED)) {
+            continue;
+        }
+        uint64_t want  = g_tlb_slot[r].cr3;
+        uint64_t addr  = g_tlb_slot[r].vaddr;
+        uint64_t pages = g_tlb_slot[r].pages;
+        if (want == 0u || want == mine) {
+            if (pages == 0u) {
+                paging_switch_cr3(mine);
+            } else {
+                for (uint64_t i = 0; i < pages; ++i) {
+                    hal_mmu_invalidate_tlb(addr + i * 4096ULL);
+                }
+            }
+        }
+        __atomic_store_n(&g_tlb_seen[me][r], seq, __ATOMIC_RELEASE);
+    }
+}
+
+/* Does CPU `c` still have to answer request `seq` from CPU `me`? */
+static int tlb_ack_outstanding(uint32_t c, uint32_t me, uint32_t seq,
+                               uint64_t want)
+{
+    if (__atomic_load_n(&g_tlb_seen[c][me], __ATOMIC_ACQUIRE) == seq) {
+        return 0;   /* answered */
+    }
+    if (want != 0u &&
+        __atomic_load_n(&g_cpu_cr3[c], __ATOMIC_ACQUIRE) != want) {
+        return 0;   /* not running this address space: nothing stale to hold */
+    }
+    return 1;
+}
+
+void smp_note_cr3(uint64_t cr3)
+{
+    uint32_t me = smp_get_current_cpu_id();
+    if (me >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        me = 0;
+    }
+    __atomic_store_n(&g_cpu_cr3[me], cr3, __ATOMIC_RELEASE);
+}
+
+void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
+{
+    uint32_t online = __atomic_load_n(&g_cpu_online, __ATOMIC_ACQUIRE);
+    uint32_t me = smp_get_current_cpu_id();
+    if (me >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        me = 0;
+    }
+#if TLB_STATS
+    __atomic_fetch_add(&g_tlb_calls, 1u, __ATOMIC_RELAXED);
+#endif
+
+    /* This CPU's own flush happens either way. */
+    if (pages == 0u) {
+        paging_switch_cr3(paging_get_active_cr3());
+    } else {
+        for (uint64_t i = 0; i < pages; ++i) {
             hal_mmu_invalidate_tlb(vaddr + i * 4096ULL);
         }
+    }
+
+    if (online <= 1u) {
         return;
     }
+    if (online > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        online = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
+    }
 
-    __atomic_store_n(&g_tlb_req.vaddr,     vaddr, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlb_req.pages,     pages, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlb_req.ack_count, 0u,    __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* Nobody else is running this address space: nobody else can hold a
+     * translation for it. This is the common case and costs no IPI at all. */
+    if (cr3 != 0u) {
+        int peers = 0;
+        for (uint32_t c = 0; c < online; ++c) {
+            if (c != me &&
+                __atomic_load_n(&g_cpu_cr3[c], __ATOMIC_ACQUIRE) == cr3) {
+                peers = 1;
+                break;
+            }
+        }
+        if (!peers) {
+            return;
+        }
+    }
 
+    g_tlb_slot[me].cr3 = cr3;
+    g_tlb_slot[me].vaddr = vaddr;
+    g_tlb_slot[me].pages = pages;
+    uint32_t seq = g_tlb_slot[me].seq + 1u;
+    __atomic_fetch_add(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlb_slot[me].seq, seq, __ATOMIC_RELEASE);
+
+#if TLB_STATS
+    __atomic_fetch_add(&g_tlb_ipis, 1u, __ATOMIC_RELAXED);
+#endif
     lapic_send_ipi(0, (3u << 18) | (uint32_t)VECTOR_TLB_SHOOTDOWN);
 
-    for (uint64_t i = 0; i < pages; i++) {
-        hal_mmu_invalidate_tlb(vaddr + i * 4096ULL);
+    for (uint32_t spins = 0; spins < TLB_ACK_SPIN_LIMIT; ++spins) {
+        int pending = 0;
+        for (uint32_t c = 0; c < online; ++c) {
+            if (c == me) continue;
+            if (tlb_ack_outstanding(c, me, seq, cr3)) {
+                pending = 1;
+                break;
+            }
+        }
+        if (!pending) {
+#if TLB_STATS
+            __atomic_fetch_add(&g_tlb_spins, (uint64_t)spins, __ATOMIC_RELAXED);
+            if ((uint64_t)spins > __atomic_load_n(&g_tlb_maxspin, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&g_tlb_maxspin, (uint64_t)spins, __ATOMIC_RELAXED);
+            }
+            uint64_t n = __atomic_load_n(&g_tlb_ipis, __ATOMIC_RELAXED);
+            if ((n & 0xFFu) == 0u) {
+                serial_write_string("[tlbstat] calls=");
+                serial_write_uint64(__atomic_load_n(&g_tlb_calls, __ATOMIC_RELAXED));
+                serial_write_string(" ipis=");
+                serial_write_uint64(n);
+                serial_write_string(" spins=");
+                serial_write_uint64(__atomic_load_n(&g_tlb_spins, __ATOMIC_RELAXED));
+                serial_write_string(" max=");
+                serial_write_uint64(__atomic_load_n(&g_tlb_maxspin, __ATOMIC_RELAXED));
+                serial_write_string("\n");
+            }
+#endif
+            __atomic_fetch_sub(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
+            return;
+        }
+        /* Another CPU may be waiting on us at the same time. */
+        tlb_service_peers(me);
+        __asm__ volatile("pause" ::: "memory");
     }
+
+    /* Timed out. Report it once in a while: reaching here means a CPU stopped
+     * answering, and the memory this shootdown was protecting is no longer
+     * protected. */
+    {
+        static volatile uint32_t reported;
+        if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 8u) {
+            serial_write_string("[tlb] ack timeout cpu=");
+            serial_write_uint32(me);
+            serial_write_string(" cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string("\n");
+        }
+    }
+    __atomic_fetch_sub(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
+}
+
+void smp_tlb_shootdown(uint64_t vaddr, uint64_t pages)
+{
+    if (pages == 0u) {
+        return;
+    }
+    smp_tlb_shootdown_cr3(0u, vaddr, pages);
 }
 
 void smp_tlb_shootdown_all(void)
 {
-    if (__atomic_load_n(&g_cpu_online, __ATOMIC_ACQUIRE) <= 1) {
-        paging_switch_cr3(paging_get_active_cr3());
+    smp_tlb_shootdown_cr3(0u, 0u, 0u);
+}
+
+void smp_tlb_poll(void)
+{
+    if (__atomic_load_n(&g_tlb_inflight, __ATOMIC_RELAXED) == 0u) {
         return;
     }
-
-    __atomic_store_n(&g_tlb_req.vaddr,     0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlb_req.pages,     0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_tlb_req.ack_count, 0u, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-    lapic_send_ipi(0, (3u << 18) | (uint32_t)VECTOR_TLB_SHOOTDOWN);
-
-    paging_switch_cr3(paging_get_active_cr3());
+    if (__atomic_load_n(&g_cpu_online, __ATOMIC_ACQUIRE) <= 1u) {
+        return;
+    }
+    uint32_t me = smp_get_current_cpu_id();
+    if (me >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        me = 0;
+    }
+    tlb_service_peers(me);
 }
 
 void smp_tlb_shootdown_handler(void)
 {
-    uint64_t addr  = __atomic_load_n(&g_tlb_req.vaddr, __ATOMIC_ACQUIRE);
-    uint64_t pages = __atomic_load_n(&g_tlb_req.pages, __ATOMIC_ACQUIRE);
-    if (pages == 0u) {
-        paging_switch_cr3(paging_get_active_cr3());
-    } else {
-        for (uint64_t i = 0; i < pages; i++) {
-            hal_mmu_invalidate_tlb(addr + i * 4096ULL);
-        }
+    uint32_t me = smp_get_current_cpu_id();
+    if (me >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        me = 0;
     }
-    __atomic_fetch_add(&g_tlb_req.ack_count, 1u, __ATOMIC_RELEASE);
+    tlb_service_peers(me);
     lapic_eoi();
 }

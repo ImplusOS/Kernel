@@ -2106,6 +2106,14 @@ int64_t syscall_memfd_read(int32_t fd, uint8_t *buffer, uint64_t len)
 
 int64_t syscall_memfd_write(int32_t fd, const uint8_t *buffer, uint64_t len)
 {
+    /* A memfd sealed against writes must refuse them. Linux answers EPERM, and
+     * Mojo depends on it: mojo::core::CreateSealedMemFD() seals the buffer and
+     * then CHECKs that the seal actually bites (channel_linux.cc:947). */
+    if (fd >= 0 && fd < FILE_MAX_FD &&
+        (g_memfds[fd].seals & (FILE_SEAL_WRITE | FILE_SEAL_FUTURE_WRITE)) != 0u) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+
     kernel_memfd_t *memfd = &g_memfds[fd];
     if (memfd->shm_handle >= 0) {
         return (int64_t)OS_STATUS_NOT_SUPPORTED;

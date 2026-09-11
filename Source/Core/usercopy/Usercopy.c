@@ -23,6 +23,12 @@ uint64_t copy_to_user(void *user_dst, const void *kernel_src, uint64_t bytes)
     if (bytes == 0) {
         return 0;
     }
+    /* Range only. Checking write permission here as well would be the honest
+     * thing -- the kernel can write straight through a read-only user mapping
+     * and Linux cannot -- but it puts a page-table walk on every syscall that
+     * returns data, which measurably slows the system down. The syscalls whose
+     * callers actually depend on the EFAULT ask for it explicitly, via
+     * process_user_buffer_is_writable(). */
     if (user_dst == 0 || kernel_src == 0 ||
         !process_user_buffer_is_valid(user_dst, bytes)) {
         return bytes;

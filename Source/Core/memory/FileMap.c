@@ -33,7 +33,13 @@
 #define FILEMAP_MAX 1024
 
 /* Pages faulted in per file-backed fault. See filemap_handle_fault(). */
-#define FILEMAP_READAHEAD_PAGES 16
+/* 64 pages (256 KiB) per fault. Sixteen was chosen when concurrent block reads
+ * overlapped -- which they did by corrupting each other, since the USB
+ * transport has one bounce buffer and no locking. Serialising those reads (see
+ * usb_storage_lock() in Drivers/Bus/USB/USB_Main.c) made the per-command cost
+ * matter, so fetch more per command. pmm_alloc_pages() halves the run down
+ * when a contiguous one that big is not available. */
+#define FILEMAP_READAHEAD_PAGES 64
 
 typedef struct {
     uint8_t  used;
@@ -224,10 +230,14 @@ int filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr)
         ++pages;
     }
 
+    /* Halve down rather than dropping straight to a single page: giving up the
+     * whole read-ahead because a 16-page run was not available turns one
+     * transfer into sixteen, and the block device is the slowest thing in
+     * this path. */
     uint8_t *frames = (uint8_t *)pmm_alloc_pages((size_t)pages);
-    if (frames == NULL && pages > 1u) {
-        pages = 1u; /* no contiguous run available: settle for the one page */
-        frames = (uint8_t *)pmm_alloc_pages(1);
+    while (frames == NULL && pages > 1u) {
+        pages /= 2u;
+        frames = (uint8_t *)pmm_alloc_pages((size_t)pages);
     }
     if (frames == NULL) {
         return 0;

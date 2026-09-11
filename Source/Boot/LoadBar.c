@@ -31,6 +31,9 @@ static volatile uint8_t  g_ready = 0;
 static volatile uint32_t g_tick_accum = 0;
 static volatile uint32_t g_pending_ticks = 0;
 static volatile uint32_t g_draw_busy = 0;
+/* Set by load_bar_stop(): the spinner no longer animates but its last frame is
+ * still on the panel, so a later load_bar_finish() still has work to do. */
+static volatile uint8_t  g_pending_erase = 0;
 
 static uint32_t g_anim_tick = 0;
 static uint32_t g_head = 2800;
@@ -299,8 +302,22 @@ void load_bar_tick(uint64_t tick) {
     __atomic_add_fetch(&g_pending_ticks, 1u, __ATOMIC_RELEASE);
 }
 
-void load_bar_finish(void) {
+void load_bar_stop(void) {
     if (!g_ready) return;
+    g_pending_erase = 1;
+    /* Same handshake as load_bar_finish(): taking the draw flag keeps a frame
+     * in flight on another CPU from landing on the panel after the caller has
+     * already captured it. */
+    if (__atomic_exchange_n(&g_draw_busy, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        g_ready = 0;
+        return;
+    }
+    g_ready = 0;
+    __atomic_store_n(&g_draw_busy, 0u, __ATOMIC_RELEASE);
+}
+
+void load_bar_finish(void) {
+    if (!g_ready && !g_pending_erase) return;
     if (__atomic_exchange_n(&g_draw_busy, 1u, __ATOMIC_ACQUIRE) != 0u) {
         g_ready = 0;
         return;
@@ -308,5 +325,6 @@ void load_bar_finish(void) {
     spinner_clear_box();
     flush_backbuffer();
     g_ready = 0;
+    g_pending_erase = 0;
     __atomic_store_n(&g_draw_busy, 0u, __ATOMIC_RELEASE);
 }

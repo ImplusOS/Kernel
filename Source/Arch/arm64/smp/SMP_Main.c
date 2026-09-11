@@ -93,3 +93,22 @@ void smp_set_current_pid(int32_t pid)
     uint32_t cpu = smp_get_current_cpu_id();
     if (cpu < 64) g_current_pid[cpu] = pid;
 }
+
+void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
+{
+    (void)cr3;
+    if (pages == 0u) {
+        smp_tlb_shootdown(vaddr, 1u);
+        return;
+    }
+    smp_tlb_shootdown(vaddr, pages);
+}
+
+void smp_note_cr3(uint64_t cr3)
+{
+    (void)cr3;
+}
+
+void smp_tlb_poll(void)
+{
+}

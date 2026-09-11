@@ -25,6 +25,7 @@
 #include "Core/timer/Timer.h"
 #include "Core/hardening/StackProtector.h"
 #include "Boot/LoadBar.h"
+#include "Boot/BootAnim.h"
 #include "Platform/acpi/ACPI.h"
 #include "Platform/interrupt/Interrupts.h"
 #include "Core/vfs/VFS.h"
@@ -39,13 +40,10 @@
 #include <stdio.h>
 #include "interfaces/arch_ops.h"
 #include "interfaces/timer_hal.h"
+#include "Core/debug/FlightRec.h"
 
 static BOOT_INFO g_boot_info_copy;
 
-#if OS_CONFIG_BOOT_FADE
-static uint32_t *g_fb_snapshot = NULL;
-static uint32_t g_fb_snapshot_pixels = 0;
-#endif
 static uint64_t g_boot_framebuffer_phys_base = 0;
 static uint64_t g_boot_framebuffer_phys_size = 0;
 
@@ -221,84 +219,6 @@ bool all_fs_initialize(void)
 
     return true;
 }
-
-#if OS_CONFIG_BOOT_FADE
-static inline uint32_t alpha_blend(uint32_t dst, uint32_t src)
-{
-    uint8_t a  = (uint8_t)((src >> 24) & 0xFFu);
-
-    if (a == 255) {
-        return src;
-    }
-
-    if (a == 0) {
-        return dst;
-    }
-
-    uint8_t sr = (uint8_t)((src >> 16) & 0xFFu);
-    uint8_t sg = (uint8_t)((src >> 8)  & 0xFFu);
-    uint8_t sb = (uint8_t)((src >> 0)  & 0xFFu);
-
-    uint8_t dr = (uint8_t)((dst >> 16) & 0xFFu);
-    uint8_t dg = (uint8_t)((dst >> 8)  & 0xFFu);
-    uint8_t db = (uint8_t)((dst >> 0)  & 0xFFu);
-
-    uint8_t r = (uint8_t)((sr * a + dr * (255 - a)) / 255);
-    uint8_t g = (uint8_t)((sg * a + dg * (255 - a)) / 255);
-    uint8_t b = (uint8_t)((sb * a + db * (255 - a)) / 255);
-
-    return
-        (0xFF << 24) |
-        (r << 16) |
-        (g << 8) |
-        b;
-}
-
-static bool fb_snapshot_create(BOOT_INFO *bi)
-{
-    if (!bi || !bi->FrameBufferBase || bi->FrameBufferSize == 0) {
-        return false;
-    }
-
-    g_fb_snapshot_pixels = (uint32_t)(bi->FrameBufferSize / 4);
-
-    g_fb_snapshot = malloc(bi->FrameBufferSize);
-
-    if (!g_fb_snapshot) {
-        return false;
-    }
-
-    memcpy(
-        g_fb_snapshot,
-        (void *)bi->FrameBufferBase,
-        bi->FrameBufferSize
-    );
-
-    return true;
-}
-
-static void fb_clear(BOOT_INFO *bi, uint32_t color)
-{
-    if (!g_fb_snapshot) {
-        return;
-    }
-
-    uint32_t *fb = (uint32_t *)bi->FrameBufferBase;
-    uint32_t pixels = (uint32_t)(bi->FrameBufferSize / 4);
-
-    for (uint32_t i = 0; i < pixels; i++) {
-        fb[i] = alpha_blend(g_fb_snapshot[i], color);
-    }
-}
-
-static void kernel_boot_screen_color(uint32_t color)
-{
-    if (g_boot_info_copy.FrameBufferBase == 0 || g_boot_info_copy.FrameBufferSize < 4) {
-        return;
-    }
-    fb_clear(&g_boot_info_copy, color);
-}
-#endif
 
 static void load_spinner_timer(uint64_t tick)
 {
@@ -496,23 +416,23 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
     syscall_file_init();
     boot_profile_end("kernel_services", phase_ns);
 
+    /* Kernel init is done with the screen. Freeze the spinner (leaving its
+     * last frame on the panel so it goes out with the rest of the boot
+     * screen rather than blinking away first), then play the hand-off
+     * transition: the captured screen scales to 150% while it dissolves to
+     * black. The init process resumes the same motion from 50% on its own
+     * first screen. If the transition cannot run -- no framebuffer, or no
+     * room on the heap for the snapshot -- the load_bar_finish() below just
+     * erases the spinner, which is what this used to do unconditionally; it
+     * is also what clears the spinner's region once the transition has run
+     * (onto an already black panel, so nothing shows). */
+    phase_ns = boot_profile_begin();
 #if OS_CONFIG_BOOT_FADE
-    bool fb_snapshot_ok = fb_snapshot_create(boot_info);
-#else
-    bool fb_snapshot_ok = false;
+    load_bar_stop();
+    (void)boot_anim_play_handoff(boot_info);
 #endif
-    (void)fb_snapshot_ok;
     load_bar_finish();
-#if OS_CONFIG_BOOT_FADE
-    for (int i = 0; i <= 10; i++) {
-        timer_apic_sleep_ms(1);
-        uint8_t alpha = (uint8_t)(i * 255 / 10);
-        uint32_t color =
-            (alpha << 24) |
-            0x000000;
-        kernel_boot_screen_color(color);
-    }
-#endif
+    boot_profile_end("boot_handoff_anim", phase_ns);
 
     if (fs_ready) {
         phase_ns = boot_profile_begin();
@@ -601,6 +521,10 @@ void kernel_main(BOOT_INFO *boot_info)
     debugger_init(boot_info);
 
     serial_init();
+    /* Straight after the serial port is usable: prints whatever the previous
+     * boot recorded before it died, which for a triple fault is the only
+     * evidence there is. Compiled out unless -DFLIGHT_REC=1. */
+    flight_rec_init();
 
     if (boot_info != NULL) {
         memcpy(&g_boot_info_copy, boot_info, sizeof(BOOT_INFO));
