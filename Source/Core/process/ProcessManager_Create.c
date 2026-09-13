@@ -2003,6 +2003,16 @@ void process_manager_init(void)
     if (g_processes == NULL) {
         halt_forever();
     }
+    /* The heap does not zero what it hands out, and reset_process_slot() leaves
+     * kernel_stack_base alone on purpose (the stack belongs to the slot). So
+     * every slot must start from zero here, or a slot inherits whatever that
+     * memory last held. After a warm reset that is the previous boot's own
+     * table -- same deterministic heap layout, so a plausible-looking stack
+     * pointer -- and initialize_process_memory() skips the allocation and runs
+     * the process on memory this boot gave to someone else. That surfaced as
+     * "[KSTACK] kernel stack overflow pid=1 name=Userland.ELF" right after any
+     * reboot that was not a power-on. */
+    memset(g_processes, 0, (size_t)table_size_u64);
 
     uint64_t sleep_table_size_u64 =
         (uint64_t)desired_capacity * (uint64_t)sizeof(uint64_t);
