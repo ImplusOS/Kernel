@@ -35,6 +35,10 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
 
+#ifndef LINUX_CLONE_TRACE
+#define LINUX_CLONE_TRACE 0
+#endif
+
 #ifndef LINUX_SYSCALL_PROFILE
 #define LINUX_SYSCALL_PROFILE 0
 #endif
@@ -133,6 +137,28 @@ static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
 #define LINUX_F_GET_SEALS 1034
 #define LINUX_F_SETFL  4
 #define LINUX_F_DUPFD_CLOEXEC 1030
+/* POSIX advisory record locks, and the open-file-description variants glibc
+ * and LevelDB reach for. */
+#define LINUX_F_GETLK      5
+#define LINUX_F_SETLK      6
+#define LINUX_F_SETLKW     7
+#define LINUX_F_OFD_GETLK  36
+#define LINUX_F_OFD_SETLK  37
+#define LINUX_F_OFD_SETLKW 38
+#define LINUX_F_RDLCK      0
+#define LINUX_F_WRLCK      1
+#define LINUX_F_UNLCK      2
+
+/* struct flock as the x86_64 kernel ABI lays it out. */
+typedef struct {
+    int16_t l_type;
+    int16_t l_whence;
+    int32_t __pad;
+    int64_t l_start;
+    int64_t l_len;
+    int32_t l_pid;
+    int32_t __pad2;
+} linux_flock_t;
 #define LINUX_FD_CLOEXEC 1u
 
 #define LINUX_FIONREAD 0x541Bu
@@ -185,10 +211,13 @@ int64_t syscall_arch_prctl(uint64_t code, uint64_t addr)
     return LINUX_EINVAL;
 }
 
+/* Defined with the sched_*affinity calls that first needed it; the rule is the
+ * same here, because a Linux "pid" in these interfaces is a thread id. */
+static int linux_sched_pid_is_self(uint64_t pid);
+
 int64_t syscall_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limit, uint64_t old_limit)
 {
-    int32_t current = process_get_current_pid();
-    if (pid != 0u && (int32_t)pid != current) return LINUX_ESRCH;
+    if (!linux_sched_pid_is_self(pid)) return LINUX_ESRCH;
     if (new_limit != 0u) {
         /* Limits are not enforced yet; accept the request (matching what a
          * setrlimit() with sufficient privilege would do on Linux) instead
@@ -704,6 +733,63 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
                                                 ((uint32_t)arg & 0x0800u) != 0u);
             }
             return syscall_file_set_status_flags(fd, (uint32_t)arg);
+
+        /* Advisory record locks.
+         *
+         * Returning ENOTSUP here cost Chromium its whole profile. LevelDB
+         * takes a whole-file lock on <db>/LOCK before opening a database, via
+         * fcntl(F_SETLK); the failure made every one of the two dozen
+         * databases behind a Chrome profile fail to open --
+         *
+         *   Unable to open /tmp/chromium/Default: IO error:
+         *   /tmp/chromium/Default/LOCK
+         *
+         * -- and the browser came up with "Something went wrong when opening
+         * your profile. Some features may be unavailable."
+         *
+         * The locks are granted unconditionally, and that is a real
+         * simplification rather than an implementation: the kernel keeps no
+         * lock table, so two processes locking the same range both succeed and
+         * F_GETLK always answers "nobody holds it". What it does provide is
+         * the contract a *single* locker depends on, which is what every
+         * consumer in this runtime is -- LevelDB already refuses a second lock
+         * on the same file inside one process from its own bookkeeping. A
+         * second process opening the same database would not be stopped; when
+         * something in this runtime needs that, this is where the table goes.
+         * See Docs/Others/TODO_Chromium_LinuxABI.md section 10.-5. */
+        case LINUX_F_SETLK:
+        case LINUX_F_SETLKW:
+        case LINUX_F_OFD_SETLK:
+        case LINUX_F_OFD_SETLKW: {
+            linux_flock_t lk;
+            if (arg == 0u ||
+                copy_from_user(&lk, (const void *)(uintptr_t)arg,
+                               sizeof(lk)) != 0u) {
+                return LINUX_EFAULT;
+            }
+            if (lk.l_type != LINUX_F_RDLCK && lk.l_type != LINUX_F_WRLCK &&
+                lk.l_type != LINUX_F_UNLCK) {
+                return LINUX_EINVAL;
+            }
+            return 0;
+        }
+        case LINUX_F_GETLK:
+        case LINUX_F_OFD_GETLK: {
+            linux_flock_t lk;
+            if (arg == 0u ||
+                copy_from_user(&lk, (const void *)(uintptr_t)arg,
+                               sizeof(lk)) != 0u) {
+                return LINUX_EFAULT;
+            }
+            /* F_UNLCK in l_type is how "the range is free" is reported. */
+            lk.l_type = LINUX_F_UNLCK;
+            lk.l_pid = 0;
+            if (copy_to_user_trusted((void *)(uintptr_t)arg, &lk,
+                                     sizeof(lk)) != 0u) {
+                return LINUX_EFAULT;
+            }
+            return 0;
+        }
         default:
             return LINUX_ENOTSUP;
     }
@@ -1805,7 +1891,9 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
  * set (reusing the same per-fd probe epoll uses). If nothing is ready and a
  * non-zero timeout was requested it parks the caller for a short slice and
  * returns 0 - the same "blocking degrades to a timed poll" compromise
- * syscall_epoll_wait_ex() uses, since this path can't block internally. */
+ * syscall_epoll_wait_ex() uses, since this path cannot block internally: see
+ * the long comment at the top of Syscall_Epoll.c for why a park-and-rescan
+ * loop in here spins instead of sleeping. */
 #define LINUX_POLLIN   0x0001
 #define LINUX_POLLPRI  0x0002
 #define LINUX_POLLOUT  0x0004
@@ -1813,13 +1901,68 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
 #define LINUX_POLLHUP  0x0010
 #define LINUX_POLLNVAL 0x0020
 #define LINUX_POLL_MAX_FDS  256u
-#define LINUX_POLL_SLICE_MS 8u
+#define LINUX_POLL_SLICE_MS 1u
 
 typedef struct {
     int32_t fd;
     int16_t events;
     int16_t revents;
 } linux_pollfd_t;
+
+#ifndef PROCESS_STALL_DUMP
+#define PROCESS_STALL_DUMP 0
+#endif
+#if PROCESS_STALL_DUMP
+/* The fd set a thread was last left waiting on, for the stall dump.
+ *
+ * "Everything is idle and nobody is making progress" is not diagnosable from
+ * syscall counts: the question is always which descriptor a thread is waiting
+ * on and whether the kernel thinks it is ready. Recorded only on the path
+ * where the wait gave up with nothing ready, which is exactly the stalled
+ * case. */
+#define LX_POLLTRACE_MAX_FDS 8u
+#define LX_POLLTRACE_MAX_PID 64u
+static uint8_t  g_lx_poll_n[LX_POLLTRACE_MAX_PID];
+static int32_t  g_lx_poll_fd[LX_POLLTRACE_MAX_PID][LX_POLLTRACE_MAX_FDS];
+static uint16_t g_lx_poll_ev[LX_POLLTRACE_MAX_PID][LX_POLLTRACE_MAX_FDS];
+
+static void linux_poll_trace_note(const linux_pollfd_t *pfds, uint64_t nfds)
+{
+    int32_t tid = process_get_current_tid();
+    if (tid < 0 || (uint32_t)tid >= LX_POLLTRACE_MAX_PID) {
+        return;
+    }
+    uint32_t n = (nfds > LX_POLLTRACE_MAX_FDS) ? LX_POLLTRACE_MAX_FDS
+                                               : (uint32_t)nfds;
+    for (uint32_t i = 0; i < n; ++i) {
+        g_lx_poll_fd[tid][i] = pfds[i].fd;
+        g_lx_poll_ev[tid][i] = (uint16_t)pfds[i].events;
+    }
+    g_lx_poll_n[tid] = (uint8_t)n;
+}
+
+void linux_poll_trace_dump_all(void);
+void linux_poll_trace_dump_all(void)
+{
+    for (uint32_t tid = 0; tid < LX_POLLTRACE_MAX_PID; ++tid) {
+        if (g_lx_poll_n[tid] == 0u) {
+            continue;
+        }
+        serial_write_string("[poll] ");
+        serial_write_uint32(tid);
+        for (uint32_t i = 0; i < g_lx_poll_n[tid]; ++i) {
+            int32_t fd = g_lx_poll_fd[tid][i];
+            serial_write_string(" ");
+            serial_write_uint32((uint32_t)fd);
+            serial_write_string("/w");
+            serial_write_uint32(g_lx_poll_ev[tid][i]);
+            serial_write_string("/r");
+            serial_write_uint32(syscall_poll_one_fd(fd, 0x1u | 0x4u));
+        }
+        serial_write_char('\n');
+    }
+}
+#endif
 
 static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
                                  int64_t timeout_ms, int *should_switch_out,
@@ -1896,6 +2039,9 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     if (ready_count > 0 || timeout_ms == 0) {
         return ready_count;
     }
+#if PROCESS_STALL_DUMP
+    linux_poll_trace_note(pfds, nfds);
+#endif
     if (poll_wait_park(generation, slice_ms) != 0 && should_switch_out != NULL) {
         *should_switch_out = 1;
     }
@@ -2146,6 +2292,24 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         serial_write_string("[lx] clone/thread create failed\n");
         return LINUX_EAGAIN;
     }
+#if LINUX_CLONE_TRACE
+    /* What glibc handed us for the new thread: its initial user RSP (which is
+     * the top of the stack block glibc allocated and recorded in the TCB) and
+     * its TLS base. V8 asks glibc for the running thread's stack bounds and
+     * CHECKs that its own stack pointer lies inside them
+     * (Isolate::IsOnCentralStack); when that fails, the question is whether
+     * the stack is where glibc thinks it is, so print both and compare
+     * against the RSP in the crash report. */
+    serial_write_string("[clone] tid=");
+    serial_write_uint32((uint32_t)tid);
+    serial_write_string(" stack=");
+    serial_write_uint64(stack);
+    serial_write_string(" tls=");
+    serial_write_uint64(has_tls ? tls : 0u);
+    serial_write_string(" flags=");
+    serial_write_uint64(flags);
+    serial_write_char('\n');
+#endif
     if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u && parent_tid != 0u) {
         int32_t tid32 = tid;
         if (copy_to_user_trusted((void *)(uintptr_t)parent_tid,
@@ -3609,11 +3773,50 @@ static int64_t linux_fstatfs(uint64_t fd, uint64_t buf_ptr)
     return linux_statfs(0u, buf_ptr);
 }
 
+/* Does `pid`, as the sched_*affinity and sched_getparam family use it, name a
+ * task the caller may ask about?
+ *
+ * 0 means "me". Anything else is a *thread* id in Linux terms, and glibc leans
+ * on that: pthread_getattr_np() calls __pthread_getaffinity_np(), which issues
+ * sched_getaffinity(pd->tid, ...) for the thread being asked about -- never the
+ * thread-group id. Comparing the argument against process_get_current_pid(),
+ * which answers with the address-space owner, therefore rejected every call
+ * made on a non-main thread with ESRCH.
+ *
+ * That one errno was enough to stop Chromium rendering a page. glibc's
+ * pthread_getattr_np() returns the affinity error to its caller, V8's
+ * base::Stack::GetStackStart() cannot then learn the thread's stack bounds,
+ * and Heap::CollectGarbage() opens with
+ * CHECK(isolate_->IsOnCentralStack()) -- so the first garbage collection on
+ * any renderer thread aborted the browser:
+ *
+ *   Check failed: isolate_->IsOnCentralStack().
+ *   #4 v8::internal::Heap::CollectGarbage(...)
+ *   #9 v8::internal::Runtime_AllocateInYoungGeneration(...)
+ *
+ * See Docs/Others/TODO_Chromium_LinuxABI.md section 10.-5. */
+static int linux_sched_pid_is_self(uint64_t pid)
+{
+    if (pid == 0u) {
+        return 1;
+    }
+    int32_t target = (int32_t)pid;
+    if (target < 0) {
+        return 0;
+    }
+    if (target == process_get_current_tid() ||
+        target == process_get_current_pid()) {
+        return 1;
+    }
+    /* A sibling thread: same address-space owner. */
+    int32_t owner = process_memory_owner_pid_of(target);
+    return (owner >= 0 && owner == process_get_current_pid());
+}
+
 static int64_t linux_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
                                        uint64_t mask_ptr)
 {
-    int32_t current = process_get_current_pid();
-    if (pid != 0u && (int32_t)pid != current) {
+    if (!linux_sched_pid_is_self(pid)) {
         return LINUX_ESRCH;
     }
     if (cpusetsize == 0u || mask_ptr == 0u) {
@@ -3641,8 +3844,7 @@ static int64_t linux_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
 static int64_t linux_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
                                        uint64_t mask_ptr)
 {
-    int32_t current = process_get_current_pid();
-    if (pid != 0u && (int32_t)pid != current) {
+    if (!linux_sched_pid_is_self(pid)) {
         return LINUX_ESRCH;
     }
     (void)cpusetsize;
@@ -3661,7 +3863,6 @@ static int64_t linux_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 /* A page of zeroes to copy out of. Static rather than a stack buffer: it is
  * read-only, so it is safe to share across CPUs, and 4 KiB is far too much
  * kernel stack. */
-static const uint8_t g_zero_page[PAGE_SIZE];
 
 static int64_t linux_madvise(uint64_t addr, uint64_t length, uint64_t advice)
 {
@@ -3676,12 +3877,27 @@ static int64_t linux_madvise(uint64_t addr, uint64_t length, uint64_t advice)
      * libxcb receiving a xcb_connection_t with a garbage ->setup pointer and
      * free()ing it.
      *
-     * There is no reclaim subsystem here, so the pages are kept and zeroed in
-     * place: the memory is not given back, but what the caller reads next is
-     * what Linux would have given it. Pages not currently present are left
-     * alone -- they already fault in as zero. A file-backed mapping should
-     * re-read from the file instead of zeroing, but no caller in this
-     * runtime madvises one. */
+     * The pages are discarded rather than zeroed in place, which is both what
+     * Linux does and the only safe thing to do: PartitionAlloc decommits a
+     * span by mprotect(PROT_NONE) *and then* madvise(MADV_DONTNEED), so by the
+     * time this runs the pages are frequently not writable, and zeroing them
+     * through the user mapping faulted in kernel mode on a present read-only
+     * page -- which used to panic the machine in the middle of Chromium's
+     * startup. Dropping the mapping instead hands the frames back to the
+     * allocator and lets the next access demand-zero, so the caller still
+     * reads what Linux would have given it. Pages not currently present are
+     * left alone; they already fault in as zero.
+     *
+     * One consequence worth naming: a discarded page is absent, and the
+     * demand-zero path maps an absent user page writable without consulting
+     * the protection the program last asked for. A span that PartitionAlloc
+     * decommitted with mprotect(PROT_NONE) + madvise() therefore reads back as
+     * accessible zeroes rather than faulting, so a use-after-free that
+     * PROT_NONE would have caught goes unnoticed. That is already true of
+     * every never-touched page in a PROT_NONE reservation here (see the
+     * demand-paging comment in Arch/x86_64/cpu/IDT_Main.c); tracking
+     * per-region protection is what would fix both at once.
+     * See Docs/Others/TODO_Chromium_LinuxABI.md section 10.-6. */
     if (advice != LINUX_MADV_DONTNEED && advice != LINUX_MADV_FREE &&
         advice != LINUX_MADV_REMOVE) {
         (void)addr; (void)length;
@@ -3712,21 +3928,35 @@ static int64_t linux_madvise(uint64_t addr, uint64_t length, uint64_t advice)
     if (addr < USER_MMAP_BASE || end > USER_MMAP_LIMIT) {
         return 0;
     }
-    for (uint64_t page = addr; page < end; page += PAGE_SIZE) {
-        if (paging_virt_to_phys(cr3, page) == 0u) {
-            continue; /* not present: already demand-zero */
+    /* Unmapped in runs, not page by page: paging_unmap_range() ends with a
+     * TLB shootdown across every CPU on this address space, and a decommitted
+     * PartitionAlloc span is hundreds of contiguous pages. One shootdown per
+     * run instead of per page is the difference between a hint and a stall. */
+    uint64_t run_start = 0u;
+    uint64_t run_end = 0u;
+    for (uint64_t page = addr; page <= end; page += PAGE_SIZE) {
+        int eligible = 0;
+        if (page < end && paging_virt_to_phys(cr3, page) != 0u) {
+            /* Private anonymous pages only. A file-backed or shared page keeps
+             * its contents on Linux -- MADV_DONTNEED just drops the cached
+             * copy and the next access reads the file (or the shared object)
+             * again. Discarding one of those would lose Chromium's mapped
+             * .pak/ICU data and its shared-memory regions for good. */
+            eligible = !filemap_addr_is_file_backed(self, page) &&
+                       !shared_memory_addr_is_mapped(page);
         }
-        /* Private anonymous pages only. A file-backed or shared page keeps its
-         * contents on Linux -- MADV_DONTNEED just drops the cached copy and
-         * the next access reads the file (or the shared object) again. Zeroing
-         * one of those in place ate Chromium's mapped .pak/ICU data and its
-         * shared-memory regions. */
-        if (filemap_addr_is_file_backed(self, page) ||
-            shared_memory_addr_is_mapped(page)) {
+
+        if (eligible) {
+            if (run_end == 0u) {
+                run_start = page;
+            }
+            run_end = page + PAGE_SIZE;
             continue;
         }
-        (void)copy_to_user_trusted((void *)(uintptr_t)page, g_zero_page,
-                                   PAGE_SIZE);
+        if (run_end != 0u) {
+            (void)paging_unmap_range(cr3, run_start, run_end - run_start);
+            run_end = 0u;
+        }
     }
     return 0;
 }
@@ -4434,6 +4664,7 @@ static void linux_trace_exit(uint64_t num, int64_t result)
 
 static uint32_t g_lx_hb_last_num[LX_HEARTBEAT_MAX_PID];
 static uint64_t g_lx_hb_last_arg[LX_HEARTBEAT_MAX_PID];
+static uint64_t g_lx_hb_last_rip[LX_HEARTBEAT_MAX_PID];
 static uint64_t g_lx_hb_count[LX_HEARTBEAT_MAX_PID];
 static uint64_t g_lx_hb_next_dump_ns;
 
@@ -4444,14 +4675,31 @@ static uint64_t g_lx_hb_next_dump_ns;
  * heartbeat below can never report. */
 uint32_t linux_heartbeat_last_num(int32_t pid);
 uint64_t linux_heartbeat_count(int32_t pid);
+uint64_t linux_heartbeat_last_arg(int32_t pid);
+uint64_t linux_heartbeat_last_rip(int32_t pid);
 
-static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1)
+static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1,
+                                    uint64_t saved_rsp)
 {
-    int32_t pid = process_get_current_pid();
+    /* Indexed by thread, not by memory owner: a stalled multithreaded process
+     * is only diagnosable if each thread's last syscall is visible separately.
+     * Keyed on the owner, every thread of Chromium wrote into one slot and the
+     * dump said nothing more than "chrome is alive". */
+    int32_t pid = process_get_current_tid();
     if (pid >= 0 && (uint32_t)pid < LX_HEARTBEAT_MAX_PID) {
         g_lx_hb_last_num[pid] = (uint32_t)num;
         g_lx_hb_last_arg[pid] = arg1;
         g_lx_hb_count[pid]++;
+#if defined(__x86_64__)
+        /* SYSCALL leaves the user return address in RCX, and the entry stub
+         * saves it in the frame -- the same word linux_syscall_restart()
+         * rewinds. It is the only handle the kernel has on where a stalled
+         * foreign binary actually is. */
+        g_lx_hb_last_rip[pid] =
+            ((const uint64_t *)(uintptr_t)saved_rsp)[SYSCALL_FRAME_RCX];
+#else
+        (void)saved_rsp;
+#endif
     }
 
     if (!OS_CONFIG_FOREIGN_TRACE) {
@@ -4672,7 +4920,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     int request_restart = 0;
 
     flight_rec(FR_TAG_SYSCALL, num, (uint64_t)(uint32_t)process_get_current_pid());
-    linux_syscall_heartbeat(num, arg1);
+    linux_syscall_heartbeat(num, arg1, saved_rsp);
 #if LINUX_SYSCALL_PROFILE
     linux_syscall_profile(num);
 #endif
@@ -6106,4 +6354,16 @@ uint64_t linux_heartbeat_count(int32_t pid)
 {
     if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
     return g_lx_hb_count[pid];
+}
+
+uint64_t linux_heartbeat_last_arg(int32_t pid)
+{
+    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
+    return g_lx_hb_last_arg[pid];
+}
+
+uint64_t linux_heartbeat_last_rip(int32_t pid)
+{
+    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
+    return g_lx_hb_last_rip[pid];
 }

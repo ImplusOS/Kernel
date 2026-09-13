@@ -194,13 +194,12 @@ static int  fd_promote_owner_locked(kernel_file_t *f);
 static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len);
 static int64_t syscall_pipe_write(int32_t fd, const uint8_t *buffer, uint64_t len);
 
+/* Same monotonic base as Syscall_Clock.c's CLOCK_MONOTONIC, so a timerfd
+ * armed with TFD_TIMER_ABSTIME from a clock_gettime() reading fires when the
+ * caller meant it to. */
 static uint64_t timer_ms_now(void)
 {
-    uint32_t hz = timer_hz();
-    if (hz == 0) {
-        hz = 60;
-    }
-    return (timer_ticks() * 1000u) / hz;
+    return timer_monotonic_ns() / 1000000ULL;
 }
 
 __attribute__((unused))

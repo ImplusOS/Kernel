@@ -1,5 +1,6 @@
 #include "ProcessManager.h"
 #include "ProcessScheduler.h"
+#include "Core/debug/FlightRec.h"
 
 #include "IPC/IPC_Main.h"
 #include "IPC/PnP_Notifications.h"
@@ -777,6 +778,7 @@ static void release_process_resources(process_t *proc)
                                     "running on other CPUs\n");
             }
         } else {
+            flight_rec(FR_TAG_DESTROY, proc->cr3, (uint64_t)(uint32_t)owner_pid);
             paging_destroy_process_space(proc->cr3);
         }
         proc->cr3 = 0;
@@ -1461,6 +1463,9 @@ static void process_kstack_canary_check(const process_t *proc)
 
 static void activate_process_context(process_t *proc)
 {
+    flight_rec(FR_TAG_SWITCH,
+               (uint64_t)(uint32_t)(proc != NULL ? (int32_t)(proc - g_processes) : -1),
+               proc != NULL ? proc->cr3 : 0u);
     process_kstack_canary_check(proc);
     if (paging_get_active_cr3() != proc->cr3) {
         paging_switch_cr3(proc->cr3);
@@ -4236,11 +4241,16 @@ static int process_group_has_living_member_locked(int32_t leader_pid)
 #define PROCESS_STALL_DUMP 0
 #endif
 #if PROCESS_STALL_DUMP
+#ifndef PROCESS_STALL_DUMP_FDS
+#define PROCESS_STALL_DUMP_FDS 0
+#endif
 #ifndef PROCESS_STALL_DUMP_MS
 #define PROCESS_STALL_DUMP_MS 10000u
 #endif
 extern uint32_t linux_heartbeat_last_num(int32_t pid);
 extern uint64_t linux_heartbeat_count(int32_t pid);
+extern uint64_t linux_heartbeat_last_arg(int32_t pid);
+extern uint64_t linux_heartbeat_last_rip(int32_t pid);
 
 void process_stall_dump_tick(void)
 {
@@ -4262,14 +4272,36 @@ void process_stall_dump_tick(void)
         if (p->state == PROCESS_STATE_UNUSED) continue;
         serial_write_string(" ");
         serial_write_uint32((uint32_t)i);
+        serial_write_string(":");
+        serial_write_string(p->name);
         serial_write_string(":s");
         serial_write_uint32((uint32_t)p->state);
         serial_write_string(":#");
         serial_write_uint32(linux_heartbeat_last_num(i));
+        serial_write_string(":a");
+        serial_write_uint64(linux_heartbeat_last_arg(i));
+        serial_write_string(":r");
+        serial_write_uint64(linux_heartbeat_last_rip(i));
         serial_write_string(":n");
         serial_write_uint64(linux_heartbeat_count(i));
     }
     serial_write_char('\n');
+
+    /* The fd-level dumps below are megabytes of serial traffic emitted from a
+     * timer interrupt, which distorts the very timing being measured. Enable
+     * one at a time with -DPROCESS_STALL_DUMP_FDS=1 when a stall needs them. */
+#if PROCESS_STALL_DUMP_FDS
+    {
+        extern void epoll_debug_dump(void);
+        extern void linux_poll_trace_dump_all(void);
+        extern void unix_socket_debug_dump(void);
+        extern void unix_socket_wire_dump(void);
+        epoll_debug_dump();
+        linux_poll_trace_dump_all();
+        unix_socket_debug_dump();
+        unix_socket_wire_dump();
+    }
+#endif
 }
 #endif
 

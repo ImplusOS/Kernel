@@ -104,11 +104,12 @@ static void futex_ensure_init(void)
     }
 }
 
+/* Same monotonic base as Syscall_Clock.c's CLOCK_MONOTONIC, so a caller that
+ * reads the clock and then asks for a relative futex timeout gets the
+ * duration it asked for. */
 static uint64_t futex_uptime_ms(void)
 {
-    uint32_t hz = timer_hz();
-    if (hz == 0) hz = 60;
-    return (timer_ticks() * 1000ULL) / hz;
+    return timer_monotonic_ns() / 1000000ULL;
 }
 
 /* Reclaim entries whose waiter no longer exists. Nothing hooks thread teardown

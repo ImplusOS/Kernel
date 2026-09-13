@@ -74,6 +74,12 @@ uint64_t paging_virt_to_phys(uint64_t cr3, uint64_t virt_addr);
  * definition for why the kernel has to ask. */
 int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len);
 
+/* Diagnostics: the leaf PTE for an address, 0 if unmapped. See the .c. */
+uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt_addr);
+
+/* Non-zero when the address falls in a user address-space window. */
+int paging_addr_is_user(uint64_t virt_addr);
+
 /* Drop this CPU's TLB entry for the page containing `vaddr`. */
 void paging_invalidate_page(uint64_t vaddr);
 

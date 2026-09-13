@@ -10,6 +10,7 @@
 #include "MemoryManagement/Memory_Main.h"
 #include "mmu/Paging_Main.h"
 #include "kernel/config.h"
+#include "Debug/serial/Serial.h"
 
 #define PROCFS_BUFFER_CAP 4096u
 
@@ -292,9 +293,23 @@ static const procfs_static_scalar_t g_procfs_static_scalars[] = {
     { "/proc/sys/fs/nr_open",                "1048576\n" },
 };
 
+/* Which /proc files a foreign program actually reads, and whether it got
+ * anything. Enabled with -DPROCFS_TRACE=1. Chromium and glibc consult a dozen
+ * of these and quietly change behaviour on what they find, so "is this file
+ * even being read" is the first question worth answering before improving one.
+ */
+#ifndef PROCFS_TRACE
+#define PROCFS_TRACE 0
+#endif
+
 static bool procfs_generate(const char *path, char *buf, uint32_t cap,
                             uint32_t *size_out)
 {
+#if PROCFS_TRACE
+    serial_write_string("[procfs] ");
+    serial_write_string(path);
+    serial_write_char('\n');
+#endif
     const char *suffix = NULL;
     int32_t pid = procfs_resolve_pid(path, &suffix);
     if (pid >= 0) {

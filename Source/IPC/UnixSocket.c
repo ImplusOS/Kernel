@@ -4,6 +4,7 @@
 #include "Core/memory/SharedMemory.h"
 #include "Core/syscall/Syscall_File.h"
 #include "Debug/serial/Serial.h"
+#include "Core/timer/Timer.h"
 #include "Core/syscall/Poll_Wait.h"
 #include "kernel/config.h"
 #include <stddef.h>
@@ -34,6 +35,16 @@ typedef struct {
     char path[UNIX_SOCK_PATH_MAX];
     uint8_t  buf[UNIX_SOCK_BUF_SIZE];
     uint32_t buf_head, buf_tail;
+    /* Bumped every time something is appended to this endpoint's queues.
+     *
+     * epoll's edge-triggered mode needs to know that data *arrived*, and a
+     * poller that only samples readiness cannot see that: once the fd is
+     * readable it stays readable, so a second arrival looks identical to the
+     * first and no new edge is ever reported. A reader that drains less than
+     * the whole ring then waits forever on bytes the kernel is holding -- see
+     * Syscall_Epoll.c's epoll_check_once() and TODO_Chromium_LinuxABI.md
+     * section 10.-5. This counter is the arrival event epoll compares against. */
+    uint32_t rx_seq;
     /* Pending SCM_RIGHTS transfers: each entry is a shared-memory handle
      * already granted to this endpoint's owner and holding one reference.
      * recvmsg() adopts it into a fresh memfd fd; close() releases any left. */
@@ -41,6 +52,14 @@ typedef struct {
     uint32_t fds_head, fds_tail;
     spinlock_t lock;
 } unix_sock_t;
+
+#ifndef PROCESS_STALL_DUMP
+#define PROCESS_STALL_DUMP 0
+#endif
+#if PROCESS_STALL_DUMP
+static void usock_wire_note_dir(int32_t from, int32_t to, uint8_t dir,
+                                const uint8_t *buf, uint64_t len);
+#endif
 
 static unix_sock_t g_usocks[UNIX_SOCK_MAX];
 static int g_usock_init_done = 0;
@@ -192,6 +211,7 @@ int64_t unix_socket_accept(int32_t fd) {
                     ns->fds_head = nx;
                     s->fds_tail = (s->fds_tail + 1) % UNIX_SOCK_FD_MAX;
                 }
+                ++ns->rx_seq;
                 spinlock_unlock(&s->lock);
                 g_usocks[i].peer_fd = (int32_t)new_fd;
             }
@@ -268,12 +288,18 @@ int64_t unix_socket_send(int32_t fd, const void *buf, uint64_t len) {
         peer->buf[peer->buf_head] = src[written++];
         peer->buf_head = next;
     }
+    if (written != 0u) {
+        ++peer->rx_seq;
+    }
     spinlock_unlock(&peer->lock);
     if (written == 0 && len > 0) {
         usock_trace2("tx-EAGAIN", fd, (int64_t)len);
         return -11; /* EAGAIN: ring full */
     }
     usock_trace2("tx", fd, (int64_t)written);
+#if PROCESS_STALL_DUMP
+    usock_wire_note_dir(fd, s->peer_fd, 0u, (const uint8_t *)buf, written);
+#endif
     /* The peer is now readable. Cut short any poll()/select()/epoll_wait()
      * that is parked waiting for exactly this -- an X11 round trip crosses
      * that wait twice, so leaving it to time out cost ~16 ms per request. */
@@ -305,6 +331,9 @@ int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
         return is_eof ? 0 : -11; /* 0 = EOF, -11 = EAGAIN */
     }
     usock_trace2("rx", fd, (int64_t)rd);
+#if PROCESS_STALL_DUMP
+    usock_wire_note_dir(fd, s->peer_fd, 1u, (const uint8_t *)buf, rd);
+#endif
     /* Draining the ring makes the peer writable again. */
     poll_wait_notify();
     return (int64_t)rd;
@@ -358,6 +387,7 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
                         if (next != peer->fds_tail) {
                             peer->fd_queue[peer->fds_head] = h;
                             peer->fds_head = next;
+                            ++peer->rx_seq;
                             spinlock_unlock(&peer->lock);
                         } else {
                             spinlock_unlock(&peer->lock);
@@ -536,6 +566,123 @@ int unix_socket_is_nonblock(int32_t fd)
 {
     unix_sock_t *s = usock_get(fd);
     return (s && s->nonblock) ? 1 : 0;
+}
+
+#ifndef PROCESS_STALL_DUMP
+#define PROCESS_STALL_DUMP 0
+#endif
+#if PROCESS_STALL_DUMP
+/* Every live endpoint with how much is queued on it, for the stall dump.
+ * A client blocked in poll() on an X connection and a server blocked in
+ * epoll_wait() on the same pair look identical from the syscall side; the
+ * byte counts are what say whether a request is sitting undelivered. */
+void unix_socket_debug_dump(void);
+void unix_socket_debug_dump(void)
+{
+    for (int i = 0; i < UNIX_SOCK_MAX; ++i) {
+        unix_sock_t *s = &g_usocks[i];
+        if (!s->used) {
+            continue;
+        }
+        spinlock_lock(&s->lock);
+        uint32_t queued = (s->buf_head + UNIX_SOCK_BUF_SIZE - s->buf_tail) %
+                          UNIX_SOCK_BUF_SIZE;
+        uint32_t fds    = (s->fds_head + UNIX_SOCK_FD_MAX - s->fds_tail) %
+                          UNIX_SOCK_FD_MAX;
+        int32_t  peer   = s->peer_fd;
+        int32_t  owner  = s->owner_pid;
+        uint8_t  conn   = s->connected;
+        uint8_t  lst    = s->listening;
+        spinlock_unlock(&s->lock);
+
+        serial_write_string("[usock] ");
+        serial_write_uint32((uint32_t)(UNIX_SOCK_FD_BASE + i));
+        serial_write_string(" own=");
+        serial_write_uint32((uint32_t)owner);
+        serial_write_string(" peer=");
+        serial_write_uint32((uint32_t)peer);
+        serial_write_string(conn ? " c" : (lst ? " l" : " -"));
+        serial_write_string(" q=");
+        serial_write_uint32(queued);
+        serial_write_string(" fds=");
+        serial_write_uint32(fds);
+        serial_write_char('\n');
+    }
+}
+#endif
+
+#if PROCESS_STALL_DUMP
+/* Ring of the most recent transfers, for the stall dump: which endpoint, how
+ * many bytes, and the first four of them. An X client and the X server that
+ * are both asleep look the same whether the client never sent its request or
+ * the server never answered it; the wire trace is what tells them apart. */
+#define USOCK_WIRE_MAX 48u
+typedef struct {
+    uint32_t ms;
+    int32_t  from;
+    int32_t  to;
+    uint32_t len;
+    uint8_t  dir;      /* 0 = send into the peer, 1 = recv out of this ring */
+    uint8_t  head[4];
+} usock_wire_t;
+static usock_wire_t g_usock_wire[USOCK_WIRE_MAX];
+static uint32_t     g_usock_wire_pos;
+static spinlock_t   g_usock_wire_lock;
+
+static void usock_wire_note_dir(int32_t from, int32_t to, uint8_t dir,
+                                const uint8_t *buf, uint64_t len)
+{
+    uint64_t flags = irq_save_disable();
+    spinlock_lock(&g_usock_wire_lock);
+    usock_wire_t *w = &g_usock_wire[g_usock_wire_pos % USOCK_WIRE_MAX];
+    ++g_usock_wire_pos;
+    w->ms   = (uint32_t)(timer_monotonic_ns() / 1000000ull);
+    w->from = from;
+    w->to   = to;
+    w->dir  = dir;
+    w->len  = (uint32_t)len;
+    for (uint32_t i = 0; i < 4u; ++i) {
+        w->head[i] = (i < len) ? buf[i] : 0u;
+    }
+    spinlock_unlock(&g_usock_wire_lock);
+    irq_restore(flags);
+}
+
+void unix_socket_wire_dump(void);
+void unix_socket_wire_dump(void)
+{
+    uint32_t pos = g_usock_wire_pos;
+    uint32_t n = (pos < USOCK_WIRE_MAX) ? pos : USOCK_WIRE_MAX;
+    for (uint32_t k = 0; k < n; ++k) {
+        const usock_wire_t *w = &g_usock_wire[(pos - n + k) % USOCK_WIRE_MAX];
+        serial_write_string("[wire] t=");
+        serial_write_uint32(w->ms);
+        serial_write_string(w->dir ? " rx " : " tx ");
+        serial_write_uint32((uint32_t)w->from);
+        serial_write_string(">");
+        serial_write_uint32((uint32_t)w->to);
+        serial_write_string(" l=");
+        serial_write_uint32(w->len);
+        serial_write_string(" b=");
+        for (uint32_t i = 0; i < 4u; ++i) {
+            serial_write_uint32(w->head[i]);
+            serial_write_string(",");
+        }
+        serial_write_char('\n');
+    }
+}
+#endif
+
+uint32_t unix_socket_rx_seq(int32_t fd)
+{
+    unix_sock_t *s = usock_get(fd);
+    if (!s) {
+        return 0u;
+    }
+    spinlock_lock(&s->lock);
+    uint32_t seq = s->rx_seq;
+    spinlock_unlock(&s->lock);
+    return seq;
 }
 
 uint32_t unix_socket_poll(int32_t fd, uint32_t events) {

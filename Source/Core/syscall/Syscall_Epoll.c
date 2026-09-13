@@ -8,6 +8,7 @@
 #include "Poll_Wait.h"
 #include "IPC/UnixSocket.h"
 #include "interfaces/hal_cpu.h"
+#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -23,15 +24,24 @@
  *
  * True "block inside this syscall until a wakeup or the timeout, then
  * resume this exact call" is not something this kernel's scheduler
- * supports: a syscall can only "block" by registering a sleep/blocked
- * state and *returning all the way to userspace* - see
- * process_block_current()/process_sleep_current_ms() and how
- * process_schedule_on_syscall() only ever resumes a process at "right
- * after the `syscall` instruction that invoked it", never mid-C-function
- * (process_run_next_on_current_cpu() confirms this: switching to another
- * process is a one-way jump via enter_user_mode(), not a call that
- * returns). So instead of busy-spinning with hal_cpu_pause() (100% CPU,
- * the pre-existing behavior) or claiming to honor the full timeout in one
+ * supports, and it is worth being precise about why, because the obvious
+ * fix -- scan, park, scan again, all inside the syscall -- was tried and
+ * is much worse than what is here.
+ *
+ * process_sleep_current_ms() does not block. It marks the caller
+ * PROCESS_STATE_BLOCKED, records a wake deadline and asks for a
+ * reschedule, then *returns*; the switch happens on the way back out to
+ * userspace, because process_run_next_on_current_cpu() reaches another
+ * process by a one-way enter_user_mode() jump, never by a call that
+ * returns. So a loop around it does not sleep between rounds -- it spins
+ * at full speed with the process marked blocked, re-arming its own wake
+ * deadline every iteration. Measured, that turned every X11 round trip
+ * into seconds (the request sat in the socket while the server burned a
+ * CPU pretending to wait for it) and a 20 s X server startup into 170 s.
+ * See Docs/Others/TODO_Chromium_LinuxABI.md section 10.-5.
+ *
+ * So instead of busy-spinning with hal_cpu_pause() (100% CPU, the
+ * pre-existing behavior) or claiming to honor the full timeout in one
  * shot (impossible here), epoll_wait sleeps for a short bounded slice and
  * returns 0 ("nothing ready yet") slightly before the caller's requested
  * timeout when nothing is ready, actually yielding the CPU via
@@ -47,6 +57,10 @@
  * readiness event in the system and X11 round trips cost ~16 ms each no
  * matter how fast the machine was.
  */
+
+#ifndef PROCESS_STALL_DUMP
+#define PROCESS_STALL_DUMP 0
+#endif
 
 #define EPOLL_MAX_INSTANCES   16
 #define EPOLL_MAX_ENTRIES     64
@@ -64,7 +78,9 @@
 /* Bounded slice a single epoll_wait() call sleeps for when nothing is
  * ready and the caller allows blocking (timeout_ms != 0). Small enough
  * to stay responsive, large enough to not dominate scheduling overhead. */
-#define EPOLL_POLL_SLICE_MS 8u
+#define EPOLL_POLL_SLICE_MS 1u
+
+
 
 /* Must match Syscall_Socket.c's SOCKET_FD_BASE/SOCKET_TABLE_SIZE - kept
  * as a separate small constant here (rather than a shared header) the
@@ -86,6 +102,18 @@ typedef struct {
      * mask is cleared again once the fd stops being ready. Unused for
      * level-triggered entries. */
     uint32_t last_ready;
+    /* ...and the fd's arrival counter as of that report, where it has one.
+     *
+     * A rising edge in the sampled readiness mask is not the same event Linux
+     * arms an edge-triggered fd on. Linux arms on arrival; this poller only
+     * sees the level, and a second arrival while the fd is already readable
+     * does not change it. The X server registers its client sockets
+     * edge-triggered, so one short read left 20 bytes of a Chromium request
+     * queued in the kernel with no further edge ever reported and both
+     * processes asleep -- the machine idle and the browser hung. Comparing
+     * the arrival counter recovers the missing event.
+     * See TODO_Chromium_LinuxABI.md section 10.-5. */
+    uint32_t last_seq;
 } epoll_entry_t;
 
 typedef struct {
@@ -149,6 +177,37 @@ static epoll_instance_t *epoll_lookup(int32_t epfd)
     return g_epoll_instances[idx].used ? &g_epoll_instances[idx] : NULL;
 }
 
+static uint32_t epoll_fd_ready_seq(int32_t fd);
+
+/* Could `fd` ever name something one of the fd tables owns?
+ *
+ * epoll_ctl() on Linux rejects a bad fd with EBADF; this accepted anything.
+ * That mattered because epoll_poll_fd() answers EPOLLERR for an fd it cannot
+ * place, and EPOLLERR is always reported -- so one junk entry made
+ * epoll_wait() return an event immediately, forever. Xorg's dbus-core module
+ * does exactly this: its bus connection fails, it hands the failed call's
+ * negative return to SetNotifyFd() as an fd, and the X server then spun a
+ * whole CPU re-entering epoll_wait and starved every client on the machine
+ * (Chromium among them). See TODO_Chromium_LinuxABI.md section 10.-5. */
+static int epoll_fd_is_addressable(int32_t fd)
+{
+    if (fd < 0) {
+        return 0;
+    }
+    if (fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
+        return 1;
+    }
+    if (fd >= EPOLL_SOCKET_FD_BASE &&
+        fd < EPOLL_SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
+        return 1;
+    }
+    if (fd >= EPOLL_EVENTFD_FD_BASE &&
+        fd < EPOLL_EVENTFD_FD_BASE + EVENTFD_MAX_INSTANCES) {
+        return 1;
+    }
+    return unix_socket_fd_in_range(fd);
+}
+
 int32_t syscall_epoll_ctl(int32_t epfd, int32_t op, int32_t fd,
                           const epoll_event_t *event)
 {
@@ -160,7 +219,24 @@ int32_t syscall_epoll_ctl(int32_t epfd, int32_t op, int32_t fd,
         return -9;
     }
 
+    if (!epoll_fd_is_addressable(fd)) {
+        spinlock_unlock(&g_epoll_lock);
+        return -9; /* EBADF */
+    }
+
+    uint32_t found = inst->count;
+    for (uint32_t i = 0; i < inst->count; ++i) {
+        if (inst->entries[i].fd == fd) {
+            found = i;
+            break;
+        }
+    }
+
     if (op == EPOLL_CTL_ADD) {
+        if (found != inst->count) {
+            spinlock_unlock(&g_epoll_lock);
+            return -17; /* EEXIST */
+        }
         if (inst->count >= EPOLL_MAX_ENTRIES) {
             spinlock_unlock(&g_epoll_lock);
             return -12;
@@ -170,22 +246,26 @@ int32_t syscall_epoll_ctl(int32_t epfd, int32_t op, int32_t fd,
         e->events = event ? event->events : (EPOLLIN | EPOLLOUT);
         e->data   = event ? event->data : 0;
         e->last_ready = 0u;
+        e->last_seq   = epoll_fd_ready_seq(fd);
     } else if (op == EPOLL_CTL_DEL) {
-        for (uint32_t i = 0; i < inst->count; ++i) {
-            if (inst->entries[i].fd == fd) {
-                inst->entries[i] = inst->entries[--inst->count];
-                break;
-            }
+        if (found == inst->count) {
+            spinlock_unlock(&g_epoll_lock);
+            return -2; /* ENOENT */
         }
+        inst->entries[found] = inst->entries[--inst->count];
     } else if (op == EPOLL_CTL_MOD) {
-        for (uint32_t i = 0; i < inst->count; ++i) {
-            if (inst->entries[i].fd == fd) {
-                inst->entries[i].events = event ? event->events : (EPOLLIN | EPOLLOUT);
-                inst->entries[i].data   = event ? event->data : 0;
-                inst->entries[i].last_ready = 0u; /* re-arm the edge */
-                break;
-            }
+        if (found == inst->count) {
+            spinlock_unlock(&g_epoll_lock);
+            return -2; /* ENOENT */
         }
+        inst->entries[found].events =
+            event ? event->events : (EPOLLIN | EPOLLOUT);
+        inst->entries[found].data = event ? event->data : 0;
+        inst->entries[found].last_ready = 0u; /* re-arm the edge */
+        inst->entries[found].last_seq = epoll_fd_ready_seq(fd);
+    } else {
+        spinlock_unlock(&g_epoll_lock);
+        return -22; /* EINVAL */
     }
 
     spinlock_unlock(&g_epoll_lock);
@@ -216,6 +296,17 @@ static uint32_t eventfd_poll_locked(int32_t fd, uint32_t requested)
  * in (regular/pipe/timerfd/memfd/signalfd, socket, or eventfd - these are
  * disjoint numeric ranges, see kernel/config.h's OS_CONFIG_FILE_MAX_FD
  * comment and Syscall_Socket.c's SOCKET_FD_BASE comment). */
+/* The fd's arrival counter, or 0 for a kind of fd that does not keep one.
+ * An fd with no counter keeps the pre-existing level-transition behaviour:
+ * its seq never changes, so it never forces an edge on its own. */
+static uint32_t epoll_fd_ready_seq(int32_t fd)
+{
+    if (unix_socket_fd_in_range(fd)) {
+        return unix_socket_rx_seq(fd);
+    }
+    return 0u;
+}
+
 static uint32_t epoll_poll_fd(int32_t fd, uint32_t requested)
 {
     if (fd >= 0 && fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
@@ -271,6 +362,7 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
      * (epoll_poll_fd() must not run while g_epoll_lock is held). */
     int      et_fd[EPOLL_MAX_ENTRIES];
     uint32_t et_ready[EPOLL_MAX_ENTRIES];
+    uint32_t et_seq[EPOLL_MAX_ENTRIES];
     uint32_t et_n = 0;
 
     for (uint32_t i = 0; i < count && n < maxevents; ++i) {
@@ -283,15 +375,20 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
 
         uint32_t deliver = ready;
         if ((snapshot[i].events & EPOLLET) != 0u) {
-            /* Edge-triggered: only surface bits that were not ready at the
-             * previous report. EPOLLERR/EPOLLHUP are always surfaced (Linux
-             * delivers them regardless; over-notification is safe for a
-             * correct drain-until-EAGAIN consumer). Record the new mask so
-             * the fd must go quiet before it can edge again. */
-            deliver = (ready & ~snapshot[i].last_ready) |
+            /* Edge-triggered: surface bits that were not ready at the previous
+             * report, plus everything still ready if something has arrived
+             * since -- that arrival is the edge, and the level alone cannot
+             * show it. EPOLLERR/EPOLLHUP are always surfaced (Linux delivers
+             * them regardless; over-notification is safe for a correct
+             * drain-until-EAGAIN consumer). Record both, so the fd must go
+             * quiet, or take a fresh arrival, before it can edge again. */
+            uint32_t seq = epoll_fd_ready_seq(snapshot[i].fd);
+            uint32_t since_report = (seq != snapshot[i].last_seq) ? ready : 0u;
+            deliver = (ready & ~snapshot[i].last_ready) | since_report |
                       (ready & (EPOLLERR | EPOLLHUP));
             et_fd[et_n]    = snapshot[i].fd;
             et_ready[et_n] = ready;
+            et_seq[et_n]   = seq;
             ++et_n;
         }
 
@@ -310,6 +407,7 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
                 for (uint32_t j = 0; j < inst2->count; ++j) {
                     if (inst2->entries[j].fd == et_fd[k]) {
                         inst2->entries[j].last_ready = et_ready[k];
+                        inst2->entries[j].last_seq   = et_seq[k];
                         break;
                     }
                 }
@@ -360,6 +458,57 @@ int32_t syscall_epoll_wait_ex(int32_t epfd, epoll_event_t *events,
     }
     return 0;
 }
+
+#if PROCESS_STALL_DUMP
+/* Every epoll set with its per-fd readiness, for the timer-driven stall dump.
+ * "Which fd keeps reporting itself ready" is not answerable from the syscall
+ * counts alone, and an fd that is wrongly always-ready turns a well-behaved
+ * event loop into a spin that starves everything else on the machine. */
+void epoll_debug_dump(void)
+{
+    /* Static, not automatic: this runs from the timer interrupt, and a
+     * EPOLL_MAX_ENTRIES-wide snapshot is over a kilobyte. On the interrupt
+     * stack that was enough to trip the kernel's own stack canary and panic
+     * with "stack smashing detected" at SMP=4 -- a diagnostic that crashes
+     * the thing it is measuring. Serialised by g_epoll_lock below, and the
+     * dump is single-threaded by construction (CPU 0's timer tick). */
+    static epoll_entry_t snapshot[EPOLL_MAX_ENTRIES];
+
+    for (int i = 0; i < EPOLL_MAX_INSTANCES; ++i) {
+        uint32_t count;
+
+        spinlock_lock(&g_epoll_lock);
+        if (!g_epoll_instances[i].used) {
+            spinlock_unlock(&g_epoll_lock);
+            continue;
+        }
+        count = g_epoll_instances[i].count;
+        memcpy(snapshot, g_epoll_instances[i].entries,
+               count * sizeof(epoll_entry_t));
+        spinlock_unlock(&g_epoll_lock);
+
+        serial_write_string("[epoll] ");
+        serial_write_uint32((uint32_t)(0x4000 + i));
+        serial_write_string(" n=");
+        serial_write_uint32(count);
+        for (uint32_t k = 0; k < count; ++k) {
+            uint32_t requested = snapshot[k].events & (EPOLLIN | EPOLLOUT);
+            if (requested == 0u) {
+                requested = EPOLLIN | EPOLLOUT;
+            }
+            uint32_t ready = epoll_poll_fd(snapshot[k].fd, requested) &
+                             (snapshot[k].events | EPOLLERR | EPOLLHUP);
+            serial_write_string(" ");
+            serial_write_uint32((uint32_t)snapshot[k].fd);
+            serial_write_string("/w");
+            serial_write_uint32(snapshot[k].events);
+            serial_write_string("/r");
+            serial_write_uint32(ready);
+        }
+        serial_write_char('\n');
+    }
+}
+#endif
 
 int32_t syscall_eventfd(uint64_t initval, uint64_t flags)
 {

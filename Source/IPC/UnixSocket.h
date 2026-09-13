@@ -59,3 +59,9 @@ int unix_socket_fd_in_range(int32_t fd);
 /* poll(2)/epoll readiness for an AF_UNIX fd. `events`/result use EPOLL*
  * (== POLL*) bits. */
 uint32_t unix_socket_poll(int32_t fd, uint32_t events);
+
+/* Count of appends to this endpoint's receive queues. Only equality across
+ * two reads is meaningful: it tells epoll's edge-triggered mode that data
+ * arrived, which sampling readiness alone cannot. See the field comment in
+ * UnixSocket.c. */
+uint32_t unix_socket_rx_seq(int32_t fd);

@@ -574,6 +574,33 @@ int paging_cow_clone_user_range(uint64_t child_cr3, uint64_t parent_cr3,
     return 0;
 }
 
+/* The leaf PTE for `virt_addr`, or 0 when the walk stops short.
+ *
+ * For diagnostics only: a kernel-mode fault at a user address says nothing on
+ * its own -- "absent" is demand paging, "present but read-only" is a write to
+ * a mapping the program asked to be read-only, and the two need opposite
+ * responses. The flags are the only way to tell them apart in the report. */
+/* Is `virt_addr` inside one of the user address-space windows? Exposed for the
+ * fault handler, which has to tell "a syscall touching a user buffer it may
+ * not touch" (the process's problem) from "a wild kernel pointer" (the
+ * kernel's), and must not answer the first one with a panic. */
+int paging_addr_is_user(uint64_t virt_addr)
+{
+    return is_user_virtual_address(virt_addr);
+}
+
+uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt_addr)
+{
+    uint64_t *pml4e = NULL, *pdpte = NULL, *pde = NULL, *pte = NULL;
+    if (cr3 == 0 ||
+        resolve_fault_leaf_entry(cr3, virt_addr & PAGE_MASK,
+                                 &pml4e, &pdpte, &pde, &pte) < 0 ||
+        pte == NULL) {
+        return 0;
+    }
+    return *pte;
+}
+
 int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr)
 {
     if (cr3 == 0) return 0;

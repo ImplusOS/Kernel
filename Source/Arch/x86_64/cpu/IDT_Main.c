@@ -335,6 +335,7 @@ void general_protection_fault_handler(const uint64_t *gpregs,
                                       const uint64_t *frame,
                                       uint64_t rbp)
 {
+    flight_rec(FR_TAG_GP, rip, error_code);
     /* `frame` points at the CPU-pushed exception frame:
      * [0]=error_code [1]=rip [2]=cs [3]=rflags [4]=user_rsp [5]=user_ss.
      * `gpregs`, when non-NULL (fed by isr_general_protection), is the
@@ -350,14 +351,38 @@ void general_protection_fault_handler(const uint64_t *gpregs,
      * accesses land here too. */
     int from_user = (frame != NULL) && ((frame[2] & 0x3ULL) == 0x3ULL);
     int32_t pid = process_get_current_pid();
+    /* The thread, as distinct from the process that owns its address space.
+     *
+     * process_get_current_pid() answers with the *memory owner*, and that can
+     * already be gone: a multithreaded process dies one thread at a time, and
+     * release_process_resources() defers tearing the address space down while
+     * "threads still running on other CPUs". A sibling that faults inside that
+     * window has no resolvable owner, and this used to fall through to
+     * panic_exception() -- so Chromium's own CHECK() failure, which is an
+     * ordinary userland `int3`, took the whole kernel down as a fatal
+     * general_protection with a user-space RIP in the report. A fault from
+     * CPL 3 is never the kernel's problem; if the owner cannot be named, the
+     * thread can still be killed. */
+    int32_t tid = process_get_current_tid();
 
-    if (from_user && pid >= 0) {
+    /* No `pid >= 0` (or tid) condition here on purpose. A fault at CPL 3 is
+     * the userland program's fault by definition, and there is no state of
+     * the process table that makes it the kernel's. Gating on "can we still
+     * name the thread" meant that the last thread of a process dying -- the
+     * window where the per-CPU current pid has already been cleared -- turned
+     * Chromium's own CHECK() failure into a kernel panic reporting a
+     * user-space RIP. If the thread cannot be named it cannot be killed
+     * either, but this CPU can still go find other work instead of taking the
+     * machine down. */
+    if (from_user) {
         extern const char *process_get_current_name_str(void);
         extern void process_debug_dump_pid(int32_t pid);
         extern void process_exit_current_signaled(int32_t signum);
 
         serial_write_string("[OS] [#GP] user-mode #GP -> terminating pid=");
         serial_write_uint64((uint64_t)(uint32_t)pid);
+        serial_write_string(" tid=");
+        serial_write_uint64((uint64_t)(uint32_t)tid);
         serial_write_string(" name=");
         const char *pn = process_get_current_name_str();
         serial_write_string(pn ? pn : "?");
@@ -434,9 +459,16 @@ void general_protection_fault_handler(const uint64_t *gpregs,
                 }
             }
         }
-        process_debug_dump_pid(pid);
+        if (pid >= 0) {
+            process_debug_dump_pid(pid);
+        }
 
-        process_exit_current_signaled(4 /* SIGILL: int3/ud2/priv-insn */);
+        if (pid >= 0 || tid >= 0) {
+            process_exit_current_signaled(4 /* SIGILL: int3/ud2/priv-insn */);
+        } else {
+            serial_write_string("[OS] [#GP] no current thread on this CPU; "
+                                "parking instead of panicking\n");
+        }
 
         while (!process_run_next_on_current_cpu()) {
             hal_cpu_enable_interrupts();
@@ -758,7 +790,10 @@ int32_t page_fault_handler(uint64_t error_code,
     serial_write_string((error_code & PF_INSTR) ? "yes" : "no");
     serial_write_string("\n");
 
-    if ((error_code & PF_USER) && pid >= 0) {
+    /* Same rule as the #GP handler: a fault from user mode kills the thread,
+     * even when its address space's owner has already exited and cannot be
+     * named. See the comment on `tid` in general_protection_fault_handler(). */
+    if ((error_code & PF_USER)) {
         if (process_is_guard_page_fault(cr2)) {
             serial_write_string("[OS][PF] Guard page hit (stack/heap overflow) pid=");
             serial_write_uint32((uint32_t)pid);
@@ -1092,19 +1127,27 @@ int32_t page_fault_handler(uint64_t error_code,
             const int32_t sigsegv = 11;
             uint64_t *kernel_regs = (uint64_t *)(uintptr_t)(kernel_rsp + 8u);
             uint64_t *cpu_frame = (uint64_t *)(uintptr_t)frame_rsp;
-            if (process_signal_deliver_fault_now(pid, sigsegv, cr2,
+            if (pid >= 0 &&
+                process_signal_deliver_fault_now(pid, sigsegv, cr2,
                                                  kernel_regs, cpu_frame)) {
                 return 0; /* Resume via iretq, straight into the handler. */
             }
         }
 
         extern void process_debug_dump_pid(int32_t pid);
-        process_debug_dump_pid(pid);
+        if (pid >= 0) {
+            process_debug_dump_pid(pid);
+        }
 
         /* Unhandled SIGSEGV: record the termination cause so wait4()/waitid()
          * in the Linux ABI report WIFSIGNALED / WTERMSIG == SIGSEGV. */
         extern void process_exit_current_signaled(int32_t signum);
-        process_exit_current_signaled(11);
+        if (pid >= 0 || process_get_current_tid() >= 0) {
+            process_exit_current_signaled(11);
+        } else {
+            serial_write_string("[OS] [PF] no current thread on this CPU; "
+                                "parking instead of panicking\n");
+        }
 
         serial_write_string("[OS] [PF] Idle-waiting for scheduler...\n");
 
@@ -1115,6 +1158,55 @@ int32_t page_fault_handler(uint64_t error_code,
 
         return -1;
     } else {
+        /* A supervisor-mode fault at a *user* address is a syscall copying
+         * into a buffer the tables will not allow. Name the PTE and the
+         * syscall before giving up: "absent" would have been demand-paged
+         * above, so reaching here means the page is present and the access is
+         * refused -- and which syscall, on which mapping, is the whole
+         * question. */
+        {
+            extern uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt);
+            extern uint32_t linux_heartbeat_last_num(int32_t pid);
+            extern int filemap_addr_is_file_backed(int32_t pid, uint64_t addr);
+            uint64_t pte = paging_debug_leaf_pte(process_get_current_cr3(), cr2);
+            int32_t tid = process_get_current_tid();
+            serial_write_string("[OS] [PF] kernel-mode at user addr: pte=");
+            serial_write_uint64(pte);
+            serial_write_string(" P=");
+            serial_write_uint64(pte & 1u);
+            serial_write_string(" RW=");
+            serial_write_uint64((pte >> 1) & 1u);
+            serial_write_string(" U=");
+            serial_write_uint64((pte >> 2) & 1u);
+            serial_write_string(" filebacked=");
+            serial_write_uint64((uint64_t)(pid >= 0 ?
+                filemap_addr_is_file_backed(pid, cr2) : -1));
+            serial_write_string(" lastsys=");
+            serial_write_uint64(tid >= 0 ? linux_heartbeat_last_num(tid) : 0xFFFFu);
+            serial_write_string(" tid=");
+            serial_write_uint64((uint64_t)(uint32_t)tid);
+            serial_write_string("\n");
+        }
+
+        /* A refused access to a *user* address belongs to the process whose
+         * buffer it is, however the CPU got here. The copy cannot be unwound
+         * from inside a memcpy, so the thread cannot be resumed -- but killing
+         * it leaves the rest of the machine running, where panicking used to
+         * take the desktop down with it. Only a fault at a kernel address is
+         * genuinely the kernel's bug. */
+        if (paging_addr_is_user(cr2) &&
+            (pid >= 0 || process_get_current_tid() >= 0)) {
+            serial_write_string("[OS] [PF] refused user buffer -> "
+                                "terminating process\n");
+            extern void process_exit_current_signaled(int32_t signum);
+            process_exit_current_signaled(11 /* SIGSEGV */);
+            while (!process_run_next_on_current_cpu()) {
+                hal_cpu_enable_interrupts();
+                hal_cpu_halt();
+            }
+            return -1;
+        }
+
         kernel_panic("PAGE_FAULT", "Page fault in kernel mode");
         serial_write_string("[OS] [PF] Page fault in kernel mode, halting\n");
     }
