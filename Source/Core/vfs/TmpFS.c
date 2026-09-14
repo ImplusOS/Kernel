@@ -5,7 +5,17 @@
 
 #include "Core/sync/Spinlock.h"
 
-#define TMPFS_MAX_FILES 256u
+/* One table serves all four mounts below, so it has to hold everything at
+ * once: Xorg's sockets and compiled keymaps, the fontconfig cache, the login
+ * session files, and a whole browser profile. 256 was exhausted while
+ * Chromium created its profile: the next file creation failed, the syscall
+ * layer reported EIO, and whichever database was being opened at that moment
+ * broke ("GCM Store/LOCK: OS or hardware error", "Failed to load tokens
+ * (invalid SQL statement)"), which is the "Something went wrong when opening
+ * your profile" dialog. A slot is ~272 bytes with file data allocated
+ * separately, so 4096 costs about 1.1 MB, and lookups only compare slots in
+ * use. */
+#define TMPFS_MAX_FILES 4096u
 #define TMPFS_PATH_MAX  256u
 #define TMPFS_PREFIX    "/dev/shm"
 
@@ -67,6 +77,50 @@ typedef struct {
 } tmpfs_slot_t;
 
 static tmpfs_slot_t g_tmpfs_slots[TMPFS_MAX_FILES];
+
+/* How full the shared table gets. Logged at each new multiple-of-32 high-water
+ * mark, and once if it ever fills, so a boot says whether the limit is still
+ * in reach. Callers hold g_tmpfs_lock. */
+extern void serial_write_string(const char *str);
+extern void serial_write_uint32(uint32_t value);
+static uint32_t g_tmpfs_slots_used;
+static uint32_t g_tmpfs_slots_peak;
+static bool g_tmpfs_full_reported;
+
+static void tmpfs_note_claim_locked(void)
+{
+    ++g_tmpfs_slots_used;
+    if (g_tmpfs_slots_used > g_tmpfs_slots_peak) {
+        g_tmpfs_slots_peak = g_tmpfs_slots_used;
+        if ((g_tmpfs_slots_peak % 32u) == 0u) {
+            serial_write_string("[tmpfs] slots in use reached ");
+            serial_write_uint32(g_tmpfs_slots_peak);
+            serial_write_string(" of ");
+            serial_write_uint32(TMPFS_MAX_FILES);
+            serial_write_string("\n");
+        }
+    }
+}
+
+static void tmpfs_note_release_locked(void)
+{
+    if (g_tmpfs_slots_used > 0u) {
+        --g_tmpfs_slots_used;
+    }
+}
+
+static void tmpfs_note_full_locked(const char *path)
+{
+    if (g_tmpfs_full_reported) {
+        return;
+    }
+    g_tmpfs_full_reported = true;
+    serial_write_string("[tmpfs] table full (");
+    serial_write_uint32(TMPFS_MAX_FILES);
+    serial_write_string(" slots) creating ");
+    serial_write_string(path);
+    serial_write_string("\n");
+}
 static spinlock_t g_tmpfs_lock;
 
 static tmpfs_slot_t *tmpfs_find_locked(const char *path)
@@ -207,12 +261,14 @@ static bool tmpfs_vfs_creat(const char *path)
         if (!g_tmpfs_slots[i].in_use) {
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
+            tmpfs_note_claim_locked();
             g_tmpfs_slots[i].mode = TMPFS_MODE_FILE;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
             spinlock_unlock(&g_tmpfs_lock);
             return true;
         }
     }
+    tmpfs_note_full_locked(path);
     spinlock_unlock(&g_tmpfs_lock);
     return false;
 }
@@ -230,16 +286,22 @@ static bool tmpfs_vfs_mkdir(const char *path)
     }
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) == NULL) {
+        bool recorded = false;
         for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
             if (g_tmpfs_slots[i].in_use) {
                 continue;
             }
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
+            tmpfs_note_claim_locked();
             g_tmpfs_slots[i].is_dir = 1;
             g_tmpfs_slots[i].mode = TMPFS_MODE_DIR;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
+            recorded = true;
             break;
+        }
+        if (!recorded) {
+            tmpfs_note_full_locked(path);
         }
     }
     spinlock_unlock(&g_tmpfs_lock);
@@ -415,6 +477,7 @@ static bool tmpfs_vfs_unlink(const char *path)
         free(slot->data);
     }
     memset(slot, 0, sizeof(*slot));
+    tmpfs_note_release_locked();
     spinlock_unlock(&g_tmpfs_lock);
     return true;
 }
@@ -449,6 +512,7 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
             return false;
         }
         g_tmpfs_slots[i].in_use = 1;
+        tmpfs_note_claim_locked();
         g_tmpfs_slots[i].is_symlink = 1;
         g_tmpfs_slots[i].mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
         strncpy(g_tmpfs_slots[i].path, linkpath, TMPFS_PATH_MAX - 1u);
@@ -457,6 +521,7 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
         spinlock_unlock(&g_tmpfs_lock);
         return true;
     }
+    tmpfs_note_full_locked(linkpath);
     spinlock_unlock(&g_tmpfs_lock);
     return false;
 }
