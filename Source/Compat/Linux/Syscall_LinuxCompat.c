@@ -2488,6 +2488,19 @@ static int64_t linux_open_resolved(char *path, uint64_t flags)
             /* Create it, then open it with the caller's flags: the access mode
              * open() reports back has to be the one that was asked for. */
             result = (int64_t)syscall_file_creat_ex(path, flags);
+        } else if (result == LINUX_ENOENT && (flags & 3u) == 0u) {
+            /* open(dir, O_RDONLY) without O_DIRECTORY is valid on Linux, and
+             * the file table has no entry for a directory, so it came back
+             * ENOENT. LevelDB's SyncParent does exactly this before fsync()ing
+             * the directory of every database it creates; the failure made
+             * Chromium report "Unable to open directory (... SyncParent::4)"
+             * for GCM Store and put up the "Something went wrong when opening
+             * your profile" dialog. Only read-only opens qualify: opening a
+             * directory for writing is EISDIR on Linux too. */
+            int32_t dir_fd = syscall_file_register_dir(path);
+            if (dir_fd >= 0) {
+                result = (int64_t)dir_fd;
+            }
         }
 #if LINUX_MODULE_MAP_TRACE
         if (result >= 0) {
