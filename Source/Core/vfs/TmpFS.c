@@ -7,14 +7,13 @@
 
 /* One table serves all four mounts below, so it has to hold everything at
  * once: Xorg's sockets and compiled keymaps, the fontconfig cache, the login
- * session files, and a whole browser profile. 256 was exhausted while
- * Chromium created its profile: the next file creation failed, the syscall
- * layer reported EIO, and whichever database was being opened at that moment
- * broke ("GCM Store/LOCK: OS or hardware error", "Failed to load tokens
- * (invalid SQL statement)"), which is the "Something went wrong when opening
- * your profile" dialog. A slot is ~272 bytes with file data allocated
- * separately, so 4096 costs about 1.1 MB, and lookups only compare slots in
- * use. */
+ * session files, and a whole browser profile. A Chromium boot already reaches
+ * at least 224 slots, so 256 left no room for a second profile or a larger
+ * cache; once full, file creation fails and the syscall layer reports EIO.
+ * (The "Something went wrong when opening your profile" dialog is NOT this:
+ * it still appears on boots that peak below 256.) A slot is ~272 bytes with
+ * file data allocated separately, so 4096 costs about 1.1 MB, and lookups
+ * only compare slots in use. */
 #define TMPFS_MAX_FILES 4096u
 #define TMPFS_PATH_MAX  256u
 #define TMPFS_PREFIX    "/dev/shm"
