@@ -3,6 +3,7 @@ section .text
 global syscall_entry
 global syscall_enter_user_from_frame
 extern syscall_dispatch
+extern process_scheduler_clear_leaving_pid
 
 syscall_entry:
     swapgs
@@ -52,6 +53,18 @@ syscall_entry:
     call syscall_dispatch
     
     mov rsp, rax
+
+    ; Only now is the previous task's kernel stack abandoned: everything up to
+    ; here, including the return out of syscall_dispatch, ran on it. The
+    ; scheduler marked that task "leaving" on this CPU so no other CPU picks it
+    ; meanwhile (scheduler_pid_running_on_other_cpu); drop the marker now so it
+    ; does not keep the task off every other CPU until this one schedules again.
+    ; Safe to call C here: interrupts are off (IA32_FMASK clears IF), GS is the
+    ; kernel's, nothing below RSP on this stack is in use, and every register
+    ; the call may clobber is reloaded from the frame by the pops that follow.
+    sub rsp, 8
+    call process_scheduler_clear_leaving_pid
+    add rsp, 8
     
     pop rax
     pop rdx

@@ -246,10 +246,34 @@ static void process_detach_dead_current_locked(void)
         return;
     }
 
-    /* No stack parking any more: the reaper no longer frees kernel stacks, so
-     * there is nothing to rescue. The old scheme could only hold one stack per
-     * CPU, and a second death before the first was released left that one
-     * unprotected -- which is the case that actually bit. */
+    /* Park the dying process's kernel stack against this CPU and take it away
+     * from the slot. This CPU is still standing on that stack: the rest of
+     * this scheduling call runs on it, and when nothing is runnable it idles
+     * here with interrupts enabled, taking every timer tick and IPI onto it.
+     * Meanwhile the parent's wait4() -- woken by poll_wait_notify() on exit --
+     * can reap the zombie on another CPU, and a slot keeps its kernel stack for
+     * reuse, so the next fork into the slot starts running on the very stack
+     * this CPU is still using. Xorg forks and reaps xkbcomp this way twice
+     * whenever an X client connects, and the shared stack showed up as a
+     * double fault at RIP 0x800C, a triple fault with RSP 0, or a whole-guest
+     * hang with a frozen clock, always within a second of Chromium starting.
+     *
+     * With the stack detached, a reused slot allocates a fresh one, and
+     * process_release_parked_stack() frees this one at the next scheduling
+     * entry on this CPU -- only once it can see it is running elsewhere. That
+     * release always runs before the next detach on the same CPU, so the
+     * parking spot is normally empty here; if it is not, leak the older stack
+     * rather than free one we cannot prove unused. */
+    {
+        uint32_t cpu = smp_get_current_cpu_id();
+        if (cpu < (uint32_t)OS_CONFIG_SMP_MAX_CPUS &&
+            proc->kernel_stack_base != NULL) {
+            g_parked_stack[cpu].base = proc->kernel_stack_base;
+            g_parked_stack[cpu].top = proc->kernel_stack_top;
+            proc->kernel_stack_base = NULL;
+            proc->kernel_stack_top = 0u;
+        }
+    }
     /* This CPU is also still running on the dying process's page tables, and
      * the reap tears those down (paging_destroy_process_space). Get onto the
      * kernel's own CR3 first, or the next instruction faults with no page

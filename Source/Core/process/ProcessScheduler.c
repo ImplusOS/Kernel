@@ -36,7 +36,23 @@ static int scheduler_pid_running_on_other_cpu(const process_t *processes,
         num_cpus = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
     }
     for (uint32_t cpu = 0; cpu < num_cpus; ++cpu) {
-        if (cpu != current_cpu && g_current_pid_per_cpu[cpu] == pid) {
+        if (cpu == current_cpu) {
+            continue;
+        }
+        /* "Leaving" counts as running. A CPU that has already picked its next
+         * task still returns out of the scheduler, through syscall_dispatch,
+         * on the previous task's kernel stack until syscall_entry loads the
+         * new RSP -- and a vCPU can be descheduled by the host for
+         * milliseconds anywhere in that stretch. Picking the task here
+         * meanwhile put two CPUs on one stack: the second one's frames
+         * overwrote the first one's return address, which then "returned" to
+         * 0x8000 and ran the SMP trampoline as 64-bit code (RSP 0, RBP still
+         * inside the other CPU's live frame) -- the reset, double fault or
+         * whole-guest hang in Chromium's first second. syscall_entry clears
+         * the marker the moment the new RSP is loaded, so this refusal lasts
+         * only for that stretch. */
+        if (g_current_pid_per_cpu[cpu] == pid ||
+            g_leaving_pid_per_cpu[cpu] == pid) {
             return 1;
         }
     }
