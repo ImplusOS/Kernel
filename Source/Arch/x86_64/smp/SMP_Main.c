@@ -134,6 +134,36 @@ static inline void io_wait(void)
     hal_io_delay();
 }
 
+/* The current CPU's index without a VM exit.
+ *
+ * smp_get_current_cpu_id() runs several times per syscall -- the scheduler,
+ * syscall_set_user_rsp(), the TSS rsp0 update, process_get_current_pid(),
+ * and every spinlock that polls for TLB shootdowns -- and reading the local
+ * APIC ID is an MMIO access, which is a VM exit under KVM. Profiling Chromium
+ * starting up found most busy vCPU samples either inside lapic_get_id() or
+ * spinning behind a lock whose holder was.
+ *
+ * RDTSCP hands back MSR_TSC_AUX in ECX and runs natively under KVM, so each
+ * CPU stores (index + 1) there as it comes up. Zero, the reset value, means
+ * "not stored yet" and the lookup falls back to the APIC ID. */
+#define MSR_TSC_AUX 0xC0000103U
+static bool g_cpu_id_rdtscp;
+
+static bool cpu_has_rdtscp(void)
+{
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    hal_cpu_get_id(0x80000000u, 0, &eax, &ebx, &ecx, &edx);
+    if (eax < 0x80000001u) return false;
+    hal_cpu_get_id(0x80000001u, 0, &eax, &ebx, &ecx, &edx);
+    return (edx & (1u << 27)) != 0u;
+}
+
+static void smp_publish_cpu_index(uint32_t cpu_idx)
+{
+    if (!cpu_has_rdtscp()) return;
+    hal_cpu_write_msr(MSR_TSC_AUX, (uint64_t)cpu_idx + 1u);
+}
+
 static void smp_delay_ms(uint32_t ms)
 {
     uint64_t start = timer_monotonic_ns();
@@ -187,6 +217,8 @@ void ap_entry_c(void)
     if (!found) {
         while (1) { hal_cpu_halt(); }
     }
+
+    smp_publish_cpu_index(cpu_idx);
 
     /* We are past the real-mode trampoline and running on the kernel stack
      * it handed us, so SMP_SHARED_PHYS has been fully consumed and the BSP
@@ -291,6 +323,15 @@ void smp_init(void)
     memset((void *)(uintptr_t)SMP_SHARED_PHYS, 0, 4096);
 
     uint32_t bsp_lapic_id = lapic_get_id();
+    for (uint32_t i = 0; i < g_cpu_apic_count; i++) {
+        if (g_cpu_apic_ids[i] == (uint8_t)bsp_lapic_id) {
+            if (cpu_has_rdtscp()) {
+                smp_publish_cpu_index(i);
+                g_cpu_id_rdtscp = true;
+            }
+            break;
+        }
+    }
     uint8_t  trampoline_vector = (uint8_t)(SMP_TRAMPOLINE_PHYS >> 12);
 
     uint64_t bsp_cr3 = hal_cpu_read_cr(3);
@@ -360,6 +401,13 @@ uint32_t smp_get_possible_cpu_count(void)
 
 uint32_t smp_get_current_cpu_id(void)
 {
+    if (g_cpu_id_rdtscp) {
+        uint32_t lo, hi, aux;
+        __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        (void)lo;
+        (void)hi;
+        if (aux != 0u) return aux - 1u;
+    }
     if (!lapic_is_present()) return 0;
     uint32_t lid = lapic_get_id();
     for (uint32_t i = 0; i < g_cpu_apic_count; i++) {

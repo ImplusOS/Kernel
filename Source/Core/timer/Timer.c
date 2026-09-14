@@ -171,6 +171,75 @@ static void timer_core_handler(void) {
     }
 }
 
+#if defined(PLATFORM_X86_64)
+/* A monotonic clock that does not leave the guest.
+ *
+ * hpet_monotonic_ns() is an MMIO read that QEMU emulates in user space, so
+ * every call is a full VM exit to the QEMU process. The scheduler and the
+ * poll/futex wait paths read the clock on every syscall, usually with the
+ * process table lock held, and profiling Chromium starting up found the other
+ * vCPUs spinning behind that lock while its holder waited on HPET reads.
+ *
+ * RDTSC runs natively under KVM. It is calibrated once against HPET here and
+ * then used alone. KVM keeps the vCPUs' TSCs in step, but a clock must never
+ * run backwards even if two of them disagree by a few ticks, so the result is
+ * clamped to the largest value any CPU has returned so far. */
+#define TIMER_TSC_CAL_WINDOW_NS 50000000ULL /* 50 ms */
+
+static uint64_t g_tsc_base;
+static uint64_t g_tsc_base_ns;
+static uint64_t g_tsc_ns_per_tick_q32;
+static volatile uint8_t g_tsc_ready;
+static volatile uint64_t g_tsc_last_ns;
+
+static inline uint64_t timer_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void timer_tsc_calibrate(void) {
+    if (!hpet_is_available()) {
+        return;
+    }
+    uint64_t ns0 = hpet_monotonic_ns();
+    uint64_t tsc0 = timer_rdtsc();
+    uint64_t ns1;
+    do {
+        ns1 = hpet_monotonic_ns();
+    } while (ns1 - ns0 < TIMER_TSC_CAL_WINDOW_NS);
+    uint64_t tsc1 = timer_rdtsc();
+    if (tsc1 <= tsc0) {
+        return;
+    }
+    /* ns1 - ns0 is about 5e7, so shifting it left by 32 cannot overflow. */
+    uint64_t per_tick = ((ns1 - ns0) << 32) / (tsc1 - tsc0);
+    if (per_tick == 0u) {
+        return;
+    }
+    g_tsc_ns_per_tick_q32 = per_tick;
+    g_tsc_base = tsc1;
+    g_tsc_base_ns = ns1;
+    g_tsc_last_ns = ns1;
+    __atomic_store_n(&g_tsc_ready, 1u, __ATOMIC_RELEASE);
+}
+
+static uint64_t timer_tsc_monotonic_ns(void) {
+    uint64_t tsc = timer_rdtsc();
+    uint64_t delta = tsc > g_tsc_base ? tsc - g_tsc_base : 0u;
+    uint64_t ns = g_tsc_base_ns +
+                  (uint64_t)(((unsigned __int128)delta * g_tsc_ns_per_tick_q32) >> 32);
+    uint64_t last = __atomic_load_n(&g_tsc_last_ns, __ATOMIC_ACQUIRE);
+    while (ns > last) {
+        if (__atomic_compare_exchange_n(&g_tsc_last_ns, &last, ns, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+            return ns;
+        }
+    }
+    return last;
+}
+#endif
+
 void timer_init(const timer_hal_t* hal) {
     if (g_timer_initialized) {
         return;
@@ -179,6 +248,9 @@ void timer_init(const timer_hal_t* hal) {
     g_timer_hal = hal;
     g_requested_hz = TIMER_DEFAULT_HZ;
     (void)hpet_init();
+#if defined(PLATFORM_X86_64)
+    timer_tsc_calibrate();
+#endif
 
     if (g_timer_hal && g_timer_hal->init) {
         if (g_timer_hal->set_handler) {
@@ -221,6 +293,11 @@ uint32_t timer_hz(void) {
 }
 
 uint64_t timer_monotonic_ns(void) {
+#if defined(PLATFORM_X86_64)
+    if (__atomic_load_n(&g_tsc_ready, __ATOMIC_RELAXED) != 0u) {
+        return timer_tsc_monotonic_ns();
+    }
+#endif
     if (hpet_is_available()) {
         return hpet_monotonic_ns();
     }
