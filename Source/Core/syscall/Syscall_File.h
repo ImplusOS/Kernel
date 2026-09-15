@@ -34,6 +34,18 @@ void syscall_file_close_all_for_pid(int32_t pid, uint32_t *closed_fds_out, uint3
 void syscall_file_close_cloexec_for_pid(int32_t pid);
 int32_t syscall_file_pipe(int32_t fds_out[2]);
 int32_t syscall_file_dup(int32_t oldfd);
+
+/* A value identifying the file behind `fd` -- equal for every open of the
+ * same file -- or 0 when it cannot be told (not a regular file, no backing
+ * object). Used to find a file's memory mappings from a write to it. */
+uint64_t syscall_file_identity(int32_t fd);
+
+/* Called after every successful write to a regular file, with the offset the
+ * write started at and the bytes written (`data` is whatever buffer the
+ * caller passed in). One observer; NULL removes it. */
+typedef void (*file_write_observer_t)(int32_t fd, uint32_t offset,
+                                      const uint8_t *data, uint64_t len);
+void syscall_file_set_write_observer(file_write_observer_t observer);
 int32_t syscall_file_dup2(int32_t oldfd, int32_t newfd);
 int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd);
 
@@ -100,6 +112,9 @@ int64_t syscall_signalfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
  * `reacquire` takes another on a handle already held (fork), `read` fills a
  * KERNEL buffer from the mapped file, `release` drops one reference. */
 int32_t syscall_file_mmap_acquire(int32_t fd);
+/* Shared-memory handle backing a tmpfs file for mmap(MAP_SHARED), or <= 0
+ * when `fd` is not such a file. See tmpfs_share_mapping(). */
+int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length);
 int32_t syscall_file_mmap_reacquire(int32_t handle);
 int64_t syscall_file_mmap_read(int32_t handle, uint64_t offset,
                                uint8_t *kernel_buffer, uint32_t length);

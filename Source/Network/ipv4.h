@@ -12,6 +12,12 @@ void ipv4_init(uint32_t local_ipv4_addr,
                uint32_t subnet_mask,
                uint32_t gateway_ipv4_addr);
 
+/* Change the local address, mask and gateway without touching the protocol
+ * handlers registered since ipv4_init() (use this for DHCP). */
+void ipv4_set_address(uint32_t local_ipv4_addr,
+                      uint32_t subnet_mask,
+                      uint32_t gateway_ipv4_addr);
+
 uint32_t ipv4_local_address(void);
 
 bool ipv4_register_protocol(uint8_t protocol, ipv4_protocol_handler_t handler);

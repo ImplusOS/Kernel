@@ -896,6 +896,10 @@ int64_t syscall_access(const char *path, int32_t mode)
     return -2; /* ENOENT */
 }
 
+static int64_t linux_socket_sendto(uint64_t fd, uint64_t buf, uint64_t len,
+                                   uint64_t flags, uint64_t addr_ptr,
+                                   uint64_t addr_len);
+
 int64_t write(int fd, const void *buf, uint64_t count)
 {
     if (buf == NULL) {
@@ -935,6 +939,13 @@ int64_t write(int fd, const void *buf, uint64_t count)
             if ((uint64_t)w < n) break;
         }
         return (int64_t)total;
+    }
+
+    /* AF_INET write(): the same gap read() had -- socket fds are outside the
+     * file table, so this failed instead of sending. */
+    if (syscall_socket_fd_in_range(fd)) {
+        return linux_socket_sendto((uint64_t)fd, (uint64_t)(uintptr_t)buf,
+                                   count, 0u, 0u, 0u);
     }
 
     if ((fd == 1 || fd == 2) &&
@@ -1339,26 +1350,9 @@ static int64_t linux_copy_cstring(char *out, uint64_t capacity,
     return 0;
 }
 
-static int64_t linux_days_from_civil(int64_t year, unsigned month,
-                                     unsigned day)
-{
-    year -= (month <= 2u) ? 1 : 0;
-    int64_t era = (year >= 0 ? year : year - 399) / 400;
-    unsigned yoe = (unsigned)(year - era * 400);
-    unsigned doy =
-        (153u * (month + (month > 2u ? 0u : 9u)) + 2u) / 5u + day - 1u;
-    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
-    return era * 146097 + (int64_t)doe - 719468;
-}
-
 static int64_t linux_realtime_seconds(void)
 {
-    rtc_time_t rtc;
-    rtc_read_time(&rtc);
-    int64_t days = linux_days_from_civil((int64_t)rtc.year,
-                                         rtc.month, rtc.day);
-    return days * 86400 + (int64_t)rtc.hour * 3600 +
-           (int64_t)rtc.minute * 60 + (int64_t)rtc.second;
+    return clock_realtime_ns() / 1000000000LL;
 }
 
 static int64_t linux_brk(uint64_t addr)
@@ -1390,7 +1384,19 @@ static int64_t linux_brk(uint64_t addr)
  * munmap(2)/exit - i.e. mmap()-as-file-write works. A dup of the fd is held so
  * the mapping outlives a user close(). memfd / /dev/shm shared memory (the
  * path Chromium actually relies on) is unaffected - it is tmpfs-backed and
- * already coherent. */
+ * already coherent.
+ *
+ * The other direction matters just as much: a file written with write() or
+ * pwrite() while it is mapped. The mapping is a copy taken at mmap() time, so
+ * without help it keeps showing the old bytes. SQLite does exactly this -- it
+ * writes pages with pwrite() and reads them back through a read-only
+ * MAP_SHARED mapping -- and every database Chromium created read back a
+ * schema from before its own tables existed, failed with "invalid SQL
+ * statement", and was razed ("Something went wrong when opening your
+ * profile"). linux_mshared_note_write() copies each write into the mappings
+ * of that file in the writer's address space. And only writable mappings are
+ * written back: flushing a read-only snapshot on munmap() put stale pages
+ * back over the file every time SQLite remapped a growing database. */
 #define LINUX_MSHARED_MAX 96
 typedef struct {
     int32_t  in_use;
@@ -1400,6 +1406,9 @@ typedef struct {
     uint64_t length;
     uint64_t file_offset;
     uint64_t writeback_len; /* min(length, file bytes from offset at map time) */
+    uint64_t file_key;      /* syscall_file_identity() of the mapped file */
+    uint64_t cr3;           /* address space the mapping lives in */
+    int32_t  writable;      /* PROT_WRITE: flush back to the file */
 } linux_mshared_t;
 
 static linux_mshared_t g_linux_mshared[LINUX_MSHARED_MAX];
@@ -1417,11 +1426,54 @@ static void linux_mshared_init_once(void)
     }
 }
 
+/* A regular file was written: bring every MAP_SHARED copy of that range in
+ * the writer's address space up to date. */
+static void linux_mshared_note_write(int32_t fd, uint32_t offset,
+                                     const uint8_t *data, uint64_t len)
+{
+    if (!g_linux_mshared_ready || data == NULL || len == 0u) {
+        return;
+    }
+    uint64_t key = syscall_file_identity(fd);
+    uint64_t cr3 = process_get_current_cr3();
+    if (key == 0u || cr3 == 0u) {
+        return;
+    }
+    uint64_t w_lo = (uint64_t)offset;
+    uint64_t w_hi = w_lo + len;
+    for (int i = 0; i < LINUX_MSHARED_MAX; ++i) {
+        uint64_t uaddr = 0u, foff = 0u, mlen = 0u;
+        int match = 0;
+        spinlock_lock(&g_linux_mshared_lock);
+        const linux_mshared_t *e = &g_linux_mshared[i];
+        if (e->in_use && e->file_key == key && e->cr3 == cr3) {
+            uaddr = e->uaddr;
+            foff = e->file_offset;
+            mlen = e->length;
+            match = 1;
+        }
+        spinlock_unlock(&g_linux_mshared_lock);
+        if (!match) {
+            continue;
+        }
+        uint64_t lo = w_lo > foff ? w_lo : foff;
+        uint64_t hi = w_hi < foff + mlen ? w_hi : foff + mlen;
+        if (lo >= hi) {
+            continue;
+        }
+        (void)copy_to_user_trusted((void *)(uintptr_t)(uaddr + (lo - foff)),
+                                   data + (lo - w_lo), hi - lo);
+    }
+}
+
 static void linux_mshared_register(int32_t owner_pid, int32_t src_fd,
                                    uint64_t uaddr, uint64_t length,
-                                   uint64_t file_offset, uint64_t writeback_len)
+                                   uint64_t file_offset, uint64_t writeback_len,
+                                   int32_t writable)
 {
     linux_mshared_init_once();
+    syscall_file_set_write_observer(linux_mshared_note_write);
+    uint64_t file_key = syscall_file_identity(src_fd);
     int32_t dup_fd = syscall_file_dup(src_fd);
     if (dup_fd < 0) {
         return; /* best effort: fall back to private-copy semantics */
@@ -1436,6 +1488,9 @@ static void linux_mshared_register(int32_t owner_pid, int32_t src_fd,
             g_linux_mshared[i].length = length;
             g_linux_mshared[i].file_offset = file_offset;
             g_linux_mshared[i].writeback_len = writeback_len;
+            g_linux_mshared[i].file_key = file_key;
+            g_linux_mshared[i].cr3 = process_get_current_cr3();
+            g_linux_mshared[i].writable = writable;
             spinlock_unlock(&g_linux_mshared_lock);
             return;
         }
@@ -1457,6 +1512,7 @@ static void linux_mshared_flush_range(int32_t owner_pid, uint64_t lo,
         int32_t fd = -1;
         uint64_t uaddr = 0, wlen = 0, foff = 0;
         int do_unreg = 0;
+        int writable = 0;
 
         spinlock_lock(&g_linux_mshared_lock);
         linux_mshared_t *e = &g_linux_mshared[i];
@@ -1466,6 +1522,7 @@ static void linux_mshared_flush_range(int32_t owner_pid, uint64_t lo,
             uaddr = e->uaddr;
             wlen = e->writeback_len;
             foff = e->file_offset;
+            writable = e->writable;
             if (unregister) {
                 e->in_use = 0;
                 do_unreg = 1;
@@ -1477,7 +1534,7 @@ static void linux_mshared_flush_range(int32_t owner_pid, uint64_t lo,
             continue;
         }
         uint64_t done = 0;
-        while (done < wlen) {
+        while (writable && done < wlen) {
             uint64_t want = wlen - done;
             if (want > LINUX_MAX_IO_BYTES) want = LINUX_MAX_IO_BYTES;
             int64_t w = linux_pwrite64((uint64_t)fd, uaddr + done, want,
@@ -1650,6 +1707,18 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
              * nothing -- demand-zero on first touch. Elsewhere (glibc placing
              * something into the heap) keep the eager mapping. */
             if (process_user_addr_in_mmap_arena(addr, length)) {
+                /* MAP_FIXED replaces whatever is mapped there with fresh zero
+                 * pages. Committing nothing is only half of that: pages
+                 * already present kept their old contents, and PartitionAlloc
+                 * decommits-and-zeroes a span exactly this way
+                 * (mmap(MAP_FIXED, PROT_NONE)) and then builds allocator
+                 * metadata on it believing it is zero -- which is how
+                 * Chromium's heap came back full of its own pixels and CSS
+                 * text. Drop them, so the next touch demand-zeroes. */
+                uint64_t cr3 = process_get_current_cr3();
+                if (cr3 != 0u) {
+                    (void)paging_unmap_range(cr3, addr, length);
+                }
                 /* Anonymous pages must read as zero even where they land on
                  * top of a demand-paged file mapping -- this is precisely how
                  * a shared object's .bss is placed over the mapping of its own
@@ -1700,6 +1769,30 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 return LINUX_ENOMEM;
             }
             return (int64_t)(uintptr_t)p;
+        }
+    }
+
+    /* MAP_SHARED of a tmpfs file (Chromium's shared memory lives in /dev/shm
+     * files): map the file's shared pages, so every mapping -- in this process
+     * or another -- sees the same bytes. The snapshot copy below made each
+     * mapping private, so a buffer one side wrote was never seen by the other
+     * (the GPU thread crashed on its first new frame after a click, and pages
+     * could stay blank for good). */
+#ifndef LINUX_TMPFS_SHARED_MMAP
+/* Off: mapping tmpfs files through shared-memory objects deadlocked
+ * Chromium at startup (every thread parked in futex before the profile
+ * loaded). Kept switchable while that is investigated. */
+#define LINUX_TMPFS_SHARED_MMAP 0
+#endif
+    if (LINUX_TMPFS_SHARED_MMAP &&
+        (flags & LINUX_MAP_SHARED) != 0u && offset == 0u &&
+        (flags & LINUX_MAP_FIXED) == 0u) {
+        int32_t tmpfs_handle = syscall_file_tmpfs_share((int32_t)fd, length);
+        if (tmpfs_handle > 0) {
+            void *p = shared_memory_map_new(tmpfs_handle);
+            if (p != NULL) {
+                return (int64_t)(uintptr_t)p;
+            }
         }
     }
 
@@ -1754,6 +1847,15 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                     return LINUX_EINVAL;
                 }
                 reserved = (void *)(uintptr_t)addr;
+                /* As for anonymous MAP_FIXED: pages already present would
+                 * hide the file's contents. Drop them so this range faults in
+                 * from the file. */
+                if (process_user_addr_in_mmap_arena(addr, length)) {
+                    uint64_t fixed_cr3 = process_get_current_cr3();
+                    if (fixed_cr3 != 0u) {
+                        (void)paging_unmap_range(fixed_cr3, addr, length);
+                    }
+                }
             } else {
                 reserved = process_user_reserve(length);
             }
@@ -1825,7 +1927,8 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (self >= 0) {
             linux_mshared_register(self, (int32_t)fd,
                                    (uint64_t)(uintptr_t)mapped, length,
-                                   offset, read_len);
+                                   offset, read_len,
+                                   (prot & 0x2u /* PROT_WRITE */) != 0u);
         }
     }
 #if LINUX_MODULE_MAP_TRACE
@@ -2186,9 +2289,10 @@ static int64_t linux_gettimeofday(uint64_t tv_ptr)
                                       sizeof(int64_t) * 2u)) {
         return LINUX_EFAULT;
     }
+    int64_t now_ns = clock_realtime_ns();
     int64_t tv[2];
-    tv[0] = linux_realtime_seconds();
-    tv[1] = 0;
+    tv[0] = now_ns / 1000000000LL;
+    tv[1] = (now_ns % 1000000000LL) / 1000LL;
     if (copy_to_user_trusted((void *)(uintptr_t)tv_ptr, tv, sizeof(tv)) != 0u) {
         return LINUX_EFAULT;
     }
@@ -2333,6 +2437,10 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
     return (int64_t)tid;
 }
 
+static int64_t linux_socket_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
+                                     uint64_t flags, uint64_t addr_ptr,
+                                     uint64_t addr_len_ptr);
+
 static int64_t linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (count == 0u) {
@@ -2365,6 +2473,14 @@ static int64_t linux_read(uint64_t fd, uint64_t buf, uint64_t count)
      * failed. */
     if (unix_socket_fd_in_range((int32_t)fd)) {
         return unix_socket_recv((int32_t)fd, (void *)(uintptr_t)buf, count);
+    }
+    /* AF_INET read(): socket fds live outside the file table, so this used to
+     * fail with EINVAL. Chromium reads DNS replies from connected UDP sockets
+     * and HTTP responses from TCP sockets with plain read(), so every reply
+     * that arrived was dropped and the page failed with
+     * DNS_PROBE_FINISHED_NO_INTERNET while the answers sat in the queue. */
+    if (syscall_socket_fd_in_range((int32_t)fd)) {
+        return linux_socket_recvfrom(fd, buf, count, 0u, 0u, 0u);
     }
     return (int64_t)syscall_file_read((int32_t)fd,
                                       (uint8_t *)(uintptr_t)buf, count);
@@ -3317,6 +3433,148 @@ static int64_t linux_socket_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
         }
     }
     return result;
+}
+
+/* recvmsg(2)/sendmsg(2) on AF_INET sockets.
+ *
+ * Only AF_UNIX used to be routed here; an AF_INET socket got EOPNOTSUPP.
+ * Chromium's DNS client sends its queries with sendto() but reads every reply
+ * with recvmsg(), so each answer that arrived was left in the queue, the query
+ * timed out and was re-sent, and pages failed with
+ * DNS_PROBE_FINISHED_NO_INTERNET.
+ *
+ * The data goes through a staging buffer the size of one datagram: a UDP
+ * payload always fits, and a stream socket is allowed to return (or accept)
+ * less than was asked for. msg_control is not modelled -- no ancillary data
+ * is ever delivered, so msg_controllen comes back 0. */
+#define LINUX_INET_MSG_STAGING 1536u
+
+typedef struct {
+    uint64_t msg_name;
+    uint32_t msg_namelen;
+    uint32_t pad0;
+    uint64_t msg_iov;
+    uint64_t msg_iovlen;
+    uint64_t msg_control;
+    uint64_t msg_controllen;
+    int32_t  msg_flags;
+    uint32_t pad1;
+} linux_msghdr_inet_t;
+
+typedef struct {
+    uint64_t iov_base;
+    uint64_t iov_len;
+} linux_iovec_inet_t;
+
+static int64_t linux_inet_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
+{
+    linux_msghdr_inet_t msg;
+    if (copy_from_user(&msg, (const void *)(uintptr_t)msg_ptr, sizeof(msg)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    if (msg.msg_iovlen > 1024u) {
+        return LINUX_EINVAL;
+    }
+    uint64_t want = 0u;
+    for (uint64_t i = 0; i < msg.msg_iovlen && want < LINUX_INET_MSG_STAGING; ++i) {
+        linux_iovec_inet_t iov;
+        if (copy_from_user(&iov, (const void *)(uintptr_t)(msg.msg_iov + i * sizeof(iov)),
+                           sizeof(iov)) != 0u) {
+            return LINUX_EFAULT;
+        }
+        want += iov.iov_len;
+    }
+    if (want > LINUX_INET_MSG_STAGING) {
+        want = LINUX_INET_MSG_STAGING;
+    }
+
+    uint8_t staging[LINUX_INET_MSG_STAGING];
+    uint32_t src_ip = 0u;
+    uint16_t src_port = 0u;
+    int64_t got = (int64_t)syscall_socket_recvfrom((int32_t)fd, staging, (uint16_t)want,
+                                                   &src_ip, &src_port);
+    if (got == 0 && want != 0u && (flags & 0x40u /* MSG_DONTWAIT */) != 0u &&
+        syscall_socket_get_type((int32_t)fd) == (int32_t)LINUX_SOCK_DGRAM) {
+        return LINUX_EAGAIN;
+    }
+    if (got < 0) {
+        return got;
+    }
+
+    uint64_t done = 0u;
+    for (uint64_t i = 0; i < msg.msg_iovlen && done < (uint64_t)got; ++i) {
+        linux_iovec_inet_t iov;
+        if (copy_from_user(&iov, (const void *)(uintptr_t)(msg.msg_iov + i * sizeof(iov)),
+                           sizeof(iov)) != 0u) {
+            return LINUX_EFAULT;
+        }
+        uint64_t n = (uint64_t)got - done;
+        if (n > iov.iov_len) n = iov.iov_len;
+        if (n != 0u && copy_to_user((void *)(uintptr_t)iov.iov_base, staging + done, n) != 0u) {
+            return LINUX_EFAULT;
+        }
+        done += n;
+    }
+
+    uint32_t namelen = 0u;
+    if (msg.msg_name != 0u && msg.msg_namelen >= sizeof(linux_sockaddr_in_t)) {
+        linux_sockaddr_in_t addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = LINUX_AF_INET;
+        addr.sin_port = linux_be16_to_host(src_port);
+        addr.sin_addr = src_ip;
+        if (copy_to_user((void *)(uintptr_t)msg.msg_name, &addr, sizeof(addr)) != 0u) {
+            return LINUX_EFAULT;
+        }
+        namelen = (uint32_t)sizeof(addr);
+    }
+    msg.msg_namelen = namelen;
+    msg.msg_controllen = 0u;
+    msg.msg_flags = 0;
+    if (copy_to_user((void *)(uintptr_t)msg_ptr, &msg, sizeof(msg)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    return (int64_t)done;
+}
+
+static int64_t linux_inet_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
+{
+    linux_msghdr_inet_t msg;
+    if (copy_from_user(&msg, (const void *)(uintptr_t)msg_ptr, sizeof(msg)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    if (msg.msg_iovlen > 1024u) {
+        return LINUX_EINVAL;
+    }
+    uint8_t staging[LINUX_INET_MSG_STAGING];
+    uint64_t len = 0u;
+    for (uint64_t i = 0; i < msg.msg_iovlen && len < LINUX_INET_MSG_STAGING; ++i) {
+        linux_iovec_inet_t iov;
+        if (copy_from_user(&iov, (const void *)(uintptr_t)(msg.msg_iov + i * sizeof(iov)),
+                           sizeof(iov)) != 0u) {
+            return LINUX_EFAULT;
+        }
+        uint64_t n = iov.iov_len;
+        if (n > LINUX_INET_MSG_STAGING - len) n = LINUX_INET_MSG_STAGING - len;
+        if (n != 0u && copy_from_user(staging + len, (const void *)(uintptr_t)iov.iov_base, n) != 0u) {
+            return LINUX_EFAULT;
+        }
+        len += n;
+    }
+    uint32_t dst_ip = 0u;
+    uint16_t dst_port = 0u;
+    if (msg.msg_name != 0u && msg.msg_namelen != 0u) {
+        int64_t rc = linux_copy_sockaddr_in(msg.msg_name, &dst_ip, &dst_port);
+        if (rc < 0) {
+            return rc;
+        }
+    }
+    if (syscall_socket_get_type((int32_t)fd) == (int32_t)LINUX_SOCK_STREAM) {
+        int64_t sent = (int64_t)syscall_socket_send((int32_t)fd, staging, (uint16_t)len);
+        return linux_send_result_sigpipe(sent, flags);
+    }
+    return (int64_t)syscall_socket_sendto((int32_t)fd, staging, (uint16_t)len,
+                                          dst_ip, dst_port);
 }
 
 static int64_t linux_socket_setsockopt(uint64_t fd, uint64_t level,
@@ -5528,7 +5786,69 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_FUTEX: {
-            result = syscall_futex(arg1, arg2, arg3, arg4, arg5, arg6);
+            /* For FUTEX_WAIT and FUTEX_WAIT_BITSET the fourth argument is a
+             * pointer to a struct timespec -- relative for WAIT, an absolute
+             * deadline on CLOCK_MONOTONIC (CLOCK_REALTIME with
+             * FUTEX_CLOCK_REALTIME) for WAIT_BITSET. It used to reach
+             * syscall_futex_wait() as the pointer value itself, read as
+             * nanoseconds: every timed wait lasted ~20 minutes whatever it
+             * asked for. Chromium's threads that recover from a missed signal
+             * by timing out never did, and the browser sat on a blank page. */
+            uint64_t futex_cmd = arg2 & 0x7fULL;
+            uint64_t futex_timeout = arg4;
+            int futex_done = 0;
+            int futex_restart = 0;
+            /* A wait already queued by an earlier pass of this syscall is
+             * finished (or resumed) before anything else looks at the
+             * arguments -- in particular before the timeout below would be
+             * re-derived from them. See syscall_futex_linux_resume(). */
+            if ((futex_cmd == 0u || futex_cmd == 9u) &&
+                syscall_futex_linux_resume(&result, &futex_restart)) {
+                futex_done = 1;
+            }
+            if (!futex_done && (futex_cmd == 0u || futex_cmd == 9u) && arg4 != 0u) {
+                struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+                if (copy_from_user(&ts, (const void *)(uintptr_t)arg4, sizeof(ts)) != 0u) {
+                    result = LINUX_EFAULT;
+                    futex_done = 1;
+                } else if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL) {
+                    result = LINUX_EINVAL;
+                    futex_done = 1;
+                } else {
+                    int64_t ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+                    if (futex_cmd == 9u) {
+                        int64_t now = (arg2 & 0x100u) != 0u /* FUTEX_CLOCK_REALTIME */
+                            ? clock_realtime_ns()
+                            : (int64_t)timer_monotonic_ns();
+                        ns -= now;
+                    }
+                    if (ns <= 0) {
+                        /* Already due: Linux still checks the value first. */
+                        int32_t cur = 0;
+                        if (copy_from_user(&cur, (const void *)(uintptr_t)arg1, sizeof(cur)) != 0u) {
+                            result = LINUX_EFAULT;
+                        } else {
+                            result = (cur != (int32_t)arg3) ? LINUX_EAGAIN : -110LL /* ETIMEDOUT */;
+                        }
+                        futex_done = 1;
+                    } else {
+                        futex_timeout = (uint64_t)ns;
+                    }
+                }
+            }
+            if (!futex_done && (futex_cmd == 0u || futex_cmd == 9u)) {
+                result = syscall_futex_wait_linux(
+                    arg1, (int32_t)arg3, futex_timeout,
+                    futex_cmd == 9u ? (uint32_t)arg6 : 0xFFFFFFFFu,
+                    &futex_restart);
+            } else if (!futex_done) {
+                result = syscall_futex(arg1, arg2, arg3, futex_timeout, arg5, arg6);
+            }
+            if (futex_restart) {
+                request_restart = 1;
+                request_switch = 1;
+                break;
+            }
             uint64_t command = arg2 & 0x7fULL;
             /* 0=WAIT, 9=WAIT_BITSET, 6/13=LOCK_PI[2]: these can park the
              * calling thread, so yield the CPU on the way out. */
@@ -5826,7 +6146,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
              * comment in UnixSocket.c) - only the top-level struct is
              * validated here, not the msg_iov/msg_control buffers it
              * points to (a pre-existing gap in unix_socket_sendmsg()). */
-            if (!unix_socket_fd_in_range((int32_t)arg1)) {
+            if (syscall_socket_fd_in_range((int32_t)arg1)) {
+                result = linux_inet_sendmsg(arg1, arg2, arg3);
+            } else if (!unix_socket_fd_in_range((int32_t)arg1)) {
                 result = LINUX_ENOTSUP;
             } else if (!process_user_buffer_is_valid(
                            (const void *)(uintptr_t)arg2, 56u)) {
@@ -5838,7 +6160,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
         case LINUX_SYS_RECVMSG: {
             int should_switch = 0;
-            if (!unix_socket_fd_in_range((int32_t)arg1)) {
+            if (syscall_socket_fd_in_range((int32_t)arg1)) {
+                result = linux_inet_recvmsg(arg1, arg2, arg3);
+            } else if (!unix_socket_fd_in_range((int32_t)arg1)) {
                 result = LINUX_ENOTSUP;
             } else if (!process_user_buffer_is_valid(
                            (const void *)(uintptr_t)arg2, 56u)) {

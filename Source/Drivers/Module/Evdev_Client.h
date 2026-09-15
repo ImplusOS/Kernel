@@ -14,6 +14,12 @@
 #define REL_X 0
 #define REL_Y 1
 #define REL_WHEEL 8
+#define ABS_X 0
+#define ABS_Y 1
+/* Device 1 reports absolute position over this range on both axes; the X
+ * server scales it to the screen, so the pointer lands exactly where the
+ * compositor's cursor is instead of drifting with relative motion. */
+#define EVDEV_ABS_MAX 65535
 #define BTN_LEFT 0x110
 #define BTN_RIGHT 0x111
 #define BTN_MIDDLE 0x112
@@ -38,3 +44,6 @@ int64_t evdev_close(int32_t fd);
 void evdev_push_key_event(uint16_t code, int32_t value);
 void evdev_push_rel_event(uint16_t code, int32_t value);
 void evdev_push_abs_event(uint16_t code, int32_t value);
+/* Queue one raw event on device `device` (0 = keyboard, 1 = pointer). The
+ * caller sends its own EV_SYN/SYN_REPORT to close a frame. */
+int64_t evdev_inject(uint32_t device, uint16_t type, uint16_t code, int32_t value);

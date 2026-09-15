@@ -79,7 +79,14 @@ typedef struct {
     uint8_t mouse_endpoint;
     uint16_t mouse_vendor_id;
     uint16_t mouse_device_id;
+    /* Consecutive failed enumerations of the device now on this port. */
+    uint8_t enum_failures;
 } usb_root_port_state_t;
+
+/* After this many failed attempts a connected port is left alone until its
+ * device goes away. Every attempt starts with a port reset, and a reset is
+ * not harmless: it reinitialises whatever is plugged in. */
+#define USB_ROOT_PORT_ENUM_RETRIES 3u
 
 static usb_root_port_state_t g_root_ports[USB_HC_TABLE_SIZE][USB_MAX_TRACKED_ROOT_PORTS];
 
@@ -847,6 +854,7 @@ static void usb_clear_root_port_states(void)
             g_root_ports[hc][port].mouse_endpoint = 0u;
             g_root_ports[hc][port].mouse_vendor_id = 0u;
             g_root_ports[hc][port].mouse_device_id = 0u;
+            g_root_ports[hc][port].enum_failures = 0u;
         }
     }
 
@@ -923,6 +931,12 @@ static void usb_disconnect_root_device(usb_root_port_state_t *state)
     }
 
     if (state->addr != 0u) {
+        /* The controller still holds a slot for the departed device; a slot
+         * left behind makes the next device on this port fail Address
+         * Device ("port already assigned"). */
+        if (state->hc == USB_HC_XHCI) {
+            xhci_disable_slot(state->addr);
+        }
         g_dev_hc[state->addr] = USB_HC_NONE;
         g_dev_ep0_mps[state->addr] = 0u;
         g_dev_root_port[state->addr] = 0u;
@@ -947,6 +961,7 @@ static void usb_disconnect_root_device(usb_root_port_state_t *state)
     state->mouse_endpoint = 0u;
     state->mouse_vendor_id = 0u;
     state->mouse_device_id = 0u;
+    state->enum_failures = 0u;
 }
 
 static void usb_record_root_device(usb_root_port_state_t *state,
@@ -960,6 +975,7 @@ static void usb_record_root_device(usb_root_port_state_t *state,
     }
 
     state->connected = true;
+    state->enum_failures = 0u;
     state->addr = addr;
     state->hc = hc;
     state->port = port;
@@ -992,7 +1008,7 @@ static void usb_record_root_device(usb_root_port_state_t *state,
     }
 }
 
-static bool usb_enumerate_root_port(usb_hc_type_t hc, uint32_t port)
+static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
 {
     usb_root_port_state_t *state = usb_root_port_state(hc, port);
     if (state == NULL || !usb_hc_port_valid(hc, port)) {
@@ -1043,11 +1059,37 @@ static bool usb_enumerate_root_port(usb_hc_type_t hc, uint32_t port)
     return true;
 }
 
+static bool usb_enumerate_root_port(usb_hc_type_t hc, uint32_t port)
+{
+    bool ok = usb_enumerate_root_port_once(hc, port);
+    usb_root_port_state_t *state = usb_root_port_state(hc, port);
+    if (!ok && state != NULL && state->enum_failures < 0xFFu &&
+        usb_hc_port_valid(hc, port) && usb_hc_port_connected(hc, port)) {
+        ++state->enum_failures;
+    }
+    return ok;
+}
+
 extern bool xhci_is_ready(void);
 
 void usb_core_init(void)
 {
     usb_wait_ms(g_hc_type, 500);
+
+    /* usb_storage_init() calls this again when it finds no storage, to give
+     * slow devices another chance. Only the first call may start from a clean
+     * slate: the devices enumerated by then still own their controller slots
+     * and their addresses. Clearing the tables anyway restarted addresses at 1
+     * (aliasing the keyboard's) and forgot every connected port, so each
+     * rescan reset the keyboard and mouse ports, failed Address Device on the
+     * slots they still held, and left the hotplug poll repeating that about
+     * once a second -- the reason USB keyboard/mouse input never arrived. A
+     * repeat call now just retries ports that are not yet enumerated. */
+    static bool core_state_ready = false;
+    if (core_state_ready) {
+        goto rescan;
+    }
+    core_state_ready = true;
 
     g_usb_next_addr = 1u;
     g_mass_storage_addr = 0;
@@ -1078,6 +1120,7 @@ void usb_core_init(void)
     }
     usb_clear_root_port_states();
 
+rescan:;
     usb_hc_type_t hc_types[] = { USB_HC_XHCI, USB_HC_EHCI, USB_HC_OHCI, USB_HC_UHCI };
 
     for (int pass = 0; pass < 3; pass++) {
@@ -1135,7 +1178,13 @@ static bool usb_poll_hc_hotplug(usb_hc_type_t hc)
             continue;
         }
 
-        if (!state->connected && connected) {
+        if (!connected) {
+            state->enum_failures = 0u;
+            continue;
+        }
+
+        if (!state->connected &&
+            state->enum_failures < USB_ROOT_PORT_ENUM_RETRIES) {
             if (usb_enumerate_root_port(hc, port)) {
                 changed = true;
             }

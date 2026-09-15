@@ -43,3 +43,13 @@ int32_t shared_memory_release(int32_t handle);
 
 /* Size in bytes of the object behind `handle`, or 0 if unknown/invalid. */
 uint32_t shared_memory_size(int32_t handle);
+
+/* Let any address space map the object (see shared_object_t.is_public). */
+int32_t shared_memory_set_public(int32_t handle);
+
+/* Byte-level access to the object's pages from kernel code: copy `len` bytes
+ * at `offset` in or out. Fails if the range runs past the object. */
+int32_t shared_memory_copy_in(int32_t handle, uint32_t offset,
+                              const uint8_t *data, uint32_t len);
+int32_t shared_memory_copy_out(int32_t handle, uint32_t offset,
+                               uint8_t *out, uint32_t len);

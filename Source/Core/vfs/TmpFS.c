@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "Core/sync/Spinlock.h"
+#include "Core/memory/SharedMemory.h"
 
 /* One table serves all four mounts below, so it has to hold everything at
  * once: Xorg's sockets and compiled keymaps, the fontconfig cache, the login
@@ -73,7 +74,22 @@ typedef struct {
     uint8_t *data;
     uint32_t size;
     uint32_t capacity;
+    /* Opens not yet closed, and whether the name was unlinked while some were
+     * still open. POSIX keeps an unlinked file's data until its last close,
+     * and Chromium depends on it: every shared-memory region is a /dev/shm
+     * file that is created, opened, unlinked at once and then used through
+     * the fd. Freeing the slot on unlink let the next file created take the
+     * same slot, and two unrelated regions shared one buffer. */
+    uint32_t open_count;
+    uint8_t unlinked;
+    /* > 0 once the file has been mapped MAP_SHARED: its bytes then live in
+     * this shared-memory object (shm_size bytes, >= size) instead of `data`,
+     * so read/write and every mapping see the same pages. */
+    int32_t shm_handle;
+    uint32_t shm_size;
 } tmpfs_slot_t;
+
+static const vfs_driver_t g_tmpfs_vfs_driver;
 
 static tmpfs_slot_t g_tmpfs_slots[TMPFS_MAX_FILES];
 
@@ -181,8 +197,45 @@ static bool tmpfs_vfs_read_at(vfs_file_t *file, uint32_t offset,
         spinlock_unlock(&g_tmpfs_lock);
         return false;
     }
+    if (slot->shm_handle > 0) {
+        bool ok = shared_memory_copy_out(slot->shm_handle, offset, buffer, size) == 0;
+        spinlock_unlock(&g_tmpfs_lock);
+        return ok;
+    }
     memcpy(buffer, slot->data + offset, size);
     spinlock_unlock(&g_tmpfs_lock);
+    return true;
+}
+
+/* Zero [from, to) of a shared slot's object. */
+static void tmpfs_shm_zero_locked(tmpfs_slot_t *slot, uint32_t from, uint32_t to)
+{
+    static const uint8_t zeros[256];
+    while (from < to) {
+        uint32_t n = to - from < sizeof(zeros) ? to - from : (uint32_t)sizeof(zeros);
+        (void)shared_memory_copy_in(slot->shm_handle, from, zeros, n);
+        from += n;
+    }
+}
+
+/* Move a shared slot's bytes back to heap storage and drop its object (the
+ * pages stay alive for mappings that still hold them). Needed when the file
+ * has to grow past the object. */
+static bool tmpfs_unshare_locked(tmpfs_slot_t *slot)
+{
+    if (slot->shm_handle <= 0) {
+        return true;
+    }
+    uint32_t keep = slot->size < slot->shm_size ? slot->size : slot->shm_size;
+    if (!tmpfs_ensure_capacity_locked(slot, keep != 0u ? keep : 1u)) {
+        return false;
+    }
+    if (keep != 0u) {
+        (void)shared_memory_copy_out(slot->shm_handle, 0u, slot->data, keep);
+    }
+    (void)shared_memory_release(slot->shm_handle);
+    slot->shm_handle = 0;
+    slot->shm_size = 0u;
     return true;
 }
 
@@ -195,12 +248,36 @@ static bool tmpfs_vfs_write_at(vfs_file_t *file, uint32_t offset,
     tmpfs_slot_t *slot = (tmpfs_slot_t *)file->driver_data;
     spinlock_lock(&g_tmpfs_lock);
     uint64_t end = (uint64_t)offset + (uint64_t)size;
-    if (end > 0xFFFFFFFFu || !tmpfs_ensure_capacity_locked(slot, (uint32_t)end)) {
+    if (end > 0xFFFFFFFFu) {
         spinlock_unlock(&g_tmpfs_lock);
         return false;
     }
-    if (buffer != NULL && size != 0u) {
-        memcpy(slot->data + offset, buffer, size);
+    if (slot->shm_handle > 0 && end > (uint64_t)slot->shm_size &&
+        !tmpfs_unshare_locked(slot)) {
+        spinlock_unlock(&g_tmpfs_lock);
+        return false;
+    }
+    if (slot->shm_handle > 0) {
+        if (offset > slot->size) {
+            tmpfs_shm_zero_locked(slot, slot->size, offset);
+        }
+        if (buffer != NULL && size != 0u) {
+            (void)shared_memory_copy_in(slot->shm_handle, offset, buffer, size);
+        }
+    } else {
+        if (!tmpfs_ensure_capacity_locked(slot, (uint32_t)end)) {
+            spinlock_unlock(&g_tmpfs_lock);
+            return false;
+        }
+        /* A write past the end leaves a hole that must read back as zeros.
+         * Fresh capacity is zeroed when it is allocated, but bytes a truncate
+         * cut off are still in the buffer. */
+        if (offset > slot->size) {
+            memset(slot->data + slot->size, 0, offset - slot->size);
+        }
+        if (buffer != NULL && size != 0u) {
+            memcpy(slot->data + offset, buffer, size);
+        }
     }
     if ((uint32_t)end > slot->size) {
         slot->size = (uint32_t)end;
@@ -227,13 +304,24 @@ static bool tmpfs_vfs_truncate(vfs_file_t *file, uint32_t new_size)
     }
     tmpfs_slot_t *slot = (tmpfs_slot_t *)file->driver_data;
     spinlock_lock(&g_tmpfs_lock);
-    if (new_size > slot->capacity &&
-        !tmpfs_ensure_capacity_locked(slot, new_size)) {
+    if (slot->shm_handle > 0 && new_size > slot->shm_size &&
+        !tmpfs_unshare_locked(slot)) {
         spinlock_unlock(&g_tmpfs_lock);
         return false;
     }
-    if (new_size > slot->size) {
-        memset(slot->data + slot->size, 0, new_size - slot->size);
+    if (slot->shm_handle > 0) {
+        if (new_size > slot->size) {
+            tmpfs_shm_zero_locked(slot, slot->size, new_size);
+        }
+    } else {
+        if (new_size > slot->capacity &&
+            !tmpfs_ensure_capacity_locked(slot, new_size)) {
+            spinlock_unlock(&g_tmpfs_lock);
+            return false;
+        }
+        if (new_size > slot->size) {
+            memset(slot->data + slot->size, 0, new_size - slot->size);
+        }
     }
     slot->size = new_size;
     file->size = new_size;
@@ -458,10 +546,102 @@ static int32_t tmpfs_vfs_closedir(int32_t handle)
     return 0;
 }
 
+static void tmpfs_free_slot_locked(tmpfs_slot_t *slot)
+{
+    if (slot->data != NULL) {
+        free(slot->data);
+    }
+    if (slot->shm_handle > 0) {
+        (void)shared_memory_release(slot->shm_handle);
+    }
+    memset(slot, 0, sizeof(*slot));
+    tmpfs_note_release_locked();
+}
+
+static bool tmpfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
+{
+    (void)flags;
+    if (file == NULL || file->driver_data == NULL) {
+        return true;
+    }
+    tmpfs_slot_t *slot = (tmpfs_slot_t *)file->driver_data;
+    spinlock_lock(&g_tmpfs_lock);
+    if (slot->in_use) {
+        ++slot->open_count;
+    }
+    spinlock_unlock(&g_tmpfs_lock);
+    return true;
+}
+
 static bool tmpfs_vfs_close_file(vfs_file_t *file)
 {
-    (void)file;
-    return true; /* Backing slot persists across opens. */
+    if (file == NULL || file->driver_data == NULL) {
+        return true;
+    }
+    tmpfs_slot_t *slot = (tmpfs_slot_t *)file->driver_data;
+    spinlock_lock(&g_tmpfs_lock);
+    if (slot->in_use && slot->open_count > 0u) {
+        --slot->open_count;
+        if (slot->open_count == 0u && slot->unlinked) {
+            tmpfs_free_slot_locked(slot);
+        }
+    }
+    spinlock_unlock(&g_tmpfs_lock);
+    return true;
+}
+
+int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
+{
+    if (file == NULL || file->fs_driver != &g_tmpfs_vfs_driver ||
+        file->driver_data == NULL) {
+        return -1;
+    }
+    tmpfs_slot_t *slot = (tmpfs_slot_t *)file->driver_data;
+    spinlock_lock(&g_tmpfs_lock);
+    if (!slot->in_use || slot->is_dir || slot->is_symlink) {
+        spinlock_unlock(&g_tmpfs_lock);
+        return -1;
+    }
+    if (slot->shm_handle > 0) {
+        int32_t existing = length <= (uint64_t)slot->shm_size ? slot->shm_handle : -1;
+        spinlock_unlock(&g_tmpfs_lock);
+        return existing;
+    }
+    uint64_t want = slot->size > length ? (uint64_t)slot->size : length;
+    spinlock_unlock(&g_tmpfs_lock);
+    if (want == 0u || want > 64ull * 1024ull * 1024ull) {
+        return -1;
+    }
+
+    /* Allocating the pages can take a while: do it unlocked, then check
+     * nobody else shared (or removed) the slot meanwhile. */
+    int32_t handle = shared_memory_create((uint32_t)want);
+    if (handle <= 0) {
+        return -1;
+    }
+    (void)shared_memory_set_public(handle);
+
+    spinlock_lock(&g_tmpfs_lock);
+    if (!slot->in_use || slot->shm_handle > 0 ||
+        (uint64_t)slot->size > want) {
+        int32_t existing = (slot->in_use && slot->shm_handle > 0 &&
+                            length <= (uint64_t)slot->shm_size) ? slot->shm_handle : -1;
+        spinlock_unlock(&g_tmpfs_lock);
+        (void)shared_memory_release(handle);
+        return existing;
+    }
+    if (slot->size != 0u && slot->data != NULL) {
+        (void)shared_memory_copy_in(handle, 0u, slot->data, slot->size);
+    }
+    if (slot->data != NULL) {
+        free(slot->data);
+    }
+    slot->data = NULL;
+    slot->capacity = 0u;
+    slot->shm_handle = handle;
+    slot->shm_size = (uint32_t)want;
+    spinlock_unlock(&g_tmpfs_lock);
+    return handle;
 }
 
 static bool tmpfs_vfs_unlink(const char *path)
@@ -472,11 +652,15 @@ static bool tmpfs_vfs_unlink(const char *path)
         spinlock_unlock(&g_tmpfs_lock);
         return false;
     }
-    if (slot->data != NULL) {
-        free(slot->data);
+    if (slot->open_count > 0u) {
+        /* Still open: drop the name now (lookups and a new file of the same
+         * name no longer see this slot), keep the data until the last close. */
+        slot->unlinked = 1u;
+        slot->path[0] = '\0';
+        spinlock_unlock(&g_tmpfs_lock);
+        return true;
     }
-    memset(slot, 0, sizeof(*slot));
-    tmpfs_note_release_locked();
+    tmpfs_free_slot_locked(slot);
     spinlock_unlock(&g_tmpfs_lock);
     return true;
 }
@@ -575,6 +759,7 @@ static const vfs_driver_t g_tmpfs_vfs_driver = {
     .opendir = tmpfs_vfs_opendir,
     .readdir = tmpfs_vfs_readdir,
     .closedir = tmpfs_vfs_closedir,
+    .open_file = tmpfs_vfs_open_file,
     .close_file = tmpfs_vfs_close_file,
     .unlink = tmpfs_vfs_unlink,
     .list_root = tmpfs_vfs_list_root,

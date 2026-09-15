@@ -146,7 +146,7 @@ static void dhcp_on_udp(uint32_t src_ip, uint16_t src_port,
         g_dhcp_assigned_ip = net_ntohl(hdr->yiaddr);
         g_dhcp_state = 3;
 
-        ipv4_init(g_dhcp_assigned_ip, g_dhcp_subnet_mask, g_dhcp_gateway);
+        ipv4_set_address(g_dhcp_assigned_ip, g_dhcp_subnet_mask, g_dhcp_gateway);
     }
 }
 

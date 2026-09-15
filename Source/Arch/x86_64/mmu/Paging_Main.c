@@ -1490,7 +1490,25 @@ int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
     return rc;
 }
 
-static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size)
+/* Frames a locked unmap took out of the page tables. Another CPU running the
+ * same address space may still reach them through its TLB (or its cached
+ * paging-structure entries) until the shootdown that follows the unlock, so
+ * they are freed only after it. Freeing first handed a page straight back to
+ * the allocator while a sibling thread could still write to it: Chromium's
+ * heap metadata came back overwritten with pixel data, resource text and -1,
+ * and PartitionAlloc crashed on the next free. */
+#define PAGING_DEFERRED_FREE_MAX 128u
+typedef struct {
+    void    *frames[PAGING_DEFERRED_FREE_MAX];
+    uint32_t count;
+} paging_deferred_frees_t;
+
+/* Returns 0 when the whole range is done, 1 when `deferred` filled up and the
+ * walk stopped before `*resume_addr` (nothing at or past it was touched), and
+ * -1 on error. */
+static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size,
+                                     paging_deferred_frees_t *deferred,
+                                     uint64_t *resume_addr)
 {
     if (cr3 == 0 || size == 0) {
         return -1;
@@ -1550,6 +1568,12 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
             continue;
         }
 
+        /* Room for this page's frame and, if it empties, its table. */
+        if (deferred->count + 2u > PAGING_DEFERRED_FREE_MAX) {
+            *resume_addr = addr;
+            return 1;
+        }
+
         uint64_t *pt = (uint64_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
         uint64_t old_pte = pt[pt_index];
         if ((old_pte & PAGE_SWAP) != 0 && (old_pte & PAGE_PRESENT) == 0) {
@@ -1557,7 +1581,8 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
             swap_free_slot(slot);
         } else if ((old_pte & PAGE_PRESENT) != 0 && (old_pte & PAGE_USER) != 0) {
             if ((old_pte & PAGE_EXTERNAL) == 0) {
-                free_page((void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK));
+                deferred->frames[deferred->count++] =
+                    (void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK);
             }
         }
         swap_forget_track(cr3, addr);
@@ -1592,7 +1617,7 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
                 }
             }
 #endif
-            free_page(pt);
+            deferred->frames[deferred->count++] = pt;
             pd_table[pd_index] = 0;
         }
         if (refresh_pdpt_entry(cr3, addr, pd_table) < 0) {
@@ -1605,18 +1630,39 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
 
 int paging_unmap_range(uint64_t cr3, uint64_t start, uint64_t size)
 {
-    uint64_t irq = irq_save_disable();
-    spinlock_lock(&g_page_table_lock);
-    int rc = paging_unmap_range_locked(cr3, start, size);
-    spinlock_unlock(&g_page_table_lock);
-    irq_restore(irq);
+    uint64_t end = start + size;
+    uint64_t pos = start;
+    int rc = 0;
+    for (;;) {
+        paging_deferred_frees_t deferred;
+        deferred.count = 0u;
+        uint64_t resume = end;
 
-    /* Every CPU on this address space, not just this one, and not until they
-     * have actually done it: the frames just freed go back to the allocator
-     * immediately, so a sibling thread still holding a translation would read
-     * and write memory that now belongs to somebody else. Done outside the
-     * lock, since the CPUs being waited on may want it themselves. */
-    smp_tlb_shootdown_cr3(cr3, 0u, 0u);
+        uint64_t irq = irq_save_disable();
+        spinlock_lock(&g_page_table_lock);
+        int step = (pos < end) ?
+            paging_unmap_range_locked(cr3, pos, end - pos, &deferred, &resume) : 0;
+        spinlock_unlock(&g_page_table_lock);
+        irq_restore(irq);
+
+        /* Every CPU on this address space, not just this one, and not until
+         * they have actually done it -- and only then may the frames go back
+         * to the allocator (see paging_deferred_frees_t). Outside the lock,
+         * since the CPUs being waited on may want it themselves. */
+        smp_tlb_shootdown_cr3(cr3, 0u, 0u);
+        for (uint32_t i = 0; i < deferred.count; ++i) {
+            free_page(deferred.frames[i]);
+        }
+
+        if (step < 0) {
+            rc = -1;
+            break;
+        }
+        if (step == 0) {
+            break;
+        }
+        pos = resume;
+    }
     return rc;
 }
 
@@ -1699,12 +1745,14 @@ static int paging_map_user_page_locked(uint64_t cr3,
                                       uint64_t virt_addr,
                                       uint64_t phys_addr,
                                       uint64_t flags,
-                                      int *replaced_out)
+                                      int *replaced_out,
+                                      void **old_frame_out)
 {
     if (cr3 == 0) {
         return -1;
     }
     *replaced_out = 0;
+    *old_frame_out = NULL;
 
     uint64_t saved_cr3 = read_cr3();
     uint64_t kernel_cr3 = paging_get_kernel_cr3();
@@ -1816,7 +1864,8 @@ static int paging_map_user_page_locked(uint64_t cr3,
     int replaced_live_mapping = (old_pte & PAGE_PRESENT) != 0;
     if ((old_pte & PAGE_PRESENT) != 0 && (old_pte & PAGE_USER) != 0) {
         if ((old_pte & PAGE_EXTERNAL) == 0) {
-            free_page((void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK));
+            /* Freed by the caller once the shootdown is done. */
+            *old_frame_out = (void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK);
         }
     } else if ((old_pte & PAGE_SWAP) != 0 && (old_pte & PAGE_USER) != 0) {
         uint32_t slot = (uint32_t)((old_pte & PAGE_FRAME_MASK) >> 12);
@@ -1920,10 +1969,11 @@ int paging_map_user_page(uint64_t cr3,
 #endif
 
     int replaced = 0;
+    void *old_frame = NULL;
     uint64_t irq = irq_save_disable();
     spinlock_lock(&g_page_table_lock);
     int rc = paging_map_user_page_locked(cr3, virt_addr, phys_addr, flags,
-                                         &replaced);
+                                         &replaced, &old_frame);
     spinlock_unlock(&g_page_table_lock);
     irq_restore(irq);
 
@@ -1934,6 +1984,9 @@ int paging_map_user_page(uint64_t cr3,
          * the other CPUs running this address space have to drop it before we
          * return -- but only this page, not their whole TLB. */
         smp_tlb_shootdown_cr3(cr3, virt_addr & PAGE_MASK, 1ULL);
+    }
+    if (old_frame != NULL) {
+        free_page(old_frame);
     }
     return rc;
 }

@@ -4,6 +4,8 @@
 #include "Core/timer/Timer.h"
 #include "Platform/timer/HPET.h"
 #include "Platform/rtc/RTC.h"
+#include "Core/sync/Spinlock.h"
+#include "Syscall_Clock.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -42,7 +44,16 @@ static void clock_monotonic_now(kernel_timespec_t *out)
     out->tv_nsec = (int64_t)(ns % 1000000000ULL);
 }
 
-static void clock_realtime_now(kernel_timespec_t *out)
+/* The RTC's reading at the moment the monotonic clock read `base_mono_ns`,
+ * as nanoseconds since the Unix epoch. Taken once: the RTC only counts whole
+ * seconds and every read is a dozen port exits, while monotonic time is
+ * precise and cheap. */
+static volatile uint8_t g_realtime_base_ready;
+static int64_t g_realtime_base_ns;
+static uint64_t g_realtime_base_mono_ns;
+static spinlock_t g_realtime_base_lock;
+
+static int64_t clock_rtc_epoch_seconds(void)
 {
     rtc_time_t rtc;
     rtc_read_time(&rtc);
@@ -62,8 +73,39 @@ static void clock_realtime_now(kernel_timespec_t *out)
     days += (uint64_t)(rtc.day - 1);
     uint64_t secs = days * 86400ULL + (uint64_t)rtc.hour * 3600ULL +
                     (uint64_t)rtc.minute * 60ULL + (uint64_t)rtc.second;
-    out->tv_sec = (int64_t)secs;
-    out->tv_nsec = 0;
+    return (int64_t)secs;
+}
+
+int64_t clock_realtime_ns(void)
+{
+    if (__atomic_load_n(&g_realtime_base_ready, __ATOMIC_ACQUIRE) == 0u) {
+        uint64_t irq_flags = irq_save_disable();
+        spinlock_lock(&g_realtime_base_lock);
+        if (g_realtime_base_ready == 0u) {
+            /* Wait for the seconds digit to change so the base lands on a
+             * second boundary instead of being up to a second behind. */
+            int64_t first = clock_rtc_epoch_seconds();
+            int64_t secs = first;
+            uint64_t start = timer_monotonic_ns();
+            while (secs == first && timer_monotonic_ns() - start < 1100000000ULL) {
+                secs = clock_rtc_epoch_seconds();
+            }
+            g_realtime_base_mono_ns = timer_monotonic_ns();
+            g_realtime_base_ns = secs * 1000000000LL;
+            __atomic_store_n(&g_realtime_base_ready, 1u, __ATOMIC_RELEASE);
+        }
+        spinlock_unlock(&g_realtime_base_lock);
+        irq_restore(irq_flags);
+    }
+    return g_realtime_base_ns +
+           (int64_t)(timer_monotonic_ns() - g_realtime_base_mono_ns);
+}
+
+static void clock_realtime_now(kernel_timespec_t *out)
+{
+    int64_t ns = clock_realtime_ns();
+    out->tv_sec = ns / 1000000000LL;
+    out->tv_nsec = ns % 1000000000LL;
 }
 
 int64_t syscall_clock_gettime(int32_t clk_id, uint64_t tp_ptr)

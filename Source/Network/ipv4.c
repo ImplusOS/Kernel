@@ -170,6 +170,26 @@ void ipv4_init(uint32_t local_ipv4_addr,
     arp_set_local_ipv4(local_ipv4_addr);
 }
 
+void ipv4_set_address(uint32_t local_ipv4_addr,
+                      uint32_t subnet_mask,
+                      uint32_t gateway_ipv4_addr)
+{
+    /* Changes only the address. ipv4_init() also clears the protocol table,
+     * and DHCP used to call it on ACK: UDP, TCP and ICMP were unregistered
+     * the moment the lease arrived, so every IPv4 packet received for the
+     * rest of the session was dropped -- DNS answers and TCP handshakes
+     * reached the NIC and went nowhere. */
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_ipv4_lock);
+    g_ipv4_local_addr = local_ipv4_addr;
+    g_ipv4_subnet_mask = subnet_mask;
+    g_ipv4_gateway = gateway_ipv4_addr;
+    spinlock_unlock(&g_ipv4_lock);
+    irq_restore(irq_flags);
+
+    arp_set_local_ipv4(local_ipv4_addr);
+}
+
 uint32_t ipv4_local_address(void)
 {
     uint64_t irq_flags = irq_save_disable();

@@ -314,10 +314,22 @@ static volatile uint32_t g_mirror_dirty;
  * its client would have the next flip memcpy into pages that now belong to
  * something else. */
 static int32_t  g_mirror_pid = -1;
+/* Set once a redirection surface has been withdrawn, cleared when a new one
+ * is registered or the DRM client goes away. While set, flips are dropped
+ * instead of falling back to the panel: the X server behind a closing
+ * session does not stop the instant its mirror is released -- it regenerates
+ * when its last client leaves and keeps presenting until it is killed -- and
+ * each of those frames used to be blitted straight over the window manager,
+ * leaving a black rectangle the size of the old window on the desktop. A
+ * server that never had a mirror still drives the panel as before. */
+static uint8_t  g_mirror_released;
 
 int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
 {
     if (pixels == 0u) {
+        if (g_mirror_page_count != 0u) {
+            g_mirror_released = 1u;
+        }
         g_mirror_page_count = 0u;
         g_mirror_w = g_mirror_h = 0u;
         g_mirror_pid = -1;
@@ -348,12 +360,16 @@ int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
     g_mirror_h = height;
     g_mirror_pid = process_get_current_pid();
     g_mirror_page_count = (uint32_t)pages;
+    g_mirror_released = 0u;
     return 0;
 }
 
 void drm_kms_notify_process_exit(int32_t pid)
 {
     if (pid >= 0 && pid == g_mirror_pid) {
+        if (g_mirror_page_count != 0u) {
+            g_mirror_released = 1u;
+        }
         g_mirror_page_count = 0u;
         g_mirror_w = g_mirror_h = 0u;
         g_mirror_pid = -1;
@@ -405,6 +421,10 @@ static void blit_fb_to_display(drm_fb_t *fb)
         /* No display_present(): the window manager owns the panel now and
          * will composite this surface on its own schedule. */
         return;
+    }
+
+    if (g_mirror_released) {
+        return;   /* see g_mirror_released */
     }
 
     void *hw = display_get_framebuffer();
@@ -915,5 +935,6 @@ void drm_kms_close(void)
     memset(g_fbs, 0, sizeof(g_fbs));
     g_evq_head = g_evq_tail = 0;
     g_scanout_fb_id = 0;
+    g_mirror_released = 0u;
     spinlock_unlock(&g_lock);
 }

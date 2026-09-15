@@ -574,8 +574,17 @@ void ps2_input_poll(void)
         uint8_t value = inb(PS2_DATA_PORT);
         poll_count++;
 
-        if (value == PS2_ACK || value == PS2_RESEND) {
-            g_mouse_packet_index = 0;
+        /* 0xFA/0xFE are command replies only where a reply can appear: on the
+         * keyboard channel, or on the mouse channel before a packet has
+         * started. Inside a mouse packet they are movement deltas (-6, -2);
+         * treating them as ACK/RESEND dropped the byte and restarted the
+         * packet, so the stream fell out of step and later motion and clicks
+         * decoded as garbage or vanished. */
+        if ((value == PS2_ACK || value == PS2_RESEND) &&
+            ((status & PS2_STATUS_AUX_DATA) == 0u || g_mouse_packet_index == 0u)) {
+            if ((status & PS2_STATUS_AUX_DATA) != 0u) {
+                g_mouse_packet_index = 0;
+            }
             continue;
         }
 

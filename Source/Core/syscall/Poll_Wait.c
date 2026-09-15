@@ -70,7 +70,16 @@ int poll_wait_park(uint64_t generation, uint32_t ms)
     (void)generation;
     return process_sleep_current_ms(ms) == 0 ? 1 : 0;
 #else
-    int32_t pid = process_get_current_pid();
+    /* The calling THREAD's slot, not its process: process_sleep_current_ms()
+     * blocks the slot that is running and process_wake_pid() wakes exactly
+     * the slot it is given. Registering the thread-group id instead meant a
+     * notify could only ever wake a multi-threaded program's main thread,
+     * while every other thread parked in poll/epoll served out its whole
+     * slice -- and all of them shared one parked bit and one run of declined
+     * sleeps, clearing each other's registrations. Chromium, with ~60 threads
+     * in epoll_wait/ppoll, spent tens of seconds at start-up with every
+     * thread cycling through those syscalls and the window left blank. */
+    int32_t pid = process_get_current_tid();
     if (pid < 0 || (uint32_t)pid >= (uint32_t)OS_CONFIG_PROCESS_MAX_COUNT ||
         ms == 0u) {
         return 0;

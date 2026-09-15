@@ -399,14 +399,23 @@ int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
         uint16_t port = socket->bound_port;
         spinlock_unlock(&g_socket_lock);
         if (port == 0u) {
-            return 0; /* Nothing bound yet => nothing can have arrived. */
+            /* Nothing bound yet => nothing can have arrived. */
+            return syscall_socket_is_nonblocking(fd) ?
+                (int32_t)OS_STATUS_WOULD_BLOCK : 0;
         }
         uint8_t staging[UDP_USER_HEADER_BYTES + 1472u];
         uint32_t want = (uint32_t)length + UDP_USER_HEADER_BYTES;
         if (want > sizeof(staging)) want = sizeof(staging);
         int32_t got = udp_user_recv(owner_pid, port, staging, want);
         if (got < (int32_t)UDP_USER_HEADER_BYTES) {
-            return got < 0 ? (int32_t)OS_STATUS_IO_ERROR : 0;
+            if (got < 0) return (int32_t)OS_STATUS_IO_ERROR;
+            /* An empty queue on a non-blocking socket is EAGAIN, as on the
+             * TCP path below. 0 means "a zero-length datagram arrived", so a
+             * resolver polling its socket read every empty check as a reply
+             * -- Chromium's DNS client discarded them as malformed and
+             * re-sent the query. */
+            return syscall_socket_is_nonblocking(fd) ?
+                (int32_t)OS_STATUS_WOULD_BLOCK : 0;
         }
         uint32_t src_ip = (uint32_t)staging[0] | ((uint32_t)staging[1] << 8) |
             ((uint32_t)staging[2] << 16) | ((uint32_t)staging[3] << 24);

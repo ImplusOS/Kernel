@@ -39,6 +39,9 @@ typedef struct {
     uint64_t **pages;
     uint32_t references;
     uint32_t mapping_count;
+    /* Any address space may map it (backing store of a file that anyone can
+     * open, e.g. under /dev/shm), not just the owner and its grantee. */
+    uint8_t is_public;
     shared_mapping_t mappings[SHARED_MEMORY_MAPPING_MAX];
 } shared_object_t;
 
@@ -202,7 +205,8 @@ static void *shared_memory_map_ex(int32_t handle, int allow_alias)
     spinlock_lock(&g_shared_memory_lock);
     shared_object_t *object = shared_memory_find_locked(handle, NULL);
     if (!object ||
-        (object->owner_pid != caller && object->granted_pid != caller) ||
+        (!object->is_public &&
+         object->owner_pid != caller && object->granted_pid != caller) ||
         object->mapping_count >= SHARED_MEMORY_MAPPING_MAX) {
         spinlock_unlock(&g_shared_memory_lock);
         return NULL;
@@ -492,6 +496,64 @@ int32_t shared_memory_release(int32_t handle)
     shared_memory_destroy_locked(object);
     spinlock_unlock(&g_shared_memory_lock);
     return 0;
+}
+
+int32_t shared_memory_set_public(int32_t handle)
+{
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    shared_object_t *object = shared_memory_find_locked(handle, NULL);
+    if (object) {
+        object->is_public = 1u;
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+    return object ? 0 : (int32_t)OS_STATUS_NOT_FOUND;
+}
+
+/* Copy between a kernel buffer and the object's pages. The pages are
+ * identity-reachable physical frames, so this needs no mapping. The object
+ * stays alive for the copy because the caller holds a reference. */
+static int32_t shared_memory_copy(int32_t handle, uint32_t offset,
+                                  uint8_t *buffer, uint32_t len, int to_object)
+{
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    shared_object_t *object = shared_memory_find_locked(handle, NULL);
+    if (!object || (uint64_t)offset + (uint64_t)len > (uint64_t)object->size) {
+        spinlock_unlock(&g_shared_memory_lock);
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    uint64_t **pages = object->pages;
+    spinlock_unlock(&g_shared_memory_lock);
+
+    uint32_t done = 0u;
+    while (done < len) {
+        uint32_t pos = offset + done;
+        uint32_t page = pos / (uint32_t)PAGE_SIZE;
+        uint32_t in_page = pos % (uint32_t)PAGE_SIZE;
+        uint32_t n = (uint32_t)PAGE_SIZE - in_page;
+        if (n > len - done) n = len - done;
+        uint8_t *frame = (uint8_t *)(uintptr_t)pages[page];
+        if (to_object) {
+            memcpy(frame + in_page, buffer + done, n);
+        } else {
+            memcpy(buffer + done, frame + in_page, n);
+        }
+        done += n;
+    }
+    return 0;
+}
+
+int32_t shared_memory_copy_in(int32_t handle, uint32_t offset,
+                              const uint8_t *data, uint32_t len)
+{
+    return shared_memory_copy(handle, offset, (uint8_t *)(uintptr_t)data, len, 1);
+}
+
+int32_t shared_memory_copy_out(int32_t handle, uint32_t offset,
+                               uint8_t *out, uint32_t len)
+{
+    return shared_memory_copy(handle, offset, out, len, 0);
 }
 
 uint32_t shared_memory_size(int32_t handle)

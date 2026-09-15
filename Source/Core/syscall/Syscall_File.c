@@ -17,6 +17,8 @@
 #include "Core/timer/Timer.h"
 #include "Core/memory/SharedMemory.h"
 #include "Debug/serial/Serial.h"
+#include "IPC/UnixSocket.h"
+#include "Core/vfs/TmpFS.h"
 
 enum {
     FILE_MAX_FD = FILE_MAX_FD_CONFIG,
@@ -314,13 +316,29 @@ static void std_fd_mark_open(int32_t fd, int32_t pid)
 /* Lowest free descriptor at or above `minimum` that `pid` may be given. Only
  * that process's own closed standard descriptors are candidates below 3.
  * Caller holds g_file_table_lock. */
+/* fds UNIX_SOCK_FD_BASE..+UNIX_SOCK_MAX are AF_UNIX sockets, not files: the
+ * table skips over them (see OS_CONFIG_FILE_MAX_FD in kernel/config.h).
+ *
+ * EVERY loop that hands out a slot of this table has to honour that, not just
+ * allocate_fd_locked(): Linux close() routes an fd in this range to
+ * unix_socket_close(). A memfd, pipe, timerfd or signalfd numbered 0xC2 was
+ * therefore a second name for whatever socket held 0xC2, and closing it tore
+ * the socket down. Chromium, past ~190 descriptors, closed its own X
+ * connection and ProcessSingleton socket that way right after a click, and
+ * exited on "X connection error". */
+static int fd_in_unix_hole(int32_t fd)
+{
+    return fd >= (int32_t)UNIX_SOCK_FD_BASE &&
+           fd < (int32_t)(UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX);
+}
+
 static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
 {
     if (minimum < 0) {
         minimum = 0;
     }
     for (int32_t fd = minimum; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used != 0) {
+        if (g_files[fd].used != 0 || fd_in_unix_hole(fd)) {
             continue;
         }
         if (fd <= 2 && !std_fd_is_closed_by(fd, pid)) {
@@ -796,6 +814,25 @@ int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len)
     return (int64_t)read_total;
 }
 
+static file_write_observer_t g_file_write_observer;
+
+void syscall_file_set_write_observer(file_write_observer_t observer)
+{
+    g_file_write_observer = observer;
+}
+
+uint64_t syscall_file_identity(int32_t fd)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != 1) {
+        return 0u;
+    }
+    kernel_open_file_t *file = fd_open_file(fd);
+    if (file == NULL || file->file.driver_data == NULL) {
+        return 0u;
+    }
+    return (uint64_t)(uintptr_t)file->file.driver_data;
+}
+
 int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
 {
     if (fd < 0 || fd >= FILE_MAX_FD || buffer == NULL || g_files[fd].used == 0) {
@@ -839,6 +876,7 @@ int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
     }
 
     uint64_t write_total = 0;
+    uint32_t write_start = file->offset;
 
     while (write_total < len) {
         uint64_t chunk64 = len - write_total;
@@ -860,6 +898,10 @@ int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
 
     file->offset += (uint32_t)len;
     open_file_cache_invalidate(file);
+    file_write_observer_t observer = g_file_write_observer;
+    if (observer != NULL) {
+        observer(fd, write_start, buffer, len);
+    }
     return (int64_t)len;
 }
 
@@ -916,8 +958,15 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
             return (int64_t)OS_STATUS_INVALID_ARG;
     }
 
+    /* Seeking past the end is legal, as on Linux: a read there returns 0 and
+     * a write fills the gap with zeros. Refusing it broke every SQLite
+     * database Chromium creates -- SQLite reads the header of a new, empty
+     * file at offset 24 and a journal at its page size, both past the end,
+     * pread() came back EINVAL instead of 0, and the database failed to open
+     * ("Failed to load tokens (invalid SQL statement)", "Something went
+     * wrong when opening your profile"). */
     int64_t next = base + offset;
-    if (next < 0 || (uint64_t)next > (uint64_t)file->file.size) {
+    if (next < 0 || (uint64_t)next > 0xFFFFFFFFull) {
         return (int64_t)OS_STATUS_INVALID_ARG;
     }
 
@@ -1209,7 +1258,7 @@ int32_t syscall_file_pipe(int32_t fds_out[2])
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
     for (int32_t fd = 3; fd < FILE_MAX_FD && (read_fd < 0 || write_fd < 0); ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             if (read_fd < 0) {
                 read_fd = fd;
             } else {
@@ -1440,6 +1489,25 @@ int syscall_file_is_pipe(int32_t fd)
  * soon as the shared object is mapped), so demand-paged file mappings hold a
  * reference on the kernel_open_file_t rather than on the fd. See
  * Core/memory/FileMap.c. */
+
+int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_FILE ||
+        !fd_is_owned_by_current_process(fd)) {
+        return -1;
+    }
+    kernel_open_file_t *open_file = fd_open_file(fd);
+    if (open_file == NULL || open_file->file.fs_driver != tmpfs_vfs_get_driver()) {
+        return -1;
+    }
+    int32_t handle = tmpfs_share_mapping(&open_file->file, length);
+    if (handle > 0) {
+        /* Reads now go through the shared pages; a cached copy would be stale
+         * the moment anything writes through a mapping. */
+        open_file_cache_invalidate(open_file);
+    }
+    return handle;
+}
 
 int32_t syscall_file_mmap_acquire(int32_t fd)
 {
@@ -1685,7 +1753,8 @@ int32_t syscall_file_dup(int32_t oldfd)
 
 int32_t syscall_file_dup2(int32_t oldfd, int32_t newfd)
 {
-    if (oldfd < 0 || oldfd >= FILE_MAX_FD || newfd < 0 || newfd >= FILE_MAX_FD) {
+    if (oldfd < 0 || oldfd >= FILE_MAX_FD || newfd < 0 || newfd >= FILE_MAX_FD ||
+        fd_in_unix_hole(newfd)) {
         return (int32_t)OS_STATUS_FAULT;
     }
     if (oldfd == newfd) return newfd;
@@ -2188,7 +2257,7 @@ int32_t syscall_file_register_dir(const char *path)
     spinlock_lock(&g_file_table_lock);
     int32_t result = (int32_t)OS_STATUS_LIMIT_REACHED;
     for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             g_files[fd].used = FILE_USED_DIR;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;
@@ -2301,7 +2370,7 @@ int32_t syscall_file_create_timerfd(void)
     spinlock_lock(&g_file_table_lock);
     int32_t result = (int32_t)OS_STATUS_LIMIT_REACHED;
     for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             g_files[fd].used = FILE_USED_TIMERFD;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;
@@ -2375,7 +2444,7 @@ int32_t syscall_file_create_memfd(const char *name)
     spinlock_lock(&g_file_table_lock);
     int32_t result = (int32_t)OS_STATUS_LIMIT_REACHED;
     for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             g_files[fd].used = FILE_USED_MEMFD;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;
@@ -2430,7 +2499,7 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
     spinlock_lock(&g_file_table_lock);
     int32_t result = (int32_t)OS_STATUS_LIMIT_REACHED;
     for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             g_files[fd].used = FILE_USED_MEMFD;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;
@@ -2476,7 +2545,7 @@ int32_t syscall_file_create_signalfd(uint64_t mask)
     spinlock_lock(&g_file_table_lock);
     int32_t result = (int32_t)OS_STATUS_LIMIT_REACHED;
     for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used == 0) {
+        if (g_files[fd].used == 0 && !fd_in_unix_hole(fd)) {
             g_files[fd].used = FILE_USED_SIGNALFD;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;

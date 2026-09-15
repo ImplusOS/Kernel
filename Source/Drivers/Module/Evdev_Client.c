@@ -15,6 +15,7 @@ typedef struct {
 
 static evdev_device_t g_devs[EVDEV_MAX_DEVICES];
 static int g_evdev_init_done = 0;
+static int32_t g_abs_value[2];
 
 void evdev_init(void) {
     memset(g_devs, 0, sizeof(g_devs));
@@ -62,7 +63,20 @@ void evdev_push_rel_event(uint16_t code, int32_t value) {
 
 void evdev_push_abs_event(uint16_t code, int32_t value) {
     if (!g_evdev_init_done) evdev_init();
+    if (code <= ABS_Y) g_abs_value[code] = value;
     evdev_push(&g_devs[1], EV_ABS, code, value);
+}
+
+int64_t evdev_inject(uint32_t device, uint16_t type, uint16_t code, int32_t value) {
+    if (!g_evdev_init_done) evdev_init();
+    if (device > 1u) return -22;
+    if (type == EV_ABS && device == 1u && code <= ABS_Y) {
+        if (value < 0) value = 0;
+        if (value > EVDEV_ABS_MAX) value = EVDEV_ABS_MAX;
+        g_abs_value[code] = value;
+    }
+    evdev_push(&g_devs[device], type, code, value);
+    return 0;
 }
 
 int64_t evdev_open(const char *path) {
@@ -108,7 +122,7 @@ int evdev_has_events(int32_t fd) {
 /* --- Linux evdev ioctl subset for the X "evdev" input driver -------------
  * type 'E' (0x45). We decode nr and (for the variable-length "get" calls)
  * the size field from the _IOC-encoded request. dev 0 = keyboard, dev 1 =
- * relative pointer. Enough for xf86-input-evdev to classify the devices and
+ * absolute pointer with a wheel. Enough for xf86-input-evdev to classify the devices and
  * start reading events; not a complete implementation. */
 #define IOC_NR(c)   ((uint32_t)((c) >> 0)  & 0xffu)
 #define IOC_TYPE(c) ((uint32_t)((c) >> 8)  & 0xffu)
@@ -138,7 +152,7 @@ static int64_t evdev_fill_bits(uint64_t arg, uint32_t size, uint32_t evtype, int
          * control path, which writes input_events back to the device node
          * (something this shim does not implement). */
         if (is_kbd) { bm_set(bm, 0x14 /*EV_REP*/); }
-        else        { bm_set(bm, EV_REL); }
+        else        { bm_set(bm, EV_REL); bm_set(bm, EV_ABS); }
     } else if (evtype == EV_KEY) {
         if (is_kbd) {
             for (uint32_t k = 1; k < 248; k++) bm_set(bm, k); /* KEY_ESC..KEY_MICMUTE-ish */
@@ -146,7 +160,16 @@ static int64_t evdev_fill_bits(uint64_t arg, uint32_t size, uint32_t evtype, int
             bm_set(bm, BTN_LEFT); bm_set(bm, BTN_RIGHT); bm_set(bm, BTN_MIDDLE);
         }
     } else if (evtype == EV_REL && !is_kbd) {
+        /* Position comes from ABS_X/ABS_Y, which track the compositor's cursor
+         * inside the X window exactly; REL_X/REL_Y are never sent. They are
+         * still advertised because xf86-input-evdev classifies an absolute
+         * device with BTN_LEFT and no REL_X/REL_Y as a touchscreen ("some
+         * touchscreens use BTN_LEFT rather than BTN_TOUCH"), and a
+         * touchscreen ignores the wheel. xorg.conf sets IgnoreRelativeAxes
+         * so the server still takes position from the absolute axes. */
         bm_set(bm, REL_X); bm_set(bm, REL_Y); bm_set(bm, REL_WHEEL);
+    } else if (evtype == EV_ABS && !is_kbd) {
+        bm_set(bm, ABS_X); bm_set(bm, ABS_Y);
     } else {
         /* nothing for this type */
     }
@@ -212,9 +235,15 @@ int64_t evdev_ioctl(int32_t fd, uint64_t request, uint64_t arg) {
         if (arg && copy_to_user((void *)(uintptr_t)arg, z, sz) != 0u) return -14;
         return (int64_t)sz;
     }
-    if (nr >= 0x40 && nr <= 0x40 + 0x3f) { /* EVIOCGABS(abs) - we have no abs axes */
-        uint8_t z[24]; memset(z, 0, sizeof(z));
-        if (arg && copy_to_user((void *)(uintptr_t)arg, z, sizeof(z)) != 0u) return -14;
+    if (nr >= 0x40 && nr <= 0x40 + 0x3f) { /* EVIOCGABS(abs) -> struct input_absinfo */
+        /* {value, minimum, maximum, fuzz, flat, resolution}, all s32. */
+        int32_t info[6] = {0, 0, 0, 0, 0, 0};
+        uint32_t axis = nr - 0x40u;
+        if (!is_kbd && axis <= ABS_Y) {
+            info[0] = g_abs_value[axis];
+            info[2] = EVDEV_ABS_MAX;
+        }
+        if (arg && copy_to_user((void *)(uintptr_t)arg, info, sizeof(info)) != 0u) return -14;
         return 0;
     }
     if (nr == 0x90 || nr == 0x91 || nr == 0xa0) { /* EVIOCGRAB / REVOKE / SCLOCKID */

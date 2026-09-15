@@ -12,6 +12,10 @@ static const driver_binary_t *g_api = NULL;
 #define inb g_api->inb
 #endif
 
+#include "Core/sync/Spinlock.h"
+
+static spinlock_t g_rtc_lock;
+
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
 
@@ -29,15 +33,36 @@ void rtc_init(void) {
 }
 
 void rtc_read_time(rtc_time_t *time) {
-    while (is_update_in_progress());
+    /* CMOS is an index/data port pair, so two CPUs reading at once can select
+     * a register and read back the one the other selected -- seconds as the
+     * month, and so on. Chromium's log dates wandered between January and
+     * December and TLS rejected certificates as expired. Serialize the
+     * access, and take two full readings until they agree, so an update that
+     * lands between registers cannot mix two different times either. */
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_rtc_lock);
 
-    uint8_t second = get_rtc_register(0x00);
-    uint8_t minute = get_rtc_register(0x02);
-    uint8_t hour   = get_rtc_register(0x04);
-    uint8_t day    = get_rtc_register(0x07);
-    uint8_t month  = get_rtc_register(0x08);
-    uint8_t year   = get_rtc_register(0x09);
+    uint8_t second, minute, hour, day, month, year;
+    for (int attempt = 0; ; ++attempt) {
+        while (is_update_in_progress());
+        second = get_rtc_register(0x00);
+        minute = get_rtc_register(0x02);
+        hour   = get_rtc_register(0x04);
+        day    = get_rtc_register(0x07);
+        month  = get_rtc_register(0x08);
+        year   = get_rtc_register(0x09);
+        if (attempt >= 8) break;
+        while (is_update_in_progress());
+        if (second == get_rtc_register(0x00) && minute == get_rtc_register(0x02) &&
+            hour == get_rtc_register(0x04) && day == get_rtc_register(0x07) &&
+            month == get_rtc_register(0x08) && year == get_rtc_register(0x09)) {
+            break;
+        }
+    }
     uint8_t registerB = get_rtc_register(0x0B);
+
+    spinlock_unlock(&g_rtc_lock);
+    irq_restore(irq_flags);
 
     if (!(registerB & 0x04)) {
         second = (uint8_t)((second & 0x0F) + ((second / 16) * 10));

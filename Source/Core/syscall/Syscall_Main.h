@@ -220,6 +220,9 @@
  * has the pool mapped needs to know how far the mapping really reaches
  * before it believes a resize request. */
 #define SYSCALL_SHARED_MEMORY_SIZE     274
+/* evdev_inject(device, type, code, value): feed a window's keyboard/mouse
+ * input to /dev/input/eventN so an X server hosted in that window sees it. */
+#define SYSCALL_EVDEV_INJECT           275
 
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241

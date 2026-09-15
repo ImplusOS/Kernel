@@ -1,5 +1,6 @@
 #include "Syscall_Main.h"
 #include "Core/process/ProcessManager.h"
+#include "Core/process/ProcessScheduler.h"
 #include "Core/usercopy/Usercopy.h"
 #include "Core/timer/Timer.h"
 #include "Core/sync/Spinlock.h"
@@ -69,6 +70,12 @@ typedef struct {
 
 static futex_waiter_t g_futex_waiters[FUTEX_WAIT_QUEUE_SIZE];
 static spinlock_t     g_futex_lock;
+/* Set, per task, when the timer rather than a FUTEX_WAKE ended its wait, so
+ * the wait can report ETIMEDOUT. Indexed by tid (< OS_CONFIG_PROCESS_MAX_COUNT). */
+static uint8_t        g_futex_timed_out[FUTEX_WAIT_QUEUE_SIZE];
+/* The waiter slot a Linux task's FUTEX_WAIT left queued, or -1. Indexed by
+ * tid. See syscall_futex_linux_resume(). */
+static int16_t        g_futex_linux_slot[FUTEX_WAIT_QUEUE_SIZE];
 
 /* g_futex_lock is taken from process context (the futex syscalls) *and* from
  * interrupt context (syscall_futex_on_timer_tick(), called out of the timer
@@ -99,6 +106,7 @@ static void futex_ensure_init(void)
         spinlock_init(&g_futex_lock);
         for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
             g_futex_waiters[i].used = 0;
+            g_futex_linux_slot[i] = -1;
         }
         g_futex_initialized = 1;
     }
@@ -127,8 +135,9 @@ static void futex_gc_locked(void)
     }
 }
 
-int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
-                           uint64_t timeout_ns, uint32_t bitset)
+static int64_t futex_wait_common(uint64_t uaddr, int32_t expected,
+                                 uint64_t timeout_ns, uint32_t bitset,
+                                 int *restart_out)
 {
     uint64_t futex_flags = 0;
     futex_ensure_init();
@@ -199,14 +208,108 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
     g_futex_waiters[slot].uaddr       = uaddr;
     g_futex_waiters[slot].bitset      = bitset ? bitset : 0xFFFFFFFFu;
     g_futex_waiters[slot].deadline_ms = deadline;
+    if (tid < FUTEX_WAIT_QUEUE_SIZE) {
+        g_futex_timed_out[tid] = 0u;
+        if (restart_out != NULL) {
+            g_futex_linux_slot[tid] = (int16_t)slot;
+        }
+    }
     futex_unlock_irq(futex_flags);
     if (process_block_current() < 0) {
         futex_flags = futex_lock_irq();
         g_futex_waiters[slot].used = 0;
+        if (tid < FUTEX_WAIT_QUEUE_SIZE) {
+            g_futex_linux_slot[tid] = -1;
+        }
         futex_unlock_irq(futex_flags);
         return FUTEX_EINTR;
     }
+    if (restart_out != NULL && tid < FUTEX_WAIT_QUEUE_SIZE) {
+        *restart_out = 1;
+    }
     return 0;
+}
+
+int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
+                           uint64_t timeout_ns, uint32_t bitset)
+{
+    return futex_wait_common(uaddr, expected, timeout_ns, bitset, NULL);
+}
+
+/* FUTEX_WAIT for a Linux task: queues the waiter, blocks, and asks for the
+ * syscall to be restarted rather than returning. The wait is then finished
+ * by syscall_futex_linux_resume() on re-entry. */
+int64_t syscall_futex_wait_linux(uint64_t uaddr, int32_t expected,
+                                 uint64_t timeout_ns, uint32_t bitset,
+                                 int *restart_out)
+{
+    if (restart_out != NULL) {
+        *restart_out = 0;
+    }
+    return futex_wait_common(uaddr, expected, timeout_ns, bitset,
+                             restart_out);
+}
+
+/* The second half of a Linux FUTEX_WAIT.
+ *
+ * process_block_current() only marks the task blocked; the sleep itself
+ * happens on the way out of the syscall, and whatever makes the task
+ * runnable again sends it straight back to userspace. Only a FUTEX_WAKE
+ * (or a requeue, or the timeout) takes the waiter out of the queue, but many
+ * other things make a blocked task runnable: a poll-wait notify aimed at a
+ * registration the task left behind, a wake credit banked while it was
+ * running. Returning 0 then is a spurious wakeup glibc can absorb -- but the
+ * waiter entry stayed queued. glibc waits again, queuing a second entry, and
+ * a later FUTEX_WAKE(1) could spend itself on the stale one: it "woke" a task
+ * that was not asleep while the one that was stayed asleep forever. That is
+ * the lock Chromium's main thread and a second thread were found parked on,
+ * both in FUTEX_WAIT on one address, with the window blank for good.
+ *
+ * So a Linux wait always re-enters. If its entry is still queued, nothing has
+ * woken it for real and it goes back to sleep; once the entry is gone it
+ * returns 0, or ETIMEDOUT if the timer removed it. Returns 1 when the calling
+ * task was resuming such a wait (and fills in the outputs), 0 when it was not.
+ */
+int syscall_futex_linux_resume(int64_t *result_out, int *restart_out)
+{
+    futex_ensure_init();
+    *restart_out = 0;
+    int32_t tid = process_get_current_tid();
+    if (tid < 0 || tid >= FUTEX_WAIT_QUEUE_SIZE) {
+        return 0;
+    }
+
+    uint64_t futex_flags = futex_lock_irq();
+    int16_t slot = g_futex_linux_slot[tid];
+    if (slot < 0) {
+        futex_unlock_irq(futex_flags);
+        return 0;
+    }
+    if (g_futex_waiters[slot].used && g_futex_waiters[slot].tid == tid) {
+        futex_unlock_irq(futex_flags);
+        /* A wake that removes the entry between the unlock and this block
+         * leaves a credit, so the block returns at once and the next re-entry
+         * finds the entry gone. */
+        if (process_block_current() < 0) {
+            futex_flags = futex_lock_irq();
+            if (g_futex_waiters[slot].used && g_futex_waiters[slot].tid == tid) {
+                g_futex_waiters[slot].used = 0;
+            }
+            g_futex_linux_slot[tid] = -1;
+            futex_unlock_irq(futex_flags);
+            *result_out = FUTEX_EINTR;
+            return 1;
+        }
+        *restart_out = 1;
+        *result_out = 0;
+        return 1;
+    }
+    g_futex_linux_slot[tid] = -1;
+    uint8_t timed_out = g_futex_timed_out[tid];
+    g_futex_timed_out[tid] = 0u;
+    futex_unlock_irq(futex_flags);
+    *result_out = timed_out ? -110 /* ETIMEDOUT */ : 0;
+    return 1;
 }
 
 int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
@@ -263,6 +366,10 @@ void syscall_futex_on_timer_tick(void)
             g_futex_waiters[i].deadline_ms != 0 &&
             g_futex_waiters[i].deadline_ms <= now) {
             tids[count++] = g_futex_waiters[i].tid;
+            if (g_futex_waiters[i].tid >= 0 &&
+                g_futex_waiters[i].tid < FUTEX_WAIT_QUEUE_SIZE) {
+                g_futex_timed_out[g_futex_waiters[i].tid] = 1u;
+            }
             g_futex_waiters[i].used = 0;
         }
     }

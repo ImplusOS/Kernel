@@ -73,15 +73,20 @@
  * Syscall_Socket.c's SOCKET_FD_BASE (socket fds live in a disjoint numeric
  * range starting there) - see OS_CONFIG_FILE_MAX_FD_MAX below.
  *
- * 192, not 256, because UnixSocket.h's UNIX_SOCK_FD_BASE follows immediately
- * after this table and the X server refuses a client whose fd is >= its
- * lastfdesc -- which is min(RLIMIT_NOFILE-1, MAXSELECT, MAXCLIENTS) and so is
- * pinned at the compile-time MAXCLIENTS of 256 no matter what -maxclients
- * says. With the table at 256 every AF_UNIX fd started at 256, so every X
- * client was accepted and instantly closed. 192 files + 64 AF_UNIX keeps the
- * whole range a client can land in under 256. See
- * Docs/Others/TODO_Doom_Xorg_MethodA.md M22. */
-#define OS_CONFIG_FILE_MAX_FD 192
+ * The AF_UNIX range (UnixSocket.h, UNIX_SOCK_FD_BASE 192, 64 fds) has to stay
+ * below 256: the X server refuses a client whose fd is >= its lastfdesc --
+ * min(RLIMIT_NOFILE-1, MAXSELECT, MAXCLIENTS), pinned at the compile-time
+ * MAXCLIENTS of 256 no matter what -maxclients says -- so every X client was
+ * accepted and instantly closed when AF_UNIX fds started at 256. See
+ * Docs/Others/TODO_Doom_Xorg_MethodA.md M22.
+ *
+ * So the table is 512 slots with a hole: 0..191 and 256..511 are files,
+ * 192..255 are never handed out here and belong to AF_UNIX. fd numbers stay
+ * plain indexes into the table. 192 slots were not enough for Chromium alone
+ * -- ~130 open files plus ~40 shared-memory regions -- and once they ran out
+ * it could not create the buffer for its next frame and terminated itself
+ * ("Creating shared memory in /dev/shm/... failed: Too many open files"). */
+#define OS_CONFIG_FILE_MAX_FD 512
 #endif
 #endif
 
@@ -89,8 +94,9 @@
 #ifdef FILE_MAX_DIR_HANDLE_CONFIG
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE FILE_MAX_DIR_HANDLE_CONFIG
 #else
-/* Kept <= OS_CONFIG_FILE_MAX_FD, which dropped to 192 so the AF_UNIX fd
- * range that follows it stays under the X server's 256-fd client limit. */
+/* Kept <= OS_CONFIG_FILE_MAX_FD. 192 is where the AF_UNIX fd range begins
+ * (it must stay under the X server's 256-fd client limit); the file table
+ * itself skips that range and continues above it. */
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE 192
 #endif
 #endif
@@ -114,7 +120,7 @@
  * range for sockets) and <= Userland/POSIX/include/posix_fdtable.h's
  * POSIX_FD_TABLE_SIZE / posix_io.h's FD_SETSIZE (both 1024, indexed
  * directly by raw fd value with no indirection). */
-#define OS_CONFIG_FILE_MAX_FD_MAX         256
+#define OS_CONFIG_FILE_MAX_FD_MAX         512
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE_MIN 4
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE_MAX 256
 

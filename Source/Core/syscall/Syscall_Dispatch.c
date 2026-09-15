@@ -2145,6 +2145,12 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
             set_syscall_result(saved_rsp, (uint64_t)evdev_close((int32_t)arg1));
             break;
         }
+        case SYSCALL_EVDEV_INJECT: {
+            extern int64_t evdev_inject(uint32_t, uint16_t, uint16_t, int32_t);
+            set_syscall_result(saved_rsp, (uint64_t)evdev_inject(
+                (uint32_t)arg1, (uint16_t)arg2, (uint16_t)arg3, (int32_t)arg4));
+            break;
+        }
 
         case SYSCALL_UNIX_SOCKET: {
             extern int64_t unix_socket_create(int32_t);

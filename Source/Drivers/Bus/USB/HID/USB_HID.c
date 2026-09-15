@@ -67,6 +67,14 @@ static const uint16_t hid_to_ps2_set1[256] = {
     [0x65] = KEY_COMPOSE,
     [0x87] = KEY_RO, [0x88] = KEY_KATAKANAHIRAGANA, [0x89] = KEY_YEN,
     [0x8A] = KEY_HENKAN, [0x8B] = KEY_MUHENKAN,
+    /* Modifiers. A boot-protocol report never lists these in its key array;
+     * they are the bits of byte 0, turned into these usages by
+     * process_kbd_report() so the modifier keys themselves reach the input
+     * stack as presses and releases. */
+    [0xE0] = KEY_LEFTCTRL,  [0xE1] = KEY_LEFTSHIFT,
+    [0xE2] = KEY_LEFTALT,   [0xE3] = KEY_LEFTMETA,
+    [0xE4] = KEY_RIGHTCTRL, [0xE5] = KEY_RIGHTSHIFT,
+    [0xE6] = KEY_RIGHTALT,  [0xE7] = KEY_RIGHTMETA,
 };
 
 typedef struct {
@@ -377,6 +385,18 @@ static void process_kbd_report(uint8_t *report)
     if (mods & 0x10) ps2_mods |= DRIVER_KBD_MOD_CTRL;
     if (mods & 0x04) ps2_mods |= DRIVER_KBD_MOD_ALT;
     if (mods & 0x40) ps2_mods |= DRIVER_KBD_MOD_ALT;
+
+    /* Modifier transitions first, so a chord's Ctrl is already down when its
+     * letter arrives. Only reporting them in `modifiers` was not enough: a
+     * consumer that tracks key state itself -- the X server behind XSession --
+     * never saw Ctrl pressed, and USB Ctrl+L typed a plain "l". */
+    uint8_t mod_changes = (uint8_t)(mods ^ g_last_kbd_report[0]);
+    for (uint8_t bit = 0u; bit < 8u; ++bit) {
+        if ((mod_changes & (1u << bit)) != 0u) {
+            push_kbd_event((uint16_t)(0xE0u + bit),
+                           (uint8_t)((mods >> bit) & 1u), ps2_mods);
+        }
+    }
 
     for (int i = 2; i < 8; i++) {
         if (report[i] != 0) {

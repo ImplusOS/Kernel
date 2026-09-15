@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "kernel/config.h"
+#include "Network/dhcp/DHCP.h"
 
 #define ETCFS_BUFFER_CAP 4096u
 
@@ -35,17 +36,22 @@ static uint32_t etcfs_build_hosts(char *buf, uint32_t cap)
 
 static uint32_t etcfs_build_resolv_conf(char *buf, uint32_t cap)
 {
-    /* OS_CONFIG_NET_IPV4_GATEWAY is 10.0.2.2 by default, which is QEMU
-     * user-mode networking's (SLIRP) built-in DNS proxy address - the
-     * same host that already serves as the default gateway in this
-     * config. If the gateway is overridden to a real router that isn't
-     * also a DNS forwarder, this will need to change accordingly. */
-    char gw_ip[16];
-    etcfs_format_ip(OS_CONFIG_NET_IPV4_GATEWAY, gw_ip, sizeof(gw_ip));
+    /* The DNS server DHCP handed out, or 10.0.2.3 before DHCP has answered:
+     * that is QEMU user-mode networking's (SLIRP) built-in DNS forwarder.
+     * This used to name OS_CONFIG_NET_IPV4_GATEWAY (10.0.2.2), which SLIRP
+     * routes but does not answer DNS on, so every lookup by a Linux program
+     * (Chromium's resolver, glibc getaddrinfo) timed out. The native netstack
+     * service already used DHCP's server with the same fallback. */
+    uint32_t dns = dhcp_get_dns_server();
+    if (dns == 0u) {
+        dns = 0x0A000203u;
+    }
+    char dns_ip[16];
+    etcfs_format_ip(dns, dns_ip, sizeof(dns_ip));
     return (uint32_t)snprintf(buf, cap,
         "nameserver %s\n"
         "options edns0\n",
-        gw_ip);
+        dns_ip);
 }
 
 /* Static text files that glibc's NSS / dynamic loader / getaddrinfo read
