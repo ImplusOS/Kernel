@@ -790,6 +790,28 @@ int32_t page_fault_handler(uint64_t error_code,
     serial_write_string((error_code & PF_INSTR) ? "yes" : "no");
     serial_write_string("\n");
 
+    /* The leaf PTE, for user faults as well as kernel ones. A write fault on
+     * a page the tables say is present has exactly one interesting question
+     * behind it -- which permission bit is missing and whether the page was
+     * marked copy-on-write -- and the error code alone cannot answer it. */
+    {
+        extern uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt);
+        uint64_t leaf = paging_debug_leaf_pte(process_get_current_cr3(), cr2);
+        serial_write_string("[OS] [PF] pte=");
+        serial_write_uint64(leaf);
+        serial_write_string(" P=");
+        serial_write_uint64(leaf & 1u);
+        serial_write_string(" RW=");
+        serial_write_uint64((leaf >> 1) & 1u);
+        serial_write_string(" U=");
+        serial_write_uint64((leaf >> 2) & 1u);
+        serial_write_string(" EXT=");
+        serial_write_uint64((leaf >> 10) & 1u);
+        serial_write_string(" COW=");
+        serial_write_uint64((leaf >> 11) & 1u);
+        serial_write_string("\n");
+    }
+
     /* Same rule as the #GP handler: a fault from user mode kills the thread,
      * even when its address space's owner has already exited and cannot be
      * named. See the comment on `tid` in general_protection_fault_handler(). */

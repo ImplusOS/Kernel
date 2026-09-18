@@ -5,6 +5,7 @@
 #include "IPC/IPC_Main.h"
 #include "IPC/PnP_Notifications.h"
 #include "IPC/UnixSocket.h"
+#include "Core/vfs/ProcFS.h"
 #include "Core/elf/ELF_Loader.h"
 #include "Core/memory/SharedMemory.h"
 #include "Core/memory/FileMap.h"
@@ -630,6 +631,8 @@ static void process_wake_sleepers_locked(uint64_t now_ns)
     }
 }
 
+static int process_group_on_cpu_locked(int32_t pid);
+
 static int is_valid_pid(int32_t pid)
 {
     return process_table_ready() && pid >= 0 && pid < g_process_capacity;
@@ -688,6 +691,12 @@ static void reset_process_slot(process_t *proc)
     memset(proc->name, 0, sizeof(proc->name));
     memset(proc->cwd, 0, sizeof(proc->cwd));
     proc->cwd[0] = '/';
+    memset(proc->root_path, 0, sizeof(proc->root_path)); /* "" == the real root */
+    proc->fs_share_pid = -1;
+    proc->pidns_init = -1;
+    proc->fork_hold_tid = -1;
+    proc->uid = 0u;
+    proc->gid = 0u;
     memset(proc->exe_path, 0, sizeof(proc->exe_path));
     memset(proc->launch_argument, 0, sizeof(proc->launch_argument));
     proc->parent_pid = -1;
@@ -1038,6 +1047,11 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
     int copy_ok = process_user_buffer_is_valid((void *)(uintptr_t)sp,
                                                sizeof(frame));
     if (copy_ok) {
+#if KERNEL_COW_FORK
+        /* The target's stack may still be shared with its fork parent, and
+         * this memcpy does not trap. */
+        (void)paging_user_range_break_cow(proc->cr3, sp, sizeof(frame));
+#endif
         memcpy((void *)(uintptr_t)sp, &frame, sizeof(frame));
     }
     paging_switch_cr3(old_cr3);
@@ -1426,11 +1440,11 @@ static int32_t find_free_slot(void)
      * sweep here is cheap and keeps memory bounded to what is actually live. */
     for (int32_t i = 1; i < g_process_capacity; ++i) {
         if (g_processes[i].state == PROCESS_STATE_DEAD &&
-            !process_scheduler_pid_in_use_on_any_cpu(i)) {
+            !process_group_on_cpu_locked(i)) {
             release_process_resources(&g_processes[i]);
             reset_process_slot(&g_processes[i]);
         } else if (g_processes[i].state == PROCESS_STATE_ZOMBIE &&
-                   !process_scheduler_pid_in_use_on_any_cpu(i)) {
+                   !process_group_on_cpu_locked(i)) {
             int32_t pp = g_processes[i].parent_pid;
             if (pp < 0 || !is_valid_pid(pp) ||
                 g_processes[pp].state == PROCESS_STATE_UNUSED ||
@@ -1511,6 +1525,14 @@ static void mark_process_runnable(process_t *proc, uint64_t entry, int32_t paren
     uint64_t now_ns = process_perf_now_ns();
     proc->entry = entry;
     proc->parent_pid = parent_pid;
+    /* A spawned program runs as whoever spawned it. */
+    if (is_valid_pid(parent_pid)) {
+        process_t *parent = process_memory_owner_locked(&g_processes[parent_pid]);
+        if (parent != NULL) {
+            proc->uid = parent->uid;
+            proc->gid = parent->gid;
+        }
+    }
     proc->timeslice = g_timeslice_ticks;
     proc->state = PROCESS_STATE_READY;
     process_perf_mark_ready_locked(proc, now_ns);
@@ -2248,6 +2270,211 @@ int process_set_current_cwd(const char *cwd)
     return result;
 }
 
+/* chroot(2) for the calling process. The path is stored as given (already
+ * resolved against any root already in force by the caller); "/" clears it.
+ * Memory-owner scoped, so every thread of a process shares one root, which is
+ * what CLONE_FS means and what Chromium's sandbox relies on when it chroots
+ * from a helper thread. */
+int process_set_current_root(const char *root)
+{
+    if (root == NULL || root[0] != '/') {
+        return -22;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    int result = -22;
+    if (is_valid_pid(current_pid_get())) {
+        process_t *proc =
+            process_memory_owner_locked(&g_processes[current_pid_get()]);
+        if (proc != NULL) {
+            if (root[1] == '\0') {
+                proc->root_path[0] = '\0';
+            } else {
+                uint32_t len = 0;
+                while (root[len] != '\0' && len + 1u < sizeof(proc->root_path)) {
+                    ++len;
+                }
+                /* A trailing slash would double up when paths are joined. */
+                while (len > 1u && root[len - 1u] == '/') {
+                    --len;
+                }
+                memcpy(proc->root_path, root, len);
+                proc->root_path[len] = '\0';
+            }
+            /* CLONE_FS partner, if any: same root by definition. */
+            if (is_valid_pid(proc->fs_share_pid)) {
+                process_t *partner =
+                    process_memory_owner_locked(&g_processes[proc->fs_share_pid]);
+                if (partner != NULL && partner != proc) {
+                    memcpy(partner->root_path, proc->root_path,
+                           sizeof(partner->root_path));
+                }
+            }
+            result = 0;
+        }
+    }
+
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return result;
+}
+
+/* Record that `child_pid` was cloned with CLONE_FS from the caller, so a
+ * later chroot() by either is seen by both. */
+/* The namespace init for `pid`'s process, or -1 (root namespace). Caller
+ * holds the table lock. */
+static int32_t process_pidns_init_locked(int32_t pid)
+{
+    if (!is_valid_pid(pid)) {
+        return -1;
+    }
+    process_t *owner = process_memory_owner_locked(&g_processes[pid]);
+    return owner != NULL ? owner->pidns_init : -1;
+}
+
+/* clone(CLONE_NEWPID): `pid` is the init of a namespace of its own. */
+/* Credentials of a process (by any of its thread slots); see process_t.uid. */
+int process_get_credentials(int32_t pid, uint32_t *uid, uint32_t *gid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int rc = -1;
+    if (is_valid_pid(pid)) {
+        process_t *owner = process_memory_owner_locked(&g_processes[pid]);
+        if (owner != NULL) {
+            if (uid) *uid = owner->uid;
+            if (gid) *gid = owner->gid;
+            rc = 0;
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return rc;
+}
+
+/* setuid()/setgid() family: (uint32_t)-1 leaves a value unchanged. */
+int process_set_current_credentials(uint32_t uid, uint32_t gid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int rc = -1;
+    int32_t pid = current_pid_get();
+    if (is_valid_pid(pid)) {
+        process_t *owner = process_memory_owner_locked(&g_processes[pid]);
+        if (owner != NULL) {
+            if (uid != 0xFFFFFFFFu) owner->uid = uid;
+            if (gid != 0xFFFFFFFFu) owner->gid = gid;
+            rc = 0;
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return rc;
+}
+
+void process_mark_pidns_init(int32_t pid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    if (is_valid_pid(pid)) {
+        g_processes[pid].pidns_init = pid;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+}
+
+/* A real pid as the calling process sees it: its namespace's init is 1,
+ * everything else keeps its number. */
+int32_t process_pid_as_seen_by_current(int32_t real)
+{
+    if (real <= 0) {
+        return real;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t init = process_pidns_init_locked(current_pid_get());
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return (init >= 0 && real == init) ? 1 : real;
+}
+
+/* The reverse: a pid the calling process named, as a real pid. */
+int32_t process_pid_from_current_view(int32_t seen)
+{
+    if (seen != 1) {
+        return seen;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t init = process_pidns_init_locked(current_pid_get());
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return init >= 0 ? init : seen;
+}
+
+/* Is the caller the init of its namespace (getppid() is then 0)? */
+int process_current_is_pidns_init(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t pid = current_pid_get();
+    int32_t init = process_pidns_init_locked(pid);
+    int32_t owner = -1;
+    if (is_valid_pid(pid)) {
+        process_t *o = process_memory_owner_locked(&g_processes[pid]);
+        owner = o ? (int32_t)(o - g_processes) : -1;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return init >= 0 && owner == init;
+}
+
+int process_set_fs_share(int32_t child_pid, int32_t partner_pid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int result = -1;
+    if (is_valid_pid(child_pid) && is_valid_pid(partner_pid)) {
+        g_processes[child_pid].fs_share_pid = partner_pid;
+        result = 0;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return result;
+}
+
+/* The calling process's root, or "" when it is the real one. Returns the
+ * length written, or -1. */
+int process_get_current_root(char *out, uint32_t capacity)
+{
+    if (out == NULL || capacity == 0u) {
+        return -1;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    int result = -1;
+    out[0] = '\0';
+    if (is_valid_pid(current_pid_get())) {
+        process_t *proc =
+            process_memory_owner_locked(&g_processes[current_pid_get()]);
+        if (proc != NULL) {
+            uint32_t len = 0;
+            while (proc->root_path[len] != '\0' && len + 1u < capacity) {
+                out[len] = proc->root_path[len];
+                ++len;
+            }
+            out[len] = '\0';
+            result = (int)len;
+        }
+    }
+
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return result;
+}
+
 int process_get_current_cwd(char *out, uint32_t capacity)
 {
     if (out == NULL || capacity == 0u) {
@@ -2537,6 +2764,13 @@ static int32_t process_create_user_internal(uint64_t entry,
     proc->timeslice = g_timeslice_ticks;
     proc->priority = 1;
     proc->parent_pid = parent_pid;
+    if (is_valid_pid(parent_pid)) {
+        process_t *parent = process_memory_owner_locked(&g_processes[parent_pid]);
+        if (parent != NULL) {
+            proc->uid = parent->uid;
+            proc->gid = parent->gid;
+        }
+    }
     if (start_ready) {
         proc->state = PROCESS_STATE_READY;
         process_perf_mark_ready_locked(proc, process_perf_now_ns());
@@ -3138,9 +3372,17 @@ static int process_clone_address_space(process_t *child, process_t *parent)
 #if KERNEL_COW_FORK
         /* Copy-on-write: share the parent's pages read-only into the child
          * and fault-in private copies on first write. Falls back to the
-         * eager copy if the COW clone reports failure. */
+         * eager copy if the COW clone reports failure.
+         *
+         * The ranges must be the same ones the eager copy below walks. They
+         * were not: this used to stop at USER_STACK_BASE, so the child got
+         * the image and the heap but no *stack* and no mmap arena, and
+         * faulted on its first instruction back in user space. That is the
+         * "COW makes boot unstable" this was turned off for. */
         if (paging_cow_clone_user_range(child->cr3, parent->cr3,
-                                        0x1000, USER_STACK_BASE) == 0) {
+                                        0x1000, USER_STACK_TOP) == 0 &&
+            paging_cow_clone_user_range(child->cr3, parent->cr3,
+                                        USER_MMAP_BASE, USER_MMAP_LIMIT) == 0) {
             clone_rc = 0;
             goto done;
         }
@@ -3207,7 +3449,102 @@ done:
     return clone_rc;
 }
 
+/* Per-ABI state that has to follow a process through fork() and exit --
+ * today the Linux layer's per-process descriptor table
+ * (Compat/Linux/Linux_FdTable.c). Registered by that layer at init, so the
+ * process manager needs no knowledge of it. */
+/* Stop the other threads of the caller's process for a fork. Returns 1 when
+ * every one of them is off-CPU (and will stay off until
+ * process_fork_hold_release()); 0 when some are still running and the caller
+ * should come back shortly -- the hold stays set meanwhile, so they get off
+ * at their next scheduling point and are not picked again. */
+int process_fork_hold_acquire(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t self = current_pid_get();
+    int ready = 0;
+    if (is_valid_pid(self)) {
+        process_t *owner = process_memory_owner_locked(&g_processes[self]);
+        if (owner != NULL) {
+            int32_t owner_pid = (int32_t)(owner - g_processes);
+            if (owner->fork_hold_tid >= 0 && owner->fork_hold_tid != self) {
+                ready = 0; /* another thread of ours is forking: wait */
+            } else {
+                owner->fork_hold_tid = self;
+                ready = 1;
+                for (int32_t i = 0; i < g_process_capacity; ++i) {
+                    process_t *p = &g_processes[i];
+                    if (i == self || p->state == PROCESS_STATE_UNUSED ||
+                        p->state == PROCESS_STATE_DEAD) {
+                        continue;
+                    }
+                    int32_t eff = p->is_thread ? p->memory_owner_pid : i;
+                    if (eff == owner_pid &&
+                        process_scheduler_pid_in_use_on_any_cpu(i)) {
+                        ready = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return ready;
+}
+
+void process_fork_hold_release(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t self = current_pid_get();
+    if (is_valid_pid(self)) {
+        process_t *owner = process_memory_owner_locked(&g_processes[self]);
+        if (owner != NULL && owner->fork_hold_tid == self) {
+            owner->fork_hold_tid = -1;
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+}
+
+static process_lifecycle_hook_t g_fork_hook;
+static process_lifecycle_hook_t g_exit_hook;
+
+void process_register_lifecycle_hooks(process_lifecycle_hook_t on_fork,
+                                      process_lifecycle_hook_t on_exit)
+{
+    g_fork_hook = on_fork;
+    g_exit_hook = on_exit;
+}
+
+static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts);
+
 int32_t process_fork(void)
+{
+    return process_fork_impl(0u, 0u);
+}
+
+/* fork() whose child starts on `child_user_rsp` (clone() with a stack). The
+ * stack has to be in place before the child can be scheduled: setting it
+ * afterwards raced the other CPUs, and a child that won the race ran on the
+ * parent's stack -- Chromium's chroot helper then "returned" into its
+ * parent's frame with RBP 0 and faulted, failing ChrootToSafeEmptyDir(). */
+int32_t process_fork_with_stack(uint64_t child_user_rsp)
+{
+    return process_fork_impl(child_user_rsp, 0u);
+}
+
+/* clone(): stack plus the per-child properties the Linux flags ask for
+ * (PROCESS_FORK_NEWPID, PROCESS_FORK_SHARE_FS), all applied before the child
+ * can run -- see process_fork_with_stack(). */
+int32_t process_fork_ex(uint64_t child_user_rsp, uint32_t opts)
+{
+    return process_fork_impl(child_user_rsp, opts);
+}
+
+static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts)
 {
     if (!process_table_ready()) return -1;
 
@@ -3221,18 +3558,32 @@ int32_t process_fork(void)
         return -3;
     }
 
-    process_t *parent = process_memory_owner_locked(&g_processes[current_pid]);
-    if (!parent || parent->state == PROCESS_STATE_UNUSED) {
+    /* Two different things are "the parent" here, and conflating them is how
+     * a fork() issued by a thread produced a child that resumed at the main
+     * thread's instruction pointer:
+     *   `owner`  owns the address space and everything process-wide (heap and
+     *            stack bounds, signal dispositions, name, cwd);
+     *   `caller` is the thread that actually called fork(), and its saved
+     *            register frame, TLS base and FPU state are what the child
+     *            has to come back on -- POSIX gives the child exactly one
+     *            thread, the one that forked.
+     * They are the same slot whenever the main thread forks. Chromium's
+     * process launcher does not run on the main thread, so they usually are
+     * not. */
+    process_t *caller = &g_processes[current_pid];
+    process_t *owner = process_memory_owner_locked(caller);
+    if (!owner || owner->state == PROCESS_STATE_UNUSED) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
         return -3;
     }
 
-    if (parent->is_thread) {
+    if (owner->is_thread) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
         return -38;
     }
+    process_t *parent = owner;
 
     int32_t child_pid = find_free_slot();
     if (child_pid < 0) {
@@ -3289,6 +3640,16 @@ int32_t process_fork(void)
      * Without this, the very first thing a forked child does with an inherited
      * fd fails -- Popen()'s child cannot dup2() the pipe it was handed. */
     syscall_file_fork_inherit(parent_pid_saved, child_pid);
+    /* AF_UNIX endpoints live in their own table and need the same treatment:
+     * without it the child could not close its inherited half without
+     * destroying the parent's, and the parent could not close its half
+     * without destroying the child's. */
+    unix_socket_fork_inherit(parent_pid_saved, child_pid);
+    /* Still before the child is READY: it must never run with a table it has
+     * not been given yet. */
+    if (g_fork_hook != NULL) {
+        g_fork_hook(parent_pid_saved, child_pid);
+    }
 
     for (uint32_t i = 0; i < PROCESS_USER_ALLOC_MAX; ++i) {
         child->user_allocs[i] = parent->user_allocs[i];
@@ -3297,13 +3658,14 @@ int32_t process_fork(void)
     child->capability_mask = parent->capability_mask;
     child->abi_mode = parent->abi_mode;
     child->priority = parent->priority;
-    child->rseq_area = parent->rseq_area;
-    child->rseq_sig = parent->rseq_sig;
-    child->fs_base = parent->fs_base;
+    /* Per-thread state comes from the calling thread, not from the process. */
+    child->rseq_area = caller->rseq_area;
+    child->rseq_sig = caller->rseq_sig;
+    child->fs_base = caller->fs_base;
     child->gs_base = hal_cpu_read_gs_base();
-    memcpy(child->fpu_state, parent->fpu_state, PROCESS_FPU_STATE_SIZE);
+    memcpy(child->fpu_state, caller->fpu_state, PROCESS_FPU_STATE_SIZE);
 
-    uint64_t *parent_kstack = (uint64_t *)(uintptr_t)parent->saved_rsp;
+    uint64_t *parent_kstack = (uint64_t *)(uintptr_t)caller->saved_rsp;
     uint64_t *child_kstack = (uint64_t *)(uintptr_t)child->kernel_stack_top;
     child_kstack -= PROCESS_CONTEXT_QWORDS;
     for (uint32_t i = 0; i < PROCESS_CONTEXT_QWORDS; ++i) {
@@ -3312,7 +3674,8 @@ int32_t process_fork(void)
     child_kstack[SYSCALL_FRAME_RAX] = 0;
 
     child->saved_rsp = (uint64_t)(uintptr_t)child_kstack;
-    child->saved_user_rsp = syscall_get_user_rsp();
+    child->saved_user_rsp = child_user_rsp != 0u ? child_user_rsp
+                                                 : syscall_get_user_rsp();
 
     irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
@@ -3331,6 +3694,13 @@ int32_t process_fork(void)
 
     memcpy(child->name, parent->name, sizeof(child->name));
     memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    memcpy(child->root_path, parent->root_path, sizeof(child->root_path));
+    child->pidns_init = (opts & PROCESS_FORK_NEWPID) ? child_pid
+                                                     : parent->pidns_init;
+    child->fs_share_pid = (opts & PROCESS_FORK_SHARE_FS)
+                              ? (int32_t)(caller - g_processes) : -1;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
     memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
     memcpy(child->launch_argument, parent->launch_argument,
            sizeof(child->launch_argument));
@@ -3344,7 +3714,7 @@ int32_t process_fork(void)
     child->altstack_sp = parent->altstack_sp;
     child->altstack_size = parent->altstack_size;
     child->altstack_flags = parent->altstack_flags;
-    child->signal_mask = parent->signal_mask;
+    child->signal_mask = caller->signal_mask;
     child->pending_signals = 0;
 
     spinlock_unlock(&g_process_table_lock);
@@ -3381,6 +3751,22 @@ int32_t process_execve(const char *path, const char *const *argv,
     }
     if (copy_from_user(path_buf, path, path_len + 1) != 0) {
         return -14;
+    }
+
+    /* /proc/self/exe (and /proc/<pid>/exe) is a symlink to the running
+     * image, and Chromium re-executes itself through it for every child it
+     * does not fork from the zygote (the network service among them). The
+     * loader only understands real paths, so follow the link here. */
+    if (strncmp(path_buf, "/proc/", 6) == 0) {
+        char target[256];
+        if (procfs_readlink(path_buf, target, sizeof(target)) == 0 &&
+            target[0] == '/') {
+            size_t tlen = strlen(target);
+            if (tlen < sizeof(path_buf)) {
+                memcpy(path_buf, target, tlen + 1u);
+                path_len = tlen;
+            }
+        }
     }
 
     if (path_buf[0] != '/') {
@@ -3837,12 +4223,11 @@ int32_t process_execve(const char *path, const char *const *argv,
     return 0;
 }
 
-int32_t process_copy_launch_argument(char *out, uint32_t capacity)
+int32_t process_copy_launch_argument_of(int32_t pid, char *out, uint32_t capacity)
 {
     if (!out || capacity == 0u) return -1;
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
-    int32_t pid = current_pid_get();
     process_t *proc = is_valid_pid(pid) ? &g_processes[pid] : NULL;
     proc = process_memory_owner_locked(proc);
     if (!proc) {
@@ -3862,12 +4247,11 @@ int32_t process_copy_launch_argument(char *out, uint32_t capacity)
     return (int32_t)length;
 }
 
-int32_t process_copy_exe_path(char *out, uint32_t capacity)
+int32_t process_copy_exe_path_of(int32_t pid, char *out, uint32_t capacity)
 {
     if (!out || capacity == 0u) return -1;
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
-    int32_t pid = current_pid_get();
     process_t *proc = is_valid_pid(pid) ? &g_processes[pid] : NULL;
     proc = process_memory_owner_locked(proc);
     if (!proc) {
@@ -3884,6 +4268,20 @@ int32_t process_copy_exe_path(char *out, uint32_t capacity)
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
     return (int32_t)length;
+}
+
+/* Current-process wrappers. /proc/<pid>/{cmdline,exe} needs the same two
+ * readers for a pid other than the caller's -- the zygote host and the crash
+ * handler both introspect their children -- so the bodies above take an
+ * explicit pid and these keep the old call sites unchanged. */
+int32_t process_copy_launch_argument(char *out, uint32_t capacity)
+{
+    return process_copy_launch_argument_of(current_pid_get(), out, capacity);
+}
+
+int32_t process_copy_exe_path(char *out, uint32_t capacity)
+{
+    return process_copy_exe_path_of(current_pid_get(), out, capacity);
 }
 
 int64_t process_get_main_image_info(uint64_t *phdr_vaddr,
@@ -4030,8 +4428,21 @@ void process_exit_current(void)
         return;
     }
     int32_t pid_to_exit = (int32_t)(owner - g_processes);
+    /* Several threads can run exit_group() at once. The first one tears the
+     * group down; a later one must not run the cleanup a second time (every
+     * table would be released twice) -- it only has to stop running. */
+    if (owner->state == PROCESS_STATE_ZOMBIE) {
+        if (current != owner) {
+            current->state = PROCESS_STATE_DEAD;
+        }
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return;
+    }
     int32_t exit_status_log = owner->exit_status;
     uint8_t abi_mode_log = (owner->abi_mode == PROCESS_ABI_LINUX) ? 1u : 0u;
+    /* Claim the teardown before dropping the lock. */
+    owner->state = PROCESS_STATE_ZOMBIE;
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
@@ -4049,6 +4460,9 @@ void process_exit_current(void)
     syscall_file_close_all_for_pid(pid_to_exit, &closed_fds, &closed_dirs);
     syscall_socket_close_all_for_pid(pid_to_exit);
     unix_socket_close_all_for_pid(pid_to_exit);
+    if (g_exit_hook != NULL) {
+        g_exit_hook(pid_to_exit, -1);
+    }
     shared_memory_cleanup_process(pid_to_exit);
     drm_kms_notify_process_exit(pid_to_exit);
     filemap_release_pid(pid_to_exit);
@@ -4068,7 +4482,16 @@ void process_exit_current(void)
         }
     }
     process_notify_parent_sigchld_locked(&g_processes[pid_to_exit]);
-    process_scheduler_release_stale_pid(pid_to_exit);
+    /* Another CPU naming the group leader as current is only stale when the
+     * leader itself is the one exiting here. When a secondary thread runs
+     * exit_group(), the leader may be legitimately mid-syscall on another
+     * CPU (often in its own exit_group()); clearing it there sent that CPU
+     * back to user space with no process behind it (a #GP on glibc's
+     * post-exit hlt, "no current thread on this CPU"), and let the parent
+     * reap the group while it was still running. */
+    if (current_pid_get() == pid_to_exit) {
+        process_scheduler_release_stale_pid(pid_to_exit);
+    }
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
@@ -4193,6 +4616,28 @@ static void process_run_robust_list_current(uint64_t head_ptr, int32_t tid)
     if (pending != 0u) {
         process_robust_handle_entry_current(pending, futex_offset, tid);
     }
+}
+
+/* exit_group() from a thread must not come back, whatever state the group is
+ * in. process_exit_current() retires every thread of a live group, but when
+ * the group is already on its way out (another thread got there first, or the
+ * owner slot is mid-teardown) it returns early and the caller stayed runnable
+ * -- it went back to user space, fell onto the hlt glibc places after the
+ * syscall, and took a #GP. Mark the caller dead outright. */
+void process_retire_current_thread(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    int32_t tid = current_pid_get();
+    if (is_valid_pid(tid) && g_processes[tid].is_thread) {
+        uint8_t st = g_processes[tid].state;
+        if (st == PROCESS_STATE_RUNNING || st == PROCESS_STATE_READY ||
+            st == PROCESS_STATE_BLOCKED) {
+            g_processes[tid].state = PROCESS_STATE_DEAD;
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
 }
 
 void process_thread_exit_current(int32_t exit_status)
@@ -4695,6 +5140,18 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
         }
     }
 
+    /* A sibling is forking this process: get off the CPU and stay off (the
+     * scheduler skips held threads) until it is done. */
+    if (!do_switch &&
+        scheduler_pid_held_for_fork(g_processes, g_process_capacity,
+                                    current_pid_get())) {
+        do_switch = 1;
+        if (current->state == PROCESS_STATE_RUNNING) {
+            current->state = PROCESS_STATE_READY;
+            process_perf_mark_ready_locked(current, now_ns);
+        }
+    }
+
     if (!do_switch &&
         (current->state == PROCESS_STATE_RUNNING ||
          current->state == PROCESS_STATE_READY)) {
@@ -4958,7 +5415,32 @@ int process_user_buffer_is_writable(const void *ptr, uint64_t len)
     if (cr3 == 0) {
         return 1;
     }
+#if KERNEL_COW_FORK
+    (void)paging_user_range_break_cow(cr3, (uint64_t)(uintptr_t)ptr, len);
+#endif
     return paging_user_range_is_writable(cr3, (uint64_t)(uintptr_t)ptr, len);
+}
+
+/* Unshare any copy-on-write pages under a user buffer the kernel is about to
+ * write. Called from process_user_buffer_is_valid(), which nearly every
+ * kernel->user copy passes through, so that a write after fork() lands in
+ * this process's own page rather than the one it still shares with its
+ * parent. Compiled out entirely when COW fork is off. */
+void process_user_break_cow(const void *ptr, uint64_t len)
+{
+#if KERNEL_COW_FORK
+    if (ptr == NULL || len == 0u) {
+        return;
+    }
+    uint64_t cr3 = process_get_current_cr3();
+    if (cr3 == 0u) {
+        return;
+    }
+    (void)paging_user_range_break_cow(cr3, (uint64_t)(uintptr_t)ptr, len);
+#else
+    (void)ptr;
+    (void)len;
+#endif
 }
 
 int process_user_buffer_is_valid(const void *ptr, uint64_t len)
@@ -6122,6 +6604,29 @@ int32_t process_waitpid(int32_t pid, int32_t *status_out, int32_t options)
     return process_waitpid_ex(pid, status_out, options, NULL);
 }
 
+/* Is the process, or any thread of it, still executing on some CPU? Reaping
+ * frees the address space, so a zombie is only reapable once every one of its
+ * threads is off-CPU. Checking the group leader alone let a parent reap a
+ * multi-threaded child while one of its threads was still returning from its
+ * own exit_group() on another CPU -- that thread came back to user space with
+ * no process behind it and took a #GP on glibc's post-exit hlt. Caller holds
+ * the table lock. */
+static int process_group_on_cpu_locked(int32_t pid)
+{
+    if (process_scheduler_pid_in_use_on_any_cpu(pid)) {
+        return 1;
+    }
+    for (int32_t i = 0; i < g_process_capacity; ++i) {
+        const process_t *t = &g_processes[i];
+        if (t->is_thread && t->memory_owner_pid == pid &&
+            t->state != PROCESS_STATE_UNUSED &&
+            process_scheduler_pid_in_use_on_any_cpu(i)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int32_t process_waitpid_ex(int32_t pid, int32_t *status_out, int32_t options,
                            int32_t *term_signal_out)
 {
@@ -6145,7 +6650,7 @@ int32_t process_waitpid_ex(int32_t pid, int32_t *status_out, int32_t options,
             return -1;
         }
         if (g_processes[pid].state == PROCESS_STATE_ZOMBIE &&
-            !process_scheduler_pid_in_use_on_any_cpu(pid)) {
+            !process_group_on_cpu_locked(pid)) {
             int32_t exit_code = g_processes[pid].exit_status;
             int32_t term_sig = g_processes[pid].exit_by_signal
                                    ? (int32_t)g_processes[pid].exit_term_signal
@@ -6171,7 +6676,7 @@ int32_t process_waitpid_ex(int32_t pid, int32_t *status_out, int32_t options,
         if (g_processes[i].state == PROCESS_STATE_ZOMBIE &&
             !g_processes[i].is_thread &&
             g_processes[i].parent_pid == my_pid &&
-            !process_scheduler_pid_in_use_on_any_cpu(i)) {
+            !process_group_on_cpu_locked(i)) {
             int32_t exit_code = g_processes[i].exit_status;
             int32_t term_sig = g_processes[i].exit_by_signal
                                    ? (int32_t)g_processes[i].exit_term_signal
@@ -6598,6 +7103,67 @@ int32_t process_count_threads(int32_t owner_pid)
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
     return count;
+}
+
+/* Ascending walk of the slots belonging to one thread group; -1 to start,
+ * -1 when done. /proc/<pid>/task is the caller: crash handling and any
+ * per-thread accounting a Linux program does starts by listing that
+ * directory. Uses the same "effective owner" rule as
+ * process_count_threads(). */
+int32_t process_next_thread_of(int32_t owner_pid, int32_t after)
+{
+    if (owner_pid < 0) {
+        return -1;
+    }
+    int32_t start = (after < 0) ? 0 : after + 1;
+    if (start < 0) {
+        return -1;
+    }
+    int32_t found = -1;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    for (int32_t i = start; i < g_process_capacity; ++i) {
+        process_t *proc = &g_processes[i];
+        if (proc->state == PROCESS_STATE_UNUSED ||
+            proc->state == PROCESS_STATE_DEAD) {
+            continue;
+        }
+        int32_t effective_owner = proc->is_thread ? proc->memory_owner_pid : i;
+        if (effective_owner == owner_pid) {
+            found = i;
+            break;
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return found;
+}
+
+/* Ascending walk of every live process slot, used to enumerate /proc. */
+int32_t process_next_live_pid(int32_t after)
+{
+    int32_t start = (after < 0) ? 0 : after + 1;
+    if (start < 0) {
+        return -1;
+    }
+    int32_t found = -1;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    for (int32_t i = start; i < g_process_capacity; ++i) {
+        uint8_t state = g_processes[i].state;
+        if (state == PROCESS_STATE_UNUSED || state == PROCESS_STATE_DEAD ||
+            state == PROCESS_STATE_ZOMBIE) {
+            continue;
+        }
+        if (g_processes[i].is_thread) {
+            continue; /* Threads appear under /proc/<tgid>/task, not at /proc. */
+        }
+        found = i;
+        break;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return found;
 }
 
 void process_record_page_fault(int32_t pid, uint64_t fault_addr, uint64_t rip,

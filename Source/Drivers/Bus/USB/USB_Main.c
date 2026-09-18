@@ -102,6 +102,20 @@ static uint8_t g_usb_hub_count = 0;
 usb_hc_type_t usb_get_hc_type(void) { return g_hc_type; }
 usb_hc_type_t usb_get_device_hc_type(uint8_t addr) { return g_dev_hc[addr]; }
 
+/* Four hex digits over COM1. serial_write_uint32() through the module vtable
+ * would pad every id to eight, and a vid/pid pair is read often enough here to
+ * be worth the six lines. */
+static void usb_log_hex16(uint16_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    if (g_api == NULL || g_api->serial_write_char == NULL) {
+        return;
+    }
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        g_api->serial_write_char(digits[(value >> shift) & 0xFu]);
+    }
+}
+
 static void usb_publish_hid_event(uint32_t device_class,
                                   uint16_t action,
                                   const char *device_name,
@@ -375,21 +389,35 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     uint8_t mouse_ep_in = 0;
     uint16_t mouse_ep_mps = 0;
 
-    /* A single vendor-specific (class 0xFF) interface, reported generically
-     * to BusRegistry via g_api->bus.report_device() below instead of being
+    /* Every vendor-specific (class 0xFF) interface, reported generically to
+     * BusRegistry via g_api->bus.report_device() below instead of being
      * dispatched to a specific driver by name/VID here -- see AX900.c
      * (Kernel/Drivers/Wi-Fi/AX900/) for the driver-side half of this
-     * contract. Only one such interface per device is tracked; a device
-     * exposing more than one vendor-specific interface only gets the last
-     * one reported (a real limitation, not exercised by any device this
-     * driver has been tested against). */
-    uint8_t vendor_iface = 0xFF;
-    uint8_t vendor_subclass = 0;
-    uint8_t vendor_protocol = 0;
-    uint8_t vendor_ep_in = 0;
-    uint8_t vendor_ep_out = 0;
-    uint16_t vendor_ep_in_mps = 0;
-    uint16_t vendor_ep_out_mps = 0;
+     * contract.
+     *
+     * Every one of them, not just the last: this used to keep a single
+     * interface, and -- worse -- did not clear the endpoints already
+     * collected for the one it replaced, so a device with two
+     * vendor-specific interfaces was reported with the second interface's
+     * number and whatever endpoints the first had left behind. The AX900's
+     * AIC8800D80 is exactly that shape (Wi-Fi and Bluetooth on separate
+     * vendor-specific interfaces), so the interface the driver wanted was
+     * either never offered or offered with the wrong pipes.
+     *
+     * Only bAlternateSetting 0 of each interface number is kept: a repeated
+     * interface number is an alternate setting, and nothing here selects one
+     * (no SET_INTERFACE is ever sent), so the first descriptor is the live
+     * one. */
+    struct usb_vendor_iface {
+        uint8_t  iface;
+        uint8_t  subclass;
+        uint8_t  protocol;
+        uint8_t  ep_in;
+        uint8_t  ep_out;
+        uint16_t ep_in_mps;
+        uint16_t ep_out_mps;
+    } vendor_ifaces[4];
+    uint32_t vendor_iface_count = 0u;
 
     uint16_t total_len = 0u;
     for (uint32_t retry = 0u; retry < 5u; ++retry) {
@@ -454,9 +482,26 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                         mouse_iface = current_iface;
                     }
                 } else if (effective_class == 0xFFu) {
-                    vendor_iface = current_iface;
-                    vendor_subclass = effective_subclass;
-                    vendor_protocol = effective_protocol;
+                    bool known = false;
+                    for (uint32_t v = 0u; v < vendor_iface_count; ++v) {
+                        if (vendor_ifaces[v].iface == current_iface) {
+                            known = true; /* an alternate setting: keep alt 0 */
+                            break;
+                        }
+                    }
+                    if (!known &&
+                        vendor_iface_count <
+                            (uint32_t)(sizeof(vendor_ifaces) / sizeof(vendor_ifaces[0]))) {
+                        struct usb_vendor_iface *slot =
+                            &vendor_ifaces[vendor_iface_count++];
+                        slot->iface = current_iface;
+                        slot->subclass = effective_subclass;
+                        slot->protocol = effective_protocol;
+                        slot->ep_in = 0u;
+                        slot->ep_out = 0u;
+                        slot->ep_in_mps = 0u;
+                        slot->ep_out_mps = 0u;
+                    }
                 }
             } else if (type == USB_DESC_ENDPOINT && len >= 7 && current_iface != 0xFF) {
                 uint8_t ep_addr = conf_buf[pos + 2];
@@ -477,13 +522,19 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                 } else if (mouse_iface != 0xFF && current_iface == mouse_iface && (attributes & 0x03u) == 3 && (ep_addr & 0x80u)) {
                     mouse_ep_in = ep_addr & 0x7Fu;
                     mouse_ep_mps = mps;
-                } else if (vendor_iface != 0xFF && current_iface == vendor_iface && (attributes & 0x03u) == 2) {
-                    if (ep_addr & 0x80u) {
-                        vendor_ep_in = ep_addr & 0x7Fu;
-                        vendor_ep_in_mps = mps;
-                    } else {
-                        vendor_ep_out = ep_addr & 0x7Fu;
-                        vendor_ep_out_mps = mps;
+                } else if ((attributes & 0x03u) == 2) {
+                    for (uint32_t v = 0u; v < vendor_iface_count; ++v) {
+                        if (vendor_ifaces[v].iface != current_iface) {
+                            continue;
+                        }
+                        if (ep_addr & 0x80u) {
+                            vendor_ifaces[v].ep_in = ep_addr & 0x7Fu;
+                            vendor_ifaces[v].ep_in_mps = mps;
+                        } else {
+                            vendor_ifaces[v].ep_out = ep_addr & 0x7Fu;
+                            vendor_ifaces[v].ep_out_mps = mps;
+                        }
+                        break;
                     }
                 }
             }
@@ -523,32 +574,61 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
         usb_wait_ms(port_hc, configured ? 150u : 300u);
     }
 
-    if (configured && vendor_iface != 0xFF && vendor_ep_in != 0 && vendor_ep_out != 0 &&
-        g_api != NULL && g_api->bus.report_device != NULL) {
-        usb_device_context_t usb_ctx;
-        usb_ctx.addr = current_addr;
-        usb_ctx.interface = vendor_iface;
-        usb_ctx.ep_in = vendor_ep_in;
-        usb_ctx.ep_out = vendor_ep_out;
-        usb_ctx.ep_in_mps = vendor_ep_in_mps;
-        usb_ctx.ep_out_mps = vendor_ep_out_mps;
-        usb_ctx.submit_bulk = usb_submit_bulk;
+    /* One line per enumerated device. Without it a device no driver claims
+     * leaves no trace at all on COM1 -- the only channel a real-hardware boot
+     * can be read from -- which made "the adapter is not recognised"
+     * impossible to tell apart from "the adapter never enumerated". */
+    if (g_api != NULL && g_api->serial_write_string != NULL) {
+        g_api->serial_write_string("[USB] dev vid=");
+        usb_log_hex16(desc.idVendor);
+        g_api->serial_write_string(" pid=");
+        usb_log_hex16(desc.idProduct);
+        g_api->serial_write_string(configured ? " configured" : " NOT-configured");
+        g_api->serial_write_string(" vendor-ifaces=");
+        if (g_api->serial_write_char != NULL) {
+            g_api->serial_write_char((char)('0' + (vendor_iface_count & 0x7u)));
+        }
+        g_api->serial_write_string("\n");
+    }
 
-        bus_device_t bus_dev;
-        bus_dev.bus_type = DEVICE_TYPE_USB;
-        bus_dev.vendor_id = desc.idVendor;
-        bus_dev.device_id = desc.idProduct;
-        bus_dev.class_code = 0xFFu;
-        bus_dev.subclass = vendor_subclass;
-        bus_dev.protocol = vendor_protocol;
-        bus_dev.bus_context = &usb_ctx;
+    if (configured && g_api != NULL && g_api->bus.report_device != NULL) {
+        for (uint32_t v = 0u; v < vendor_iface_count; ++v) {
+            const struct usb_vendor_iface *vi = &vendor_ifaces[v];
+            if (vi->ep_in == 0u || vi->ep_out == 0u) {
+                continue; /* no bulk pair: nothing a driver could talk over */
+            }
 
-        /* No match today just means no loaded driver claims this device
-         * (e.g. AX900_Driver.ELF, Kernel/Drivers/Wi-Fi/AX900/, isn't
-         * present) -- not an error. Dynamic loading of a not-yet-loaded
-         * matching module on a report_device() miss is a further step this
-         * doesn't attempt yet. */
-        (void)g_api->bus.report_device(&bus_dev);
+            usb_device_context_t usb_ctx;
+            usb_ctx.addr = current_addr;
+            usb_ctx.interface = vi->iface;
+            usb_ctx.ep_in = vi->ep_in;
+            usb_ctx.ep_out = vi->ep_out;
+            usb_ctx.ep_in_mps = vi->ep_in_mps;
+            usb_ctx.ep_out_mps = vi->ep_out_mps;
+            usb_ctx.submit_bulk = usb_submit_bulk;
+            usb_ctx.submit_bulk_timeout = usb_submit_bulk_timeout;
+
+            bus_device_t bus_dev;
+            bus_dev.bus_type = DEVICE_TYPE_USB;
+            bus_dev.vendor_id = desc.idVendor;
+            bus_dev.device_id = desc.idProduct;
+            bus_dev.class_code = 0xFFu;
+            bus_dev.subclass = vi->subclass;
+            bus_dev.protocol = vi->protocol;
+            bus_dev.bus_context = &usb_ctx;
+
+            /* No match today just means no loaded driver claims this device
+             * -- not an error. A module that is not loaded yet is still
+             * reachable from here: BusRegistry.c falls back to the on-demand
+             * manifest (DriverDB.txt) and loads it, and holds the device for
+             * one replay when it lands before the VFS is mounted, which at
+             * boot it always does. */
+            bool claimed = g_api->bus.report_device(&bus_dev);
+            if (g_api->serial_write_string != NULL) {
+                g_api->serial_write_string(claimed ? "[USB]   vendor iface claimed\n"
+                                                   : "[USB]   vendor iface unclaimed\n");
+            }
+        }
     }
 
     if (configured) {
@@ -1245,6 +1325,20 @@ bool usb_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
     else if (hc == USB_HC_XHCI)
         return xhci_submit_bulk(addr, endpoint, max_packet_size, pid, data, length);
     return false;
+}
+
+bool usb_submit_bulk_timeout(uint8_t addr, uint8_t endpoint,
+                             uint16_t max_packet_size,
+                             uint8_t pid, void *data, uint32_t length,
+                             uint32_t timeout_ms) {
+    usb_hc_type_t hc = g_dev_hc[addr];
+    if (hc == USB_HC_NONE) hc = g_hc_type;
+    if (hc == USB_HC_XHCI)
+        return xhci_submit_bulk_timeout(addr, endpoint, max_packet_size, pid,
+                                        data, length, timeout_ms);
+    /* OHCI/UHCI/EHCI wait a couple of seconds at most already, so there is
+     * nothing here worth shortening -- take their default. */
+    return usb_submit_bulk(addr, endpoint, max_packet_size, pid, data, length);
 }
 
 bool usb_set_address(uint8_t old_addr, uint8_t new_addr) {

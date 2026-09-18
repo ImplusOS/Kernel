@@ -1,28 +1,23 @@
 #pragma once
 #include <stdint.h>
 
-/* AF_UNIX fds must sit BELOW sysconf(_SC_OPEN_MAX) (== RLIMIT_NOFILE, raised
- * to 1024 in Syscall_LinuxCompat.c) and below FD_SETSIZE: X's Xtrans rejects
- * any socket fd >= _SC_OPEN_MAX ("Unable to open socket"), and select()-based
- * code indexes fd_set by the raw fd. The old 0x8000 base broke every real
- * Linux AF_UNIX consumer. Layout: file table 0..191, AF_UNIX 192..255,
- * inet sockets 512..575.
+/* Global numbering of AF_UNIX endpoints: UNIX_SOCK_FD_BASE + slot.
  *
- * The whole AF_UNIX range has to stay under 256: xserver's
- * AllocNewConnection() drops any client with fd >= lastfdesc, and lastfdesc
- * is clamped to the compile-time MAXCLIENTS (256). Base 256 meant every X
- * client was accepted and closed again in the same breath. Kept in step with
- * OS_CONFIG_FILE_MAX_FD (192) - the two ranges are adjacent by construction. */
-#define UNIX_SOCK_FD_BASE 192
-/* Global pool shared by the whole OS. An X server alone wants ~2 listeners
- * plus one accepted socket per client; 16 was exhausted the moment Xorg
- * started (compounded by the per-pid leak fixed in unix_socket_close_all_
- * for_pid). Each slot carries a UNIX_SOCK_BUF_SIZE inline buffer, so this is
- * ~UNIX_SOCK_MAX * 32 KiB of .bss. Keep 256+MAX <= 512 (inet fd base). */
-#define UNIX_SOCK_MAX 64
-/* 256 KiB per endpoint (inline). The old 1 KiB silently dropped
- * bytes on overflow, which desynced any real protocol - Wayland's registry
- * burst alone is several KiB. */
+ * These used to sit at 192..255, squeezed under the X server's 256-client
+ * limit and inside the file table's range, because Linux programs saw these
+ * numbers directly. They no longer do: a Linux-ABI process has a descriptor
+ * table of its own (Compat/Linux/Linux_FdTable.c) and never sees a global
+ * number, so the range only has to stay below 1024 for native programs (the
+ * POSIX layer and FD_SETSIZE index by raw fd). Layout: file table 0..511,
+ * inet sockets 512..767, AF_UNIX 768..1023.
+ *
+ * 256 endpoints: multi-process Chromium alone holds a socketpair per child,
+ * its zygotes' control and sandbox channels, a crash-handler channel per
+ * process and one X connection per process that draws. */
+#define UNIX_SOCK_FD_BASE 768
+#define UNIX_SOCK_MAX 256
+/* Receive ring per endpoint, allocated from the kernel heap when the
+ * endpoint is created (256 of them inline would be 8 MiB of .bss). */
 #define UNIX_SOCK_BUF_SIZE (32u * 1024u)
 #define UNIX_SOCK_PATH_MAX 108
 #define SCM_RIGHTS 1
@@ -31,6 +26,9 @@
  * an empty ring has to park the caller instead of reporting EAGAIN. */
 int unix_socket_set_nonblock(int32_t fd, int on);
 int unix_socket_is_nonblock(int32_t fd);
+/* SO_PASSCRED / SO_PEERCRED for an AF_UNIX endpoint. See UnixSocket.c. */
+int unix_socket_set_passcred(int32_t fd, int on);
+int unix_socket_peer_pid(int32_t fd, int32_t *pid_out);
 /* Bring-up trace hook, bounded by the same cap as the other [usock] lines. */
 void unix_socket_trace_note(const char *tag, int32_t fd);
 #define AF_UNIX 1
@@ -48,13 +46,33 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr);
 int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr);
 int64_t unix_socket_close(int32_t fd);
 void unix_socket_close_all_for_pid(int32_t pid);
+/* Hand every endpoint the parent holds to a newly forked child, so the two
+ * hold independent references to the same socket. */
+void unix_socket_fork_inherit(int32_t parent_pid, int32_t child_pid);
 /* socketpair(AF_UNIX, ...) - creates two already-connected endpoints
  * without bind()/listen()/connect()/accept(). Writes the two new fds to
  * out_fds[0]/out_fds[1] and returns 0, or a negative error. */
 int64_t unix_socket_pair(int32_t out_fds[2]);
+/* socketpair() with a socket type: SOCK_SEQPACKET/SOCK_DGRAM keep message
+ * boundaries, SOCK_STREAM does not. */
+int64_t unix_socket_pair_typed(int32_t type, int32_t out_fds[2]);
+
+/* How SCM_RIGHTS maps descriptors for the calling process. A Linux-ABI
+ * process names objects by its own numbers (Compat/Linux/Linux_FdTable.c):
+ * `resolve` turns one of those into a kernel-global descriptor on send, and
+ * `install` gives a received global one a number in the receiver's table. -1
+ * from resolve means "not open". Unset hooks mean identity. */
+void unix_socket_set_fd_hooks(int32_t (*resolve)(int32_t fd),
+                              int32_t (*install)(int32_t global));
 /* True if `fd` falls in the Unix-domain-socket fd range (regardless of
  * whether it is currently in use) - lets callers route by fd alone. */
 int unix_socket_fd_in_range(int32_t fd);
+
+/* Ascending walk of a process's AF_UNIX fds; -1 to start, -1 when done.
+ * Second half of what /proc/<pid>/fd lists (the first is the file table). */
+int32_t unix_socket_next_open_fd(int32_t pid, int32_t after);
+
+
 
 /* poll(2)/epoll readiness for an AF_UNIX fd. `events`/result use EPOLL*
  * (== POLL*) bits. */

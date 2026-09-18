@@ -31,3 +31,7 @@ int procfs_readlink(const char *path, char *out, uint32_t capacity);
  * it points at rather than read a generated file, so the fd layer asks this
  * before it consults the VFS. */
 int32_t procfs_parse_fd_path(const char *path);
+
+/* Per-process descriptor numbering for /proc/<pid>/fd -- see ProcFS.c. */
+void procfs_set_fd_hooks(int32_t (*translate)(int32_t pid, int32_t fd),
+                         int32_t (*next)(int32_t pid, int32_t after));

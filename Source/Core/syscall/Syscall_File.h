@@ -125,6 +125,11 @@ void    syscall_file_mmap_release(int32_t handle);
  * -- which fstat()s its own fd and bails unless S_ISDIR -- works for foreign
  * binaries (Xorg's module loader walks modules/ with opendir/readdir). */
 int syscall_file_is_dir(int32_t fd);
+/* Give another process a claim on a file-table descriptor (SCM_RIGHTS). */
+int32_t syscall_file_grant(int32_t fd, int32_t pid);
+/* Ascending walk of a process's open descriptors; -1 to start, -1 when done.
+ * Backs /proc/<pid>/fd -- see the definition. */
+int32_t syscall_file_next_open_fd(int32_t pid, int32_t after);
 
 /* Character-device fds (devfs /dev/dri/card0, /dev/input/event*). Returns 1 if
  * `fd` is an open on a devfs node exposing the vfs_driver_t dev_* hooks. */

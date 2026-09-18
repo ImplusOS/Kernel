@@ -34,6 +34,11 @@ uint64_t copy_to_user(void *user_dst, const void *kernel_src, uint64_t bytes)
         return bytes;
     }
 
+    /* Unshare any copy-on-write page under the destination first. The memcpy
+     * below goes through a read-only mapping without trapping, so writing
+     * into a page still shared with the process's fork parent would change
+     * the parent's memory too. No-op when COW fork is off. */
+    process_user_break_cow(user_dst, bytes);
     memcpy(user_dst, kernel_src, (size_t)bytes);
     return 0;
 }
@@ -60,6 +65,7 @@ uint64_t copy_to_user_trusted(void *user_dst, const void *kernel_src, uint64_t b
         return bytes;
     }
 
+    process_user_break_cow(user_dst, bytes);
     memcpy(user_dst, kernel_src, (size_t)bytes);
     return 0;
 }

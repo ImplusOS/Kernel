@@ -10,7 +10,12 @@
 #include <stddef.h>
 #include <string.h>
 
-#define SOCKET_TABLE_SIZE 64
+/* Raised from 64: a Chromium that is allowed to do its normal background
+ * networking (Sync, GCM, variations, the component updater) holds far more
+ * than 64 sockets at once. SOCKET_FD_BASE + SOCKET_TABLE_SIZE must stay
+ * <= 1024 -- the POSIX layer and FD_SETSIZE both index by the raw fd. Kept in
+ * step with Syscall_Epoll.c's EPOLL_SOCKET_FD_COUNT. */
+#define SOCKET_TABLE_SIZE 256
 /* Must stay >= OS_CONFIG_FILE_MAX_FD_MAX (kernel/config.h) so socket fds
  * (this disjoint numeric range) never collide with the regular file fd
  * table in Syscall_File.c, and SOCKET_FD_BASE + SOCKET_TABLE_SIZE must
@@ -71,6 +76,30 @@ static int32_t socket_index(int32_t fd)
 {
     int32_t index = fd - SOCKET_FD_BASE;
     return index >= 0 && index < SOCKET_TABLE_SIZE ? index : -1;
+}
+
+/* Ascending walk of a process's AF_INET sockets; -1 to start, -1 when done.
+ * Third of the three descriptor tables /proc/<pid>/fd has to merge (files,
+ * AF_UNIX, AF_INET), each living in its own numeric fd range. */
+int32_t syscall_socket_next_open_fd(int32_t pid, int32_t after)
+{
+    socket_ensure_initialized();
+    int32_t start = (after < SOCKET_FD_BASE) ? 0 : (after - SOCKET_FD_BASE) + 1;
+    if (start < 0) {
+        start = 0;
+    }
+    int32_t found = -1;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_socket_lock);
+    for (int32_t i = start; i < SOCKET_TABLE_SIZE; ++i) {
+        if (g_sockets[i].used && g_sockets[i].owner_pid == pid) {
+            found = SOCKET_FD_BASE + i;
+            break;
+        }
+    }
+    spinlock_unlock(&g_socket_lock);
+    irq_restore(irq_flags);
+    return found;
 }
 
 static kernel_socket_t *socket_owned_locked(int32_t fd)

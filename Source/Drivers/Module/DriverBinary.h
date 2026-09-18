@@ -410,6 +410,16 @@ typedef struct {
     uint16_t ep_out_mps;
     bool (*submit_bulk)(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                         uint8_t pid, void *data, uint32_t length);
+    /* submit_bulk with the caller's own deadline (0 = the controller default).
+     * submit_bulk alone gives xHCI 30 s per transfer, which is fine for a
+     * command that must complete and ruinous for a driver polling an endpoint
+     * to ask whether anything arrived -- a device that only NAKs turns every
+     * such poll into a 30 s stall. Drivers that poll must use this one.
+     * May be NULL on an older bus driver; fall back to submit_bulk. */
+    bool (*submit_bulk_timeout)(uint8_t addr, uint8_t endpoint,
+                                uint16_t max_packet_size, uint8_t pid,
+                                void *data, uint32_t length,
+                                uint32_t timeout_ms);
 } usb_device_context_t;
 
 typedef struct {

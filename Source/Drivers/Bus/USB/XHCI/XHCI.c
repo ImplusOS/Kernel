@@ -1730,9 +1730,18 @@ bool xhci_submit_control(uint8_t addr, uint8_t endpoint,
     return ok;
 }
 
-bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint,
-                       uint16_t max_packet_size,
-                       uint8_t pid, void *data, uint32_t length)
+/* The caller's own deadline, in place of XHCI_BULK_TIMEOUT_MS.
+ *
+ * 30 s is the right order of magnitude for a mass-storage command that has to
+ * complete, and completely wrong for a driver that polls an endpoint to ask
+ * whether anything arrived: a device that simply NAKs (a Wi-Fi dongle with no
+ * firmware loaded is the standing example) makes every such poll cost the full
+ * timeout, which is indistinguishable from a hang. Those callers pass a few
+ * tens of milliseconds instead. */
+bool xhci_submit_bulk_timeout(uint8_t addr, uint8_t endpoint,
+                              uint16_t max_packet_size,
+                              uint8_t pid, void *data, uint32_t length,
+                              uint32_t timeout_ms)
 {
     if (!g_ready) {
         return false;
@@ -1844,7 +1853,8 @@ bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint,
     hal_cpu_restore_interrupts(rflags);
 
     uint32_t cc = 0;
-    bool ok = xhci_wait_event(32u, slot_id, ep_idx, &cc, XHCI_BULK_TIMEOUT_MS);
+    bool ok = xhci_wait_event(32u, slot_id, ep_idx, &cc,
+                              timeout_ms != 0u ? timeout_ms : XHCI_BULK_TIMEOUT_MS);
 
     if (ok && dir_in) {
         if (g_api && g_api->memcpy)
@@ -1866,6 +1876,14 @@ bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint,
         (void)xhci_recover_endpoint(addr, ep_idx);
     }
     return ok;
+}
+
+bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint,
+                      uint16_t max_packet_size,
+                      uint8_t pid, void *data, uint32_t length)
+{
+    return xhci_submit_bulk_timeout(addr, endpoint, max_packet_size, pid, data,
+                                    length, XHCI_BULK_TIMEOUT_MS);
 }
 
 uint32_t xhci_get_max_bulk_transfer_size(void)

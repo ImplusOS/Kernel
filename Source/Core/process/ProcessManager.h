@@ -137,11 +137,27 @@ int32_t process_create_thread_ex(uint64_t entry,
 int32_t process_spawn_user_elf(const char *path);
 int32_t process_spawn_user_elf_with_arg(const char *path,
                                         const char *launch_argument);
+/* Hooks for per-ABI process state. on_fork(parent, child) runs inside
+ * process_fork() before the child can be scheduled; on_exit(pid, -1) runs in
+ * the exit cleanup. */
+typedef void (*process_lifecycle_hook_t)(int32_t pid, int32_t other);
+void process_register_lifecycle_hooks(process_lifecycle_hook_t on_fork,
+                                      process_lifecycle_hook_t on_exit);
 int32_t process_fork(void);
+int32_t process_fork_with_stack(uint64_t child_user_rsp);
+#define PROCESS_FORK_NEWPID   0x1u  /* child is the init of a new pid namespace */
+#define PROCESS_FORK_SHARE_FS 0x2u  /* CLONE_FS: child shares the caller's root */
+int32_t process_fork_ex(uint64_t child_user_rsp, uint32_t opts);
+void process_retire_current_thread(void);
+/* Quiesce the caller's sibling threads around a fork -- see the definitions. */
+int process_fork_hold_acquire(void);
+void process_fork_hold_release(void);
 int32_t process_execve(const char *path, const char *const *argv,
                        const char *const *envp);
 int32_t process_copy_launch_argument(char *out, uint32_t capacity);
 int32_t process_copy_exe_path(char *out, uint32_t capacity);
+int32_t process_copy_launch_argument_of(int32_t pid, char *out, uint32_t capacity);
+int32_t process_copy_exe_path_of(int32_t pid, char *out, uint32_t capacity);
 void process_exit_current_with_status(int32_t exit_status);
 void process_exit_current_signaled(int32_t signum);
 void process_exit_current(void);
@@ -181,6 +197,10 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len);
  * for the destination of a read()-style syscall, which Linux fails with EFAULT
  * when the target is read-only. */
 int process_user_buffer_is_writable(const void *ptr, uint64_t len);
+/* Unshare copy-on-write pages under a buffer the kernel is about to write.
+ * Every kernel->user write path needs this before its memcpy -- see the
+ * definition. */
+void process_user_break_cow(const void *ptr, uint64_t len);
 int process_user_cstring_length(const char *str, uint64_t max_len, uint64_t *len_out);
 void *process_user_alloc(uint64_t size);
 uint64_t process_get_heap_cursor(void);
@@ -232,6 +252,21 @@ int process_set_current_name(const char *name, uint32_t max_len);
 int process_get_current_name(char *out, uint32_t capacity);
 int process_set_current_cwd(const char *cwd);
 int process_get_current_cwd(char *out, uint32_t capacity);
+/* chroot(2): the filesystem root every absolute path of this process is
+ * resolved against. "" (the default) means the real root. */
+int process_set_current_root(const char *root);
+int process_get_current_root(char *out, uint32_t capacity);
+/* clone(CLONE_FS): tie a child's filesystem root to another process's. */
+int process_set_fs_share(int32_t child_pid, int32_t partner_pid);
+/* PID namespaces as far as Linux programs can observe them: the init of a
+ * namespace sees itself as pid 1. See process_t.pidns_init. */
+void process_mark_pidns_init(int32_t pid);
+/* Per-process uid/gid (process_t.uid). (uint32_t)-1 = leave unchanged. */
+int process_get_credentials(int32_t pid, uint32_t *uid, uint32_t *gid);
+int process_set_current_credentials(uint32_t uid, uint32_t gid);
+int32_t process_pid_as_seen_by_current(int32_t real);
+int32_t process_pid_from_current_view(int32_t seen);
+int process_current_is_pidns_init(void);
 int32_t process_waitpid(int32_t pid, int32_t *status_out, int32_t options);
 /* Like process_waitpid, but also reports how the child terminated so the
  * Linux ABI can build a POSIX wait status. On a successful reap:
@@ -270,6 +305,10 @@ int32_t process_get_full_info(int32_t pid, void *info_out);
 int32_t process_get_perf_info(int32_t pid, process_perf_info_t *info_out);
 int32_t process_get_capacity(void);
 int32_t process_count_threads(int32_t owner_pid);
+/* Ascending walks backing /proc/<pid>/task and /proc itself; -1 to start,
+ * -1 when done. See the definitions in ProcessManager_Create.c. */
+int32_t process_next_thread_of(int32_t owner_pid, int32_t after);
+int32_t process_next_live_pid(int32_t after);
 void process_perf_note_syscall(int32_t pid);
 void process_perf_note_ipc_send(int32_t pid);
 void process_perf_note_ipc_recv(int32_t pid);

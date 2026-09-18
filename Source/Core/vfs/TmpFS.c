@@ -5,6 +5,8 @@
 
 #include "Core/sync/Spinlock.h"
 #include "Core/memory/SharedMemory.h"
+#include "Debug/serial/Serial.h"
+#include "kernel/config.h"
 
 /* One table serves all four mounts below, so it has to hold everything at
  * once: Xorg's sockets and compiled keymaps, the fontconfig cache, the login
@@ -423,7 +425,22 @@ static int32_t tmpfs_vfs_get_mode(const char *path)
     return mode;
 }
 
-#define TMPFS_DIR_HANDLE_MAX 8u
+/* Matched to the fd layer's own directory limit (FAT32 and exFAT already size
+ * their pools this way), so the fd table is the only thing that can run out.
+ *
+ * It was 8. Every other filesystem here allows 32-256, and Syscall_File.c hands
+ * out up to FILE_MAX_DIR_HANDLE_CONFIG directory fds, so tmpfs was the one
+ * mount that could be exhausted by ordinary use -- and running out is not a
+ * clean failure: linux_stat_path() treats "vfs_opendir() said no" as "this
+ * path does not exist", so stat() of a perfectly real /tmp directory returns
+ * ENOENT as soon as eight directories under /tmp, /run, /var or /dev/shm are
+ * open at once. Chromium's ProcessSingleton stats the directory mkdtemp() just
+ * made for it and CHECK-fails on a stat it cannot do ("Temp directory mode is
+ * not 700: 0" -- the 0 is its uninitialised local, not a mode this ever
+ * stores). That needs nothing more than Xorg holding a few handles while the
+ * browser starts, which is why it showed up on real hardware and not under
+ * QEMU, where the X server had already died. */
+#define TMPFS_DIR_HANDLE_MAX ((uint32_t)FILE_MAX_DIR_HANDLE_CONFIG)
 static uint8_t g_tmpfs_dir_in_use[TMPFS_DIR_HANDLE_MAX];
 static uint32_t g_tmpfs_dir_cursor[TMPFS_DIR_HANDLE_MAX];
 static char g_tmpfs_dir_path[TMPFS_DIR_HANDLE_MAX][TMPFS_PATH_MAX];
@@ -467,6 +484,21 @@ static bool tmpfs_is_dir_locked(const char *path)
     return false;
 }
 
+static bool g_tmpfs_dir_handles_full_reported = false;
+
+static void tmpfs_note_dir_handles_full_locked(const char *path)
+{
+    if (g_tmpfs_dir_handles_full_reported) {
+        return;
+    }
+    g_tmpfs_dir_handles_full_reported = true;
+    serial_write_string("[tmpfs] all ");
+    serial_write_uint32(TMPFS_DIR_HANDLE_MAX);
+    serial_write_string(" directory handles in use, opendir failed for ");
+    serial_write_string(path);
+    serial_write_string("\n");
+}
+
 static int32_t tmpfs_vfs_opendir(const char *path)
 {
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
@@ -492,6 +524,10 @@ static int32_t tmpfs_vfs_opendir(const char *path)
             return (int32_t)i;
         }
     }
+    /* Out of handles. Worth a line: the caller above sees only "-1", and the
+     * syscall layer turns that into ENOENT, so without this the symptom is an
+     * existing directory that stat() says is not there. */
+    tmpfs_note_dir_handles_full_locked(path);
     spinlock_unlock(&g_tmpfs_lock);
     return -1;
 }

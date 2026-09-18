@@ -6,6 +6,8 @@
 
 #include "interfaces/uart_hal.h"
 #include "Core/vfs/VFS.h"
+#include "Core/sync/Spinlock.h"
+#include "smp/SMP_Main.h"
 
 /* In-RAM scrollback for the on-screen log viewer / panic screen. 8 KiB was too
  * small to keep a verbose Chromium abort (the [FATAL:...] line plus its stack)
@@ -36,6 +38,51 @@ static vfs_file_t g_log_file;
 static bool g_log_file_open = false;
 static uint32_t g_log_file_offset = 0;
 static volatile uint8_t g_log_file_writing = 0;
+
+/*
+ * One writer at a time on the wire.
+ *
+ * Nothing used to serialise these, and with four CPUs logging at once a line
+ * came back spliced through another character by character -- to the point
+ * that "ERROR" in a Chromium message could not be grepped for, because half
+ * of a kernel trace line sat in the middle of it. Every question about a
+ * multi-process boot is answered by reading this log, so a line has to
+ * survive as a line.
+ *
+ * Only the ring and the UART are covered. The log *file* write goes through
+ * the VFS, which takes locks of its own and is reached from code that logs,
+ * so holding this across it invites a lock-order deadlock; a torn line in
+ * /var/log is the lesser problem. The owner check keeps a backend that logs
+ * from inside its own write path from deadlocking on itself.
+ */
+static spinlock_t g_serial_lock;
+static volatile int32_t g_serial_lock_owner = -1;
+static volatile uint8_t g_serial_lock_ready = 0;
+
+static int serial_lock_acquire(uint64_t *irq_flags_out)
+{
+    *irq_flags_out = irq_save_disable();
+    if (!g_serial_lock_ready) {
+        spinlock_init(&g_serial_lock);
+        g_serial_lock_ready = 1u;
+    }
+    int32_t cpu = (int32_t)smp_get_current_cpu_id();
+    if (g_serial_lock_owner == cpu) {
+        return 0; /* Re-entered on this CPU: already inside the critical section. */
+    }
+    spinlock_lock(&g_serial_lock);
+    g_serial_lock_owner = cpu;
+    return 1;
+}
+
+static void serial_lock_release(int held, uint64_t irq_flags)
+{
+    if (held) {
+        g_serial_lock_owner = -1;
+        spinlock_unlock(&g_serial_lock);
+    }
+    irq_restore(irq_flags);
+}
 
 static void serial_backend_init(void)
 {
@@ -138,13 +185,56 @@ static void serial_log_file_char(char c)
 
 void serial_write_char(char c)
 {
+    uint64_t irq_flags;
+    int held = serial_lock_acquire(&irq_flags);
     serial_ring_char(c);
     if (g_backend && g_backend->write_char) {
         g_backend->write_char(c);
-    } else {
-        serial_write_char_to_uart(c);
-        serial_mirror_char(c);
-        serial_log_file_char(c);
+        serial_lock_release(held, irq_flags);
+        return;
+    }
+    serial_write_char_to_uart(c);
+    serial_mirror_char(c);
+    serial_lock_release(held, irq_flags);
+
+    serial_log_file_char(c);
+}
+
+/* A counted write, held under the same lock for its whole length.
+ *
+ * This is what a foreign program's stdout/stderr goes through. Emitting it a
+ * character at a time took and dropped the lock per character, so a Chromium
+ * log line still came back shredded by whatever another CPU was printing.
+ * One write() from user space should appear as one run of bytes. */
+void serial_write_buffer(const char *data, uint32_t length)
+{
+    if (data == NULL || length == 0u) {
+        return;
+    }
+
+    uint64_t irq_flags;
+    int held = serial_lock_acquire(&irq_flags);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        serial_ring_char(data[i]);
+    }
+
+    if (g_backend && g_backend->write_char) {
+        for (uint32_t i = 0; i < length; ++i) {
+            g_backend->write_char(data[i]);
+        }
+        serial_lock_release(held, irq_flags);
+        return;
+    }
+
+    for (uint32_t i = 0; i < length; ++i) {
+        serial_write_char_to_uart(data[i]);
+        serial_mirror_char(data[i]);
+    }
+    serial_lock_release(held, irq_flags);
+
+    for (uint32_t i = 0; i < length; ++i) {
+        serial_log_file_char(data[i]);
     }
 }
 
@@ -154,23 +244,29 @@ void serial_write_string(const char *str)
         return;
     }
 
+    uint64_t irq_flags;
+    int held = serial_lock_acquire(&irq_flags);
+
     for (const char *p = str; *p != '\0'; ++p) {
         serial_ring_char(*p);
     }
 
     if (g_backend && g_backend->write_string) {
         g_backend->write_string(str);
-    } else {
-        serial_write_string_to_uart(str);
-        serial_mirror_string(str);
+        serial_lock_release(held, irq_flags);
+        return;
+    }
 
-        if (g_log_file_open && g_log_file_writing == 0) {
-            g_log_file_writing = 1;
-            uint32_t len = (uint32_t)strlen(str);
-            vfs_write_at(&g_log_file, g_log_file_offset, (const uint8_t *)str, len);
-            g_log_file_offset += len;
-            g_log_file_writing = 0;
-        }
+    serial_write_string_to_uart(str);
+    serial_mirror_string(str);
+    serial_lock_release(held, irq_flags);
+
+    if (g_log_file_open && g_log_file_writing == 0) {
+        g_log_file_writing = 1;
+        uint32_t len = (uint32_t)strlen(str);
+        vfs_write_at(&g_log_file, g_log_file_offset, (const uint8_t *)str, len);
+        g_log_file_offset += len;
+        g_log_file_writing = 0;
     }
 }
 

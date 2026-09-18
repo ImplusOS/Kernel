@@ -29,8 +29,10 @@
  *   - ax900_download_firmware(): reads real firmware bytes via g_api->fs
  *     (driver_binary_t API 2.2) from /Kernel/Driver/Firmware/AX900/ and
  *     pushes them to the chip via DBG_MEM_WRITE_REQ. This is retried
- *     opportunistically from ax900_poll() (not blocked on from ax900_probe())
- *     so it tolerates VFS not being mounted yet at USB enumeration time.
+ *     from ax900_poll() (never from ax900_probe(), which must not touch the
+ *     device at all -- it runs inside a boot phase), so it tolerates VFS not
+ *     being mounted yet at USB enumeration time, and it is paced and
+ *     eventually abandoned -- see ax900_try_bringup().
  *     It still won't succeed in this repository, because AICSemi's
  *     firmware .bin files are proprietary and were never available to
  *     embed here -- find_file() simply returns false until someone
@@ -47,7 +49,9 @@
  * What is still an honest stub, and why:
  *   - ax900_send_msg()'s wait for a reply times out whenever the chip isn't
  *     actually running firmware yet (i.e. today, absent real firmware
- *     files); the wait/signal plumbing itself (g_api->event) is real.
+ *     files). It drains the bulk IN endpoint itself while waiting, since
+ *     nothing else on this thread could; the wait is bounded, and so is
+ *     every transfer under it (AX900_USB_XFER_TIMEOUT_MS).
  *   - WPA2-PSK: ax900_build_wpa2_ies() builds a real, spec-correct RSN IE,
  *     but how the passphrase itself reaches AICSemi's firmware over this
  *     transport was never captured from source (the reference driver's
@@ -128,8 +132,27 @@ typedef struct {
     uint16_t ep_out_mps;
     bool (*submit_bulk)(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                         uint8_t pid, void *data, uint32_t length);
+    /* The bounded form of the same call (usb_device_context_t). Every transfer
+     * this driver makes goes through it, because the unbounded one gives xHCI
+     * 30 s per transfer and this driver talks to a device that answers nothing
+     * at all until firmware is loaded. NULL only on an older bus driver. */
+    bool (*submit_bulk_timeout)(uint8_t addr, uint8_t endpoint,
+                                uint16_t max_packet_size, uint8_t pid,
+                                void *data, uint32_t length,
+                                uint32_t timeout_ms);
 
     bool     fw_loaded; /* always false today -- see ax900_download_firmware() */
+
+    /* Bring-up pacing. The ladder below (chip id -> firmware -> MM_RESET/
+     * MM_ADD_IF) cannot complete without the proprietary firmware blobs, so it
+     * has to cost nothing on the boots where it never will: retried no more
+     * often than AX900_RETRY_INTERVAL_MS and given up on entirely after
+     * AX900_MAX_BRINGUP_ATTEMPTS. */
+    uint32_t bringup_attempts;
+    uint64_t last_attempt_ticks;
+    bool     gave_up;
+
+    bool     chip_id_valid;
     uint8_t  chip_id;
     uint8_t  chip_sub_id;
 
@@ -157,19 +180,46 @@ typedef struct {
 static ax900_state_t g_ax900 = {0};
 
 /* One outstanding request/response wait at a time -- adequate for the
- * bring-up/scan/connect command sequence, which is inherently serial. */
+ * bring-up/scan/connect command sequence, which is inherently serial.
+ *
+ * `got` replaces the driver_binary_t event object this used to wait on. Only
+ * ax900_rx_drain() can ever set it, and ax900_rx_drain() only runs on this
+ * same thread, so waiting on an event here could never have been woken by
+ * anyone: ax900_send_msg() now drains the IN endpoint itself while it waits. */
 typedef struct {
     bool     waiting;
+    bool     got;
     uint16_t expect_msg_id;
     void    *out_buf;
     uint16_t out_cap;
     uint16_t out_len;
-    void    *event;
 } ax900_pending_cfm_t;
 
 static ax900_pending_cfm_t g_pending = {0};
 
 /* ---- USB packet framing (AX900_Protocol.h) ---- */
+
+/* How long one bulk transfer may take. Deliberately short: nothing this driver
+ * sends is a bulk data move that needs time to stream, and every transfer it
+ * makes before firmware is running is answered with NAKs forever. The xHCI
+ * default of 30 s spent inside a poll (which runs on the syscall path) is what
+ * made a plugged-in AX900 look like a kernel that stopped booting. */
+#define AX900_USB_XFER_TIMEOUT_MS 50u
+
+/* One bulk transfer, always bounded. */
+static bool ax900_bulk(uint8_t endpoint, uint16_t mps, uint8_t pid,
+                       void *data, uint32_t length)
+{
+    if (g_ax900.submit_bulk_timeout != NULL) {
+        return g_ax900.submit_bulk_timeout(g_ax900.addr, endpoint, mps, pid,
+                                           data, length,
+                                           AX900_USB_XFER_TIMEOUT_MS);
+    }
+    if (g_ax900.submit_bulk != NULL) {
+        return g_ax900.submit_bulk(g_ax900.addr, endpoint, mps, pid, data, length);
+    }
+    return false;
+}
 
 static bool ax900_usb_send_packet(uint8_t type, const void *payload, uint16_t payload_len)
 {
@@ -196,19 +246,33 @@ static bool ax900_usb_send_packet(uint8_t type, const void *payload, uint16_t pa
      * aic8800_fdrv/aicwf_usb.c. A dedicated msg pipe is a real TODO
      * enhancement, not a functional requirement. */
     uint16_t total = (uint16_t)(AX900_USB_HDR_LEN + payload_len);
-    return g_ax900.submit_bulk(g_ax900.addr, g_ax900.ep_out, g_ax900.ep_out_mps, 0u, buf, total);
+    return ax900_bulk(g_ax900.ep_out, g_ax900.ep_out_mps, 0u, buf, total);
 }
 
 /* ---- message send + wait for the matching *_CFM ---- */
+
+/* Defined further down, next to ax900_poll(): one bounded read of the bulk IN
+ * endpoint plus dispatch of whatever came back. Declared here because
+ * ax900_send_msg() is what has to run it while it waits. */
+static void ax900_rx_drain(void);
+
+/* Milliseconds elapsed since `since_ticks`, or `fallback` when the timer HAL
+ * cannot answer (in which case a caller's loop must not spin forever). */
+static uint32_t ax900_ms_since(uint64_t since_ticks, uint32_t fallback)
+{
+    uint32_t hz = g_api->timer_hz();
+    if (hz == 0u) {
+        return fallback;
+    }
+    uint64_t elapsed = g_api->timer_ticks() - since_ticks;
+    uint64_t ms = elapsed * 1000u / hz;
+    return (ms > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)ms;
+}
 
 static bool ax900_send_msg(uint16_t msg_id, uint16_t expect_cfm_id,
                            const void *param, uint16_t param_len,
                            void *cfm_out, uint16_t cfm_cap, uint32_t timeout_ms)
 {
-    if (g_api->event.create == NULL || g_api->event.wait == NULL ||
-        g_api->event.signal == NULL || g_api->event.destroy == NULL) {
-        return false;
-    }
     if ((uint32_t)sizeof(ax900_msg_hdr_t) + param_len > AX900_CMD_BUF_MAX - AX900_USB_HDR_LEN) {
         return false;
     }
@@ -224,41 +288,59 @@ static bool ax900_send_msg(uint16_t msg_id, uint16_t expect_cfm_id,
         g_api->memcpy(body + sizeof(hdr), param, param_len);
     }
 
-    void *event = g_api->event.create();
-    if (event == NULL) {
-        return false;
-    }
-
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_ax900.lock);
     g_pending.waiting = true;
+    g_pending.got = false;
     g_pending.expect_msg_id = expect_cfm_id;
     g_pending.out_buf = cfm_out;
     g_pending.out_cap = cfm_cap;
     g_pending.out_len = 0u;
-    g_pending.event = event;
     spinlock_unlock(&g_ax900.lock);
     irq_restore(irq_flags);
 
     bool sent = ax900_usb_send_packet(AX900_PKT_TYPE_CFG, body,
                                       (uint16_t)(sizeof(hdr) + param_len));
 
-    /* NOTE: nothing here spawns a thread to pump ax900_poll() -- driver
-     * modules have no thread-create primitive in driver_binary_t. Whatever
-     * drives NIC/USB polling elsewhere in the system must keep calling
-     * ax900_poll() for this wait to ever succeed; on its own this call
-     * will simply time out, which today it always does anyway because
-     * firmware was never loaded (see file header). */
-    bool got_cfm = sent && g_api->event.wait(event, timeout_ms);
+    /* Drive the receive side from right here rather than waiting on an event.
+     * Driver modules have no thread-create primitive in driver_binary_t, so
+     * the only code that can ever read the reply is ax900_rx_drain() on this
+     * same thread -- a wait that expected someone else to signal it could
+     * never be woken, and simply burned its whole timeout every time.
+     *
+     * The loop is bounded twice over: each ax900_rx_drain() is one bulk
+     * transfer with AX900_USB_XFER_TIMEOUT_MS on it, and the whole wait stops
+     * at `timeout_ms`. */
+    bool got_cfm = false;
+    if (sent) {
+        uint64_t started = g_api->timer_ticks();
+        for (;;) {
+            ax900_rx_drain();
+
+            irq_flags = irq_save_disable();
+            spinlock_lock(&g_ax900.lock);
+            got_cfm = g_pending.got;
+            spinlock_unlock(&g_ax900.lock);
+            irq_restore(irq_flags);
+
+            if (got_cfm) {
+                break;
+            }
+            /* ax900_ms_since()'s fallback ends the loop after one pass when
+             * the timer HAL cannot answer -- better a missed reply than a
+             * spin with no way out. */
+            if (ax900_ms_since(started, timeout_ms) >= timeout_ms) {
+                break;
+            }
+        }
+    }
 
     irq_flags = irq_save_disable();
     spinlock_lock(&g_ax900.lock);
     g_pending.waiting = false;
-    g_pending.event = NULL;
     spinlock_unlock(&g_ax900.lock);
     irq_restore(irq_flags);
 
-    g_api->event.destroy(event);
     return got_cfm;
 }
 
@@ -292,7 +374,7 @@ static void ax900_handle_cfg_rsp_locked(const uint8_t *payload, uint16_t len)
             g_api->memcpy(g_pending.out_buf, param, copy_len);
         }
         g_pending.out_len = copy_len;
-        g_api->event.signal(g_pending.event);
+        g_pending.got = true;
     }
 
     if (hdr.id == AX900_SM_CONNECT_IND && param_len >= sizeof(ax900_sm_connect_ind_t)) {
@@ -325,8 +407,11 @@ static bool ax900_read_chip_id(void)
 {
     ax900_dbg_mem_read_req_t req_id = { .mem_addr = AX900_REG_CHIP_ID_ADDR };
     ax900_dbg_mem_read_cfm_t cfm_id = {0};
+    /* A register read off a chip that is up answers immediately; the only
+     * thing a longer deadline buys is a longer stall on the boots where the
+     * chip is not up at all. */
     if (!ax900_send_msg(AX900_DBG_MEM_READ_REQ, AX900_DBG_MEM_READ_CFM,
-                        &req_id, sizeof(req_id), &cfm_id, sizeof(cfm_id), 1000u)) {
+                        &req_id, sizeof(req_id), &cfm_id, sizeof(cfm_id), 300u)) {
         return false;
     }
     g_ax900.chip_id = (uint8_t)((cfm_id.mem_data >> 16) & 0xFFu);
@@ -334,7 +419,7 @@ static bool ax900_read_chip_id(void)
     ax900_dbg_mem_read_req_t req_sub = { .mem_addr = 0x00000004u };
     ax900_dbg_mem_read_cfm_t cfm_sub = {0};
     if (!ax900_send_msg(AX900_DBG_MEM_READ_REQ, AX900_DBG_MEM_READ_CFM,
-                        &req_sub, sizeof(req_sub), &cfm_sub, sizeof(cfm_sub), 1000u)) {
+                        &req_sub, sizeof(req_sub), &cfm_sub, sizeof(cfm_sub), 300u)) {
         return false;
     }
     g_ax900.chip_sub_id = (uint8_t)((cfm_sub.mem_data >> 4) & 0xFFu);
@@ -612,6 +697,7 @@ static bool ax900_probe(const bus_device_t *dev)
     g_ax900.ep_in_mps = ctx->ep_in_mps;
     g_ax900.ep_out_mps = ctx->ep_out_mps;
     g_ax900.submit_bulk = ctx->submit_bulk;
+    g_ax900.submit_bulk_timeout = ctx->submit_bulk_timeout;
     g_ax900.mtu = 1500u;
     spinlock_unlock(&g_ax900.lock);
     irq_restore(irq_flags);
@@ -620,13 +706,18 @@ static bool ax900_probe(const bus_device_t *dev)
         g_api->serial_write_string("[AX900] UGREEN AX900 (AIC8800D80) attached\n");
     }
 
-    /* Best-effort chip-id read (a pre-firmware bootloader-level command in
-     * the reference driver, matching its own bring-up order). Firmware
-     * download is deliberately NOT attempted here: VFS may not be mounted
-     * yet at USB-enumeration time (drivers are loaded before filesystems
-     * in kernel_main.c's boot order). ax900_poll() retries it instead,
-     * every poll, until it succeeds -- see ax900_download_firmware(). */
-    (void)ax900_read_chip_id();
+    /* Nothing that touches the device happens here -- probe() runs inside a
+     * boot phase, and every transfer to an AX900 that is not running firmware
+     * yet is answered with NAKs until the transfer times out. Doing the
+     * chip-id read here (as this did) stalled the driver_module_deferred phase
+     * for as long as the USB stack was willing to wait, which with xHCI's
+     * default is 30 s per transfer: the boot stopped dead on the line above.
+     *
+     * The whole bring-up ladder -- chip id, firmware download, MM_RESET/
+     * MM_ADD_IF -- is run from ax900_poll() instead, paced and bounded, and
+     * abandoned once it is clear it cannot succeed. Firmware download could
+     * never have run here anyway: the VFS is not mounted at USB-enumeration
+     * time. */
     return true;
 }
 
@@ -659,45 +750,73 @@ static bool ax900_nic_init(void)
     return g_ax900.attached;
 }
 
-void ax900_poll(void)
+/* How long to leave between bring-up attempts, and how many to make before
+ * concluding the chip is never going to answer. Both exist because the ladder
+ * cannot succeed without the proprietary firmware blobs (see
+ * ax900_download_firmware()): on those boots -- which is every boot in this
+ * repository -- the driver has to stop costing anything rather than retry for
+ * the life of the system on a code path that runs from the syscall handler. */
+#define AX900_RETRY_INTERVAL_MS    5000u
+#define AX900_MAX_BRINGUP_ATTEMPTS 3u
+
+static void ax900_try_bringup(void)
 {
-    if (!g_ax900.attached || g_ax900.ep_in == 0u || g_ax900.submit_bulk == NULL) {
+    if (g_ax900.bringup_done || g_ax900.gave_up) {
         return;
     }
+    if (g_ax900.bringup_attempts != 0u &&
+        ax900_ms_since(g_ax900.last_attempt_ticks, AX900_RETRY_INTERVAL_MS) <
+            AX900_RETRY_INTERVAL_MS) {
+        return;
+    }
+    g_ax900.last_attempt_ticks = g_api->timer_ticks();
+    ++g_ax900.bringup_attempts;
 
-    /* Retried every poll while not yet loaded: cheap when the firmware
-     * files simply aren't present (find_file() fails immediately, see
-     * ax900_load_firmware_blob()), bounded even if they are present but
-     * the chip never responds (the write loop bails on the first failed
-     * DBG_MEM_WRITE_REQ). Stops being attempted forever once it succeeds. */
+    /* A pre-firmware bootloader-level register read, matching the reference
+     * driver's own bring-up order. */
+    if (!g_ax900.chip_id_valid) {
+        g_ax900.chip_id_valid = ax900_read_chip_id();
+    }
+
+    /* Cheap when the firmware files simply aren't present (find_file() fails
+     * immediately, see ax900_load_firmware_blob()), bounded even if they are
+     * present but the chip never responds (the write loop bails on the first
+     * failed DBG_MEM_WRITE_REQ). */
     if (!g_ax900.fw_loaded) {
         g_ax900.fw_loaded = ax900_download_firmware();
     }
 
-    /* Same retry-every-poll shape as firmware download above, and for the
-     * same reason: cheap (one RESET_REQ + one ADD_IF_REQ) when it fails,
-     * stops being attempted once bringup_done is true. Split from the
-     * fw_loaded branch above because the reboot triggered by
-     * ax900_download_firmware() needs real wall-clock time to take effect
-     * before the chip will answer a fresh MM_RESET_REQ -- retrying here on
-     * a later poll rather than immediately after reboot gives it that
+    /* Deliberately a separate attempt from the download above, not a
+     * continuation of it: the reboot ax900_download_firmware() triggers needs
+     * real wall-clock time to take effect before the chip will answer a fresh
+     * MM_RESET_REQ, and coming back one retry interval later gives it that
      * window for free. */
     if (g_ax900.fw_loaded && !g_ax900.bringup_done) {
         (void)ax900_bring_up();
     }
 
-    if (g_ax900.scanning) {
-        uint64_t elapsed_ticks = g_api->timer_ticks() - g_ax900.scan_started_ticks;
-        uint32_t hz = g_api->timer_hz();
-        if (hz != 0u && elapsed_ticks * 1000u / hz >= 3000u) {
-            g_ax900.scanning = false; /* no explicit "scan complete" message in this
-                                       * trimmed protocol -- see AX900_Protocol.h's
-                                       * SCANU task comment. Bounded window instead. */
+    if (!g_ax900.bringup_done &&
+        g_ax900.bringup_attempts >= AX900_MAX_BRINGUP_ATTEMPTS) {
+        g_ax900.gave_up = true;
+        if (g_api->serial_write_string != NULL) {
+            g_api->serial_write_string(
+                "[AX900] no response from the chip -- firmware missing from "
+                "/Kernel/Driver/Firmware/AX900/; giving up\n");
         }
+    }
+}
+
+/* One bounded read of the bulk IN endpoint, plus dispatch of whatever came
+ * back. Called from ax900_poll() and, while it waits for a reply, from
+ * ax900_send_msg(). */
+static void ax900_rx_drain(void)
+{
+    if (!g_ax900.attached || g_ax900.ep_in == 0u) {
+        return;
     }
 
     uint8_t rx_buf[AX900_DATA_BUF_MAX];
-    if (!g_ax900.submit_bulk(g_ax900.addr, g_ax900.ep_in, g_ax900.ep_in_mps, 1u, rx_buf, sizeof(rx_buf))) {
+    if (!ax900_bulk(g_ax900.ep_in, g_ax900.ep_in_mps, 1u, rx_buf, sizeof(rx_buf))) {
         return; /* nothing available / transfer failed -- normal while idle */
     }
 
@@ -761,6 +880,34 @@ void ax900_poll(void)
         pos += aligned;
         processed++;
     }
+}
+
+/* driver_nic_t.poll. Runs on the syscall path (Syscall_Dispatch.c ->
+ * network_stack_poll()), so everything it can reach has to be bounded: no
+ * transfer here may wait longer than AX900_USB_XFER_TIMEOUT_MS, and the
+ * bring-up ladder is paced and eventually abandoned. */
+void ax900_poll(void)
+{
+    if (!g_ax900.attached || g_ax900.ep_in == 0u || g_ax900.submit_bulk == NULL) {
+        return;
+    }
+
+    ax900_try_bringup();
+
+    /* Until the station interface exists the chip sends nothing, so reading
+     * the IN endpoint could only ever burn a transfer timeout per poll. */
+    if (!g_ax900.bringup_done) {
+        return;
+    }
+
+    if (g_ax900.scanning &&
+        ax900_ms_since(g_ax900.scan_started_ticks, 3000u) >= 3000u) {
+        g_ax900.scanning = false; /* no explicit "scan complete" message in this
+                                   * trimmed protocol -- see AX900_Protocol.h's
+                                   * SCANU task comment. Bounded window instead. */
+    }
+
+    ax900_rx_drain();
 }
 
 /* ---- public: NIC-shaped surface (not yet wired into NicManager, see AX900.h) ---- */
@@ -1018,27 +1165,30 @@ void ax900_get_wifi_status(driver_wifi_status_t *out_status)
 
 /* ---- standalone driver module wiring ---- */
 
-/* Matches the vendor-specific USB interface AX900_Protocol.h and USB_Main.c
- * agree on (class/subclass/protocol == 0xFF, either AICSemi USB VID). Two
- * entries because match_flags can't OR two vendor ids together. */
+/* Matches a vendor-specific (class 0xFF) USB interface on either AICSemi USB
+ * VID. Two entries because match_flags can't OR two vendor ids together.
+ *
+ * Vendor id + interface class only, deliberately: the same rule
+ * Kernel/Drivers/Manifest/DriverDB.txt states for its own AX900 lines, and
+ * the two have to agree or a device the manifest loads this module for is
+ * then refused by the module's own table. Real units differ in what they put
+ * in bInterfaceSubClass/Protocol, and USB_Main.c substitutes the *device*
+ * descriptor's subclass/protocol whenever the interface reports 0 -- so
+ * insisting on 0xFF/0xFF here (as this did) drops any SKU that leaves either
+ * field zero, which is the usual shape. bInterfaceClass 0xFF plus an AICSemi
+ * VID is already specific enough; probe() re-checks the endpoints. */
 static const driver_bus_match_t g_ax900_bus_matches[] = {
     {
         .bus_type = DEVICE_TYPE_USB,
         .vendor_id = (uint16_t)AX900_USB_VENDOR_ID_AIC,
         .class_code = AX900_USB_IFACE_CLASS_VENDOR,
-        .subclass = AX900_USB_IFACE_SUBCLASS_VENDOR,
-        .protocol = AX900_USB_IFACE_PROTOCOL_VENDOR,
-        .match_flags = DRIVER_BUS_MATCH_VENDOR | DRIVER_BUS_MATCH_CLASS |
-                       DRIVER_BUS_MATCH_SUBCLASS | DRIVER_BUS_MATCH_PROTOCOL,
+        .match_flags = DRIVER_BUS_MATCH_VENDOR | DRIVER_BUS_MATCH_CLASS,
     },
     {
         .bus_type = DEVICE_TYPE_USB,
         .vendor_id = (uint16_t)AX900_USB_VENDOR_ID_AIC_V2,
         .class_code = AX900_USB_IFACE_CLASS_VENDOR,
-        .subclass = AX900_USB_IFACE_SUBCLASS_VENDOR,
-        .protocol = AX900_USB_IFACE_PROTOCOL_VENDOR,
-        .match_flags = DRIVER_BUS_MATCH_VENDOR | DRIVER_BUS_MATCH_CLASS |
-                       DRIVER_BUS_MATCH_SUBCLASS | DRIVER_BUS_MATCH_PROTOCOL,
+        .match_flags = DRIVER_BUS_MATCH_VENDOR | DRIVER_BUS_MATCH_CLASS,
     },
 };
 

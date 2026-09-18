@@ -52,6 +52,10 @@ int paging_cow_clone_user_range(uint64_t child_cr3, uint64_t parent_cr3,
  * (caller resumes the faulting instruction), 0 if the address was not a COW
  * page (caller continues to swap / SIGSEGV handling). */
 int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr);
+/* Unshare every copy-on-write page in a user range so the kernel may write
+ * into it. See the definition: CR0.WP is clear, so a kernel write would
+ * otherwise go through to the frame the parent and child still share. */
+int paging_user_range_break_cow(uint64_t cr3, uint64_t start, uint64_t len);
 int paging_map_user_page(uint64_t cr3,
                          uint64_t virt_addr,
                          uint64_t phys_addr,

@@ -59,6 +59,23 @@ static int scheduler_pid_running_on_other_cpu(const process_t *processes,
     return 0;
 }
 
+/* Is `pid` a thread whose process is being forked by a different thread?
+ * See process_t.fork_hold_tid. */
+int scheduler_pid_held_for_fork(const process_t *processes, int32_t capacity,
+                                int32_t pid)
+{
+    if (processes == 0 || pid < 0 || pid >= capacity) {
+        return 0;
+    }
+    int32_t owner = processes[pid].is_thread ? processes[pid].memory_owner_pid
+                                             : pid;
+    if (owner < 0 || owner >= capacity) {
+        return 0;
+    }
+    int32_t holder = processes[owner].fork_hold_tid;
+    return holder >= 0 && holder != pid;
+}
+
 static uint32_t scheduler_timeslice_for_process(const process_t *proc)
 {
     if (proc == NULL) {
@@ -172,6 +189,7 @@ int32_t process_scheduler_pick_next(process_t *processes,
     for (int32_t step = 1; step <= capacity; ++step) {
         int32_t idx = (start + step) % capacity;
         if (processes[idx].state == PROCESS_STATE_READY &&
+            !scheduler_pid_held_for_fork(processes, capacity, idx) &&
             !scheduler_pid_running_on_other_cpu(processes, capacity,
                                                 idx, cpu)) {
             if (cpu != 0u && (idx == 0 || idx == 1)) {
@@ -182,6 +200,7 @@ int32_t process_scheduler_pick_next(process_t *processes,
     }
 
     if (current_pid >= 0 && current_pid < capacity &&
+        !scheduler_pid_held_for_fork(processes, capacity, current_pid) &&
         !scheduler_pid_running_on_other_cpu(processes, capacity,
                                             current_pid, cpu) &&
         (processes[current_pid].state == PROCESS_STATE_RUNNING ||

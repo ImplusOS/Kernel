@@ -113,9 +113,13 @@ static const etcfs_static_file_t g_etcfs_static_files[] = {
       "0123456789abcdef0123456789abcdef\n" },
     { "/etc/passwd",
       "root:x:0:0:root:/root:/bin/sh\n"
+      /* The account desktop programs run as (Chromium launcher). HOME
+       * matches the HOME=/tmp every Linux program is given. */
+      "implus:x:1000:1000:ImplusOS user:/tmp:/bin/sh\n"
       "nobody:x:65534:65534:nobody:/:/bin/false\n" },
     { "/etc/group",
       "root:x:0:\n"
+      "implus:x:1000:\n"
       "nogroup:x:65534:\n" },
     { "/etc/host.conf",
       "multi on\n" },

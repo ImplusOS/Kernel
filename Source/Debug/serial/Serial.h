@@ -15,6 +15,9 @@ void serial_set_screen_mirror(serial_mirror_char_t writer);
 void serial_register_backend(const serial_backend_t *backend);
 void serial_write_char(char c);
 void serial_write_string(const char *str);
+/* Counted write, atomic against other CPUs for its whole length -- see the
+ * definition. Used for a foreign program's stdout/stderr. */
+void serial_write_buffer(const char *data, uint32_t length);
 void serial_write_uint64(uint64_t value);
 void serial_write_uint32(uint32_t value);
 void serial_write_uint16(uint16_t value);

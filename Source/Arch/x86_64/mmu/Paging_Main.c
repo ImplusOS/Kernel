@@ -475,8 +475,16 @@ static int cow_share_one_page(uint64_t child_cr3, uint64_t v,
     }
 
     int was_writable = (pte & PAGE_RW) != 0u;
+    /* A page an *earlier* fork already downgraded is read-only but still
+     * writable as far as the program is concerned -- it is waiting for a
+     * write to trap. Without this, the second fork of a process that has not
+     * written to the page since the first one shared it on as a plain
+     * read-only page, and the new child took an unrecoverable SIGSEGV the
+     * moment it touched it. (Xorg forks xkbcomp twice: the first keymap
+     * compiled, the second died in glibc's post-fork code.) */
+    int shared_cow = (pte & PAGE_COW) != 0u;
     uint64_t child_flags = PAGE_PRESENT | PAGE_USER | (pte & PAGE_NX);
-    if (was_writable) {
+    if (was_writable || shared_cow) {
         child_flags |= PAGE_COW; /* read-only in the child until it writes */
     }
 
@@ -945,6 +953,67 @@ uint64_t paging_get_active_cr3(void)
  * that the call fails with EFAULT -- and takes the process down when it does
  * not.
  */
+/*
+ * Give this address space private copies of every copy-on-write page in a
+ * range, before the kernel writes into it.
+ *
+ * User-mode writes to a COW page trap and are repaired by
+ * paging_handle_cow_fault(). Kernel-mode writes do not: CR0.WP is clear here,
+ * so a memcpy() into a user buffer goes straight through a read-only mapping
+ * -- into the frame the parent and child are still sharing. A read(2) landing
+ * in a freshly forked process's buffer would write the parent's memory too.
+ *
+ * So the sharing is broken up front, at the points where the kernel is about
+ * to write (and at the point where it decides whether a buffer is writable at
+ * all -- a COW page is writable, it just needs unsharing first, and answering
+ * EFAULT there is what made Xorg unable to read back the keymap xkbcomp had
+ * just compiled for it).
+ *
+ * Returns the number of pages unshared.
+ */
+int paging_user_range_break_cow(uint64_t cr3, uint64_t start, uint64_t len)
+{
+    if (cr3 == 0 || len == 0) {
+        return 0;
+    }
+    uint64_t first = start & PAGE_MASK;
+    uint64_t last  = (start + len - 1ULL) & PAGE_MASK;
+    if (last < first) {
+        return 0; /* wrapped: not a range worth touching */
+    }
+    if (!is_user_virtual_address(first)) {
+        return 0;
+    }
+
+    int broken = 0;
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    for (uint64_t page = first; ; page += PAGE_SIZE_BYTES) {
+        uint64_t e = pml4[PML4_INDEX(page)];
+        if ((e & PAGE_PRESENT) != 0) {
+            uint64_t *pdpt = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+            e = pdpt[PDPT_INDEX(page)];
+            if ((e & PAGE_PRESENT) != 0 && (e & PAGE_PS) == 0) {
+                uint64_t *pd = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+                e = pd[PD_INDEX(page)];
+                if ((e & PAGE_PRESENT) != 0 && (e & PAGE_PS) == 0) {
+                    uint64_t *pt = (uint64_t *)(uintptr_t)(e & PAGE_FRAME_MASK);
+                    uint64_t pte = pt[PT_INDEX(page)];
+                    if ((pte & PAGE_PRESENT) != 0 && (pte & PAGE_RW) == 0 &&
+                        (pte & PAGE_COW) != 0) {
+                        if (paging_handle_cow_fault(cr3, page) > 0) {
+                            ++broken;
+                        }
+                    }
+                }
+            }
+        }
+        if (page == last) {
+            break;
+        }
+    }
+    return broken;
+}
+
 int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len)
 {
     if (cr3 == 0 || len == 0) {
@@ -969,7 +1038,8 @@ int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len)
                      * carry a user bit this kernel installs lazily (the fault
                      * handlers repair it on the way past), so folding those in
                      * would reject writes that are perfectly legal. */
-                    if ((pte & PAGE_PRESENT) != 0 && (pte & PAGE_RW) == 0) {
+                    if ((pte & PAGE_PRESENT) != 0 && (pte & PAGE_RW) == 0 &&
+                        (pte & PAGE_COW) == 0) {
                         return 0;
                     }
                 }
@@ -1432,18 +1502,29 @@ static int paging_protect_user_range_locked(uint64_t cr3, uint64_t start,
         uint64_t entry = pt[i1];
         if ((entry & PAGE_PRESENT) == 0) { if (lenient) continue; return -1; }
         uint64_t old_entry = entry;
-        uint64_t keep_cow = entry & PAGE_COW;
         uint64_t new_flags = flags & (PAGE_RW | PAGE_USER | PAGE_NX);
-        /* A still-shared copy-on-write page must stay read-only even when the
-         * caller asks for write access: the first write then traps into
-         * paging_handle_cow_fault(), which makes the private copy and grants
-         * PAGE_RW. Clearing RW here without that would let two address spaces
-         * write the same frame. */
-        if (keep_cow != 0u) {
-            new_flags &= ~PAGE_RW;
+        uint64_t cow = 0u;
+        /* PAGE_COW means "writable, but shared with another address space
+         * until the first write". So:
+         *  - write access requested on a page that is (or may still be)
+         *    shared: mark it COW and leave RW clear, so the first write traps
+         *    into paging_handle_cow_fault() and gets a private copy. Setting
+         *    RW directly would let two address spaces write one frame.
+         *  - write access removed: drop COW as well. Keeping it made a page
+         *    mprotect()ed read-only after a fork still count as writable,
+         *    and the kernel unshared it and wrote through -- Chromium's
+         *    protected-memory self-check (read() into a PROT_READ page must
+         *    fail with EFAULT) CHECK-failed in every zygote child. */
+        if ((new_flags & PAGE_RW) != 0u) {
+            uint64_t frame = entry & PAGE_FRAME_MASK;
+            if ((entry & PAGE_COW) != 0u ||
+                ((entry & PAGE_EXTERNAL) == 0u && pmm_page_ref_get(frame) > 1u)) {
+                new_flags &= ~PAGE_RW;
+                cow = PAGE_COW;
+            }
         }
-        entry &= ~(PAGE_RW | PAGE_USER | PAGE_NX);
-        entry |= new_flags | keep_cow;
+        entry &= ~(PAGE_RW | PAGE_USER | PAGE_NX | PAGE_COW);
+        entry |= new_flags | cow;
         pt[i1] = entry;
         if ((flags & PAGE_USER) != 0u) {
             pml4[i4] |= PAGE_USER | PAGE_RW;

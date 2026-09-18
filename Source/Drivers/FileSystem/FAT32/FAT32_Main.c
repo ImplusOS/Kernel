@@ -639,9 +639,26 @@ static uint32_t data_start_lba(void) {
     return bpb.reserved_sectors + (bpb.num_fats * bpb.fat_size_sectors);
 }
 
+/* Absolute disk LBA of a cluster's first sector -- g_fat32_partition_lba
+ * included, so the result can be handed straight to disk_read()/disk_write().
+ *
+ * It used to return a volume-relative sector and leave every caller to add the
+ * partition base itself, which three of them forgot: _fat32_readdir() and
+ * _fat32_list_root_files() read, and _fat32_mkdir() *wrote*, that many sectors
+ * too early. On the LiveCD that is invisible (ISO9660/UDF serve the root, and
+ * a bare FAT32 image starts at LBA 0), but on an installed disk the partition
+ * base is nonzero, so readdir() walked whatever precedes the volume, saw a
+ * zero byte where a directory entry should be, and reported every directory as
+ * empty. Xorg's FindModuleInSubdir() is opendir/readdir-driven, which is why
+ * "module does not exist" came back for glx/modesetting/evdev -- and hence
+ * "No drivers available" and no X server for Chromium to connect to.
+ *
+ * 0 still means "invalid cluster": the first data sector of a FAT32 volume is
+ * never absolute LBA 0 (reserved_sectors is at least 1 even at LBA 0). */
 static uint32_t cluster_to_lba(uint32_t cluster) {
     if (cluster < 2u) return 0u;
-    uint64_t lba = (uint64_t)data_start_lba() + (uint64_t)(cluster - 2u) * bpb.sectors_per_cluster;
+    uint64_t lba = (uint64_t)g_fat32_partition_lba + (uint64_t)data_start_lba() +
+                   (uint64_t)(cluster - 2u) * bpb.sectors_per_cluster;
     if (lba > 0xFFFFFFFFULL) return 0u;
     return (uint32_t)lba;
 }
@@ -737,8 +754,8 @@ static uint32_t fat32_total_clusters(void) {
 }
 
 static bool fat32_zero_cluster(uint32_t cluster) {
-    uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-    if (lba == g_fat32_partition_lba) return false;
+    uint32_t lba = cluster_to_lba(cluster);
+    if (lba == 0u) return false;
     uint32_t cluster_size = fat32_cluster_size_bytes();
     if (cluster_size == 0u || cluster_size > FAT32_CLUSTER_BUFFER_SIZE) return false;
     memset(g_read_buffer, 0, cluster_size);
@@ -932,7 +949,7 @@ static bool fat32_dir_pos_advance(uint32_t *sector, uint16_t *offset)
     uint32_t cluster = rel / bpb.sectors_per_cluster + 2u;
     uint32_t next_c  = fat_get_next_cluster(cluster);
     if (next_c < 2u || next_c >= FAT32_EOC_MARKER) return false;
-    *sector = g_fat32_partition_lba + cluster_to_lba(next_c);
+    *sector = cluster_to_lba(next_c);
     return true;
 }
 
@@ -966,7 +983,7 @@ static bool fat32_dir_pos_prev(uint32_t dir_cluster,
     for (uint32_t i = 0u; i < guard; ++i) {
         uint32_t nc = fat_get_next_cluster(prev);
         if (nc == cur_cluster) {
-            *sector = g_fat32_partition_lba + cluster_to_lba(prev) + bpb.sectors_per_cluster - 1u;
+            *sector = cluster_to_lba(prev) + bpb.sectors_per_cluster - 1u;
             *offset = (uint16_t)(bpb.bytes_per_sector - FAT32_DIR_ENTRY_SIZE);
             return true;
         }
@@ -984,8 +1001,8 @@ static bool fat32_short_name_exists_impl(uint32_t dir_cluster,
 
     for (uint32_t g = 0u; g < guard; ++g) {
         if (cluster < 2u) break;
-        uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-        if (lba == g_fat32_partition_lba) return false;
+        uint32_t lba = cluster_to_lba(cluster);
+        if (lba == 0u) return false;
 
         for (uint8_t sec = 0u; sec < bpb.sectors_per_cluster; ++sec) {
             if (!disk_read(lba + sec, g_sector_buffer, 1)) return false;
@@ -1089,8 +1106,8 @@ static bool fat32_find_consecutive_free(uint32_t  dir_cluster,
         if (cluster < 2u) break;
         last_cluster = cluster;
 
-        uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-        if (lba == g_fat32_partition_lba) return false;
+        uint32_t lba = cluster_to_lba(cluster);
+        if (lba == 0u) return false;
 
         for (uint8_t sec = 0u; sec < bpb.sectors_per_cluster; ++sec) {
             if (!disk_read(lba + sec, g_sector_buffer, 1)) return false;
@@ -1149,9 +1166,9 @@ need_new_cluster:;
         ((uint32_t)bpb.sectors_per_cluster * bpb.bytes_per_sector) / FAT32_DIR_ENTRY_SIZE;
 
     if (run_len + entries_in_new >= count) {
-        *first_sector_out = (run_len > 0u) ? run_sector : (g_fat32_partition_lba + cluster_to_lba(new_cluster));
+        *first_sector_out = (run_len > 0u) ? run_sector : (cluster_to_lba(new_cluster));
         *first_offset_out = (run_len > 0u) ? run_offset : 0u;
-        return (*first_sector_out != g_fat32_partition_lba);
+        return (*first_sector_out != 0u);
     }
     return false;
 }
@@ -1290,8 +1307,8 @@ static bool fat32_lookup_entry_in_directory(uint32_t    dir_cluster,
     uint32_t max_clusters = (total > 65536u) ? 65536u : total;
 
     for (uint32_t c = 0u; c < max_clusters; ++c) {
-        uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-        if (lba == g_fat32_partition_lba) {
+        uint32_t lba = cluster_to_lba(cluster);
+        if (lba == 0u) {
             return false;
         }
         for (uint8_t sec = 0u; sec < bpb.sectors_per_cluster; ++sec) {
@@ -1397,7 +1414,7 @@ static bool fat32_lookup_entry_in_directory(uint32_t    dir_cluster,
         cluster = next;
     }
     if (dir_cluster == bpb.root_cluster) {
-        uint32_t dump_lba = g_fat32_partition_lba + cluster_to_lba(bpb.root_cluster);
+        uint32_t dump_lba = cluster_to_lba(bpb.root_cluster);
         uint8_t *dump_buf = g_read_buffer;
         if (disk_read(dump_lba, dump_buf, 1)) {
             for (uint32_t i = 0u; i < 4u; ++i) {
@@ -1535,8 +1552,8 @@ static bool fat32_write_existing_range(FAT32_FILE *file, uint32_t offset,
     uint32_t cached_fat_sector = 0xFFFFFFFFu;
     uint32_t bytes_left = size;
     while (bytes_left) {
-        uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-        if (lba == g_fat32_partition_lba) {
+        uint32_t lba = cluster_to_lba(cluster);
+        if (lba == 0u) {
             return false;
         }
 
@@ -1648,8 +1665,8 @@ bool fat32_read_at(FAT32_FILE *file, uint32_t offset, uint8_t *buffer, uint32_t 
     }
 
     while (bytes_left > 0u) {
-        uint32_t lba = g_fat32_partition_lba + cluster_to_lba(cluster);
-        if (lba == g_fat32_partition_lba) {
+        uint32_t lba = cluster_to_lba(cluster);
+        if (lba == 0u) {
             ok = false;
             break;
         }
@@ -2267,8 +2284,28 @@ static bool fat32_ops_find_file(const char *path, void *handle,
     if (!fat32_find_file(path, file)) {
         return false;
     }
-    /* Per-open handle pointer, matching the identity the old bridge used. */
-    *out_id = (uint64_t)(uintptr_t)file;
+    /* Stable per-file identity: the on-disk location of the file's directory
+     * entry (sector + byte offset within it), which is unique per file and
+     * the same for every open of it.
+     *
+     * NOT the handle pointer this used to return. The Linux compat layer maps
+     * this to st_ino, and glibc's ld.so treats two objects with the same
+     * (st_dev, st_ino) as *the same shared object*: it keeps the first link
+     * map and just adds the second name as an alias, never loading the file.
+     * The bridge malloc()s a fresh handle per open and free()s it on close, so
+     * recycled heap addresses made unrelated libraries collide -- on a FAT32
+     * root, LD_PRELOAD=libgbm.so.1 (loaded first) swallowed libc.so.6, and
+     * Xorg died with "no version information available (required by Xorg)"
+     * followed by "undefined symbol: stderr, version GLIBC_2.2.5". ISO9660 and
+     * UDF always returned a real on-disk identity (extent/FE LBA), which is
+     * why this only ever reproduced off the installed disk and never from the
+     * LiveCD under QEMU.
+     *
+     * first_cluster would not do: it is 0 for every empty file. The directory
+     * entry location is unique even for those, and fat32_find_file() leaves
+     * dir_entry_sector == 0 only for a file it did not find. */
+    *out_id = ((uint64_t)file->dir_entry_sector << 32) |
+              (uint64_t)file->dir_entry_offset;
     *out_size = file->size;
     return true;
 }

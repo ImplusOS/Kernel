@@ -42,3 +42,11 @@ int  syscall_eventfd_is_valid(int32_t fd);
 int64_t syscall_eventfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_eventfd_write(int32_t fd, const uint8_t *buffer, uint64_t len);
 int32_t syscall_eventfd_close(int32_t fd);
+void syscall_eventfd_addref(int32_t fd);
+/* epoll descriptor lifetime: refcounted across fork, freed with the last
+ * close. syscall_epoll_forget_fd_for() drops a closed descriptor from the
+ * closing process's interest lists. */
+int  syscall_epoll_is_valid(int32_t epfd);
+void syscall_epoll_addref(int32_t epfd);
+int32_t syscall_epoll_close(int32_t epfd);
+void syscall_epoll_forget_fd_for(int32_t fd, int32_t owner_pid);

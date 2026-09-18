@@ -113,6 +113,44 @@ typedef struct __attribute__((aligned(16))) {
     uint64_t blocked_since_ns;
     char     name[64];
     char     cwd[256];
+    /* chroot(2). Empty means "/" -- the ordinary case. When set, every
+     * absolute path a Linux-ABI process resolves is taken relative to this
+     * directory, which is what makes Chromium's sandbox able to prove it has
+     * dropped filesystem access: it chroots to an empty directory and then
+     * CHECKs that /proc is no longer there. Inherited across fork and kept
+     * across execve, as on Linux. */
+    char     root_path[256];
+    /* CLONE_FS: the process this one shares its filesystem root with, or -1.
+     * clone(CLONE_FS) means "we two have one root and one cwd", and Chromium's
+     * sandbox depends on it -- it does the chroot in a short-lived helper
+     * cloned with CLONE_FS and expects the caller to come out chrooted. A
+     * CLONE_VM clone is a separate process here (see linux_clone), so the
+     * root has to be propagated explicitly rather than shared by construction. */
+    int32_t  fs_share_pid;
+    /* PID namespace: the real pid of the "init" of the namespace this process
+     * lives in, or -1 for the root namespace. Inside a namespace that init
+     * sees itself as pid 1 and everyone else keeps their real number; see
+     * process_pid_as_seen_by_current(). That is all Chromium's sandbox asks
+     * of a namespace -- its zygote and each renderer CHECK getpid() == 1 --
+     * and it is not isolation: kill() and /proc still reach every process. */
+    int32_t  pidns_init;
+    /* fork() in progress (on the memory owner): the thread doing it, or -1.
+     * While set, no other thread of the process is scheduled. Copy-on-write
+     * fork rewrites the parent's page tables in place, and a sibling thread
+     * that meanwhile unmapped a range (freeing a page table the walk was
+     * about to write into) or took a fault on a page being downgraded left a
+     * page table reused as data -- the corruption that killed Chromium's
+     * zygote. Linux gets the same guarantee from holding mmap_lock across
+     * fork. */
+    int32_t  fork_hold_tid;
+    /* Credentials a Linux program sees: getuid()/getgid() and friends, the
+     * owner stat() reports for files, SCM_CREDENTIALS. Nothing in the kernel
+     * enforces them; they exist because programs make decisions on them --
+     * Chromium refuses to start its sandbox as root ("Running as root without
+     * --no-sandbox is not supported"). 0 unless a launcher set them; passed on
+     * to spawned and forked children and kept across execve. */
+    uint32_t uid;
+    uint32_t gid;
     /* Absolute path the process was exec'd from. Backs /proc/self/exe (glibc /
      * Chromium read it via readlink to locate their own asset directory) and
      * argv[0] for Linux-ABI binaries. Empty for the idle/kernel tasks. */
@@ -177,3 +215,6 @@ void process_scheduler_add_idle_ns(uint64_t ns);
 uint64_t process_scheduler_get_idle_ns(uint32_t cpu);
 uint32_t process_scheduler_max_cpus(void);
 void process_scheduler_debug_dump_cpus(void);
+
+int scheduler_pid_held_for_fork(const process_t *processes, int32_t capacity,
+                                int32_t pid);

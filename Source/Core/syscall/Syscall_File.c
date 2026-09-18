@@ -326,10 +326,16 @@ static void std_fd_mark_open(int32_t fd, int32_t pid)
  * the socket down. Chromium, past ~190 descriptors, closed its own X
  * connection and ProcessSingleton socket that way right after a click, and
  * exited on "X connection error". */
-static int fd_in_unix_hole(int32_t fd)
+static int fd_in_unix_hole_for(int32_t pid, int32_t fd)
 {
+    (void)pid;
     return fd >= (int32_t)UNIX_SOCK_FD_BASE &&
            fd < (int32_t)(UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX);
+}
+
+static int fd_in_unix_hole(int32_t fd)
+{
+    return fd_in_unix_hole_for(process_get_current_pid(), fd);
 }
 
 static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
@@ -338,7 +344,7 @@ static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
         minimum = 0;
     }
     for (int32_t fd = minimum; fd < FILE_MAX_FD; ++fd) {
-        if (g_files[fd].used != 0 || fd_in_unix_hole(fd)) {
+        if (g_files[fd].used != 0 || fd_in_unix_hole_for(pid, fd)) {
             continue;
         }
         if (fd <= 2 && !std_fd_is_closed_by(fd, pid)) {
@@ -974,6 +980,28 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
     return next;
 }
 
+/* Let `pid` use a file-table descriptor it did not open: what receiving one
+ * over SCM_RIGHTS means. Same mechanism fork() uses to share a descriptor. */
+int32_t syscall_file_grant(int32_t fd, int32_t pid)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || pid < 0) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+    int32_t rc = (int32_t)OS_STATUS_INVALID_ARG;
+    if (g_files[fd].used != 0) {
+        if (g_files[fd].owner_pid != pid &&
+            !fd_extra_owner_test(&g_files[fd], pid)) {
+            fd_extra_owner_set(&g_files[fd], pid);
+        }
+        rc = 0;
+    }
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    return rc;
+}
+
 int32_t syscall_file_close(int32_t fd)
 {
     if (fd < 0 || fd >= FILE_MAX_FD) {
@@ -1002,6 +1030,39 @@ int32_t syscall_file_close(int32_t fd)
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
     return 0;
+}
+
+/* Walk this process's open file descriptors in ascending order: pass -1 to
+ * start, then the previous result, until -1 comes back. /proc/<pid>/fd is the
+ * only caller, and it is not optional -- Crashpad's StartHandler() enumerates
+ * that directory to decide which descriptors to close in the handler it is
+ * about to exec, and treats a directory it cannot read as a hard failure
+ * ("opendir /proc/self/fd", then CHECK(client.StartHandler(...))).
+ * Descriptors shared with the caller through fork() count as open here, the
+ * same way they do on Linux. */
+int32_t syscall_file_next_open_fd(int32_t pid, int32_t after)
+{
+    int32_t fd = (after < 0) ? 0 : after + 1;
+    if (fd < 0) {
+        return -1;
+    }
+    int32_t found = -1;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+    for (; fd < FILE_MAX_FD; ++fd) {
+        const kernel_file_t *entry = &g_files[fd];
+        if (entry->used == 0) {
+            continue;
+        }
+        if (entry->owner_pid != pid && !fd_extra_owner_test(entry, pid)) {
+            continue;
+        }
+        found = fd;
+        break;
+    }
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    return found;
 }
 
 int32_t syscall_file_mkdir(const char *path)
@@ -2492,6 +2553,43 @@ int32_t syscall_memfd_shm_handle(int32_t fd)
  * shared_memory reference is available for this fd to adopt (the SCM_RIGHTS
  * receiver path transfers the in-flight reference). Returns the new fd or a
  * negative os_status_t. */
+/* The descriptor table is global, so "full" is a statement about the whole
+ * system. Name the heaviest holders the first few times it happens. */
+void syscall_file_report_full(const char *where)
+{
+    static uint32_t reported;
+    if (reported >= 4u) {
+        return;
+    }
+    ++reported;
+    uint16_t per_pid[OS_CONFIG_PROCESS_MAX_COUNT];
+    memset(per_pid, 0, sizeof(per_pid));
+    uint32_t used = 0;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+    for (int32_t fd = 0; fd < FILE_MAX_FD; ++fd) {
+        if (g_files[fd].used == 0) continue;
+        ++used;
+        int32_t o = g_files[fd].owner_pid;
+        if (o >= 0 && o < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) ++per_pid[o];
+    }
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    serial_write_string("[fd] table full in ");
+    serial_write_string(where);
+    serial_write_string(" used=");
+    serial_write_uint32(used);
+    for (int32_t p = 0; p < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT; ++p) {
+        if (per_pid[p] >= 16u) {
+            serial_write_string(" pid");
+            serial_write_uint32((uint32_t)p);
+            serial_write_string("=");
+            serial_write_uint32(per_pid[p]);
+        }
+    }
+    serial_write_string("\n");
+}
+
 int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
 {
     int32_t current_pid = process_get_current_pid();
@@ -2503,7 +2601,8 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
             g_files[fd].used = FILE_USED_MEMFD;
             g_files[fd].owner_pid = current_pid;
             g_files[fd].open_index = -1;
-            g_files[fd].status_flags = status_flags ? status_flags : FILE_O_RDWR;
+            /* As given: O_RDONLY is 0 and must survive (see UnixSocket.c). */
+            g_files[fd].status_flags = status_flags;
             g_files[fd].descriptor_flags = 0;
             memset(&g_memfds[fd], 0, sizeof(g_memfds[fd]));
             g_memfds[fd].used = 1;
@@ -2516,6 +2615,9 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
+    if (result < 0) {
+        syscall_file_report_full("memfd_install_shm");
+    }
     return result;
 }
 

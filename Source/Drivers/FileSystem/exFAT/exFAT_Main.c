@@ -762,7 +762,13 @@ static bool exfat_ops_find_file(const char *path, void *handle,
     if (!exfat_find_file(path, file)) {
         return false;
     }
-    *out_id = (uint64_t)(uintptr_t)file;
+    /* Stable per-file identity: where the file's entry set lives on disk
+     * (cluster + byte offset of its 0x85 entry), not the per-open handle
+     * pointer this used to return -- see the matching comment in
+     * FAT32_Main.c's fat32_ops_find_file() for what a recycled handle address
+     * does to glibc's ld.so once it reaches st_ino. */
+    *out_id = ((uint64_t)file->dir_cluster << 32) |
+              (uint64_t)file->dir_entry_offset;
     *out_size = exfat_clamp_size(file->size);
     return true;
 }

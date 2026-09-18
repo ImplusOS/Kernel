@@ -62,9 +62,25 @@
 #define PROCESS_STALL_DUMP 0
 #endif
 
-#define EPOLL_MAX_INSTANCES   16
-#define EPOLL_MAX_ENTRIES     64
-#define EVENTFD_MAX_INSTANCES 32
+/*
+ * One epoll instance per thread that runs a message loop, and Chromium has
+ * far more than sixteen of those once it is not being told to switch its
+ * subsystems off: with the first-run flow, Sync, background networking and
+ * the component updater all running, epoll_create1() started returning EMFILE
+ * about six minutes in and the browser died on
+ *   Check failed: epoll_.is_valid(). : Too many open files (24)
+ * (message_pump_epoll.cc). The entry count per instance is what one of those
+ * pumps watches at once; the browser's IO thread alone is well past 64.
+ *
+ * Cost is .bss: EPOLL_MAX_INSTANCES * EPOLL_MAX_ENTRIES * sizeof(epoll_entry_t).
+ * The epfd numbering is 0x4000 + index and must stay below
+ * EPOLL_EVENTFD_FD_BASE (0x5000), so the instance count has 4096 of headroom.
+ */
+#define EPOLL_MAX_INSTANCES   128
+#define EPOLL_MAX_ENTRIES     192
+/* eventfd is how Chromium signals between its threads; 32 is a handful of
+ * WaitableEvents. */
+#define EVENTFD_MAX_INSTANCES 128
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
@@ -87,7 +103,7 @@
  * same way Syscall_Socket.c already cross-references config.h in a
  * comment; there is no runtime dependency, just a documented invariant. */
 #define EPOLL_SOCKET_FD_BASE  512
-#define EPOLL_SOCKET_FD_COUNT 64
+#define EPOLL_SOCKET_FD_COUNT 256
 #define EPOLL_EVENTFD_FD_BASE 0x5000
 
 #define LINUX_EFD_SEMAPHORE 1u
@@ -116,14 +132,23 @@ typedef struct {
     uint32_t last_seq;
 } epoll_entry_t;
 
+/* `refs` counts the processes holding a descriptor for the instance. There
+ * was no close at all before: every epoll_create1() leaked its slot for the
+ * life of the system, which is what actually exhausted the table in a long
+ * Chromium session (one instance per message-loop thread, and threads come
+ * and go). A fork() that hands the descriptor to the child is a second
+ * reference; the instance goes away with the last one. */
 typedef struct {
     uint8_t       used;
+    uint32_t      refs;
+    int32_t       owner_pid;   /* process that created it (memory owner) */
     uint32_t      count;
     epoll_entry_t entries[EPOLL_MAX_ENTRIES];
 } epoll_instance_t;
 
 typedef struct {
     uint8_t  used;
+    uint32_t refs;
     uint64_t counter;
     int      flags;
 } eventfd_instance_t;
@@ -161,6 +186,9 @@ int32_t syscall_epoll_create(uint64_t flags)
     for (int i = 0; i < EPOLL_MAX_INSTANCES; ++i) {
         if (!g_epoll_instances[i].used) {
             g_epoll_instances[i].used  = 1;
+            g_epoll_instances[i].refs  = 1;
+            g_epoll_instances[i].owner_pid =
+                process_memory_owner_pid_of(process_get_current_pid());
             g_epoll_instances[i].count = 0;
             spinlock_unlock(&g_epoll_lock);
             return (int32_t)(0x4000 + i);
@@ -168,6 +196,77 @@ int32_t syscall_epoll_create(uint64_t flags)
     }
     spinlock_unlock(&g_epoll_lock);
     return -24;
+}
+
+int syscall_epoll_is_valid(int32_t epfd)
+{
+    int idx = epfd - 0x4000;
+    if (idx < 0 || idx >= EPOLL_MAX_INSTANCES) return 0;
+    epoll_ensure_init();
+    spinlock_lock(&g_epoll_lock);
+    int used = g_epoll_instances[idx].used;
+    spinlock_unlock(&g_epoll_lock);
+    return used;
+}
+
+/* One more process holds this epoll descriptor (fork). */
+void syscall_epoll_addref(int32_t epfd)
+{
+    int idx = epfd - 0x4000;
+    if (idx < 0 || idx >= EPOLL_MAX_INSTANCES) return;
+    epoll_ensure_init();
+    spinlock_lock(&g_epoll_lock);
+    if (g_epoll_instances[idx].used) ++g_epoll_instances[idx].refs;
+    spinlock_unlock(&g_epoll_lock);
+}
+
+/* close(2) of an epoll descriptor: drop one reference, free on the last. */
+int32_t syscall_epoll_close(int32_t epfd)
+{
+    int idx = epfd - 0x4000;
+    if (idx < 0 || idx >= EPOLL_MAX_INSTANCES) return -9;
+    epoll_ensure_init();
+    spinlock_lock(&g_epoll_lock);
+    epoll_instance_t *inst = &g_epoll_instances[idx];
+    if (!inst->used) {
+        spinlock_unlock(&g_epoll_lock);
+        return -9;
+    }
+    if (inst->refs > 1u) {
+        --inst->refs;
+    } else {
+        inst->used = 0;
+        inst->refs = 0;
+        inst->count = 0;
+    }
+    spinlock_unlock(&g_epoll_lock);
+    return 0;
+}
+
+/* A process has closed its last descriptor for `fd`: take it out of that
+ * process's interest lists.
+ * Linux does this implicitly when the open file description goes away. Here
+ * descriptor numbers are recycled, so a stale entry would go on to watch
+ * whatever object is handed that number next. */
+void syscall_epoll_forget_fd_for(int32_t fd, int32_t owner_pid)
+{
+    epoll_ensure_init();
+    spinlock_lock(&g_epoll_lock);
+    for (int i = 0; i < EPOLL_MAX_INSTANCES; ++i) {
+        epoll_instance_t *inst = &g_epoll_instances[i];
+        if (!inst->used) continue;
+        /* Only the closing process's own interest lists: another process
+         * that still holds the object is still legitimately watching it. */
+        if (inst->owner_pid != owner_pid) continue;
+        uint32_t w = 0;
+        for (uint32_t r = 0; r < inst->count; ++r) {
+            if (inst->entries[r].fd == fd) continue;
+            if (w != r) inst->entries[w] = inst->entries[r];
+            ++w;
+        }
+        inst->count = w;
+    }
+    spinlock_unlock(&g_epoll_lock);
 }
 
 static epoll_instance_t *epoll_lookup(int32_t epfd)
@@ -521,6 +620,7 @@ int32_t syscall_eventfd(uint64_t initval, uint64_t flags)
     for (int i = 0; i < EVENTFD_MAX_INSTANCES; ++i) {
         if (!g_eventfd_instances[i].used) {
             g_eventfd_instances[i].used    = 1;
+            g_eventfd_instances[i].refs    = 1;
             g_eventfd_instances[i].counter = initval;
             g_eventfd_instances[i].flags   = (int)flags;
             spinlock_unlock(&g_eventfd_lock);
@@ -612,7 +712,22 @@ int32_t syscall_eventfd_close(int32_t fd)
     int idx = fd - EPOLL_EVENTFD_FD_BASE;
     if (idx < 0 || idx >= EVENTFD_MAX_INSTANCES) return -9;
     spinlock_lock(&g_eventfd_lock);
-    g_eventfd_instances[idx].used = 0;
+    if (g_eventfd_instances[idx].refs > 1u) {
+        --g_eventfd_instances[idx].refs;
+    } else {
+        g_eventfd_instances[idx].used = 0;
+        g_eventfd_instances[idx].refs = 0;
+    }
     spinlock_unlock(&g_eventfd_lock);
     return 0;
+}
+
+/* One more process holds this eventfd (fork). */
+void syscall_eventfd_addref(int32_t fd)
+{
+    int idx = fd - EPOLL_EVENTFD_FD_BASE;
+    if (idx < 0 || idx >= EVENTFD_MAX_INSTANCES) return;
+    spinlock_lock(&g_eventfd_lock);
+    if (g_eventfd_instances[idx].used) ++g_eventfd_instances[idx].refs;
+    spinlock_unlock(&g_eventfd_lock);
 }

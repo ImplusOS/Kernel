@@ -44,3 +44,7 @@ int32_t syscall_socket_fd_in_range(int32_t fd);
 int32_t syscall_socket_set_nonblocking(int32_t fd, int32_t enabled);
 int32_t syscall_socket_get_status_flags(int32_t fd);
 int32_t syscall_socket_is_nonblocking(int32_t fd);
+
+/* Ascending walk of a process's AF_INET socket fds; -1 to start, -1 when
+ * done. Backs the AF_INET part of /proc/<pid>/fd. */
+int32_t syscall_socket_next_open_fd(int32_t pid, int32_t after);

@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "Compat/Linux/Syscall_LinuxCompat.h"
 #include "Compat/compat_registry.h"
@@ -23,6 +24,7 @@
 #include "Core/vfs/DevFS.h"
 #include "Core/vfs/ProcFS.h"
 #include "IPC/UnixSocket.h"
+#include "Compat/Linux/Linux_FdTable.h"
 #include "Crypto/Crypto.h"
 #include "Debug/serial/Serial.h"
 #include "kernel/config.h"
@@ -959,9 +961,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
             if (copy_from_user_trusted(chunk, (const uint8_t *)buf + total, n) != 0u) {
                 return total != 0u ? (int64_t)total : -1;
             }
-            for (uint64_t i = 0; i < n; ++i) {
-                serial_write_char((char)chunk[i]);
-            }
+            serial_write_buffer((const char *)chunk, (uint32_t)n);
             total += n;
         }
         return (int64_t)count;
@@ -1090,6 +1090,18 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_GETRANDOM    318u
 #define LINUX_SYS_MEMFD_CREATE 319u
 #define LINUX_SYS_STATX        332u
+/* Namespaces, chroot and seccomp -- the calls Chromium's sandbox makes.
+ * See linux_unshare()/linux_chroot()/linux_seccomp() for what each one
+ * actually does here. */
+#define LINUX_SYS_PTRACE       101u
+#define LINUX_SYS_PIVOT_ROOT   155u
+#define LINUX_SYS_CHROOT       161u
+#define LINUX_SYS_MOUNT        165u
+#define LINUX_SYS_UMOUNT2      166u
+#define LINUX_SYS_UNSHARE      272u
+#define LINUX_SYS_SETNS        308u
+#define LINUX_SYS_SECCOMP      317u
+#define LINUX_SYS_NAME_TO_HANDLE_AT 303u
 #define LINUX_SYS_RSEQ         334u
 
 /* Additional Linux x86_64 syscall numbers - self-contained glibc/Chromium
@@ -1233,6 +1245,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_PR_GET_NAME      16u
 
 #define LINUX_CLONE_VM              0x00000100u
+#define LINUX_CLONE_FS              0x00000200u
 /* 0x00008000 is CLONE_PARENT ("share my parent"), not CLONE_PARENT_SETTID.
  * With the wrong value every pthread_create() looked like it had not asked
  * for the child's TID to be stored, so glibc's `pd->tid` stayed 0 in every
@@ -1762,6 +1775,14 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if (offset != 0u) {
                 return LINUX_EINVAL;
             }
+            /* Whoever holds a descriptor for a memfd may map it -- that is
+             * the whole access model on Linux, and the descriptor layer has
+             * already checked this caller holds one. The per-object grant
+             * (one pid) cannot describe a region handed through the zygote
+             * to a child it then forked: the child's mmap failed with ENOMEM
+             * and Chromium died on "Pseudonymization salt must be
+             * initialized in child processes". */
+            (void)shared_memory_set_public(shm_handle);
             /* A fresh mapping per mmap(): Chromium keys its shared-memory
              * bookkeeping on the returned address. */
             void *p = shared_memory_map_new(shm_handle);
@@ -2119,8 +2140,11 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
         uint32_t want = 0u;
         if ((pfds[i].events & LINUX_POLLIN) != 0)  want |= 0x1u;
         if ((pfds[i].events & LINUX_POLLOUT) != 0) want |= 0x4u;
-        uint32_t r = syscall_poll_one_fd(pfds[i].fd,
-                                         want != 0u ? want : (0x1u | 0x4u));
+        /* The caller's own descriptor numbers (Linux_FdTable.c). */
+        int32_t global = lxfd_get(pfds[i].fd);
+        uint32_t r = (global < 0) ? 0x20u /* POLLNVAL */
+                                  : syscall_poll_one_fd(global,
+                                        want != 0u ? want : (0x1u | 0x4u));
         uint16_t rev = 0;
         if ((r & 0x1u) != 0u)  rev |= LINUX_POLLIN;
         if ((r & 0x4u) != 0u)  rev |= LINUX_POLLOUT;
@@ -2177,6 +2201,11 @@ static int64_t linux_wait4(uint64_t pid, uint64_t status_ptr,
                            int *should_switch_out, int *restart_out)
 {
     (void)rusage;
+    /* __WNOTHREAD (0x20000000), __WALL (0x40000000), __WCLONE (0x80000000)
+     * select which children are eligible; every child here is an ordinary
+     * one, so they change nothing. Chromium waits for its clone() helpers
+     * with __WALL. */
+    options &= ~(uint64_t)0xE0000000u;
     if ((options & ~(LINUX_WNOHANG | 2u)) != 0u) {
         return LINUX_EINVAL;
     }
@@ -2335,6 +2364,167 @@ static int64_t linux_getcpu(uint64_t cpu_ptr, uint64_t node_ptr,
     return 0;
 }
 
+/*
+ * Process-lifecycle trace.
+ *
+ * fork/exec/exit are rare enough that naming each one costs nothing, and
+ * every multi-process question -- which slot a child landed in, whether it
+ * exec'd or exited, in what order -- is unanswerable without it.
+ *
+ * Each line is assembled in a local buffer and handed to the serial port in
+ * one call. serial_write_string() is not atomic against another CPU writing
+ * at the same time, and a Chromium boot has four CPUs logging at once: a
+ * line emitted field-by-field comes back interleaved character-by-character
+ * with someone else's, which is exactly the state in which fork traces stop
+ * being readable.
+ */
+typedef struct {
+    char buf[224];
+    uint32_t len;
+} lx_trace_line_t;
+
+static void lx_trace_str(lx_trace_line_t *line, const char *text)
+{
+    while (*text != '\0' && line->len + 1u < sizeof(line->buf)) {
+        line->buf[line->len++] = *text++;
+    }
+    line->buf[line->len] = '\0';
+}
+
+static void lx_trace_hex(lx_trace_line_t *line, uint64_t value)
+{
+    char digits[17];
+    int i = 16;
+    digits[16] = '\0';
+    if (value == 0u) {
+        lx_trace_str(line, "0");
+        return;
+    }
+    while (value != 0u && i > 0) {
+        uint8_t nibble = (uint8_t)(value & 0xFu);
+        digits[--i] = (char)(nibble < 10u ? (uint8_t)('0' + nibble)
+                                          : (uint8_t)('a' + (nibble - 10u)));
+        value >>= 4;
+    }
+    lx_trace_str(line, "0x");
+    lx_trace_str(line, &digits[i]);
+}
+
+static void lx_trace_dec(lx_trace_line_t *line, uint64_t value)
+{
+    char digits[21];
+    int i = 20;
+    digits[20] = '\0';
+    if (value == 0u) {
+        lx_trace_str(line, "0");
+        return;
+    }
+    while (value != 0u && i > 0) {
+        digits[--i] = (char)('0' + (uint8_t)(value % 10u));
+        value /= 10u;
+    }
+    lx_trace_str(line, &digits[i]);
+}
+
+static void lx_trace_emit(lx_trace_line_t *line)
+{
+    lx_trace_str(line, "\n");
+    serial_write_string(line->buf);
+}
+
+__attribute__((unused))
+static void lx_proc_trace(const char *what, uint64_t a, uint64_t b)
+{
+    lx_trace_line_t line = { {0}, 0u };
+    lx_trace_str(&line, "[lxproc] ");
+    lx_trace_str(&line, what);
+    lx_trace_str(&line, " pid=");
+    lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_pid());
+    lx_trace_str(&line, " tid=");
+    lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_tid());
+    lx_trace_str(&line, " a=");
+    lx_trace_hex(&line, a);
+    lx_trace_str(&line, " b=");
+    lx_trace_hex(&line, b);
+    lx_trace_emit(&line);
+}
+
+/* Off by default: one line per fork/exec/exit plus a prefix of every new
+ * process's syscalls is exactly what a multi-process bring-up needs and
+ * exactly what nobody wants on a normal boot. Build with
+ * -DLINUX_PROC_TRACE=1 to turn it on. */
+#ifndef LINUX_PROC_TRACE
+#define LINUX_PROC_TRACE 0
+#endif
+
+#if LINUX_PROC_TRACE
+#define LX_PROC_TRACE(what, a, b) lx_proc_trace((what), (uint64_t)(a), (uint64_t)(b))
+#else
+#define LX_PROC_TRACE(what, a, b) ((void)0)
+#endif
+
+/*
+ * The first syscalls a forked child makes.
+ *
+ * A child that gets its resume state wrong says nothing about it: it simply
+ * does something other than what the program's child branch does, and the
+ * only visible consequence is the parent reporting a failure much later.
+ * Recording a short prefix of each newborn's syscalls -- the child branch of
+ * fork() is only a few dozen calls before execve() -- makes that first
+ * divergence legible, and costs nothing for every other process.
+ */
+#ifndef LINUX_NEWBORN_TRACE
+#define LINUX_NEWBORN_TRACE 160u
+#endif
+static uint8_t g_lx_newborn_left[OS_CONFIG_PROCESS_MAX_COUNT];
+
+static void lx_newborn_arm(int32_t pid, uint32_t calls)
+{
+    if (!LINUX_PROC_TRACE) {
+        return;
+    }
+    if (pid >= 0 && pid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        if (calls > 255u) {
+            calls = 255u;
+        }
+        g_lx_newborn_left[pid] = (uint8_t)calls;
+    }
+}
+
+/* Logged at syscall *exit* so the result is in the line: "which call went
+ * wrong" is the question, and an argument list without a return value cannot
+ * answer it. */
+static void lx_newborn_note(uint64_t num, uint64_t a1, uint64_t a2,
+                            int64_t result)
+{
+    if (!LINUX_PROC_TRACE) {
+        return;
+    }
+    int32_t pid = process_get_current_pid();
+    if (pid < 0 || pid >= (int32_t)OS_CONFIG_PROCESS_MAX_COUNT ||
+        g_lx_newborn_left[pid] == 0u) {
+        return;
+    }
+    --g_lx_newborn_left[pid];
+    lx_trace_line_t line = { {0}, 0u };
+    lx_trace_str(&line, "[lxnew] pid=");
+    lx_trace_dec(&line, (uint64_t)(uint32_t)pid);
+    lx_trace_str(&line, " nr=");
+    lx_trace_dec(&line, num);
+    lx_trace_str(&line, " a1=");
+    lx_trace_hex(&line, a1);
+    lx_trace_str(&line, " a2=");
+    lx_trace_hex(&line, a2);
+    lx_trace_str(&line, " -> ");
+    if (result < 0) {
+        lx_trace_str(&line, "-");
+        lx_trace_dec(&line, (uint64_t)(-result));
+    } else {
+        lx_trace_hex(&line, (uint64_t)result);
+    }
+    lx_trace_emit(&line);
+}
+
 static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
                            uint64_t parent_tid, uint64_t child_tid,
                            uint64_t tls, int *should_switch)
@@ -2348,10 +2538,71 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
      * keymap: its only route to xkbcomp is Popen(), i.e. fork() +
      * execl("/bin/sh", ...), and the failure surfaced only as the opaque
      * "XKB: Could not invoke xkbcomp" before being fatal. */
-    if ((flags & (LINUX_CLONE_VM | LINUX_CLONE_THREAD)) == 0u) {
-        int32_t child_pid = process_fork();
+    /*
+     * Anything without CLONE_THREAD is a new *process*, however much of the
+     * caller it is asked to share.
+     *
+     * CLONE_VM used to be routed to the thread path, and that is wrong for
+     * the one caller that matters: vfork(2) and glibc's posix_spawn() issue
+     * clone(CLONE_VM|CLONE_VFORK|SIGCHLD, <stack>), and Crashpad's
+     * SpawnSubprocess() reaches exec through exactly that. Treating it as a
+     * thread ran the child branch -- close the descriptors, execve the
+     * handler -- inside the *caller's* process, so the caller's following
+     * _exit(EXIT_SUCCESS) tore down the thread that was about to exec, and
+     * Chromium reported "Check failed: client.StartHandler(...)".
+     *
+     * The address space is copied rather than shared. Real CLONE_VM would
+     * have the child write into the parent's memory, which is how
+     * posix_spawn() reports an exec failure back through its shared
+     * `args.err`; with a copy the parent reads the initial 0 and reports
+     * success, and the failure surfaces one step later as the child exiting
+     * 127. Everything else these callers do between clone and execve touches
+     * only their own stack.
+     */
+    if ((flags & LINUX_CLONE_THREAD) == 0u) {
+        LX_PROC_TRACE("fork-enter", flags, stack);
+        uint32_t fork_opts = 0u;
+        if ((flags & 0x20000000u) != 0u) fork_opts |= PROCESS_FORK_NEWPID;
+        if ((flags & LINUX_CLONE_FS) != 0u) fork_opts |= PROCESS_FORK_SHARE_FS;
+        int32_t child_pid = process_fork_ex(stack, fork_opts);
         if (child_pid < 0) {
             return LINUX_EAGAIN;
+        }
+        /* clone() with an explicit stack: the child resumed at the same
+         * instruction as the parent but on the stack the caller prepared,
+         * where glibc's wrapper has already pushed fn and arg -- installed
+         * by process_fork_with_stack() before the child could run. */
+        /* CLONE_FS (one filesystem root between the two -- Chromium's
+         * sandbox chroots from a CLONE_FS helper) and CLONE_NEWPID (the
+         * child is a namespace init and sees itself as pid 1) were applied
+         * inside process_fork_ex(), before the child could run. */
+        {
+            /* fork() is rare and every multi-process bring-up question starts
+             * here, so this line is unconditional. It names the slot the child
+             * landed in and the user-mode state it will resume with -- a child
+             * that comes back at RIP 0 is the signature of a frame that was
+             * copied from the wrong place. */
+            const uint64_t *f = (const uint64_t *)(uintptr_t)saved_rsp;
+            lx_trace_line_t line = { {0}, 0u };
+            if (!LINUX_PROC_TRACE) {
+                goto arm_newborn;
+            }
+            lx_trace_str(&line, "[lxfork] pid=");
+            lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_pid());
+            lx_trace_str(&line, " child=");
+            lx_trace_dec(&line, (uint64_t)(uint32_t)child_pid);
+            lx_trace_str(&line, " rip=");
+            lx_trace_hex(&line, f[SYSCALL_FRAME_RCX]);
+            lx_trace_str(&line, " ursp=");
+            lx_trace_hex(&line, process_get_current_user_rsp());
+            lx_trace_str(&line, " flags=");
+            lx_trace_hex(&line, flags);
+            lx_trace_emit(&line);
+        arm_newborn:
+            /* Both sides: the child's divergence and the parent's handling of
+             * it (wait4, the socket handshake) are the same story. */
+            lx_newborn_arm(child_pid, LINUX_NEWBORN_TRACE);
+            lx_newborn_arm(process_get_current_pid(), LINUX_NEWBORN_TRACE);
         }
         if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u && parent_tid != 0u) {
             int32_t pid32 = child_pid;
@@ -2372,6 +2623,9 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         return (int64_t)child_pid;
     }
 
+    /* CLONE_THREAD: a real thread in the caller's address space. glibc always
+     * allocates the new thread's stack itself, so a NULL one is a malformed
+     * request rather than "share mine". */
     if (stack == 0u) {
         return LINUX_EINVAL;
     }
@@ -2495,10 +2749,44 @@ static int64_t linux_read(uint64_t fd, uint64_t buf, uint64_t count)
  * fts walk a tree. Declared before linux_resolve_path() defines it. */
 static int64_t linux_resolve_path(char *path, uint64_t capacity);
 
+/*
+ * Rewrite a user-supplied absolute path to sit under the process's chroot.
+ *
+ * Paths that come from the cwd or from a directory descriptor are already
+ * real kernel paths (both are stored as resolved), so only a path the caller
+ * wrote as absolute needs this. Chromium's namespace sandbox chroots to an
+ * empty directory and then proves it worked by checking that /proc is gone,
+ * so a chroot that does not actually redirect lookups is worse than none:
+ * the check passes, the sandbox believes it is confined, and it is not.
+ */
+static int64_t linux_apply_root(char *path, uint64_t capacity)
+{
+    char root[256];
+    int root_len = process_get_current_root(root, sizeof(root));
+    if (root_len <= 0 || root[0] == '\0') {
+        return 0; /* the ordinary case: no chroot in force */
+    }
+    uint64_t path_len = strlen(path);
+    /* "/" alone becomes the root itself, with no trailing slash. */
+    if (path_len == 1u) {
+        if ((uint64_t)root_len + 1u > capacity) {
+            return LINUX_ENAMETOOLONG;
+        }
+        memcpy(path, root, (uint64_t)root_len + 1u);
+        return 0;
+    }
+    if ((uint64_t)root_len + path_len + 1u > capacity) {
+        return LINUX_ENAMETOOLONG;
+    }
+    memmove(path + root_len, path, path_len + 1u);
+    memcpy(path, root, (uint64_t)root_len);
+    return 0;
+}
+
 static int64_t linux_resolve_at(uint64_t dirfd, char *path, uint64_t capacity)
 {
     if (path[0] == '/') {
-        return 0;
+        return linux_apply_root(path, capacity);
     }
     if ((int64_t)dirfd == LINUX_AT_FDCWD) {
         return linux_resolve_path(path, capacity);
@@ -2532,7 +2820,7 @@ static int64_t linux_resolve_at(uint64_t dirfd, char *path, uint64_t capacity)
 static int64_t linux_resolve_path(char *path, uint64_t capacity)
 {
     if (path[0] == '/') {
-        return 0;
+        return linux_apply_root(path, capacity);
     }
     char cwd[256];
     if (process_get_current_cwd(cwd, sizeof(cwd)) != 0) {
@@ -2729,8 +3017,15 @@ static void linux_stat_fill_common_ino(linux_stat64_t *st, uint64_t size,
     st->st_dev = 0x8200u;
     st->st_ino = ino != 0u ? ino : 1u;
     st->st_nlink = 1;
-    st->st_uid = 0;
-    st->st_gid = 0;
+    /* Single-user system: every file belongs to whoever is asking. Chromium
+     * checks that its profile and socket directories are owned by the
+     * current user before it uses them. */
+    {
+        uint32_t cu = 0, cg = 0;
+        (void)process_get_credentials(process_get_current_pid(), &cu, &cg);
+        st->st_uid = cu;
+        st->st_gid = cg;
+    }
     st->st_size = (int64_t)size;
     st->st_blksize = 512;
     st->st_blocks = (size + 511u) / 512u;
@@ -2744,6 +3039,110 @@ static void linux_stat_fill_common(linux_stat64_t *st, uint64_t size)
     linux_stat_fill_common_ino(st, size, 0u);
 }
 
+/* Fill *st for a path. Returns 0 or a negative LINUX_E* code. Shared by
+ * stat/lstat/newfstatat and statx, which used to carry two copies that had
+ * drifted apart -- statx reported a fixed 0755 for every directory and never
+ * asked vfs_get_mode(), so whichever of the two a program happened to use
+ * decided whether it saw the real mode. */
+static int64_t linux_fill_stat_for_fd(int32_t fd, linux_stat64_t *st);
+
+/* If `path` is "/proc/<pid>/task" (or ".../task/"), the pid it names;
+ * otherwise -1. */
+static int32_t linux_proc_task_dir_pid(const char *path)
+{
+    if (path == NULL || strncmp(path, "/proc/", 6) != 0) {
+        return -1;
+    }
+    const char *rest = path + 6;
+    int32_t pid;
+    if (strncmp(rest, "self/", 5) == 0) {
+        pid = process_get_current_pid();
+        rest += 5;
+    } else {
+        pid = 0;
+        int digits = 0;
+        while (*rest >= '0' && *rest <= '9') {
+            pid = pid * 10 + (*rest - '0');
+            ++rest;
+            ++digits;
+        }
+        if (digits == 0 || *rest != '/') {
+            return -1;
+        }
+        ++rest;
+    }
+    if (strcmp(rest, "task") != 0 && strcmp(rest, "task/") != 0) {
+        return -1;
+    }
+    return pid;
+}
+
+static int64_t linux_fill_stat_for_path(const char *path, linux_stat64_t *st)
+{
+    memset(st, 0, sizeof(*st));
+
+    vfs_file_t vf;
+    if (vfs_find_file(path, &vf)) {
+        linux_stat_fill_common_ino(st, vf.size, vf.internal_id);
+        if (devfs_path_is_device(path)) {
+            st->st_mode = LINUX_S_IFCHR | 0x1B6u; /* crw-rw-rw- */
+            st->st_size = 0;
+            st->st_rdev = 0x0105u; /* arbitrary but stable device number */
+        } else {
+            int32_t stored = vfs_get_mode(path);
+            st->st_mode = LINUX_S_IFREG |
+                          (uint32_t)(stored >= 0 ? stored : 0x1A4);
+        }
+        return 0;
+    }
+
+    /* /proc/self/fd/<n> is a symlink to whatever <n> is open on, and stat()
+     * follows it. Chromium's sandbox walks that directory and fstatat()s
+     * every entry to prove no directory descriptor is still open before it
+     * locks itself down, so the answer has to be the descriptor's own type
+     * rather than ENOENT. */
+    {
+        int32_t proc_fd = procfs_parse_fd_path(path);
+        if (proc_fd >= 0) {
+            return linux_fill_stat_for_fd(proc_fd, st);
+        }
+    }
+
+    /* Not a file, so: is it a directory? Asking costs a directory handle,
+     * because no filesystem here exposes a cheaper "is this a directory"
+     * query -- which also means a filesystem that has run out of handles
+     * answers this with "no such path". See TMPFS_DIR_HANDLE_MAX. */
+    int32_t dir_handle = vfs_opendir(path);
+    if (dir_handle < 0) {
+        return LINUX_ENOENT;
+    }
+    (void)vfs_closedir(dir_handle);
+    linux_stat_fill_common(st, 0);
+    /* The stored mode matters: mkdtemp() makes its directory 0700 and
+       Chromium's ProcessSingleton CHECK()s that stat() says 0700 --
+       reporting a fixed 0755 aborted the browser. */
+    int32_t stored = vfs_get_mode(path);
+    st->st_mode = LINUX_S_IFDIR | (uint32_t)(stored >= 0 ? stored : 0x1ED);
+    /* /proc/<pid>/task counts threads through its link count, and that is how
+     * Chromium's sandbox decides whether it is safe to lock itself down:
+     *   fstatat(proc_fd, "self/task/", &st, 0);
+     *   CHECK_LE(3UL, st.st_nlink);        // ".", "..", one thread
+     *   return st.st_nlink == 3;           // single-threaded
+     * With the default nlink of 1 the zygote died on that CHECK the moment it
+     * started. Report ".", ".." plus one entry per thread. */
+    {
+        int32_t task_pid = linux_proc_task_dir_pid(path);
+        if (task_pid >= 0) {
+            int32_t threads = process_count_threads(task_pid);
+            if (threads < 1) {
+                threads = 1;
+            }
+            st->st_nlink = 2u + (uint64_t)(uint32_t)threads;
+        }
+    }
+    return 0;
+}
+
 static int64_t linux_stat_path(const char *path, uint64_t statbuf_ptr)
 {
     if (statbuf_ptr == 0u ||
@@ -2752,31 +3151,9 @@ static int64_t linux_stat_path(const char *path, uint64_t statbuf_ptr)
         return LINUX_EFAULT;
     }
     linux_stat64_t st;
-    memset(&st, 0, sizeof(st));
-    vfs_file_t vf;
-    if (vfs_find_file(path, &vf)) {
-        linux_stat_fill_common_ino(&st, vf.size, vf.internal_id);
-        if (devfs_path_is_device(path)) {
-            st.st_mode = LINUX_S_IFCHR | 0x1B6u; /* crw-rw-rw- */
-            st.st_size = 0;
-            st.st_rdev = 0x0105u; /* arbitrary but stable device number */
-        } else {
-            int32_t stored = vfs_get_mode(path);
-            st.st_mode = LINUX_S_IFREG |
-                         (uint32_t)(stored >= 0 ? stored : 0x1A4);
-        }
-    } else {
-        int32_t dir_handle = vfs_opendir(path);
-        if (dir_handle < 0) {
-            return LINUX_ENOENT;
-        }
-        (void)vfs_closedir(dir_handle);
-        linux_stat_fill_common(&st, 0);
-        /* The stored mode matters: mkdtemp() makes its directory 0700 and
-           Chromium's ProcessSingleton CHECK()s that stat() says 0700 --
-           reporting a fixed 0755 aborted the browser. */
-        int32_t stored = vfs_get_mode(path);
-        st.st_mode = LINUX_S_IFDIR | (uint32_t)(stored >= 0 ? stored : 0x1ED);
+    int64_t rc = linux_fill_stat_for_path(path, &st);
+    if (rc != 0) {
+        return rc;
     }
     if (copy_to_user_trusted((void *)(uintptr_t)statbuf_ptr, &st, sizeof(st)) != 0u) {
         return LINUX_EFAULT;
@@ -2904,6 +3281,201 @@ static int64_t linux_rseq(uint64_t rseq, uint64_t length, uint64_t flags,
         return LINUX_EFAULT;
     }
     return (int64_t)process_rseq_register(rseq, sig);
+}
+
+/*
+ * Namespaces, chroot and seccomp.
+ *
+ * Chromium refuses to start without --no-sandbox unless it can build a
+ * "layer one" sandbox, and on Linux that means unprivileged user namespaces:
+ * it probes /proc/self/ns/user, forks with CLONE_NEWUSER, writes the id maps,
+ * chroots to an empty directory and drops its capabilities. Every one of
+ * those steps has to succeed for the browser to get past
+ * ZygoteHostImpl::Init.
+ *
+ * What is real here and what is not:
+ *   - chroot(2) is real. It redirects every absolute path the process
+ *     resolves (linux_apply_root), which is what actually removes the
+ *     filesystem from a sandboxed renderer's reach, and it is what Chromium
+ *     verifies by checking /proc has gone.
+ *   - capabilities are real state: capset() records the set and capget()
+ *     reports it back, so DropAllCapabilities() followed by HasAnyCapability()
+ *     answers correctly.
+ *   - the namespaces themselves are NOT isolation. This kernel has one pid
+ *     space, one network stack and one mount table, and CLONE_NEWPID /
+ *     CLONE_NEWNET / CLONE_NEWNS are accepted and ignored. A renderer is
+ *     confined to the extent that it has no filesystem, no capabilities and
+ *     no descriptors it was not given -- it is not confined from the other
+ *     processes on the system.
+ *   - seccomp-bpf ("layer two") is deliberately reported as unsupported
+ *     rather than faked. A filter that is accepted and not enforced would
+ *     make about:sandbox claim a syscall firewall that does not exist;
+ *     Chromium handles an absent one by running without it and saying so.
+ */
+#define LINUX_CLONE_NEWNS     0x00020000u
+#define LINUX_CLONE_NEWCGROUP 0x02000000u
+#define LINUX_CLONE_NEWUTS    0x04000000u
+#define LINUX_CLONE_NEWIPC    0x08000000u
+#define LINUX_CLONE_NEWUSER   0x10000000u
+#define LINUX_CLONE_NEWPID    0x20000000u
+#define LINUX_CLONE_NEWNET    0x40000000u
+#define LINUX_CLONE_NEW_ANY   (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWCGROUP | \
+                               LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC | \
+                               LINUX_CLONE_NEWUSER | LINUX_CLONE_NEWPID | \
+                               LINUX_CLONE_NEWNET)
+
+/* Linux capability sets, per process.
+ *
+ * capget() used to answer "all bits set" unconditionally, which made
+ * Credentials::DropAllCapabilities() followed by HasAnyCapability() report
+ * that the drop had not worked. The three sets are stored as the 64-bit
+ * values a v3 capget/capset exchanges; everything starts fully privileged
+ * because this is a uid-0 system. */
+typedef struct {
+    uint64_t effective;
+    uint64_t permitted;
+    uint64_t inheritable;
+    uint8_t  valid;
+} linux_caps_t;
+
+static linux_caps_t g_linux_caps[OS_CONFIG_PROCESS_MAX_COUNT];
+
+static linux_caps_t *linux_caps_for_current(void)
+{
+    int32_t pid = process_memory_owner_pid_of(process_get_current_pid());
+    if (pid < 0 || pid >= (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        return NULL;
+    }
+    linux_caps_t *caps = &g_linux_caps[pid];
+    if (!caps->valid) {
+        caps->effective = ~0ULL;
+        caps->permitted = ~0ULL;
+        caps->inheritable = 0ULL;
+        caps->valid = 1u;
+    }
+    return caps;
+}
+
+/* A capget/capset data block is two {effective, permitted, inheritable}
+ * 32-bit triples for the v3 layout: index 0 carries bits 0..31, index 1 bits
+ * 32..63, and the fields are interleaved per index. */
+typedef struct {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+} linux_cap_data_t;
+
+static int64_t linux_capget(uint64_t header_ptr, uint64_t data_ptr)
+{
+    (void)header_ptr;
+    linux_caps_t *caps = linux_caps_for_current();
+    if (caps == NULL) {
+        return LINUX_EINVAL;
+    }
+    if (data_ptr == 0u) {
+        return 0; /* header-only probe: "the version is fine" */
+    }
+    linux_cap_data_t data[2];
+    data[0].effective   = (uint32_t)(caps->effective & 0xFFFFFFFFu);
+    data[0].permitted   = (uint32_t)(caps->permitted & 0xFFFFFFFFu);
+    data[0].inheritable = (uint32_t)(caps->inheritable & 0xFFFFFFFFu);
+    data[1].effective   = (uint32_t)(caps->effective >> 32);
+    data[1].permitted   = (uint32_t)(caps->permitted >> 32);
+    data[1].inheritable = (uint32_t)(caps->inheritable >> 32);
+    if (copy_to_user((void *)(uintptr_t)data_ptr, data, sizeof(data)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    return 0;
+}
+
+static int64_t linux_capset(uint64_t header_ptr, uint64_t data_ptr)
+{
+    (void)header_ptr;
+    linux_caps_t *caps = linux_caps_for_current();
+    if (caps == NULL) {
+        return LINUX_EINVAL;
+    }
+    if (data_ptr == 0u) {
+        return LINUX_EFAULT;
+    }
+    linux_cap_data_t data[2];
+    if (copy_from_user(data, (const void *)(uintptr_t)data_ptr,
+                       sizeof(data)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    caps->effective = (uint64_t)data[0].effective |
+                      ((uint64_t)data[1].effective << 32);
+    caps->permitted = (uint64_t)data[0].permitted |
+                      ((uint64_t)data[1].permitted << 32);
+    caps->inheritable = (uint64_t)data[0].inheritable |
+                        ((uint64_t)data[1].inheritable << 32);
+    return 0;
+}
+
+static int64_t linux_unshare(uint64_t flags)
+{
+    /* CLONE_FS/CLONE_FILES/CLONE_SYSVSEM detach shared state a thread was
+     * created with; nothing here shares those per-thread to begin with. The
+     * namespace bits are accepted as described above. */
+    const uint64_t known = LINUX_CLONE_NEW_ANY | LINUX_CLONE_FS |
+                           0x00000400u /* CLONE_FILES */ |
+                           0x00040000u /* CLONE_SYSVSEM */;
+    if ((flags & ~known) != 0u) {
+        return LINUX_EINVAL;
+    }
+    return 0;
+}
+
+static int64_t linux_chroot(uint64_t path_ptr)
+{
+    char path[256];
+    int64_t rc = linux_copy_cstring(path, sizeof(path),
+                                    (const char *)(uintptr_t)path_ptr);
+    if (rc < 0) {
+        return rc;
+    }
+    /* Resolve against the root already in force, so a second chroot nests
+     * the way Linux's does. */
+    rc = linux_resolve_path(path, sizeof(path));
+    if (rc < 0) {
+        return rc;
+    }
+    /* "/proc/self/..." names the *caller*. Chromium chroots a short-lived
+     * helper (clone(CLONE_FS)) to /proc/self/fdinfo/ precisely so that the
+     * directory disappears when the helper exits, leaving the sandboxed
+     * process rooted in nothing. Keeping the literal "self" would re-resolve
+     * to whichever process looks later -- a live directory. Pin the pid. */
+    if (strncmp(path, "/proc/self/", 11) == 0 || strcmp(path, "/proc/self") == 0) {
+        char pinned[256];
+        int n = snprintf(pinned, sizeof(pinned), "/proc/%d%s",
+                         (int)process_memory_owner_pid_of(process_get_current_pid()),
+                         path + 10);
+        if (n <= 0 || (size_t)n >= sizeof(pinned)) {
+            return LINUX_ENAMETOOLONG;
+        }
+        memcpy(path, pinned, (size_t)n + 1u);
+    }
+    /* It has to be a directory that exists: Chromium chroots to
+     * /proc/self/fdinfo and would otherwise be confined to nothing at all. */
+    int32_t handle = vfs_opendir(path);
+    if (handle < 0) {
+        return LINUX_ENOENT;
+    }
+    (void)vfs_closedir(handle);
+    if (process_set_current_root(path) != 0) {
+        return LINUX_EINVAL;
+    }
+    return 0;
+}
+
+static int64_t linux_seccomp(uint64_t operation)
+{
+    /* SECCOMP_GET_ACTION_AVAIL(2) / SECCOMP_GET_NOTIF_SIZES(3) are probes;
+     * SET_MODE_STRICT(0) and SET_MODE_FILTER(1) would install a filter this
+     * kernel cannot enforce. Report the feature as absent. Chromium's
+     * KernelSupportsSeccompBPF() reads that and runs with layer one only. */
+    (void)operation;
+    return LINUX_ENOSYS;
 }
 
 static int64_t linux_prctl_ext(uint64_t option, uint64_t arg2, uint64_t arg3,
@@ -3128,7 +3700,7 @@ static int64_t linux_socketpair(uint64_t domain, uint64_t type,
         return LINUX_EAFNOSUPPORT;
     }
     uint64_t base_type = type & 0xFu;
-    if (base_type != LINUX_SOCK_STREAM && base_type != 5u) {
+    if (base_type != LINUX_SOCK_STREAM && base_type != 5u && base_type != 2u) {
         return LINUX_EPROTONOSUPPORT;
     }
     if (!process_user_buffer_is_valid((void *)(uintptr_t)fds_ptr,
@@ -3136,7 +3708,9 @@ static int64_t linux_socketpair(uint64_t domain, uint64_t type,
         return LINUX_EFAULT;
     }
     int32_t fds[2];
-    int64_t rc = unix_socket_pair(fds);
+    /* The type matters: SOCK_SEQPACKET keeps message boundaries, and
+     * Chromium's zygote protocol depends on reading one request per call. */
+    int64_t rc = unix_socket_pair_typed((int32_t)base_type, fds);
     if (rc < 0) {
         return LINUX_ENOMEM;
     }
@@ -3152,11 +3726,9 @@ static int64_t linux_socket_create(uint64_t domain, uint64_t type,
     (void)protocol;
     uint64_t base_type = type & 0xFu;
     if (domain == LINUX_AF_UNIX) {
-        /* SOCK_STREAM(1) and SOCK_SEQPACKET(5) both map onto the
-         * existing byte-stream Unix socket implementation - Mojo IPC
-         * (TODO_Chromium_LinuxABI.md 3.7) mostly cares that framing is
-         * preserved by the *application*, not the kernel. */
-        if (base_type != LINUX_SOCK_STREAM && base_type != 5u) {
+        /* SOCK_STREAM(1), or SOCK_SEQPACKET(5)/SOCK_DGRAM(2), which keep
+         * message boundaries (UnixSocket.c, `seqpacket`). */
+        if (base_type != LINUX_SOCK_STREAM && base_type != 5u && base_type != 2u) {
             return LINUX_EPROTONOSUPPORT;
         }
         int64_t fd = unix_socket_create((int32_t)base_type);
@@ -3591,6 +4163,19 @@ static int64_t linux_socket_setsockopt(uint64_t fd, uint64_t level,
     if (level != LINUX_SOL_SOCKET) {
         return 0;
     }
+    /* SO_PASSCRED on an AF_UNIX endpoint is real state, not a no-op: it is
+     * what makes recvmsg() attach the SCM_CREDENTIALS control message that
+     * Crashpad's socket protocol requires. */
+    if (option == LINUX_SO_PASSCRED && unix_socket_fd_in_range((int32_t)fd)) {
+        int32_t on = 0;
+        if (value_len >= sizeof(int32_t) &&
+            copy_from_user(&on, (const void *)(uintptr_t)value_ptr,
+                           sizeof(on)) != 0u) {
+            return LINUX_EFAULT;
+        }
+        (void)unix_socket_set_passcred((int32_t)fd, on != 0);
+        return 0;
+    }
     switch (option) {
         case LINUX_SO_PASSCRED:
         case LINUX_SO_PASSSEC:
@@ -3647,6 +4232,13 @@ static int64_t linux_socket_getsockopt(uint64_t fd, uint64_t level,
      * (crashpad, D-Bus-style libs) that only check the call succeeds. */
     if (option == LINUX_SO_PEERCRED) {
         int32_t ucred[3] = { 0, 0, 0 };
+        /* Report the real pid on the other end when there is one: crashpad
+         * learns the handler process it just spawned this way. uid/gid stay 0
+         * -- this is a single-user system. */
+        if (unix_socket_fd_in_range((int32_t)fd)) {
+            (void)unix_socket_peer_pid((int32_t)fd, &ucred[0]);
+            ucred[0] = process_pid_as_seen_by_current(ucred[0]);
+        }
         int32_t want = value_len < (int32_t)sizeof(ucred) ? value_len
                                                           : (int32_t)sizeof(ucred);
         if (copy_to_user((void *)(uintptr_t)value_ptr, ucred, (uint64_t)want) != 0u) {
@@ -3908,23 +4500,9 @@ static int64_t linux_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
         rc = linux_resolve_path(path, sizeof(path));
         if (rc < 0) return rc;
 
-        vfs_file_t vf;
-        if (vfs_find_file(path, &vf)) {
-            linux_stat_fill_common_ino(&st, vf.size, vf.internal_id);
-            if (devfs_path_is_device(path)) {
-                st.st_mode = LINUX_S_IFCHR | 0x1B6u;
-                st.st_size = 0;
-            } else {
-                st.st_mode = LINUX_S_IFREG | 0x1A4u;
-            }
-        } else {
-            int32_t dir_handle = vfs_opendir(path);
-            if (dir_handle < 0) {
-                return LINUX_ENOENT;
-            }
-            (void)vfs_closedir(dir_handle);
-            linux_stat_fill_common(&st, 0);
-            st.st_mode = LINUX_S_IFDIR | 0x1EDu;
+        rc = linux_fill_stat_for_path(path, &st);
+        if (rc != 0) {
+            return rc;
         }
     }
 
@@ -4460,7 +5038,7 @@ static int64_t linux_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
     if (oldfd == newfd) {
         return LINUX_EINVAL;
     }
-    int32_t rc = syscall_file_dup2((int32_t)oldfd, (int32_t)newfd);
+    int64_t rc = (int64_t)syscall_file_dup2((int32_t)oldfd, (int32_t)newfd);
     if (rc < 0) {
         return rc;
     }
@@ -4811,6 +5389,8 @@ static int64_t linux_prctl_ext(uint64_t option, uint64_t arg2, uint64_t arg3,
         case 39u:  /* PR_GET_NO_NEW_PRIVS */
         case 41u:  /* PR_SET_THP_DISABLE  */
         case 42u:  /* PR_GET_THP_DISABLE  */
+        case 24u:  /* PR_CAPBSET_DROP     */
+        case 47u:  /* PR_CAP_AMBIENT      */
         case 45u:  /* PR_SET_PTRACER      */
         case 53u:  /* PR_SET_VMA (naming anon mappings) */
         case 59u:  /* PR_SET_SYSCALL_USER_DISPATCH */
@@ -5124,7 +5704,11 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
         uint32_t want = 0u;
         if (want_rd) want |= 0x1u;
         if (want_wr) want |= 0x4u;
-        uint32_t r = syscall_poll_one_fd((int32_t)fd, want);
+        int32_t global = lxfd_get((int32_t)fd);
+        if (global < 0) {
+            return LINUX_EBADF; /* select() reports a bad descriptor */
+        }
+        uint32_t r = syscall_poll_one_fd(global, want);
         /* An error or hangup makes the fd readable as far as select() is
          * concerned - that is how a caller learns to go and collect it. */
         if (want_rd && (r & (0x1u | 0x8u | 0x10u | 0x20u)) != 0u) {
@@ -5177,6 +5761,469 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
     return ready;
 }
 
+/* ===================================================================== */
+/* Per-process descriptor numbering (Compat/Linux/Linux_FdTable.c)        */
+/* ===================================================================== */
+
+/*
+ * Every Linux-ABI process names objects by numbers from its own table. The
+ * handlers below this point keep working in the kernel's global numbers:
+ * lx_fd_pre() rewrites descriptor arguments on the way in (and handles the
+ * calls that are purely about numbering -- close, dup*, F_DUPFD, F_[GS]ETFD
+ * -- itself), lx_fd_post() gives every descriptor a call created a number in
+ * the caller's table on the way out.
+ *
+ * Close-on-exec lives in the per-process table only. The O_CLOEXEC-style
+ * bits are recorded here and stripped before the handlers see them, so no
+ * backend ever closes a global object behind the table's back at execve().
+ */
+
+#define LX_CLOEXEC_FLAG 0x80000u /* O_/SOCK_/EFD_/TFD_/SFD_/IN_/EPOLL_CLOEXEC */
+
+/* The console is global 0/1/2 in every table and is never closed. */
+static int lx_is_console_global(int32_t g)
+{
+    return g >= 0 && g <= 2;
+}
+
+/* close(2) of a kernel-global descriptor, in whichever backend owns it. */
+static int64_t linux_close_global(int32_t g)
+{
+    if (lx_is_console_global(g)) {
+        return 0;
+    }
+    int32_t owner = process_memory_owner_pid_of(process_get_current_pid());
+    syscall_epoll_forget_fd_for(g, owner);
+    if (unix_socket_fd_in_range(g)) {
+        return unix_socket_close(g);
+    }
+    if (syscall_eventfd_is_valid(g)) {
+        return (int64_t)syscall_eventfd_close(g);
+    }
+    if (syscall_epoll_is_valid(g)) {
+        return (int64_t)syscall_epoll_close(g);
+    }
+    if (syscall_socket_get_type(g) >= 0) {
+        return (int64_t)syscall_socket_close(g);
+    }
+    return (int64_t)syscall_file_close(g);
+}
+
+static void linux_close_global_void(int32_t g)
+{
+    (void)linux_close_global(g);
+}
+
+/* fork(): the child gets a copy of the table. epoll and eventfd objects are
+ * refcounted per holding process rather than per pid, so the child's copy is
+ * one more reference to each distinct one. */
+static void lx_fork_hook(int32_t parent, int32_t child)
+{
+    lxfd_fork(parent, child);
+    /* Capability sets are inherited across fork. */
+    if (parent >= 0 && parent < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT &&
+        child >= 0 && child < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_linux_caps[child] = g_linux_caps[parent];
+    }
+    for (int32_t u = lxfd_next_open(child, -1); u >= 0;
+         u = lxfd_next_open(child, u)) {
+        int32_t g = lxfd_get_for(child, u);
+        int seen = 0;
+        for (int32_t v = lxfd_next_open(child, -1); v >= 0 && v < u;
+             v = lxfd_next_open(child, v)) {
+            if (lxfd_get_for(child, v) == g) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        if (syscall_eventfd_is_valid(g)) {
+            syscall_eventfd_addref(g);
+        } else if (syscall_epoll_is_valid(g)) {
+            syscall_epoll_addref(g);
+        }
+    }
+}
+
+/* Exit: files, pipes and sockets are released per pid by the exit path
+ * itself; epoll and eventfd hold one reference per process. */
+static void lx_exit_ref(int32_t g)
+{
+    if (syscall_eventfd_is_valid(g)) {
+        (void)syscall_eventfd_close(g);
+    } else if (syscall_epoll_is_valid(g)) {
+        (void)syscall_epoll_close(g);
+    }
+}
+
+static void lx_exit_hook(int32_t pid, int32_t unused)
+{
+    (void)unused;
+    if (pid >= 0 && pid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_linux_caps[pid].valid = 0u; /* the next process in this slot starts fresh */
+    }
+    lxfd_release_process(pid, lx_exit_ref);
+}
+
+static int lx_current_is_linux(void)
+{
+    return process_get_current_abi_mode() == PROCESS_ABI_LINUX;
+}
+
+/* SCM_RIGHTS: user number -> global on send, global -> user number on
+ * receive. */
+static int32_t lx_scm_resolve(int32_t u)
+{
+    return lx_current_is_linux() ? lxfd_get(u) : u;
+}
+
+static int32_t lx_scm_install(int32_t g)
+{
+    if (!lx_current_is_linux()) {
+        return g;
+    }
+    int32_t u = lxfd_install(g, 0, 0);
+    if (u < 0) {
+        (void)linux_close_global(g);
+    }
+    return u;
+}
+
+/* /proc/<pid>/fd for a process with a table of its own. */
+static int32_t lx_procfs_translate(int32_t pid, int32_t fd)
+{
+    if (lxfd_next_open(pid, -1) == -2) {
+        return -2;
+    }
+    return lxfd_get_for(pid, fd);
+}
+
+static int32_t lx_procfs_next(int32_t pid, int32_t after)
+{
+    return lxfd_next_open(pid, after);
+}
+
+/* Rewrite one descriptor argument; EBADF if it names nothing. */
+static int lx_xlate(uint64_t *arg)
+{
+    int32_t g = lxfd_get((int32_t)*arg);
+    if (g < 0) {
+        return -1;
+    }
+    *arg = (uint64_t)(uint32_t)g;
+    return 0;
+}
+
+/* A directory descriptor argument: AT_FDCWD passes through untouched. */
+static int lx_xlate_dirfd(uint64_t *arg)
+{
+    if ((int32_t)*arg == LINUX_AT_FDCWD) {
+        return 0;
+    }
+    return lx_xlate(arg);
+}
+
+/* A pid argument the caller wrote in its own namespace's terms. */
+static void lx_pid_in(uint64_t *arg)
+{
+    int32_t v = (int32_t)*arg;
+    if (v > 0) {
+        *arg = (uint64_t)(uint32_t)process_pid_from_current_view(v);
+    }
+}
+
+/* Returns 1 when the call is finished (result in *res). */
+static int lx_fd_pre(uint64_t num, uint64_t *a, int64_t *res, int32_t *cloexec)
+{
+    *cloexec = 0;
+    switch (num) {
+        /* ---- calls that are only about numbering ---- */
+        case LINUX_SYS_CLOSE: {
+            int32_t g = -1;
+            int last = lxfd_remove((int32_t)a[0], &g);
+            if (last < 0) {
+                *res = LINUX_EBADF;
+            } else {
+                if (last == 1) {
+                    (void)linux_close_global(g);
+                }
+                *res = 0;
+            }
+            return 1;
+        }
+        case LINUX_SYS_DUP: {
+            int32_t g = lxfd_get((int32_t)a[0]);
+            *res = (g < 0) ? LINUX_EBADF : (int64_t)lxfd_install(g, 0, 0);
+            return 1;
+        }
+        case LINUX_SYS_DUP2:
+        case LINUX_SYS_DUP3: {
+            int32_t g = lxfd_get((int32_t)a[0]);
+            int on = (num == LINUX_SYS_DUP3) && (a[2] & LX_CLOEXEC_FLAG) != 0u;
+            if (g < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            if (a[0] == a[1]) {
+                *res = (num == LINUX_SYS_DUP3) ? LINUX_EINVAL : (int64_t)a[1];
+                return 1;
+            }
+            int32_t replaced = -1;
+            int last = 0;
+            int32_t rc = lxfd_set((int32_t)a[1], g, on, &replaced, &last);
+            if (rc >= 0 && last) {
+                (void)linux_close_global(replaced);
+            }
+            *res = rc;
+            return 1;
+        }
+        case LINUX_SYS_FCNTL: {
+            int32_t cmd = (int32_t)a[1];
+            if (cmd == 0 /* F_DUPFD */ || cmd == 1030 /* F_DUPFD_CLOEXEC */) {
+                int32_t g = lxfd_get((int32_t)a[0]);
+                *res = (g < 0) ? LINUX_EBADF
+                               : (int64_t)lxfd_install(g, cmd == 1030,
+                                                       (int32_t)a[2]);
+                return 1;
+            }
+            if (cmd == 1 /* F_GETFD */) {
+                int rc = lxfd_get_cloexec((int32_t)a[0]);
+                *res = (rc < 0) ? LINUX_EBADF : (rc ? 1 : 0);
+                return 1;
+            }
+            if (cmd == 2 /* F_SETFD */) {
+                int rc = lxfd_set_cloexec((int32_t)a[0], (a[2] & 1u) != 0u);
+                *res = (rc < 0) ? LINUX_EBADF : 0;
+                return 1;
+            }
+            if (lx_xlate(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+        }
+
+        /* ---- one plain descriptor in arg1 ---- */
+        case LINUX_SYS_READ: case LINUX_SYS_WRITE: case LINUX_SYS_FSTAT:
+        case LINUX_SYS_LSEEK: case LINUX_SYS_IOCTL: case LINUX_SYS_READV:
+        case LINUX_SYS_WRITEV: case LINUX_SYS_FTRUNCATE:
+        case LINUX_SYS_FALLOCATE: case LINUX_SYS_FSTATFS:
+        case LINUX_SYS_GETDENTS64: case LINUX_SYS_EPOLL_WAIT:
+        case LINUX_SYS_EPOLL_PWAIT: case LINUX_SYS_EPOLL_PWAIT2:
+        case LINUX_SYS_TIMERFD_SETTIME: case LINUX_SYS_TIMERFD_GETTIME:
+        case LINUX_SYS_BIND: case LINUX_SYS_CONNECT: case LINUX_SYS_LISTEN:
+        case LINUX_SYS_SENDTO: case LINUX_SYS_RECVFROM:
+        case LINUX_SYS_SENDMSG: case LINUX_SYS_RECVMSG:
+        case LINUX_SYS_SHUTDOWN: case LINUX_SYS_SETSOCKOPT:
+        case LINUX_SYS_GETSOCKOPT: case LINUX_SYS_GETSOCKNAME:
+        case LINUX_SYS_GETPEERNAME: case LINUX_SYS_PREAD64:
+        case LINUX_SYS_PWRITE64: case LINUX_SYS_SENDMMSG:
+        case LINUX_SYS_RECVMMSG: case LINUX_SYS_INOTIFY_ADD_WATCH:
+        case LINUX_SYS_INOTIFY_RM_WATCH: case LINUX_SYS_FSYNC:
+        case LINUX_SYS_FDATASYNC: case LINUX_SYS_SYNCFS: case LINUX_SYS_FLOCK:
+        case LINUX_SYS_FADVISE64: case LINUX_SYS_FCHMOD:
+        case LINUX_SYS_FCHOWN:
+            if (lx_xlate(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+
+        case LINUX_SYS_ACCEPT:
+            if (lx_xlate(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+        case 288u: /* accept4 */
+            *cloexec = (a[3] & LX_CLOEXEC_FLAG) != 0u;
+            if (lx_xlate(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+
+        case LINUX_SYS_SENDFILE:
+            if (lx_xlate(&a[0]) < 0 || lx_xlate(&a[1]) < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            return 0;
+
+        case LINUX_SYS_EPOLL_CTL:
+            if (lx_xlate(&a[0]) < 0 || lx_xlate(&a[2]) < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            return 0;
+
+        case LINUX_SYS_MMAP:
+            if ((a[3] & LINUX_MAP_ANONYMOUS) == 0u && (int32_t)a[4] != -1 &&
+                lx_xlate(&a[4]) < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            return 0;
+
+        /* ---- a directory descriptor ---- */
+        case LINUX_SYS_NEWFSTATAT: case LINUX_SYS_READLINKAT:
+        case LINUX_SYS_FACCESSAT: case LINUX_SYS_FACCESSAT2:
+        case LINUX_SYS_UTIMENSAT: case LINUX_SYS_FCHMODAT:
+        case LINUX_SYS_FCHOWNAT: case LINUX_SYS_MKDIRAT:
+        case LINUX_SYS_UNLINKAT: case LINUX_SYS_STATX:
+        case LINUX_SYS_NAME_TO_HANDLE_AT:
+            if (lx_xlate_dirfd(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+        case LINUX_SYS_OPENAT:
+            *cloexec = (a[2] & LX_CLOEXEC_FLAG) != 0u;
+            a[2] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            if (lx_xlate_dirfd(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+        case LINUX_SYS_RENAMEAT: case LINUX_SYS_RENAMEAT2:
+        case LINUX_SYS_LINKAT:
+            if (lx_xlate_dirfd(&a[0]) < 0 || lx_xlate_dirfd(&a[2]) < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            return 0;
+        case LINUX_SYS_SYMLINKAT:
+            if (lx_xlate_dirfd(&a[1]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+
+        /* ---- calls that create descriptors: note close-on-exec ---- */
+        case LINUX_SYS_OPEN:
+            *cloexec = (a[1] & LX_CLOEXEC_FLAG) != 0u;
+            a[1] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            return 0;
+        case LINUX_SYS_PIPE2:
+            *cloexec = (a[1] & LX_CLOEXEC_FLAG) != 0u;
+            a[1] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            return 0;
+        case LINUX_SYS_MEMFD_CREATE:
+            *cloexec = (a[1] & 0x1u) != 0u; /* MFD_CLOEXEC */
+            a[1] &= ~(uint64_t)0x1u;
+            return 0;
+        case LINUX_SYS_SOCKET: case LINUX_SYS_SOCKETPAIR:
+        case LINUX_SYS_EVENTFD2: case LINUX_SYS_TIMERFD_CREATE:
+            *cloexec = (a[1] & LX_CLOEXEC_FLAG) != 0u;
+            if (num == LINUX_SYS_TIMERFD_CREATE) {
+                a[1] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            }
+            return 0;
+        case LINUX_SYS_EPOLL_CREATE1: case LINUX_SYS_INOTIFY_INIT1:
+            *cloexec = (a[0] & LX_CLOEXEC_FLAG) != 0u;
+            a[0] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            return 0;
+        case LINUX_SYS_SIGNALFD4:
+            *cloexec = (a[3] & LX_CLOEXEC_FLAG) != 0u;
+            a[3] &= ~(uint64_t)LX_CLOEXEC_FLAG;
+            if ((int32_t)a[0] != -1 && lx_xlate(&a[0]) < 0) {
+                *res = LINUX_EBADF;
+                return 1;
+            }
+            return 0;
+
+        /* ---- pids, in the caller's namespace ---- */
+        case LINUX_SYS_KILL: case LINUX_SYS_TKILL: case LINUX_SYS_WAIT4:
+        case LINUX_SYS_GETPGID: case LINUX_SYS_SETPGID: case LINUX_SYS_GETSID:
+        case LINUX_SYS_PRLIMIT64: case LINUX_SYS_SCHED_GETAFFINITY:
+        case LINUX_SYS_SCHED_SETAFFINITY:
+            lx_pid_in(&a[0]);
+            return 0;
+        case LINUX_SYS_TGKILL:
+            lx_pid_in(&a[0]);
+            lx_pid_in(&a[1]);
+            return 0;
+
+        default:
+            return 0;
+    }
+}
+
+/* Give each global descriptor a call produced a number of its own. */
+static int64_t lx_install_or_close(int64_t global, int32_t cloexec)
+{
+    if (global < 0) {
+        return global;
+    }
+    int32_t u = lxfd_install((int32_t)global, cloexec, 0);
+    if (u < 0) {
+        (void)linux_close_global((int32_t)global);
+        return u;
+    }
+    return u;
+}
+
+/* pipe()/pipe2()/socketpair(): the handler wrote two globals into the
+ * caller's array; replace them with the caller's own numbers. */
+static int64_t lx_install_pair(uint64_t user_array, int32_t cloexec)
+{
+    int32_t pair[2];
+    if (copy_from_user(pair, (const void *)(uintptr_t)user_array,
+                       sizeof(pair)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    int32_t u0 = lxfd_install(pair[0], cloexec, 0);
+    int32_t u1 = (u0 >= 0) ? lxfd_install(pair[1], cloexec, 0) : -24;
+    if (u0 < 0 || u1 < 0) {
+        if (u0 >= 0) {
+            int32_t g;
+            (void)lxfd_remove(u0, &g);
+        }
+        (void)linux_close_global(pair[0]);
+        (void)linux_close_global(pair[1]);
+        return -24;
+    }
+    int32_t out[2] = { u0, u1 };
+    if (copy_to_user((void *)(uintptr_t)user_array, out, sizeof(out)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    return 0;
+}
+
+static int64_t lx_fd_post(uint64_t num, const uint64_t *orig, int64_t result,
+                          int32_t cloexec)
+{
+    switch (num) {
+        case LINUX_SYS_OPEN: case LINUX_SYS_OPENAT: case LINUX_SYS_CREAT:
+        case LINUX_SYS_SOCKET: case LINUX_SYS_ACCEPT: case 288u:
+        case LINUX_SYS_TIMERFD_CREATE: case LINUX_SYS_MEMFD_CREATE:
+        case LINUX_SYS_EVENTFD: case LINUX_SYS_EVENTFD2:
+        case LINUX_SYS_EPOLL_CREATE1: case LINUX_SYS_INOTIFY_INIT:
+        case LINUX_SYS_INOTIFY_INIT1:
+            return lx_install_or_close(result, cloexec);
+        case LINUX_SYS_SIGNALFD4:
+            /* Updating an existing signalfd returns the same descriptor. */
+            if ((int32_t)orig[0] != -1) {
+                return result < 0 ? result : (int64_t)(int32_t)orig[0];
+            }
+            return lx_install_or_close(result, cloexec);
+        case LINUX_SYS_PIPE: case LINUX_SYS_PIPE2:
+            return result < 0 ? result : lx_install_pair(orig[0], cloexec);
+        case LINUX_SYS_SOCKETPAIR:
+            return result < 0 ? result : lx_install_pair(orig[3], cloexec);
+        case LINUX_SYS_EXECVE:
+            if (result >= 0) {
+                lxfd_exec_close_cloexec(linux_close_global_void);
+            }
+            return result;
+
+        /* pids out, in the caller's namespace */
+        case LINUX_SYS_GETPID: case LINUX_SYS_GETTID:
+        case LINUX_SYS_SET_TID_ADDRESS: case LINUX_SYS_WAIT4:
+        case LINUX_SYS_CLONE: case LINUX_SYS_FORK: case LINUX_SYS_VFORK:
+            return result > 0 ? (int64_t)process_pid_as_seen_by_current((int32_t)result)
+                              : result;
+        case LINUX_SYS_GETPPID:
+            if (process_current_is_pidns_init()) {
+                return 0;
+            }
+            return result > 0 ? (int64_t)process_pid_as_seen_by_current((int32_t)result)
+                              : result;
+        default:
+            return result;
+    }
+}
+
+/* Registered once, with the compat layer: the fd table has to follow
+ * processes through fork/exit and be consulted by SCM_RIGHTS and /proc. */
+static void lx_fd_hooks_register(void)
+{
+    process_register_lifecycle_hooks(lx_fork_hook, lx_exit_hook);
+    unix_socket_set_fd_hooks(lx_scm_resolve, lx_scm_install);
+    procfs_set_fd_hooks(lx_procfs_translate, lx_procfs_next);
+}
+
 uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                                 uint64_t num,
                                 uint64_t arg1,
@@ -5197,6 +6244,25 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 #endif
 
     LINUX_TRACE_ENTER(num, arg1, arg2, arg3, arg4, arg5, arg6);
+
+    /* Descriptor and pid numbers arrive in the caller's terms; see
+     * lx_fd_pre(). The originals are kept for lx_fd_post(). */
+    const uint64_t lx_orig[6] = { arg1, arg2, arg3, arg4, arg5, arg6 };
+    int32_t lx_cloexec = 0;
+    int lx_done = 0;
+    {
+        uint64_t a[6] = { arg1, arg2, arg3, arg4, arg5, arg6 };
+        int64_t early = 0;
+        if (lx_fd_pre(num, a, &early, &lx_cloexec)) {
+            result = early;
+            lx_done = 1;
+        }
+        arg1 = a[0]; arg2 = a[1]; arg3 = a[2];
+        arg4 = a[3]; arg5 = a[4]; arg6 = a[5];
+    }
+    if (lx_done) {
+        goto lx_fd_finished;
+    }
 
     switch (num) {
         case LINUX_SYS_READ: {
@@ -5482,32 +6548,49 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = linux_sendfile(arg1, arg2, arg3, arg4);
             break;
 
-        case LINUX_SYS_CLONE: {
+        case LINUX_SYS_CLONE:
+        case LINUX_SYS_FORK:
+        case LINUX_SYS_VFORK: {
+            /* A new process: stop our other threads first (see
+             * process_fork_hold_acquire()). Until they are all off-CPU, park
+             * briefly and re-enter; the hold keeps them from being scheduled
+             * again in the meantime. Threads (CLONE_THREAD) need none of it. */
+            uint64_t cflags = (num == LINUX_SYS_CLONE) ? arg1 : 0x11u /* SIGCHLD */;
+            int is_process = (cflags & LINUX_CLONE_THREAD) == 0u;
+            if (is_process && !process_fork_hold_acquire()) {
+                if (process_sleep_current_ms(1) == 0) {
+                    request_switch = 1;
+                }
+                request_restart = 1;
+                result = 0;
+                break;
+            }
             int should_switch = 0;
-            result = linux_clone(saved_rsp, arg1, arg2, arg3, arg4, arg5,
-                                 &should_switch);
+            if (num == LINUX_SYS_CLONE) {
+                result = linux_clone(saved_rsp, arg1, arg2, arg3, arg4, arg5,
+                                     &should_switch);
+            } else {
+                result = linux_clone(saved_rsp, 0x11u, 0u, 0u, 0u, 0u,
+                                     &should_switch);
+            }
+            if (is_process) {
+                process_fork_hold_release();
+            }
             if (should_switch) {
                 request_switch = 1;
             }
             break;
         }
 
-        case LINUX_SYS_FORK:
-        case LINUX_SYS_VFORK: {
-            int32_t child_pid = process_fork();
-            if (child_pid > 0) {
-                request_switch = 1;
-            }
-            result = (int64_t)child_pid;
-            break;
-        }
-
         case LINUX_SYS_EXECVE:
+            LX_PROC_TRACE("execve", (uint64_t)(uint32_t)num, 0u);
+            lx_newborn_arm(process_get_current_pid(), LINUX_NEWBORN_TRACE);
             result = linux_execve(arg1, arg2, arg3);
             request_switch = 1;
             break;
 
         case LINUX_SYS_EXIT:
+            LX_PROC_TRACE("exit", arg1, (uint64_t)process_is_current_thread());
             if (process_is_current_thread()) {
                 process_thread_exit_current((int32_t)arg1 & 0xFF);
             } else {
@@ -5518,7 +6601,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_EXIT_GROUP:
+            LX_PROC_TRACE("exit_group", arg1, 0u);
             process_exit_current_with_status((int32_t)arg1 & 0xFF);
+            process_retire_current_thread();
             result = 0;
             request_switch = 1;
             break;
@@ -5728,9 +6813,13 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_GETUID:
         case LINUX_SYS_GETGID:
         case LINUX_SYS_GETEUID:
-        case LINUX_SYS_GETEGID:
-            result = 0;
+        case LINUX_SYS_GETEGID: {
+            uint32_t uid = 0, gid = 0;
+            (void)process_get_credentials(process_get_current_pid(), &uid, &gid);
+            result = (num == LINUX_SYS_GETUID || num == LINUX_SYS_GETEUID)
+                         ? (int64_t)uid : (int64_t)gid;
             break;
+        }
 
         case LINUX_SYS_GETPPID:
             result = (int64_t)process_getppid();
@@ -6461,14 +7550,31 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_SETREUID:
         case LINUX_SYS_SETREGID:
         case LINUX_SYS_SETRESUID:
-        case LINUX_SYS_SETRESGID:
-            /* Single-user system (uid 0); accept no-op transitions. */
+        case LINUX_SYS_SETRESGID: {
+            /* Real, effective and saved ids are one value here; take the
+             * effective one the call names (-1 keeps the current value).
+             * Nothing enforces permissions, so every transition succeeds. */
+            uint32_t want;
+            if (num == LINUX_SYS_SETUID || num == LINUX_SYS_SETGID) {
+                want = (uint32_t)arg1;
+            } else {
+                want = (uint32_t)arg2; /* euid/egid position */
+                if (want == 0xFFFFFFFFu) want = (uint32_t)arg1;
+            }
+            int is_uid = (num == LINUX_SYS_SETUID || num == LINUX_SYS_SETREUID ||
+                          num == LINUX_SYS_SETRESUID);
+            (void)process_set_current_credentials(is_uid ? want : 0xFFFFFFFFu,
+                                                  is_uid ? 0xFFFFFFFFu : want);
             result = 0;
             break;
+        }
 
         case LINUX_SYS_GETRESUID:
         case LINUX_SYS_GETRESGID: {
-            uint32_t ids[3] = {0, 0, 0};
+            uint32_t cu = 0, cg = 0;
+            (void)process_get_credentials(process_get_current_pid(), &cu, &cg);
+            uint32_t v = (num == LINUX_SYS_GETRESUID) ? cu : cg;
+            uint32_t ids[3] = {v, v, v};
             if ((arg1 != 0u &&
                  copy_to_user((void *)(uintptr_t)arg1, &ids[0], 4u) != 0u) ||
                 (arg2 != 0u &&
@@ -6522,24 +7628,56 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = (arg1 == 1u || arg1 == 2u) ? 1 : 0;
             break;
 
-        case LINUX_SYS_CAPGET: {
-            /* Report an all-powerful, fully-permitted capability set
-             * (uid 0, no sandbox). struct __user_cap_data is 3 x u32 pairs
-             * for v3; write zeros for "effective/permitted/inheritable" is
-             * wrong-way round, so advertise all bits set. */
-            if (arg2 != 0u) {
-                uint32_t data[6];
-                for (int i = 0; i < 6; ++i) data[i] = 0xffffffffu;
-                result = copy_to_user((void *)(uintptr_t)arg2, data,
-                                      sizeof(data)) != 0u ? LINUX_EFAULT : 0;
-            } else {
-                result = 0;
-            }
+        case LINUX_SYS_CAPGET:
+            result = linux_capget(arg1, arg2);
             break;
-        }
 
         case LINUX_SYS_CAPSET:
-            result = 0;
+            result = linux_capset(arg1, arg2);
+            break;
+
+        case LINUX_SYS_UNSHARE:
+            result = linux_unshare(arg1);
+            break;
+
+        case LINUX_SYS_CHROOT:
+            result = linux_chroot(arg1);
+            break;
+
+        case LINUX_SYS_SECCOMP:
+            result = linux_seccomp(arg1);
+            break;
+
+        case LINUX_SYS_SETNS:
+            /* There is nothing to join: namespaces are not modelled. */
+            result = LINUX_EINVAL;
+            break;
+
+        case LINUX_SYS_PIVOT_ROOT:
+            /* chroot(2) is the path Chromium actually takes; pivot_root
+             * needs a real mount tree, which this kernel does not have. */
+            result = LINUX_EPERM;
+            break;
+
+        case LINUX_SYS_MOUNT:
+        case LINUX_SYS_UMOUNT2:
+            /* The mount table is fixed at boot (VFS_Pseudo.c). Accepting a
+             * mount silently would be a lie; refuse the way a container
+             * without CAP_SYS_ADMIN does, which callers expect. */
+            result = LINUX_EPERM;
+            break;
+
+        case LINUX_SYS_PTRACE:
+            /* No debugger interface. Crashpad only needs this on the path it
+             * takes *after* a crash, and reports the failure rather than
+             * dying of it. */
+            result = LINUX_EPERM;
+            break;
+
+        case LINUX_SYS_NAME_TO_HANDLE_AT:
+            /* "This filesystem does not support file handles" is a normal
+             * answer on Linux and the one callers have a fallback for. */
+            result = LINUX_ENOTSUP;
             break;
 
         case LINUX_SYS_RT_SIGPENDING:
@@ -6598,6 +7736,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = LINUX_ENOSYS;
             break;
     }
+
+    if (!request_restart) {
+        result = lx_fd_post(num, lx_orig, result, lx_cloexec);
+    }
+lx_fd_finished:
 
     /* Name every syscall this layer does not implement, once each. An
      * external Linux binary that dies for want of a syscall otherwise says
@@ -6661,6 +7804,12 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     }
 
     LINUX_TRACE_EXIT(num, result);
+    /* Skip in-kernel restarts: a blocking wait4() or futex re-runs from the
+     * top every slice, and logging each pass buries the one line that matters
+     * under a hundred identical ones. User space only ever sees the last. */
+    if (!request_restart) {
+        lx_newborn_note(num, arg1, arg2, result);
+    }
 
     if (request_restart) {
         linux_syscall_restart(saved_rsp, num);
@@ -6678,6 +7827,7 @@ static const compat_layer_t g_linux_compat_layer = {
 
 void linux_compat_layer_register(void)
 {
+    lx_fd_hooks_register();
     (void)compat_registry_register(&g_linux_compat_layer);
 }
 

@@ -15,6 +15,7 @@
 #include "Drivers/Module/InputManager.h"
 #include "Drivers/Module/DriverManager.h"
 #include "Drivers/Module/DriverSelect.h"
+#include "Drivers/Module/BusRegistry.h"
 #include "Drivers/Module/PlatformBuiltinDrivers.h"
 #include "Core/elf/ELF_Loader.h"
 #include "Core/syscall/Syscall_Main.h"
@@ -469,6 +470,11 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
     }
 
     phase_ns = boot_profile_begin();
+    /* Devices the bus drivers enumerated back in driver_module_critical --
+     * before disk_io_init/fs_init, so before the on-demand driver manifest
+     * could be read -- get their one replay here. Outside the irq_save below
+     * on purpose: this reads the boot medium. */
+    bus_registry_retry_unclaimed();
     uint64_t deferred_irq_flags = irq_save_disable();
     driver_module_init_deferred();
     irq_restore(deferred_irq_flags);

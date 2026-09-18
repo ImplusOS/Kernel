@@ -19,25 +19,28 @@
 #define GDT_TSS              0x30
 #endif
 
-/* Copy-on-write fork (TODO_Chromium_LinuxABI.md bucket B).
+/* Copy-on-write fork (TODO_Chromium_LinuxABI.md bucket B, sections 11.3/12.3).
  *
- * When 1, process_fork() shares the parent's pages into the child read-only
- * and copies them lazily on the first write (paging_cow_clone_user_range /
+ * process_fork() shares the parent's pages into the child read-only and
+ * copies them lazily on the first write (paging_cow_clone_user_range /
  * paging_handle_cow_fault), backed by physical-page refcounts in
- * Memory_Main.c. This makes Chromium's zygote-style repeated forks cheap.
+ * Memory_Main.c. The eager alternative duplicates the whole address space --
+ * Chromium's is around 400 MB, a measured eager fork took ~5 s, and its
+ * zygote forks once per renderer.
  *
- * Default 0: the eager full-copy fork is slower but known-good, whereas COW
- * touches PTE aliasing + SMP TLB coherence + the physical allocator at once
- * and has NOT been validated on real hardware / QEMU in this tree.
- *
- * (Was briefly flipped to 1 on 2026-08-29 for multiprocess Chromium -- see
- * TODO_glibc_Port.md G7 -- and reverted the same day: it made boot unstable
- * (intermittent pre-userland triple-fault reboots, __stack_chk_fail during
- * kernel init). Multiprocess Chromium must instead wait for COW to get a
- * dedicated QEMU boot-regression pass, or run eager-copy with more guest
- * RAM.) Flip to 1 (or -DKERNEL_COW_FORK=1) only after that validation. */
+ * What it took to make it correct:
+ *   - clone both user ranges the eager path copies (the child used to get no
+ *     stack and no mmap arena);
+ *   - keep a page copy-on-write through a second fork, and keep "read-only"
+ *     and "copy-on-write" distinct in mprotect();
+ *   - unshare before any kernel write into user memory (CR0.WP is clear, so
+ *     the kernel would otherwise write through into the shared frame);
+ *   - stop the parent's other threads for the duration of the fork
+ *     (process_fork_hold_acquire), since the clone rewrites the parent's page
+ *     tables in place -- the equivalent of Linux holding mmap_lock.
+ * -DKERNEL_COW_FORK=0 restores the eager copy. */
 #ifndef KERNEL_COW_FORK
-#define KERNEL_COW_FORK 0
+#define KERNEL_COW_FORK 1
 #endif
 
 /*
@@ -73,16 +76,11 @@
  * Syscall_Socket.c's SOCKET_FD_BASE (socket fds live in a disjoint numeric
  * range starting there) - see OS_CONFIG_FILE_MAX_FD_MAX below.
  *
- * The AF_UNIX range (UnixSocket.h, UNIX_SOCK_FD_BASE 192, 64 fds) has to stay
- * below 256: the X server refuses a client whose fd is >= its lastfdesc --
- * min(RLIMIT_NOFILE-1, MAXSELECT, MAXCLIENTS), pinned at the compile-time
- * MAXCLIENTS of 256 no matter what -maxclients says -- so every X client was
- * accepted and instantly closed when AF_UNIX fds started at 256. See
- * Docs/Others/TODO_Doom_Xorg_MethodA.md M22.
- *
- * So the table is 512 slots with a hole: 0..191 and 256..511 are files,
- * 192..255 are never handed out here and belong to AF_UNIX. fd numbers stay
- * plain indexes into the table. 192 slots were not enough for Chromium alone
+ * The AF_UNIX range used to live inside this table (192..255, under the X
+ * server's 256-client limit), so the table skipped it. Linux programs now see
+ * per-process descriptor numbers (Compat/Linux/Linux_FdTable.c) rather than
+ * these global ones, and AF_UNIX moved to 768..1023 (UnixSocket.h); the whole
+ * 0..511 range is files again. 192 slots were not enough for Chromium alone
  * -- ~130 open files plus ~40 shared-memory regions -- and once they ran out
  * it could not create the buffer for its next frame and terminated itself
  * ("Creating shared memory in /dev/shm/... failed: Too many open files"). */
@@ -94,9 +92,7 @@
 #ifdef FILE_MAX_DIR_HANDLE_CONFIG
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE FILE_MAX_DIR_HANDLE_CONFIG
 #else
-/* Kept <= OS_CONFIG_FILE_MAX_FD. 192 is where the AF_UNIX fd range begins
- * (it must stay under the X server's 256-fd client limit); the file table
- * itself skips that range and continues above it. */
+/* Kept <= OS_CONFIG_FILE_MAX_FD. */
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE 192
 #endif
 #endif

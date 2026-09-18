@@ -223,6 +223,9 @@
 /* evdev_inject(device, type, code, value): feed a window's keyboard/mouse
  * input to /dev/input/eventN so an X server hosted in that window sees it. */
 #define SYSCALL_EVDEV_INJECT           275
+/* set_credentials(uid, gid): the uid/gid Linux programs spawned by the caller
+ * will run as (process_t.uid). (uint32_t)-1 leaves a value unchanged. */
+#define SYSCALL_SET_CREDENTIALS        276
 
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241

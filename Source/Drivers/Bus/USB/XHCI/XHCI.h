@@ -162,6 +162,11 @@ bool xhci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_siz
                          struct usb_device_request *req, void *data);
 bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                       uint8_t pid, void *data, uint32_t length);
+/* Same transfer, with the caller's deadline instead of the 30 s default.
+ * timeout_ms == 0 means "use the default". */
+bool xhci_submit_bulk_timeout(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
+                              uint8_t pid, void *data, uint32_t length,
+                              uint32_t timeout_ms);
 uint32_t xhci_get_max_bulk_transfer_size(void);
 
 uint32_t xhci_get_num_ports(void);
