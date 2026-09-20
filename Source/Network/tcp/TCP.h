@@ -4,11 +4,14 @@
 #include <stdint.h>
 
 #define TCP_PROTOCOL_NUMBER  6u
-#define TCP_MAX_CONNECTIONS  32u
-#define TCP_RECV_BUF_SIZE    16384u
+/* Chromium alone keeps dozens of connections open (a YouTube page talks to
+ * a dozen hosts), and each closed one sits in TIME_WAIT for a while; 32 ran
+ * out, and connect() then failed with no obvious cause. */
+#define TCP_MAX_CONNECTIONS  128u
+#define TCP_RECV_BUF_SIZE    32768u
 #define TCP_SEND_BUF_SIZE    16384u
 #define TCP_MAX_SEGMENT_DATA 1460u
-#define TCP_DEFAULT_WINDOW   16384u
+#define TCP_DEFAULT_WINDOW   32768u
 #define TCP_RETRANSMIT_MS    1000u
 #define TCP_MAX_RETRANSMITS  5u
 #define TCP_TIME_WAIT_MS     2000u
@@ -74,6 +77,12 @@ typedef struct {
     
     uint8_t  in_use;
     uint8_t  accept_pending;
+    /* Set while a socket holds this connection id (from tcp_connect/listen/
+     * accept until tcp_close). A connection that dies under an open socket
+     * (RST, retransmit give-up) keeps its slot in TCP_STATE_CLOSED until the
+     * socket closes; freeing it at once let tcp_connect hand the same id to a
+     * new socket, and two sockets then shared one byte stream. */
+    uint8_t  user_ref;
     int32_t  parent_conn_id;  
     uint16_t listen_backlog;
 } tcp_connection_t;

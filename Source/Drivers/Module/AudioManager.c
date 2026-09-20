@@ -39,6 +39,16 @@ bool audio_manager_init(void)
         return true;
     }
     g_audio = audio_manager_select();
+    if (g_audio != NULL) {
+        static bool reported;
+        if (!reported) {
+            reported = true;
+            serial_write_string("[audio] output device: ");
+            serial_write_string(g_audio->name != NULL ? g_audio->name : "?");
+            serial_write_string(g_audio->stream_write != NULL
+                                    ? " (continuous playback)\n" : "\n");
+        }
+    }
     return g_audio != NULL;
 }
 
@@ -88,4 +98,38 @@ void audio_manager_close(void)
     }
     g_open = false;
     g_audio = NULL;
+}
+
+bool audio_manager_stream_ok(void)
+{
+    return g_open && g_audio != NULL && g_audio->stream_write != NULL &&
+           g_audio->stream_queued != NULL && g_audio->stream_space != NULL &&
+           g_audio->stream_start != NULL && g_audio->stream_stop != NULL;
+}
+
+uint64_t audio_manager_stream_write(const void *pcm, uint64_t bytes)
+{
+    return audio_manager_stream_ok() ? g_audio->stream_write(pcm, bytes) : 0u;
+}
+
+uint64_t audio_manager_stream_queued(void)
+{
+    return audio_manager_stream_ok() ? g_audio->stream_queued() : 0u;
+}
+
+uint64_t audio_manager_stream_space(void)
+{
+    return audio_manager_stream_ok() ? g_audio->stream_space() : 0u;
+}
+
+bool audio_manager_stream_start(void)
+{
+    return audio_manager_stream_ok() && g_audio->stream_start();
+}
+
+void audio_manager_stream_stop(void)
+{
+    if (audio_manager_stream_ok()) {
+        g_audio->stream_stop();
+    }
 }

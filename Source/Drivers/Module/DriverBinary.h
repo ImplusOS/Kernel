@@ -376,6 +376,25 @@ typedef struct {
     int64_t (*write)(const void *pcm, uint64_t bytes);
     bool (*drain)(uint32_t timeout_ms);
     void (*close)(void);
+
+    /* Optional continuous-playback interface (NULL when the driver only has
+     * the blocking write above). The device plays a ring of its native
+     * format (get_info) with no gaps; these never block, and may be called
+     * from the timer interrupt, so an implementation must not sleep.
+     *   stream_write  : copy up to `bytes` into the ring; returns bytes
+     *                   taken (0 when full).
+     *   stream_queued : bytes written but not yet played. Also where the
+     *                   driver notices the hardware's progress: played
+     *                   regions are silenced here so an underrun plays
+     *                   silence rather than the previous lap of the ring.
+     *   stream_space  : bytes stream_write would accept right now.
+     *   stream_start / stream_stop : run or halt the DMA engine. stop also
+     *                   discards whatever is queued. */
+    uint64_t (*stream_write)(const void *pcm, uint64_t bytes);
+    uint64_t (*stream_queued)(void);
+    uint64_t (*stream_space)(void);
+    bool (*stream_start)(void);
+    void (*stream_stop)(void);
 } driver_audio_t;
 
 typedef struct {

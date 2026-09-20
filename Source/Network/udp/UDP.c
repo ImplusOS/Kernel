@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "Network/ipv4.h"
 #include "Network/network_utils.h"
@@ -12,11 +13,16 @@
 
 #define UDP_PROTOCOL_NUMBER 17u
 #define UDP_HEADER_BYTES 8u
-#define UDP_MAX_BINDINGS 32u
+#define UDP_MAX_BINDINGS 96u
 #define UDP_MAX_PAYLOAD 1472u
 
-#define UDP_USER_MAX_BINDINGS 16u
-#define UDP_USER_QUEUE_DEPTH  8u
+/* A QUIC connection (Chromium uses HTTP/3 wherever the server offers it --
+ * every Google property) is one UDP socket per connection, and a server
+ * sends in bursts of tens of datagrams. Eight queued datagrams dropped most
+ * of each burst; QUIC's loss recovery then shrank its window to nothing and
+ * downloads stalled. The queues are allocated on first use of a slot. */
+#define UDP_USER_MAX_BINDINGS 64u
+#define UDP_USER_QUEUE_DEPTH  128u
 
 typedef struct {
     uint32_t src_ip;
@@ -31,7 +37,7 @@ typedef struct {
     uint16_t port;
     uint32_t head;
     uint32_t count;
-    udp_user_pkt_t queue[UDP_USER_QUEUE_DEPTH];
+    udp_user_pkt_t *queue; /* UDP_USER_QUEUE_DEPTH entries, kept for reuse */
 } udp_user_binding_t;
 
 static spinlock_t g_udp_user_lock = {0};
@@ -355,6 +361,11 @@ int32_t udp_user_bind(int32_t owner_pid, uint16_t port)
         return -1;
     }
 
+    /* Allocated before taking the lock (the heap may not be used with it
+     * held); handed to a slot that has none yet, freed otherwise. */
+    udp_user_pkt_t *fresh = (udp_user_pkt_t *)malloc(
+        sizeof(udp_user_pkt_t) * UDP_USER_QUEUE_DEPTH);
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_udp_user_lock);
 
@@ -363,6 +374,7 @@ int32_t udp_user_bind(int32_t owner_pid, uint16_t port)
             g_udp_user_bindings[i].port == port) {
             spinlock_unlock(&g_udp_user_lock);
             irq_restore(irq_flags);
+            if (fresh != NULL) free(fresh);
             return -1;
         }
     }
@@ -375,10 +387,15 @@ int32_t udp_user_bind(int32_t owner_pid, uint16_t port)
         }
     }
 
-    if (slot == NULL) {
+    if (slot == NULL || (slot->queue == NULL && fresh == NULL)) {
         spinlock_unlock(&g_udp_user_lock);
         irq_restore(irq_flags);
+        if (fresh != NULL) free(fresh);
         return -1;
+    }
+    if (slot->queue == NULL) {
+        slot->queue = fresh;
+        fresh = NULL;
     }
 
     slot->used = 1u;
@@ -389,6 +406,7 @@ int32_t udp_user_bind(int32_t owner_pid, uint16_t port)
 
     spinlock_unlock(&g_udp_user_lock);
     irq_restore(irq_flags);
+    if (fresh != NULL) free(fresh);
 
     if (!udp_bind(port, udp_user_dispatcher)) {
         irq_flags = irq_save_disable();

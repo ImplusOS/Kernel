@@ -1235,6 +1235,23 @@ uint32_t unix_socket_rx_seq(int32_t fd)
     return seq;
 }
 
+int64_t unix_socket_available(int32_t fd) {
+    unix_sock_t *s = usock_get(fd);
+    if (!s) return -9; /* EBADF */
+    spinlock_lock(&s->lock);
+    int64_t n;
+    if (s->seqpacket) {
+        /* SIOCINQ on a message socket: the size of the next message. */
+        uint32_t mlen = 0, mfds = 0;
+        n = usock_front_msg(s, &mlen, &mfds) ? (int64_t)mlen : 0;
+    } else {
+        n = (int64_t)((s->buf_head + UNIX_SOCK_BUF_SIZE - s->buf_tail) %
+                      UNIX_SOCK_BUF_SIZE);
+    }
+    spinlock_unlock(&s->lock);
+    return n;
+}
+
 uint32_t unix_socket_poll(int32_t fd, uint32_t events) {
     unix_sock_t *s = usock_get(fd);
     if (!s) return 0x8u; /* EPOLLERR */

@@ -1,4 +1,6 @@
+#include "Core/process/ProcessScheduler.h"
 #include "Timer.h"
+#include "Core/sound/ALSA.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -11,6 +13,7 @@
 #include "smp/SMP_Main.h"
 #include "Platform/timer/HPET.h"
 #include "Debug/serial/Serial.h"
+#include "kernel/config.h"
 
 #include <stdio.h>
 
@@ -112,9 +115,55 @@ static void timer_debug_dump_async_poll(uint64_t interval_ns)
 }
 #endif
 
+/* Latency diagnostics: where each CPU's last tick interrupted it, and how
+ * long it went without one. A long gap means that CPU ran with interrupts
+ * off; the tick that ends it lands just after whatever re-enabled them. */
+#ifndef TIMER_GAP_TRACE
+#define TIMER_GAP_TRACE 0
+#endif
+static uint64_t g_irq_rip[OS_CONFIG_SMP_MAX_CPUS];
+static uint64_t g_tick_ns[OS_CONFIG_SMP_MAX_CPUS];
+
+void timer_note_irq_rip(uint64_t rip)
+{
+    uint32_t cpu = smp_get_current_cpu_id();
+    if (cpu < OS_CONFIG_SMP_MAX_CPUS) {
+        g_irq_rip[cpu] = rip;
+    }
+}
+
+static void timer_gap_check(uint32_t cpu)
+{
+    if (!TIMER_GAP_TRACE || cpu >= OS_CONFIG_SMP_MAX_CPUS ||
+        __atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) == 0u) {
+        return;
+    }
+    uint64_t now = timer_monotonic_ns();
+    uint64_t last = g_tick_ns[cpu];
+    g_tick_ns[cpu] = now;
+    static volatile uint32_t printed;
+    if (last != 0u && now - last > 60000000ull &&
+        __atomic_fetch_add(&printed, 1u, __ATOMIC_RELAXED) < 64u) {
+        char line[96];
+        snprintf(line, sizeof(line), "[tick] cpu%u gap=%llums rip=%llx\n",
+                 (unsigned)cpu, (unsigned long long)((now - last) / 1000000ull),
+                 (unsigned long long)g_irq_rip[cpu]);
+        serial_write_string(line);
+    }
+}
+
 static void timer_core_handler(void) {
     uint32_t cpu_id = smp_get_current_cpu_id();
+    timer_gap_check(cpu_id);
     if (cpu_id != 0u) {
+        /* The APs keep no time, but they do run tasks, and those need their
+         * slices counted for the timer ISR's preemption check
+         * (process_preempt_from_user_irq) to ever fire there. */
+        if (__atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) != 0u) {
+            process_scheduler_tick_cpu();
+            /* Keep audio fed when CPU0 is late with its own tick. */
+            alsa_timer_tick_backup();
+        }
         return;
     }
 
@@ -139,6 +188,7 @@ static void timer_core_handler(void) {
 
     if (__atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) != 0u) {
         syscall_futex_on_timer_tick();
+        alsa_timer_tick();
         input_manager_schedule_poll();
         uint32_t hotplug_interval = g_requested_hz != 0u ?
                                     g_requested_hz :

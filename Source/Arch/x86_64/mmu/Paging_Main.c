@@ -609,6 +609,14 @@ uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt_addr)
     return *pte;
 }
 
+/* Serialises COW breaks. Two threads of one process writing the same shared
+ * page at once (a mutex word both are spinning on is the classic case) both
+ * fault; without this each copied the page and installed its own copy, so
+ * the second PTE store threw away every write the first thread had already
+ * made to its copy -- and both dropped a reference to the old frame, which
+ * could then be freed while the fork parent still mapped it. */
+static spinlock_t g_cow_fault_lock;
+
 int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr)
 {
     if (cr3 == 0) return 0;
@@ -618,14 +626,30 @@ int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr)
         return 0;
     }
 
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_cow_fault_lock);
+
     uint64_t *pml4e = NULL, *pdpte = NULL, *pde = NULL, *pte = NULL;
     if (resolve_fault_leaf_entry(cr3, v, &pml4e, &pdpte, &pde, &pte) < 0 ||
         pte == NULL) {
+        spinlock_unlock(&g_cow_fault_lock);
+        irq_restore(irq);
         return 0;
     }
     uint64_t entry = *pte;
+    if ((entry & PAGE_PRESENT) != 0 && (entry & PAGE_USER) != 0 &&
+        (entry & PAGE_RW) != 0) {
+        /* Another CPU broke it while we were on our way here: nothing to do
+         * but drop our stale read-only translation and retry the write. */
+        spinlock_unlock(&g_cow_fault_lock);
+        irq_restore(irq);
+        if (cr3 == read_cr3()) invlpg_addr(v);
+        return 1;
+    }
     if ((entry & PAGE_PRESENT) == 0 || (entry & PAGE_COW) == 0 ||
-        (entry & PAGE_USER) == 0 || (entry & PAGE_RW) != 0) {
+        (entry & PAGE_USER) == 0) {
+        spinlock_unlock(&g_cow_fault_lock);
+        irq_restore(irq);
         return 0; /* not a writable-intent COW page we downgraded */
     }
 
@@ -633,20 +657,36 @@ int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr)
     uint64_t keep_flags = entry & (PAGE_USER | PAGE_NX | PAGE_PWT | PAGE_PCD);
 
     if (pmm_page_ref_get(old_phys) <= 1u) {
-        /* Sole remaining owner: just take write access back, no copy. */
+        /* Sole remaining owner: just take write access back, no copy. A peer
+         * CPU's stale read-only entry for the same frame is harmless: its
+         * next write faults and finds the page writable. */
         *pte = (old_phys | keep_flags | PAGE_PRESENT | PAGE_RW);
+        spinlock_unlock(&g_cow_fault_lock);
+        irq_restore(irq);
         if (cr3 == read_cr3()) invlpg_addr(v);
         return 1;
     }
 
     void *fresh = alloc_page();
     if (fresh == NULL) {
+        spinlock_unlock(&g_cow_fault_lock);
+        irq_restore(irq);
         return 0; /* OOM: let it become a fault/SIGSEGV */
     }
     memcpy(fresh, (const void *)(uintptr_t)old_phys, PAGE_SIZE_BYTES);
     *pte = (((uint64_t)(uintptr_t)fresh) & PAGE_FRAME_MASK) |
            keep_flags | PAGE_PRESENT | PAGE_RW;
-    if (cr3 == read_cr3()) invlpg_addr(v);
+    spinlock_unlock(&g_cow_fault_lock);
+    irq_restore(irq);
+
+    /* The page moved to a new frame. Every CPU running a thread of this
+     * address space may still translate it to the old, shared one -- and
+     * would go on reading (and, being read-only there, re-faulting on) data
+     * this thread's writes no longer reach. That is how a thread came to
+     * see its PI mutex word as 0 while a sibling held the lock, and glibc
+     * aborted on the resulting FUTEX_UNLOCK_PI EPERM. Flush them all before
+     * the old frame can be reused. */
+    smp_tlb_shootdown_cr3(cr3, v, 1u);
 
     /* Drop this address space's reference to the old shared frame. free_page()
      * consults the refcount: it retains the frame for the other owner(s) and

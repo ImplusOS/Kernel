@@ -4,9 +4,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HDA_PERIOD_BYTES 2048u
-#define HDA_PERIOD_COUNT 4u
-#define HDA_BUFFER_BYTES (HDA_PERIOD_BYTES * HDA_PERIOD_COUNT)
+/* The output stream plays one cyclic DMA ring: HDA_RING_ENTRIES buffer
+ * descriptors of HDA_ENTRY_BYTES each, looped by the controller for as long
+ * as the stream runs. Software writes ahead of the hardware's link position
+ * (LPIB) and silences what the hardware has already played, so a producer
+ * that falls behind is heard as silence instead of the last lap of the ring.
+ * 16 x 2 KiB = 32 KiB, about 170 ms of 48 kHz 16-bit stereo. */
+#define HDA_ENTRY_BYTES  2048u
+#define HDA_RING_ENTRIES 16u
+#define HDA_RING_BYTES   (HDA_ENTRY_BYTES * HDA_RING_ENTRIES)
+/* Never fill the last entry: keeps the write side from lapping the reader. */
+#define HDA_RING_GUARD   HDA_ENTRY_BYTES
+#define HDA_PERIOD_BYTES HDA_ENTRY_BYTES
+#define HDA_PERIOD_COUNT HDA_RING_ENTRIES
+#define HDA_BUFFER_BYTES HDA_RING_BYTES
 #define HDA_TIMEOUT_MS   2000u
 
 typedef struct __attribute__((packed)) {
@@ -180,17 +191,10 @@ static bool hda_init(void)
     if (output_streams == 0u) return false;
     g_stream = g_regs + 0x80u + (uint32_t)input_streams * 0x20u;
     g_bdl = g_api->mem.dma_alloc_ex(
-        sizeof(hda_bdl_entry_t) * HDA_PERIOD_COUNT, 128u, 0u, &g_bdl_phys);
+        sizeof(hda_bdl_entry_t) * HDA_RING_ENTRIES, 128u, 0u, &g_bdl_phys);
     g_buffer = g_api->mem.dma_alloc_ex(
-        HDA_BUFFER_BYTES, 128u, 0u, &g_buffer_phys);
+        HDA_RING_BYTES, 128u, 0u, &g_buffer_phys);
     if (g_bdl == NULL || g_buffer == NULL) return false;
-    for (uint32_t i = 0u; i < HDA_PERIOD_COUNT; ++i) {
-        uint64_t address = g_buffer_phys + (uint64_t)i * HDA_PERIOD_BYTES;
-        g_bdl[i].address_low = (uint32_t)address;
-        g_bdl[i].address_high = (uint32_t)(address >> 32u);
-        g_bdl[i].length = HDA_PERIOD_BYTES;
-        g_bdl[i].flags = 1u;
-    }
     g_ready = true;
     return true;
 }
@@ -206,76 +210,194 @@ static bool hda_info(driver_audio_info_t *info)
     return true;
 }
 
+/* Ring bookkeeping, all in absolute byte counts since hda_open(). */
+static bool     g_running;
+static uint64_t g_written;    /* bytes placed in the ring */
+static uint64_t g_played;     /* bytes the hardware has consumed */
+static uint32_t g_last_lpib;  /* LPIB at the last update */
+
+static uint32_t hda_lpib(void)
+{
+    uint32_t lpib = *(volatile uint32_t *)(g_stream + 0x04u);
+    return lpib < HDA_RING_BYTES ? lpib : 0u;
+}
+
+static void hda_ring_zero(uint64_t from_abs, uint64_t to_abs)
+{
+    while (from_abs < to_abs) {
+        uint32_t off = (uint32_t)(from_abs % HDA_RING_BYTES);
+        uint32_t n = HDA_RING_BYTES - off;
+        if ((uint64_t)n > to_abs - from_abs) n = (uint32_t)(to_abs - from_abs);
+        g_api->mem.memset(g_buffer + off, 0, n);
+        from_abs += n;
+    }
+}
+
+/* Fold the hardware's progress into g_played and silence what it has
+ * played. Must run at least once per lap of the ring (~170 ms) while the
+ * stream runs; the ALSA layer calls it from every timer tick. */
+static void hda_update(void)
+{
+    if (!g_running) return;
+    uint32_t lpib = hda_lpib();
+    uint32_t delta = (lpib + HDA_RING_BYTES - g_last_lpib) % HDA_RING_BYTES;
+    g_last_lpib = lpib;
+    if (delta == 0u) return;
+    uint64_t before = g_played;
+    g_played += delta;
+    hda_ring_zero(before, g_played);
+    if (g_played > g_written) {
+        /* Underrun: the hardware ran through silence. Restart the write
+         * side where it is now. */
+        g_written = g_played;
+    }
+}
+
+static void hda_run(bool run)
+{
+    uint32_t ctl = stream_ctl_read();
+    ctl = (ctl & ~(0xFu << 20u)) | (1u << 20u);
+    if (run) ctl |= (1u << 1u); else ctl &= ~(1u << 1u);
+    stream_ctl_write(ctl);
+}
+
+static bool hda_program_stream(void)
+{
+    if (!hda_stream_reset()) return false;
+    for (uint32_t i = 0u; i < HDA_RING_ENTRIES; ++i) {
+        uint64_t address = g_buffer_phys + (uint64_t)i * HDA_ENTRY_BYTES;
+        g_bdl[i].address_low = (uint32_t)address;
+        g_bdl[i].address_high = (uint32_t)(address >> 32u);
+        g_bdl[i].length = HDA_ENTRY_BYTES;
+        g_bdl[i].flags = 0u; /* no interrupt on completion: we poll LPIB */
+    }
+    g_api->mem.memset(g_buffer, 0, HDA_RING_BYTES);
+    __sync_synchronize();
+    *(volatile uint32_t *)(g_stream + 0x18u) = (uint32_t)g_bdl_phys;
+    *(volatile uint32_t *)(g_stream + 0x1Cu) = (uint32_t)(g_bdl_phys >> 32u);
+    *(volatile uint32_t *)(g_stream + 0x08u) = HDA_RING_BYTES;         /* CBL */
+    *(volatile uint16_t *)(g_stream + 0x0Cu) = (uint16_t)(HDA_RING_ENTRIES - 1u); /* LVI */
+    *(volatile uint16_t *)(g_stream + 0x12u) = 0x0011u; /* 48 kHz, 16-bit, 2 ch */
+    *(volatile uint8_t *)(g_stream + 0x03u) = 0x1Cu;    /* clear status */
+    hda_run(false);
+    g_running = false;
+    g_written = 0u;
+    g_played = 0u;
+    g_last_lpib = 0u;
+    return true;
+}
+
 static bool hda_open(void)
 {
     if (!g_ready || g_open) return false;
-    if (!hda_stream_reset()) return false;
-    *(volatile uint32_t *)(g_stream + 0x18u) = (uint32_t)g_bdl_phys;
-    *(volatile uint32_t *)(g_stream + 0x1Cu) = (uint32_t)(g_bdl_phys >> 32u);
-    *(volatile uint16_t *)(g_stream + 0x12u) = 0x0011u;
-    uint32_t ctl = stream_ctl_read();
-    ctl = (ctl & ~(0xFu << 20u)) | (1u << 20u) | (1u << 2u);
-    stream_ctl_write(ctl);
-    (void)hda_verb(2u, 0x706u, 0x10u, NULL);
-    (void)hda_verb(2u, 0x200u, 0x11u, NULL);
+    if (!hda_program_stream()) return false;
+    (void)hda_verb(2u, 0x706u, 0x10u, NULL);  /* DAC: stream tag 1, channel 0 */
+    (void)hda_verb(2u, 0x200u, 0x11u, NULL);  /* DAC: 48 kHz 16-bit stereo */
     g_open = true;
     return true;
 }
 
+static uint64_t hda_stream_queued(void)
+{
+    if (!g_open) return 0u;
+    hda_update();
+    return g_written - g_played;
+}
+
+static uint64_t hda_stream_space(void)
+{
+    if (!g_open) return 0u;
+    uint64_t queued = hda_stream_queued();
+    uint64_t cap = HDA_RING_BYTES - HDA_RING_GUARD;
+    return queued >= cap ? 0u : ((cap - queued) & ~3ull);
+}
+
+static uint64_t hda_stream_write(const void *pcm, uint64_t bytes)
+{
+    if (!g_open || pcm == NULL) return 0u;
+    uint64_t space = hda_stream_space();
+    if (bytes > space) bytes = space;
+    bytes &= ~3ull;
+    const uint8_t *src = pcm;
+    uint64_t done = 0u;
+    while (done < bytes) {
+        uint32_t off = (uint32_t)(g_written % HDA_RING_BYTES);
+        uint32_t n = HDA_RING_BYTES - off;
+        if ((uint64_t)n > bytes - done) n = (uint32_t)(bytes - done);
+        g_api->mem.memcpy(g_buffer + off, src + done, n);
+        g_written += n;
+        done += n;
+    }
+    __sync_synchronize();
+    return done;
+}
+
+static bool hda_stream_start(void)
+{
+    if (!g_open) return false;
+    if (!g_running) {
+        g_last_lpib = hda_lpib();
+        hda_run(true);
+        g_running = true;
+    }
+    return true;
+}
+
+static void hda_stream_stop(void)
+{
+    if (!g_open) return;
+    hda_run(false);
+    g_running = false;
+    /* Discard what is queued and restart the ring from the top. */
+    (void)hda_program_stream();
+}
+
+/* The original blocking interface (native os_audio_write): feed the ring
+ * until everything is queued. */
 static int64_t hda_write(const void *pcm, uint64_t bytes)
 {
     if (!g_open || pcm == NULL || bytes == 0u || (bytes & 3u) != 0u) return -1;
     const uint8_t *src = pcm;
     uint64_t done = 0u;
+    uint64_t start = g_api->timer.monotonic_ns();
     while (done < bytes) {
-        uint32_t chunk = (uint32_t)(bytes - done);
-        if (chunk > HDA_BUFFER_BYTES) chunk = HDA_BUFFER_BYTES;
-        if (!hda_stream_reset()) {
-            return done == 0u ? -1 : (int64_t)done;
+        uint64_t n = hda_stream_write(src + done, bytes - done);
+        done += n;
+        if (!g_running && (done == bytes ||
+                           hda_stream_queued() >= HDA_RING_BYTES / 2u)) {
+            (void)hda_stream_start();
         }
-        g_api->mem.memset(g_buffer, 0, HDA_BUFFER_BYTES);
-        g_api->mem.memcpy(g_buffer, src + done, chunk);
-        g_bdl[0].length = chunk;
-        g_bdl[0].flags = 1u;
-        *(volatile uint32_t *)(g_stream + 0x18u) = (uint32_t)g_bdl_phys;
-        *(volatile uint32_t *)(g_stream + 0x1Cu) =
-            (uint32_t)(g_bdl_phys >> 32u);
-        *(volatile uint32_t *)(g_stream + 0x08u) = chunk;
-        *(volatile uint16_t *)(g_stream + 0x0Cu) = 0u;
-        *(volatile uint16_t *)(g_stream + 0x12u) = 0x0011u;
-        *(volatile uint8_t *)(g_stream + 0x03u) = 0x1Cu;
-        __sync_synchronize();
-        uint32_t ctl = stream_ctl_read();
-        ctl = (ctl & ~(0xFu << 20u)) |
-              (1u << 20u) | (1u << 2u) | (1u << 1u);
-        stream_ctl_write(ctl);
-        uint64_t start = g_api->timer.monotonic_ns();
-        while ((*(volatile uint8_t *)(g_stream + 0x03u) & 0x04u) == 0u) {
-            uint8_t status = *(volatile uint8_t *)(g_stream + 0x03u);
-            if ((status & 0x18u) != 0u) {
-                stream_ctl_write(stream_ctl_read() & ~(1u << 1u));
-                *(volatile uint8_t *)(g_stream + 0x03u) = status;
-                return done == 0u ? -1 : (int64_t)done;
-            }
+        if (done < bytes) {
             if (g_api->timer.monotonic_ns() - start >
                 (uint64_t)HDA_TIMEOUT_MS * 1000000ULL) {
-                stream_ctl_write(stream_ctl_read() & ~(1u << 1u));
-                return done == 0u ? -1 : (int64_t)done;
+                break;
             }
-            g_api->hal.cpu_pause();
+            g_api->timer.msleep(2u);
         }
-        stream_ctl_write(stream_ctl_read() & ~(1u << 1u));
-        *(volatile uint8_t *)(g_stream + 0x03u) = 0x04u;
-        done += chunk;
     }
-    return (int64_t)done;
+    return done == 0u ? -1 : (int64_t)done;
 }
 
-static bool hda_drain(uint32_t timeout) { (void)timeout; return g_open; }
+static bool hda_drain(uint32_t timeout)
+{
+    if (!g_open) return false;
+    if (!g_running && hda_stream_queued() != 0u) (void)hda_stream_start();
+    uint64_t start = g_api->timer.monotonic_ns();
+    while (hda_stream_queued() != 0u) {
+        if (g_api->timer.monotonic_ns() - start >
+            (uint64_t)(timeout != 0u ? timeout : HDA_TIMEOUT_MS) * 1000000ULL) {
+            return false;
+        }
+        g_api->timer.msleep(2u);
+    }
+    return true;
+}
+
 static void hda_close(void) {
     if (g_stream != NULL) {
-        stream_ctl_write(stream_ctl_read() & ~(1u << 1u));
+        hda_run(false);
     }
+    g_running = false;
     g_open = false;
 }
 static bool hda_is_ready(void) { return g_ready; }
@@ -284,6 +406,9 @@ static const driver_audio_t g_audio = {
     .name = "hda", .priority = 20u, .init = hda_init,
     .is_ready = hda_is_ready, .get_info = hda_info, .open = hda_open,
     .write = hda_write, .drain = hda_drain, .close = hda_close,
+    .stream_write = hda_stream_write, .stream_queued = hda_stream_queued,
+    .stream_space = hda_stream_space, .stream_start = hda_stream_start,
+    .stream_stop = hda_stream_stop,
 };
 
 static const driver_module_descriptor_t g_module = {

@@ -8,6 +8,15 @@ static int32_t g_current_pid_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
 static int32_t g_last_pick_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
 static int32_t g_leaving_pid_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
 static uint8_t g_resched_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
+/* Ticks left in the slice of whatever this CPU is running. CPU0 accounts
+ * through process_scheduler_on_tick() (under the process table lock, with
+ * the per-process fields); the APs, whose timer interrupts used to be
+ * dropped outright, count here without taking the lock. */
+static uint32_t g_slice_left_per_cpu[OS_CONFIG_SMP_MAX_CPUS];
+/* Set while a CPU sits in hlt waiting for work (process_scheduler_idle_wait),
+ * so a wakeup can kick it rather than leave the woken task waiting for that
+ * CPU's next timer tick. */
+static volatile uint8_t g_cpu_idle[OS_CONFIG_SMP_MAX_CPUS];
 static uint32_t g_timeslice_ticks = 6;
 static uint64_t g_cpu_idle_ns[OS_CONFIG_SMP_MAX_CPUS];
 
@@ -186,6 +195,26 @@ int32_t process_scheduler_pick_next(process_t *processes,
         }
     }
 
+    /* Real-time tasks first, then tasks just woken from a block, then the
+     * ordinary round robin. Each class is scanned from the same rotating
+     * start, so tasks within a class still take turns. */
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int32_t step = 1; step <= capacity; ++step) {
+            int32_t idx = (start + step) % capacity;
+            const process_t *c = &processes[idx];
+            if (c->state != PROCESS_STATE_READY) continue;
+            if (pass == 0 ? c->rt_policy == 0u : c->wake_boost == 0u) continue;
+            if (scheduler_pid_held_for_fork(processes, capacity, idx) ||
+                scheduler_pid_running_on_other_cpu(processes, capacity, idx, cpu)) {
+                continue;
+            }
+            if (cpu != 0u && (idx == 0 || idx == 1)) {
+                continue;
+            }
+            return idx;
+        }
+    }
+
     for (int32_t step = 1; step <= capacity; ++step) {
         int32_t idx = (start + step) % capacity;
         if (processes[idx].state == PROCESS_STATE_READY &&
@@ -257,8 +286,25 @@ void process_scheduler_prepare_run(process_t *proc)
         return;
     }
     proc->state = PROCESS_STATE_RUNNING;
+    proc->wake_boost = 0u;
     proc->timeslice = scheduler_timeslice_for_process(proc);
+    g_slice_left_per_cpu[scheduler_cpu_id()] = proc->timeslice;
     g_resched_per_cpu[scheduler_cpu_id()] = 0u;
+}
+
+void process_scheduler_tick_cpu(void)
+{
+    uint32_t cpu = scheduler_cpu_id();
+    if (g_current_pid_per_cpu[cpu] < 0) {
+        return;
+    }
+    uint32_t left = g_slice_left_per_cpu[cpu];
+    if (left > 1u) {
+        g_slice_left_per_cpu[cpu] = left - 1u;
+        return;
+    }
+    g_slice_left_per_cpu[cpu] = 0u;
+    g_resched_per_cpu[cpu] = 1u;
 }
 
 void process_scheduler_add_idle_ns(uint64_t ns)
@@ -292,4 +338,65 @@ void process_scheduler_debug_dump_cpus(void)
         serial_write_uint64((uint64_t)(uint32_t)g_leaving_pid_per_cpu[cpu]);
     }
     serial_write_string("\n");
+}
+
+#if defined(__x86_64__)
+extern void smp_send_resched_ipi(uint32_t cpu);
+#endif
+
+void process_scheduler_idle_wait(void)
+{
+    uint32_t cpu = scheduler_cpu_id();
+    __atomic_store_n(&g_cpu_idle[cpu], 1u, __ATOMIC_SEQ_CST);
+    /* sti; hlt as one sequence: an interrupt (the kick IPI) that becomes
+     * pending between the two is taken after the hlt starts, so it wakes it
+     * instead of being consumed before the CPU goes to sleep. */
+    __asm__ volatile("sti; hlt" ::: "memory");
+    __atomic_store_n(&g_cpu_idle[cpu], 0u, __ATOMIC_SEQ_CST);
+}
+
+void process_scheduler_kick_idle_cpu(void)
+{
+#if defined(__x86_64__)
+    uint32_t me = scheduler_cpu_id();
+    uint32_t n = smp_get_cpu_count();
+    if (n > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) n = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
+    for (uint32_t c = 0; c < n; ++c) {
+        if (c == me) continue;
+        if (__atomic_exchange_n(&g_cpu_idle[c], 0u, __ATOMIC_SEQ_CST) != 0u) {
+            smp_send_resched_ipi(c);
+            return;
+        }
+    }
+#endif
+}
+
+void process_scheduler_kick_for_rt(const process_t *processes, int32_t capacity)
+{
+#if defined(__x86_64__)
+    uint32_t me = scheduler_cpu_id();
+    uint32_t n = smp_get_cpu_count();
+    if (n > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) n = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
+    for (uint32_t c = 0; c < n; ++c) {
+        if (c == me) continue;
+        if (__atomic_exchange_n(&g_cpu_idle[c], 0u, __ATOMIC_SEQ_CST) != 0u) {
+            smp_send_resched_ipi(c);
+            return;
+        }
+    }
+    /* Nobody idle: take a CPU from a task that is not real-time. The IPI
+     * makes it reschedule on return to user mode, where the pick order puts
+     * the woken real-time task first. */
+    for (uint32_t c = 0; c < n; ++c) {
+        if (c == me) continue;
+        int32_t pid = g_current_pid_per_cpu[c];
+        if (pid >= 0 && pid < capacity && processes[pid].rt_policy == 0u) {
+            smp_send_resched_ipi(c);
+            return;
+        }
+    }
+#else
+    (void)processes;
+    (void)capacity;
+#endif
 }

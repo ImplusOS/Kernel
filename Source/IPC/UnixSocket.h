@@ -77,6 +77,9 @@ int32_t unix_socket_next_open_fd(int32_t pid, int32_t after);
 /* poll(2)/epoll readiness for an AF_UNIX fd. `events`/result use EPOLL*
  * (== POLL*) bits. */
 uint32_t unix_socket_poll(int32_t fd, uint32_t events);
+/* FIONREAD / SIOCINQ: bytes readable now (stream), or the size of the next
+ * message (seqpacket/dgram). */
+int64_t unix_socket_available(int32_t fd);
 
 /* Count of appends to this endpoint's receive queues. Only equality across
  * two reads is meaningful: it tells epoll's edge-triggered mode that data

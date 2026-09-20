@@ -57,6 +57,14 @@ typedef struct __attribute__((aligned(16))) {
 
     uint64_t fs_base;
     uint64_t gs_base;
+    /* Set when saved_rsp's frame alone cannot resume this task: it was
+     * preempted by the timer in user mode, or rt_sigreturn is putting back a
+     * context interrupted there. The frame's RCX/R11 slots then carry
+     * RIP/RFLAGS as usual, and these carry the task's real RCX/R11, handed to
+     * the exit path via syscall_set_full_restore() when it next runs. */
+    uint8_t  full_restore;
+    uint64_t full_rcx;
+    uint64_t full_r11;
 
     uint64_t cr3;
     uint8_t *kernel_stack_base;
@@ -85,6 +93,17 @@ typedef struct __attribute__((aligned(16))) {
     uint64_t user_mmap_cursor;
     uint32_t timeslice;
     uint8_t  priority;
+    /* sched_setscheduler(SCHED_FIFO/SCHED_RR): picked ahead of everything
+     * else, and a wakeup gets it a CPU at once (see
+     * process_scheduler_pick_next / process_scheduler_kick_for). Chromium's
+     * audio threads ask for this; without it their replies to the audio
+     * service arrived after its deadline and came out as silence. */
+    uint8_t  rt_policy;     /* 0 = SCHED_OTHER, 1 = FIFO, 2 = RR */
+    uint8_t  rt_priority;
+    /* Set when a blocked task is woken, cleared when it next runs: such a
+     * task is picked ahead of ones that were merely preempted, which keeps
+     * event-driven threads (input, compositing, IPC) responsive under load. */
+    uint8_t  wake_boost;
     uint64_t total_ticks;
     uint64_t runtime_ns;
     uint64_t ready_wait_ns;
@@ -211,6 +230,16 @@ void process_scheduler_on_tick(process_t *processes, int32_t capacity);
 void process_scheduler_request_reschedule(void);
 int process_scheduler_consume_reschedule(void);
 void process_scheduler_prepare_run(process_t *proc);
+/* Timer tick on an AP: counts down the running task's slice and requests a
+ * reschedule on this CPU when it runs out. Lock-free, interrupt context. */
+void process_scheduler_tick_cpu(void);
+/* Idle this CPU until an interrupt (sti; hlt), marked as idle meanwhile. */
+void process_scheduler_idle_wait(void);
+/* A task just became ready: wake one idle CPU (if any) to run it. */
+void process_scheduler_kick_idle_cpu(void);
+/* Like process_scheduler_kick_idle_cpu(), for a real-time task: with no CPU
+ * idle, preempt one that is running a non-real-time task. */
+void process_scheduler_kick_for_rt(const process_t *processes, int32_t capacity);
 void process_scheduler_add_idle_ns(uint64_t ns);
 uint64_t process_scheduler_get_idle_ns(uint32_t cpu);
 uint32_t process_scheduler_max_cpus(void);

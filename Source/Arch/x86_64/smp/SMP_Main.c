@@ -158,8 +158,16 @@ static bool cpu_has_rdtscp(void)
     return (edx & (1u << 27)) != 0u;
 }
 
+/* Set once every CPU has bound its per-CPU area (GS base) to its index:
+ * from then on smp_get_current_cpu_id() is one %gs-relative load. */
+static volatile bool g_cpu_id_gs;
+
 static void smp_publish_cpu_index(uint32_t cpu_idx)
 {
+    /* First thing a CPU does once it knows its index: point GS at its
+     * per-CPU area (which records the index). Nothing on this CPU has asked
+     * for its id yet, so the fast path below is valid for all of it. */
+    syscall_percpu_bind(cpu_idx);
     if (!cpu_has_rdtscp()) return;
     hal_cpu_write_msr(MSR_TSC_AUX, (uint64_t)cpu_idx + 1u);
 }
@@ -257,7 +265,7 @@ void ap_entry_c(void)
             continue;
         }
         uint64_t idle_start_ns = timer_monotonic_ns();
-        hal_cpu_halt();
+        process_scheduler_idle_wait();
         uint64_t idle_ns = timer_monotonic_ns() - idle_start_ns;
         process_scheduler_add_idle_ns(idle_ns);
     }
@@ -314,6 +322,8 @@ void smp_init(void)
     g_cpu_online = 1;
 
     if (!OS_CONFIG_SMP_ENABLED || g_cpu_possible <= 1 || !lapic_is_present()) {
+        syscall_percpu_bind(0u);
+        g_cpu_id_gs = true;
         return;
     }
 
@@ -387,6 +397,7 @@ void smp_init(void)
             aps_started++;
         }
     }
+    g_cpu_id_gs = true;
 }
 
 uint32_t smp_get_cpu_count(void)
@@ -401,6 +412,17 @@ uint32_t smp_get_possible_cpu_count(void)
 
 uint32_t smp_get_current_cpu_id(void)
 {
+    /* The kernel asks this several times per syscall (scheduler, spinlock
+     * TLB polling, current-pid lookups). RDTSCP is native under a plain KVM
+     * guest, but under nested virtualisation (QEMU/KVM inside the WSL2 VM)
+     * it can exit, and profiling put this function at ~6% of all CPU time.
+     * A %gs load cannot exit. In kernel mode GS always holds the per-CPU
+     * area (every entry path swapgs'es first). */
+    if (g_cpu_id_gs) {
+        uint64_t v;
+        __asm__ volatile("mov %%gs:40, %0" : "=r"(v));
+        if (v != 0u) return (uint32_t)(v - 1u);
+    }
     if (g_cpu_id_rdtscp) {
         uint32_t lo, hi, aux;
         __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
@@ -635,4 +657,14 @@ void smp_tlb_shootdown_handler(void)
     }
     tlb_service_peers(me);
     lapic_eoi();
+}
+
+/* Wakes CPU `cpu` out of hlt (and, if it is running user code, has it check
+ * whether to switch): see isr_resched in IDT.asm. */
+void smp_send_resched_ipi(uint32_t cpu)
+{
+    if (cpu >= g_cpu_apic_count || cpu >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        return;
+    }
+    lapic_send_ipi(g_cpu_apic_ids[cpu], (uint32_t)VECTOR_RESCHED);
 }

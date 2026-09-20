@@ -58,8 +58,16 @@ static memory_block_t *heap_search_hint = NULL;
 static uint32_t        heap_initialized = 0;
 static uint64_t        used_memory      = 0;
 
+/* The kernel heap is one contiguous region sized at boot. Besides the
+ * kernel's own structures it holds every tmpfs file's contents (/tmp, /run,
+ * /var -- including everything Chromium downloads to $HOME/Downloads and
+ * unpacks for its components), the AF_UNIX and UDP receive queues and more,
+ * so the old 128 MiB ceiling ran out under a browser: "[mem] OOM at malloc"
+ * with gigabytes of RAM free, downloads that could not be written, and
+ * "Cannot extract file from ZIP". It now takes an eighth of free memory, up
+ * to 1 GiB (the old quarter-up-to-128-MiB rule on small machines). */
 #define HEAP_PAGE_COUNT_MIN  4096U
-#define HEAP_PAGE_COUNT_MAX  32768U
+#define HEAP_PAGE_COUNT_MAX  262144U
 
 static uint32_t heap_page_count = HEAP_PAGE_COUNT_MIN;
 
@@ -334,10 +342,15 @@ void init_physical_memory(void *memory_map, size_t map_size, size_t desc_size,
     }
 
     heap_page_count = HEAP_PAGE_COUNT_MIN;
-    if (free_pages / 4 > (uint64_t)HEAP_PAGE_COUNT_MIN) {
-        uint64_t candidate = free_pages / 4;
+    {
+        uint64_t candidate = free_pages / 8;
+        if (candidate < 32768u && free_pages / 4 > candidate) {
+            candidate = free_pages / 4 < 32768u ? free_pages / 4 : 32768u;
+        }
         if (candidate > (uint64_t)HEAP_PAGE_COUNT_MAX) candidate = (uint64_t)HEAP_PAGE_COUNT_MAX;
-        heap_page_count = (uint32_t)candidate;
+        if (candidate > (uint64_t)HEAP_PAGE_COUNT_MIN) {
+            heap_page_count = (uint32_t)candidate;
+        }
     }
 }
 
@@ -366,6 +379,11 @@ void memory_init(void)
     spinlock_init(&page_lock);
 
     heap_start = (memory_block_t *)alloc_contiguous_pages(heap_page_count, 1);
+    while (heap_start == NULL && heap_page_count > 32768U) {
+        /* No run that long: settle for half. */
+        heap_page_count /= 2u;
+        heap_start = (memory_block_t *)alloc_contiguous_pages(heap_page_count, 1);
+    }
     if (heap_start == NULL) {
         if (heap_page_count > 16384U) {
             heap_page_count = 16384U;

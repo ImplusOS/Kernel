@@ -13,6 +13,7 @@
 #include "Core/vfs/ProcFS.h"
 #include "kernel/config.h"
 #include "Core/process/ProcessManager.h"
+#include "Core/process/ProcessScheduler.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/timer/Timer.h"
 #include "Core/memory/SharedMemory.h"
@@ -27,6 +28,10 @@ enum {
 
 #define FILE_IO_CHUNK_SIZE   (128U * 1024U)
 #define FILE_READ_CACHE_SIZE 4096U
+/* Descriptor numbers the table never hands out: the inet and AF_UNIX socket
+ * ranges (see OS_CONFIG_FILE_MAX_FD in kernel/config.h). */
+#define FILE_FD_HOLE_START 512U
+#define FILE_FD_HOLE_END   1024U
 #define FILE_READ_DIRECT_THRESHOLD FILE_READ_CACHE_SIZE
 #define FILE_SEEK_SET        0
 #define FILE_SEEK_CUR        1
@@ -82,7 +87,17 @@ typedef struct {
     uint8_t cache_valid;
     uint32_t cache_offset;
     uint32_t cache_size;
-    uint8_t cache_data[FILE_READ_CACHE_SIZE];
+    /* Serialises offset, read cache and write-extension of one open file.
+     * Threads of a process share the description, and Chromium does pread/
+     * pwrite on one fd from several threads at once (disk cache, parkable-
+     * image store); unserialised, one thread's refill of cache_data ran under
+     * another's memcpy out of it. Never held across anything that blocks. */
+    spinlock_t io_lock;
+    /* FILE_READ_CACHE_SIZE bytes, allocated on the first cached read and
+     * freed with the open file: most descriptors (shared memory, sockets'
+     * backing files, devices) never read through it, and 4 KiB inline in
+     * every slot of the enlarged table would be 8 MiB of kernel image. */
+    uint8_t *cache_data;
 } kernel_open_file_t;
 
 #define FILE_DIR_PATH_MAX 256u
@@ -256,6 +271,13 @@ static int open_file_cache_refill(kernel_open_file_t *file, uint32_t offset)
         to_cache = FILE_READ_CACHE_SIZE;
     }
 
+    if (file->cache_data == NULL) {
+        file->cache_data = malloc(FILE_READ_CACHE_SIZE);
+        if (file->cache_data == NULL) {
+            open_file_cache_invalidate(file);
+            return 0;
+        }
+    }
     if (!vfs_read_at(&file->file, offset, file->cache_data, to_cache)) {
         open_file_cache_invalidate(file);
         return 0;
@@ -328,14 +350,87 @@ static void std_fd_mark_open(int32_t fd, int32_t pid)
  * exited on "X connection error". */
 static int fd_in_unix_hole_for(int32_t pid, int32_t fd)
 {
-    (void)pid;
-    return fd >= (int32_t)UNIX_SOCK_FD_BASE &&
-           fd < (int32_t)(UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX);
+    /* The socket ranges (inet 512.., AF_UNIX 768..1023) sit inside this
+     * table's numeric span and are never files. */
+    if (fd >= (int32_t)FILE_FD_HOLE_START && fd < (int32_t)FILE_FD_HOLE_END) {
+        return 1;
+    }
+    /* Past the hole only for Linux-ABI processes: they see per-process
+     * numbers (Linux_FdTable.c), whereas native programs see these global
+     * ones and the POSIX layer indexes 1024-entry tables by them. */
+    if (fd >= (int32_t)FILE_FD_HOLE_END) {
+        return !(pid == process_get_current_pid() &&
+                 process_get_current_abi_mode() == PROCESS_ABI_LINUX);
+    }
+    return 0;
 }
 
 static int fd_in_unix_hole(int32_t fd)
 {
     return fd_in_unix_hole_for(process_get_current_pid(), fd);
+}
+
+static kernel_open_file_t *fd_open_file(int32_t fd);
+
+/* Diagnostic: who holds the table when it runs out (first few times). */
+static void fd_table_exhausted_dump_locked(void)
+{
+    static uint32_t dumps;
+    if (dumps >= 3u) return;
+    dumps++;
+    uint32_t by_type[8] = {0};
+    uint32_t shared = 0;
+    int32_t pids[16]; uint32_t counts[16]; uint32_t npids = 0;
+    for (int32_t fd = 0; fd < FILE_MAX_FD; ++fd) {
+        kernel_file_t *f = &g_files[fd];
+        if (f->used == 0) continue;
+        by_type[f->used & 7u]++;
+        for (uint32_t w = 0; w < FD_OWNER_WORDS; ++w) {
+            if (f->extra_owners[w] != 0u) { shared++; break; }
+        }
+        uint32_t k = 0;
+        while (k < npids && pids[k] != f->owner_pid) k++;
+        if (k == npids && npids < 16u) { pids[npids] = f->owner_pid; counts[npids] = 0; npids++; }
+        if (k < npids) counts[k]++;
+    }
+    serial_write_string("[fd] table full: file=");
+    serial_write_uint32(by_type[1]);
+    serial_write_string(" pipe=");
+    serial_write_uint32(by_type[2] + by_type[3]);
+    serial_write_string(" timerfd=");
+    serial_write_uint32(by_type[5]);
+    serial_write_string(" memfd=");
+    serial_write_uint32(by_type[6]);
+    serial_write_string(" signalfd=");
+    serial_write_uint32(by_type[7]);
+    serial_write_string(" shared=");
+    serial_write_uint32(shared);
+    serial_write_string("\n[fd] by owner:");
+    for (uint32_t k = 0; k < npids; ++k) {
+        serial_write_string(" ");
+        serial_write_uint32((uint32_t)pids[k]);
+        serial_write_string(":");
+        serial_write_uint32(counts[k]);
+    }
+    serial_write_string("\n");
+    /* A sample of the regular files' names. */
+    uint32_t shown = 0;
+    for (int32_t fd = 0; fd < FILE_MAX_FD && shown < 40u; ++fd) {
+        kernel_file_t *f = &g_files[fd];
+        if (f->used != FILE_USED_FILE) continue;
+        kernel_open_file_t *of = fd_open_file(fd);
+        if (of == NULL) continue;
+        serial_write_string("[fd]  ");
+        serial_write_uint32((uint32_t)f->owner_pid);
+        serial_write_string(" size=");
+        serial_write_uint32(of->file.size);
+        serial_write_string(" drv=");
+        serial_write_uint64((uint64_t)(uintptr_t)of->file.fs_driver);
+        serial_write_string(" ref=");
+        serial_write_uint32(of->refcount);
+        serial_write_string("\n");
+        shown++;
+    }
 }
 
 static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
@@ -352,6 +447,7 @@ static int32_t allocate_fd_locked(int32_t minimum, int32_t pid)
         }
         return fd;
     }
+    fd_table_exhausted_dump_locked();
     return -1;
 }
 
@@ -414,6 +510,9 @@ static void release_fd_locked(int32_t fd)
             }
             if (g_open_files[open_index].refcount == 0) {
                 vfs_close_file(&g_open_files[open_index].file);
+                if (g_open_files[open_index].cache_data != NULL) {
+                    free(g_open_files[open_index].cache_data);
+                }
                 memset(&g_open_files[open_index], 0, sizeof(g_open_files[open_index]));
             }
         }
@@ -717,54 +816,21 @@ int32_t syscall_file_creat(const char *path)
     return syscall_file_creat_ex(path, 1ULL);
 }
 
-int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len)
+/* Regular-file read at `position` through the open file's read cache.
+ * Caller holds file->io_lock. *end_out receives the position after the read. */
+static int64_t open_file_read_at_locked(kernel_open_file_t *file,
+                                        uint32_t position, uint8_t *buffer,
+                                        uint64_t len, uint32_t *end_out)
 {
-    if (fd < 0 || fd >= FILE_MAX_FD || buffer == NULL || g_files[fd].used == 0) {
-        return (int64_t)OS_STATUS_INVALID_ARG;
-    }
-    if (!fd_is_owned_by_current_process(fd)) {
-        return (int64_t)OS_STATUS_ACCESS_DENIED;
-    }
-    if (len == 0) {
-        return 0;
-    }
-    if (g_files[fd].used == 2) {
-        return syscall_pipe_read(fd, buffer, len);
-    }
-    if (g_files[fd].used == 5) {
-        return syscall_timerfd_read(fd, buffer, len);
-    }
-    if (g_files[fd].used == 6) {
-        return syscall_memfd_read(fd, buffer, len);
-    }
-    if (g_files[fd].used == 7) {
-        return syscall_signalfd_read(fd, buffer, len);
-    }
-    if (g_files[fd].used != 1) {
-        return (int64_t)OS_STATUS_ACCESS_DENIED;
-    }
-
-    kernel_open_file_t *file = fd_open_file(fd);
-    if (file == NULL) {
-        return (int64_t)OS_STATUS_INVALID_ARG;
-    }
-
-    /* Character devices (/dev/dri/card0, /dev/input/event*) manage their own
-     * variable-length record streams; the size/EOF model below does not fit. */
-    if (file->file.fs_driver != NULL && file->file.fs_driver->dev_read != NULL) {
-        uint32_t nonblock =
-            (g_files[fd].status_flags & FILE_O_NONBLOCK) ? 1u : 0u;
-        return vfs_dev_read(&file->file, buffer, len, nonblock);
-    }
-
-    if (file->offset >= file->file.size) {
+    *end_out = position;
+    if (position >= file->file.size) {
         return 0;
     }
 
-    uint64_t remaining = (uint64_t)file->file.size - (uint64_t)file->offset;
+    uint64_t remaining = (uint64_t)file->file.size - (uint64_t)position;
     uint64_t to_read = (len < remaining) ? len : remaining;
     uint64_t read_total = 0;
-    uint32_t cursor = file->offset;
+    uint32_t cursor = position;
 
     while (read_total < to_read) {
         uint32_t cache_end = file->cache_offset + file->cache_size;
@@ -816,8 +882,92 @@ int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len)
         }
     }
 
-    file->offset = cursor;
+    *end_out = cursor;
     return (int64_t)read_total;
+}
+
+int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || buffer == NULL || g_files[fd].used == 0) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    if (!fd_is_owned_by_current_process(fd)) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (g_files[fd].used == 2) {
+        return syscall_pipe_read(fd, buffer, len);
+    }
+    if (g_files[fd].used == 5) {
+        return syscall_timerfd_read(fd, buffer, len);
+    }
+    if (g_files[fd].used == 6) {
+        return syscall_memfd_read(fd, buffer, len);
+    }
+    if (g_files[fd].used == 7) {
+        return syscall_signalfd_read(fd, buffer, len);
+    }
+    if (g_files[fd].used != 1) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+
+    kernel_open_file_t *file = fd_open_file(fd);
+    if (file == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+
+    /* Character devices (/dev/dri/card0, /dev/input/event*) manage their own
+     * variable-length record streams; the size/EOF model below does not fit. */
+    if (file->file.fs_driver != NULL && file->file.fs_driver->dev_read != NULL) {
+        uint32_t nonblock =
+            (g_files[fd].status_flags & FILE_O_NONBLOCK) ? 1u : 0u;
+        return vfs_dev_read(&file->file, buffer, len, nonblock);
+    }
+
+    spinlock_lock(&file->io_lock);
+    uint32_t end = file->offset;
+    int64_t rc = open_file_read_at_locked(file, file->offset, buffer, len, &end);
+    if (rc >= 0) {
+        file->offset = end;
+    }
+    spinlock_unlock(&file->io_lock);
+    return rc;
+}
+
+/* pread(): read at `position` without touching the descriptor's offset. */
+int64_t syscall_file_pread(int32_t fd, uint8_t *buffer, uint64_t len,
+                           uint64_t position)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || buffer == NULL || g_files[fd].used == 0) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    if (!fd_is_owned_by_current_process(fd)) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+    if (g_files[fd].used == FILE_USED_MEMFD) {
+        return syscall_memfd_pread(fd, buffer, len, position);
+    }
+    if (g_files[fd].used != FILE_USED_FILE) {
+        return (int64_t)OS_STATUS_NOT_SUPPORTED;
+    }
+    kernel_open_file_t *file = fd_open_file(fd);
+    if (file == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    if (file->file.fs_driver != NULL && file->file.fs_driver->dev_read != NULL) {
+        return (int64_t)OS_STATUS_NOT_SUPPORTED;
+    }
+    if (len == 0 || position >= (uint64_t)file->file.size) {
+        return 0;
+    }
+    uint32_t end = 0;
+    spinlock_lock(&file->io_lock);
+    int64_t rc = open_file_read_at_locked(file, (uint32_t)position, buffer, len,
+                                          &end);
+    spinlock_unlock(&file->io_lock);
+    return rc;
 }
 
 static file_write_observer_t g_file_write_observer;
@@ -837,6 +987,36 @@ uint64_t syscall_file_identity(int32_t fd)
         return 0u;
     }
     return (uint64_t)(uintptr_t)file->file.driver_data;
+}
+
+/* Regular-file write at `position`. Caller holds file->io_lock. */
+static int64_t open_file_write_at_locked(kernel_open_file_t *file,
+                                         uint32_t position,
+                                         const uint8_t *buffer, uint64_t len)
+{
+    uint64_t write_total = 0;
+
+    while (write_total < len) {
+        uint64_t chunk64 = len - write_total;
+        if (chunk64 > FILE_IO_CHUNK_SIZE) {
+            chunk64 = FILE_IO_CHUNK_SIZE;
+        }
+
+        uint32_t chunk = (uint32_t)chunk64;
+        uint32_t write_offset = position + (uint32_t)write_total;
+        if (!vfs_write_at(&file->file,
+                            write_offset,
+                            buffer + (size_t)write_total,
+                            chunk)) {
+            open_file_cache_invalidate(file);
+            return (int64_t)OS_STATUS_IO_ERROR;
+        }
+
+        write_total += (uint64_t)chunk;
+    }
+
+    open_file_cache_invalidate(file);
+    return (int64_t)len;
 }
 
 int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
@@ -877,38 +1057,66 @@ int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len)
             (g_files[fd].status_flags & FILE_O_NONBLOCK) ? 1u : 0u;
         return vfs_dev_write(&file->file, buffer, len, nonblock);
     }
+    if ((uint64_t)file->offset + len > 0xFFFFFFFFull) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    spinlock_lock(&file->io_lock);
     if ((g_files[fd].status_flags & FILE_O_APPEND) != 0u) {
         file->offset = file->file.size;
     }
-
-    uint64_t write_total = 0;
     uint32_t write_start = file->offset;
-
-    while (write_total < len) {
-        uint64_t chunk64 = len - write_total;
-        if (chunk64 > FILE_IO_CHUNK_SIZE) {
-            chunk64 = FILE_IO_CHUNK_SIZE;
-        }
-
-        uint32_t chunk = (uint32_t)chunk64;
-        uint32_t write_offset = file->offset + (uint32_t)write_total;
-        if (!vfs_write_at(&file->file,
-                            write_offset,
-                            buffer + (size_t)write_total,
-                            chunk)) {
-            return (int64_t)OS_STATUS_IO_ERROR;
-        }
-
-        write_total += (uint64_t)chunk;
+    int64_t rc = open_file_write_at_locked(file, write_start, buffer, len);
+    if (rc > 0) {
+        file->offset = write_start + (uint32_t)rc;
     }
-
-    file->offset += (uint32_t)len;
-    open_file_cache_invalidate(file);
+    spinlock_unlock(&file->io_lock);
     file_write_observer_t observer = g_file_write_observer;
-    if (observer != NULL) {
-        observer(fd, write_start, buffer, len);
+    if (rc > 0 && observer != NULL) {
+        observer(fd, write_start, buffer, (uint64_t)rc);
     }
-    return (int64_t)len;
+    return rc;
+}
+
+/* pwrite(): write at `position` without touching the descriptor's offset. */
+int64_t syscall_file_pwrite(int32_t fd, const uint8_t *buffer, uint64_t len,
+                            uint64_t position)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || buffer == NULL || g_files[fd].used == 0) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    if (!fd_is_owned_by_current_process(fd)) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+    if (g_files[fd].used == FILE_USED_MEMFD) {
+        return syscall_memfd_pwrite(fd, buffer, len, position);
+    }
+    if (g_files[fd].used != FILE_USED_FILE) {
+        return (int64_t)OS_STATUS_NOT_SUPPORTED;
+    }
+    kernel_open_file_t *file = fd_open_file(fd);
+    if (file == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    if (file->writable == 0) {
+        return (int64_t)OS_STATUS_ACCESS_DENIED;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (vfs_file_has_dev_write(&file->file)) {
+        return (int64_t)OS_STATUS_NOT_SUPPORTED;
+    }
+    if (position + len > 0xFFFFFFFFull) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    spinlock_lock(&file->io_lock);
+    int64_t rc = open_file_write_at_locked(file, (uint32_t)position, buffer, len);
+    spinlock_unlock(&file->io_lock);
+    file_write_observer_t observer = g_file_write_observer;
+    if (rc > 0 && observer != NULL) {
+        observer(fd, (uint32_t)position, buffer, (uint64_t)rc);
+    }
+    return rc;
 }
 
 int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
@@ -949,6 +1157,7 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
         return (int64_t)OS_STATUS_INVALID_ARG;
     }
 
+    spinlock_lock(&file->io_lock);
     int64_t base = 0;
     switch (whence) {
         case FILE_SEEK_SET:
@@ -961,6 +1170,7 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
             base = (int64_t)file->file.size;
             break;
         default:
+            spinlock_unlock(&file->io_lock);
             return (int64_t)OS_STATUS_INVALID_ARG;
     }
 
@@ -973,10 +1183,12 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
      * wrong when opening your profile"). */
     int64_t next = base + offset;
     if (next < 0 || (uint64_t)next > 0xFFFFFFFFull) {
+        spinlock_unlock(&file->io_lock);
         return (int64_t)OS_STATUS_INVALID_ARG;
     }
 
     file->offset = (uint32_t)next;
+    spinlock_unlock(&file->io_lock);
     return next;
 }
 
@@ -1430,6 +1642,19 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
         if (waited_ms >= PIPE_READ_WAIT_MAX_MS) {
             return -11;
         }
+        /* A Linux task waits by being parked once and re-running the
+         * syscall (linux_unix_block_retry() turns this EAGAIN on a blocking
+         * pipe into sleep-and-restart). poll_wait_park() only marks the task
+         * blocked -- the sleep itself happens on the way out of the syscall
+         * -- so looping here never slept at all: it was a busy loop of up to
+         * PIPE_READ_WAIT_MAX_MS iterations, and a thread parked on a pipe for
+         * good (Chromium's shutdown detector, every glib/libevent wakeup
+         * pipe) kept a CPU spinning. The registration made here is what lets
+         * the writer's poll_wait_notify() cut the sleep short. */
+        if (process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+            (void)poll_wait_park(generation, 20u);
+            return -11;
+        }
         /* Cut short by syscall_pipe_write()'s poll_wait_notify(), so the 1 ms
          * is a ceiling rather than a per-round-trip cost. Xorg pipes a whole
          * keymap (tens of KB) to xkbcomp through a 4 KiB pipe, which is
@@ -1458,6 +1683,13 @@ static int64_t syscall_pipe_write_wait(int32_t fd, kernel_pipe_t *pipe,
          * byte: for a 4 KiB pipe carrying tens of KB this is the difference
          * between one round trip per millisecond and one per read. */
         uint64_t generation = poll_wait_generation();
+        if (waited_ms != 0u &&
+            process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+            /* Same as the read side: park once, then let the Linux layer
+             * sleep and restart the write rather than spin here. */
+            (void)poll_wait_park(generation, 20u);
+            return -11;
+        }
         (void)poll_wait_park(generation, 1u);
         waited_ms += 1u;
 
@@ -1550,6 +1782,16 @@ int syscall_file_is_pipe(int32_t fd)
  * soon as the shared object is mapped), so demand-paged file mappings hold a
  * reference on the kernel_open_file_t rather than on the fd. See
  * Core/memory/FileMap.c. */
+
+int syscall_file_is_tmpfs(int32_t fd)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_FILE) {
+        return 0;
+    }
+    kernel_open_file_t *open_file = fd_open_file(fd);
+    return open_file != NULL &&
+           open_file->file.fs_driver == tmpfs_vfs_get_driver();
+}
 
 int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length)
 {
@@ -2270,6 +2512,35 @@ int64_t syscall_memfd_write(int32_t fd, const uint8_t *buffer, uint64_t len)
         memfd->size = memfd->offset;
     }
     return (int64_t)len;
+}
+
+int64_t syscall_memfd_pread(int32_t fd, uint8_t *buffer, uint64_t len,
+                            uint64_t position)
+{
+    kernel_memfd_t *memfd = &g_memfds[fd];
+    if (memfd->shm_handle >= 0) {
+        return (int64_t)OS_STATUS_NOT_SUPPORTED;
+    }
+    if (position >= (uint64_t)memfd->size) {
+        return 0;
+    }
+    uint64_t avail = (uint64_t)memfd->size - position;
+    if (len > avail) len = avail;
+    memcpy(buffer, memfd->data + position, (size_t)len);
+    return (int64_t)len;
+}
+
+int64_t syscall_memfd_pwrite(int32_t fd, const uint8_t *buffer, uint64_t len,
+                             uint64_t position)
+{
+    if (position > 0xFFFFFFFFull) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    uint32_t saved = g_memfds[fd].offset;
+    g_memfds[fd].offset = (uint32_t)position;
+    int64_t rc = syscall_memfd_write(fd, buffer, len);
+    g_memfds[fd].offset = saved;
+    return rc;
 }
 
 int64_t syscall_signalfd_read(int32_t fd, uint8_t *buffer, uint64_t len)

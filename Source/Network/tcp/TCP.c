@@ -165,6 +165,7 @@ static int32_t tcp_find_connection(uint32_t local_ip, uint16_t local_port,
     for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
         if (g_tcp_connections[i].in_use == 0u) continue;
         tcp_connection_t *c = &g_tcp_connections[i];
+        if (c->state == TCP_STATE_CLOSED) continue;
         if (c->local_port == local_port && c->remote_port == remote_port &&
             c->remote_ip == remote_ip &&
             (c->local_ip == local_ip || c->local_ip == 0u)) {
@@ -223,6 +224,16 @@ static int32_t tcp_alloc_connection(void)
         }
     }
     return -1;
+}
+
+/* The connection is finished. Its slot is recycled only once no socket
+ * refers to it any more (see tcp_connection_t.user_ref). */
+static void tcp_release_locked(tcp_connection_t *c)
+{
+    c->state = TCP_STATE_CLOSED;
+    if (c->user_ref == 0u) {
+        c->in_use = 0u;
+    }
 }
 
 static uint16_t recv_buf_free(const tcp_connection_t *c)
@@ -290,6 +301,28 @@ static uint16_t recv_buf_read(tcp_connection_t *c, uint8_t *buf, uint16_t len)
                                       &c->recv_tail, buf, len);
     c->recv_count = (uint16_t)(c->recv_count - read);
     return read;
+}
+
+/* The peer acknowledged everything below ack_num: advance snd_una and drop
+ * the acknowledged bytes from the retransmission buffer. Nothing used to
+ * release them -- send_count only ever grew -- so every connection could
+ * send TCP_SEND_BUF_SIZE bytes in its whole life and then no more: an
+ * HTTP/2 connection carrying request after request (and the DevTools
+ * socket) went silent after its first 16 KiB of requests, and every
+ * response behind them waited forever. */
+static void tcp_ack_advance(tcp_connection_t *conn, uint32_t ack_num)
+{
+    int32_t ahead = (int32_t)(ack_num - conn->snd_una);
+    int32_t beyond = (int32_t)(ack_num - conn->snd_nxt);
+    if (ahead <= 0 || beyond > 0) {
+        return;
+    }
+    uint32_t acked = (uint32_t)ahead;
+    uint32_t data = acked < conn->send_count ? acked : conn->send_count;
+    conn->send_head = (uint16_t)((conn->send_head + data) % TCP_SEND_BUF_SIZE);
+    conn->send_count = (uint16_t)(conn->send_count - data);
+    conn->snd_una = ack_num;
+    conn->retransmit_count = 0;
 }
 
 static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
@@ -379,8 +412,7 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
     tcp_connection_t *conn = &g_tcp_connections[conn_id];
 
     if (flags & TCP_FLAG_RST) {
-        conn->state = TCP_STATE_CLOSED;
-        conn->in_use = 0u;
+        tcp_release_locked(conn);
         spinlock_unlock(&g_tcp_lock);
         irq_restore(irq_flags);
         return;
@@ -416,39 +448,59 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
 
     case TCP_STATE_ESTABLISHED:
         if (flags & TCP_FLAG_ACK) {
-            if (ack_num > conn->snd_una && ack_num <= conn->snd_nxt) {
-                conn->snd_una = ack_num;
-                conn->retransmit_count = 0;
-            }
+            tcp_ack_advance(conn, ack_num);
             conn->snd_wnd = window;
         }
 
-        if (seg_data_len > 0u && seq_num == conn->rcv_nxt) {
-            uint16_t space = recv_buf_free(conn);
-            uint16_t to_copy = (seg_data_len < space) ? seg_data_len : space;
-            if (to_copy > 0u) {
-                recv_buf_write(conn, seg_data, to_copy);
-                conn->rcv_nxt += to_copy;
+        {
+            /* Data. Only the in-sequence segment is taken (there is no
+             * reassembly queue), but every data segment -- early, late or
+             * duplicate -- is answered with an ACK of what we do have: that
+             * duplicate ACK is what makes the sender retransmit the missing
+             * piece at once. Dropping them silently left the sender waiting
+             * for its retransmission timer, which backs off to many seconds;
+             * a large response (YouTube's watch page) then sat half-received
+             * with the tab spinning. */
+            int fin_in_sequence = 0;
+            if (seg_data_len > 0u) {
+                if (seq_num == conn->rcv_nxt) {
+                    uint16_t space = recv_buf_free(conn);
+                    uint16_t to_copy = (seg_data_len < space) ? seg_data_len : space;
+                    if (to_copy > 0u) {
+                        recv_buf_write(conn, seg_data, to_copy);
+                        conn->rcv_nxt += to_copy;
+                    }
+                    fin_in_sequence = (to_copy == seg_data_len);
+                }
+                conn->rcv_wnd = recv_buf_free(conn);
+                if (!(fin_in_sequence && (flags & TCP_FLAG_FIN))) {
+                    tcp_send_segment(conn->local_ip, conn->remote_ip,
+                                     conn->local_port, conn->remote_port,
+                                     conn->snd_nxt, conn->rcv_nxt,
+                                     TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
+                }
+            } else {
+                fin_in_sequence = (seq_num == conn->rcv_nxt);
             }
-            conn->rcv_wnd = recv_buf_free(conn);
-            tcp_send_segment(conn->local_ip, conn->remote_ip,
-                             conn->local_port, conn->remote_port,
-                             conn->snd_nxt, conn->rcv_nxt,
-                             TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
-        }
 
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_nxt = seq_num + (uint32_t)seg_data_len + 1u;
-            conn->state = TCP_STATE_CLOSE_WAIT;
-            tcp_send_segment(conn->local_ip, conn->remote_ip,
-                             conn->local_port, conn->remote_port,
-                             conn->snd_nxt, conn->rcv_nxt,
-                             TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
+            /* A FIN counts only in sequence and once all the data before it
+             * is in: taking one that arrived early (or whose segment did not
+             * fit) jumped rcv_nxt past bytes never received -- a response
+             * silently cut short. */
+            if ((flags & TCP_FLAG_FIN) && fin_in_sequence) {
+                conn->rcv_nxt += 1u;
+                conn->state = TCP_STATE_CLOSE_WAIT;
+                tcp_send_segment(conn->local_ip, conn->remote_ip,
+                                 conn->local_port, conn->remote_port,
+                                 conn->snd_nxt, conn->rcv_nxt,
+                                 TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
+            }
         }
         break;
 
     case TCP_STATE_FIN_WAIT_1:
         if (flags & TCP_FLAG_ACK) {
+            tcp_ack_advance(conn, ack_num);
             if (ack_num == conn->snd_nxt) {
                 conn->snd_una = ack_num;
                 if (flags & TCP_FLAG_FIN) {
@@ -474,13 +526,18 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
         }
         break;
 
-    case TCP_STATE_FIN_WAIT_2:
-        if (seg_data_len > 0u && seq_num == conn->rcv_nxt) {
-            uint16_t space = recv_buf_free(conn);
-            uint16_t to_copy = (seg_data_len < space) ? seg_data_len : space;
-            if (to_copy > 0u) {
-                recv_buf_write(conn, seg_data, to_copy);
-                conn->rcv_nxt += to_copy;
+    case TCP_STATE_FIN_WAIT_2: {
+        int fin_ok = (seq_num == conn->rcv_nxt);
+        if (seg_data_len > 0u) {
+            fin_ok = 0;
+            if (seq_num == conn->rcv_nxt) {
+                uint16_t space = recv_buf_free(conn);
+                uint16_t to_copy = (seg_data_len < space) ? seg_data_len : space;
+                if (to_copy > 0u) {
+                    recv_buf_write(conn, seg_data, to_copy);
+                    conn->rcv_nxt += to_copy;
+                }
+                fin_ok = (to_copy == seg_data_len);
             }
             conn->rcv_wnd = recv_buf_free(conn);
             tcp_send_segment(conn->local_ip, conn->remote_ip,
@@ -488,8 +545,8 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
                              conn->snd_nxt, conn->rcv_nxt,
                              TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
         }
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_nxt = seq_num + (uint32_t)seg_data_len + 1u;
+        if ((flags & TCP_FLAG_FIN) && fin_ok) {
+            conn->rcv_nxt += 1u;
             conn->state = TCP_STATE_TIME_WAIT;
             conn->time_wait_start = timer_ticks();
             tcp_send_segment(conn->local_ip, conn->remote_ip,
@@ -498,6 +555,7 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
                              TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
         }
         break;
+    }
 
     case TCP_STATE_CLOSING:
         if ((flags & TCP_FLAG_ACK) && ack_num == conn->snd_nxt) {
@@ -508,16 +566,14 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
 
     case TCP_STATE_LAST_ACK:
         if ((flags & TCP_FLAG_ACK) && ack_num == conn->snd_nxt) {
-            conn->state = TCP_STATE_CLOSED;
-            conn->in_use = 0u;
+            tcp_release_locked(conn);
         }
         break;
 
     case TCP_STATE_CLOSE_WAIT:
         if (flags & TCP_FLAG_ACK) {
-            if (ack_num > conn->snd_una && ack_num <= conn->snd_nxt) {
-                conn->snd_una = ack_num;
-            }
+            tcp_ack_advance(conn, ack_num);
+            conn->snd_wnd = window;
         }
         break;
 
@@ -587,6 +643,7 @@ int32_t tcp_connect(uint32_t remote_ip, uint16_t remote_port, uint16_t local_por
     conn->state       = TCP_STATE_SYN_SENT;
     conn->last_send_tick = timer_ticks();
     conn->parent_conn_id = -1;
+    conn->user_ref    = 1u;
     
     tcp_send_segment(conn->local_ip, conn->remote_ip,
                      conn->local_port, conn->remote_port,
@@ -624,6 +681,7 @@ int32_t tcp_listen(uint16_t port)
     conn->local_port  = port;
     conn->state       = TCP_STATE_LISTEN;
     conn->parent_conn_id = -1;
+    conn->user_ref    = 1u;
     conn->listen_backlog = 1u;
 
     spinlock_unlock(&g_tcp_lock);
@@ -674,6 +732,7 @@ int32_t tcp_accept(int32_t listen_conn_id)
             c->accept_pending != 0u &&
             c->state == TCP_STATE_ESTABLISHED) {
             c->accept_pending = 0u;
+            c->user_ref = 1u;
             spinlock_unlock(&g_tcp_lock);
             irq_restore(irq_flags);
             return (int32_t)i;
@@ -694,7 +753,8 @@ int32_t tcp_send(int32_t conn_id, const void *data, uint16_t len)
     spinlock_lock(&g_tcp_lock);
 
     tcp_connection_t *conn = &g_tcp_connections[conn_id];
-    if (conn->in_use == 0u || conn->state != TCP_STATE_ESTABLISHED) {
+    if (conn->in_use == 0u || (conn->state != TCP_STATE_ESTABLISHED &&
+                               conn->state != TCP_STATE_CLOSE_WAIT)) {
         spinlock_unlock(&g_tcp_lock);
         irq_restore(irq_flags);
         return -1;
@@ -759,10 +819,24 @@ int32_t tcp_recv(int32_t conn_id, void *buf, uint16_t buf_len)
         return -1;
     }
 
+    uint32_t old_wnd = conn->rcv_wnd;
     uint16_t n = recv_buf_read(conn, (uint8_t *)buf, buf_len);
 
-    
     conn->rcv_wnd = recv_buf_free(conn);
+    /* Window update. The sender stops once our advertised window closes and
+     * only learns it reopened from an ACK -- which, with nothing more
+     * arriving, nobody sent: the connection sat idle until the peer's
+     * persist timer probed it (seconds, growing). Announce the reopened
+     * window as soon as it is worth a full segment again (receiver-side
+     * silly-window avoidance). */
+    if (n > 0u && conn->state == TCP_STATE_ESTABLISHED &&
+        old_wnd < (uint32_t)TCP_RECV_BUF_SIZE / 2u &&
+        conn->rcv_wnd >= old_wnd + TCP_MAX_SEGMENT_DATA) {
+        tcp_send_segment(conn->local_ip, conn->remote_ip,
+                         conn->local_port, conn->remote_port,
+                         conn->snd_nxt, conn->rcv_nxt,
+                         TCP_FLAG_ACK, conn->rcv_wnd, NULL, 0);
+    }
 
     spinlock_unlock(&g_tcp_lock);
     irq_restore(irq_flags);
@@ -783,9 +857,11 @@ int32_t tcp_close(int32_t conn_id)
         return -1;
     }
 
+    conn->user_ref = 0u;
     switch (conn->state) {
     case TCP_STATE_LISTEN:
     case TCP_STATE_SYN_SENT:
+    case TCP_STATE_CLOSED:
         conn->state = TCP_STATE_CLOSED;
         conn->in_use = 0u;
         break;
@@ -876,6 +952,22 @@ uint32_t tcp_poll(int32_t conn_id, uint32_t events)
     uint32_t ready = 0u;
     if (connection->in_use == 0u || connection->state == TCP_STATE_CLOSED) {
         ready = 0x0010u;
+    } else if (connection->state == TCP_STATE_LISTEN) {
+        /* A listening socket is readable when accept() has a connection to
+         * hand out -- the same condition tcp_accept() looks for. Without
+         * this an event-driven server (epoll/poll before accept: Chromium's
+         * DevTools server, any net::TCPServerSocket) never accepted. */
+        if ((events & 0x0001u) != 0u) {
+            for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
+                const tcp_connection_t *c = &g_tcp_connections[i];
+                if (c->in_use != 0u && c->parent_conn_id == conn_id &&
+                    c->accept_pending != 0u &&
+                    c->state == TCP_STATE_ESTABLISHED) {
+                    ready |= 0x0001u;
+                    break;
+                }
+            }
+        }
     } else {
         if ((events & 0x0001u) != 0u &&
             (connection->recv_count != 0u ||
@@ -891,6 +983,29 @@ uint32_t tcp_poll(int32_t conn_id, uint32_t events)
     return ready;
 }
 
+#ifndef TCP_STALL_DUMP
+#define TCP_STALL_DUMP 0
+#endif
+#if TCP_STALL_DUMP
+#include <stdio.h>
+static void tcp_dump_connections_locked(void)
+{
+    for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
+        const tcp_connection_t *c = &g_tcp_connections[i];
+        if (c->in_use == 0u || c->state == TCP_STATE_LISTEN) continue;
+        char line[200];
+        snprintf(line, sizeof(line),
+                 "[tcp] #%u st=%d rport=%u rcv_nxt=%u rq=%u rwnd=%u snd_una=%u snd_nxt=%u sq=%u swnd=%u rtx=%u\n",
+                 (unsigned)i, (int)c->state, (unsigned)c->remote_port,
+                 (unsigned)(c->rcv_nxt - c->irs), (unsigned)c->recv_count,
+                 (unsigned)c->rcv_wnd, (unsigned)(c->snd_una - c->iss),
+                 (unsigned)(c->snd_nxt - c->iss), (unsigned)c->send_count,
+                 (unsigned)c->snd_wnd, (unsigned)c->retransmit_count);
+        serial_write_string(line);
+    }
+}
+#endif
+
 void tcp_process_timer(void)
 {
     uint32_t hz = timer_hz();
@@ -903,6 +1018,16 @@ void tcp_process_timer(void)
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_tcp_lock);
 
+#if TCP_STALL_DUMP
+    {
+        static uint64_t last_dump;
+        if (now - last_dump >= (uint64_t)hz * 15u) {
+            last_dump = now;
+            tcp_dump_connections_locked();
+        }
+    }
+#endif
+
     for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
         tcp_connection_t *c = &g_tcp_connections[i];
         if (c->in_use == 0u) continue;
@@ -910,8 +1035,7 @@ void tcp_process_timer(void)
         
         if (c->state == TCP_STATE_TIME_WAIT) {
             if ((now - c->time_wait_start) >= time_wait_ticks) {
-                c->state = TCP_STATE_CLOSED;
-                c->in_use = 0u;
+                tcp_release_locked(c);
             }
             continue;
         }
@@ -921,8 +1045,7 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
-                    c->state = TCP_STATE_CLOSED;
-                    c->in_use = 0u;
+                    tcp_release_locked(c);
                     continue;
                 }
                 c->last_send_tick = now;
@@ -946,8 +1069,7 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
-                    c->state = TCP_STATE_CLOSED;
-                    c->in_use = 0u;
+                    tcp_release_locked(c);
                     continue;
                 }
                 c->last_send_tick = now;
@@ -964,8 +1086,7 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
-                    c->state = TCP_STATE_CLOSED;
-                    c->in_use = 0u;
+                    tcp_release_locked(c);
                     continue;
                 }
                 uint32_t unacked = c->snd_nxt - c->snd_una;

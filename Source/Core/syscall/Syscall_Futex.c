@@ -1,4 +1,6 @@
+#include "Debug/serial/Serial.h"
 #include "Syscall_Main.h"
+#include "Core/memory/SharedMemory.h"
 #include "Core/process/ProcessManager.h"
 #include "Core/process/ProcessScheduler.h"
 #include "Core/usercopy/Usercopy.h"
@@ -66,6 +68,9 @@ typedef struct {
     uint64_t  uaddr;
     uint32_t  bitset;
     uint64_t  deadline_ms;
+    /* PI futexes: the waiter's TID as its own process sees it, which is
+     * what goes into the futex word when ownership is handed to it. */
+    uint32_t  word_tid;
 } futex_waiter_t;
 
 static futex_waiter_t g_futex_waiters[FUTEX_WAIT_QUEUE_SIZE];
@@ -76,6 +81,9 @@ static uint8_t        g_futex_timed_out[FUTEX_WAIT_QUEUE_SIZE];
 /* The waiter slot a Linux task's FUTEX_WAIT left queued, or -1. Indexed by
  * tid. See syscall_futex_linux_resume(). */
 static int16_t        g_futex_linux_slot[FUTEX_WAIT_QUEUE_SIZE];
+/* The user address that wait was on, so a different wait -- one made from a
+ * signal handler that interrupted the first -- is not mistaken for it. */
+static uint64_t       g_futex_linux_uaddr[FUTEX_WAIT_QUEUE_SIZE];
 
 /* g_futex_lock is taken from process context (the futex syscalls) *and* from
  * interrupt context (syscall_futex_on_timer_tick(), called out of the timer
@@ -90,6 +98,28 @@ static inline uint64_t futex_lock_irq(void)
     uint64_t flags = irq_save_disable();
     spinlock_lock(&g_futex_lock);
     return flags;
+}
+
+/* Waiters are matched on a key. For a PRIVATE futex (and for any futex on
+ * memory that is not shared between processes) that is the process and the
+ * user address. A shared futex -- no FUTEX_PRIVATE_FLAG -- on a shared-memory
+ * mapping is keyed on the mapped object and the offset in it instead, so a
+ * waiter and a waker in two processes that map the object at different
+ * addresses meet (Linux keys these on the backing page). */
+#define FUTEX_SHARED_KEY_PID (-2)
+
+static void futex_key_for(uint64_t uaddr, int shared, int32_t *key_pid,
+                          uint64_t *key_addr)
+{
+    *key_pid = process_get_current_pid();
+    *key_addr = uaddr;
+    if (shared) {
+        uint64_t k = shared_memory_addr_key(uaddr);
+        if (k != 0u) {
+            *key_pid = FUTEX_SHARED_KEY_PID;
+            *key_addr = k;
+        }
+    }
 }
 
 static inline void futex_unlock_irq(uint64_t flags)
@@ -137,7 +167,7 @@ static void futex_gc_locked(void)
 
 static int64_t futex_wait_common(uint64_t uaddr, int32_t expected,
                                  uint64_t timeout_ns, uint32_t bitset,
-                                 int *restart_out)
+                                 int *restart_out, int shared)
 {
     uint64_t futex_flags = 0;
     futex_ensure_init();
@@ -202,16 +232,20 @@ static int64_t futex_wait_common(uint64_t uaddr, int32_t expected,
         futex_unlock_irq(futex_flags);
         return FUTEX_EINTR; /* never ENOMEM: see FUTEX_EINTR above */
     }
+    int32_t key_pid;
+    uint64_t key_addr;
+    futex_key_for(uaddr, shared, &key_pid, &key_addr);
     g_futex_waiters[slot].used        = 1;
     g_futex_waiters[slot].tid         = tid;
-    g_futex_waiters[slot].owner_pid   = owner_pid;
-    g_futex_waiters[slot].uaddr       = uaddr;
+    g_futex_waiters[slot].owner_pid   = key_pid;
+    g_futex_waiters[slot].uaddr       = key_addr;
     g_futex_waiters[slot].bitset      = bitset ? bitset : 0xFFFFFFFFu;
     g_futex_waiters[slot].deadline_ms = deadline;
     if (tid < FUTEX_WAIT_QUEUE_SIZE) {
         g_futex_timed_out[tid] = 0u;
         if (restart_out != NULL) {
             g_futex_linux_slot[tid] = (int16_t)slot;
+            g_futex_linux_uaddr[tid] = uaddr;
         }
     }
     futex_unlock_irq(futex_flags);
@@ -233,7 +267,7 @@ static int64_t futex_wait_common(uint64_t uaddr, int32_t expected,
 int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
                            uint64_t timeout_ns, uint32_t bitset)
 {
-    return futex_wait_common(uaddr, expected, timeout_ns, bitset, NULL);
+    return futex_wait_common(uaddr, expected, timeout_ns, bitset, NULL, 1);
 }
 
 /* FUTEX_WAIT for a Linux task: queues the waiter, blocks, and asks for the
@@ -241,13 +275,13 @@ int64_t syscall_futex_wait(uint64_t uaddr, int32_t expected,
  * by syscall_futex_linux_resume() on re-entry. */
 int64_t syscall_futex_wait_linux(uint64_t uaddr, int32_t expected,
                                  uint64_t timeout_ns, uint32_t bitset,
-                                 int *restart_out)
+                                 int *restart_out, int shared)
 {
     if (restart_out != NULL) {
         *restart_out = 0;
     }
     return futex_wait_common(uaddr, expected, timeout_ns, bitset,
-                             restart_out);
+                             restart_out, shared);
 }
 
 /* The second half of a Linux FUTEX_WAIT.
@@ -270,7 +304,8 @@ int64_t syscall_futex_wait_linux(uint64_t uaddr, int32_t expected,
  * returns 0, or ETIMEDOUT if the timer removed it. Returns 1 when the calling
  * task was resuming such a wait (and fills in the outputs), 0 when it was not.
  */
-int syscall_futex_linux_resume(int64_t *result_out, int *restart_out)
+int syscall_futex_linux_resume(uint64_t uaddr, int64_t *result_out,
+                               int *restart_out)
 {
     futex_ensure_init();
     *restart_out = 0;
@@ -282,6 +317,22 @@ int syscall_futex_linux_resume(int64_t *result_out, int *restart_out)
     uint64_t futex_flags = futex_lock_irq();
     int16_t slot = g_futex_linux_slot[tid];
     if (slot < 0) {
+        futex_unlock_irq(futex_flags);
+        return 0;
+    }
+    if (g_futex_linux_uaddr[tid] != uaddr) {
+        /* Not the wait that was left pending: a signal handler interrupted
+         * that one and is now waiting on something else. Taking this for a
+         * resume made an untimed wait return the old one's ETIMEDOUT (glibc:
+         * "The futex facility returned an unexpected error code.", abort) or
+         * sleep on the old address. Drop the stale wait -- the interrupted
+         * code re-issues it when the handler returns, as it would after
+         * EINTR -- and let this one start from scratch. */
+        if (g_futex_waiters[slot].used && g_futex_waiters[slot].tid == tid) {
+            g_futex_waiters[slot].used = 0;
+        }
+        g_futex_linux_slot[tid] = -1;
+        g_futex_timed_out[tid] = 0u;
         futex_unlock_irq(futex_flags);
         return 0;
     }
@@ -312,7 +363,16 @@ int syscall_futex_linux_resume(int64_t *result_out, int *restart_out)
     return 1;
 }
 
+static int64_t futex_wake_key(uint64_t uaddr, int32_t count, uint32_t bitset,
+                              int shared);
+
 int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
+{
+    return futex_wake_key(uaddr, count, bitset, 1);
+}
+
+static int64_t futex_wake_key(uint64_t uaddr, int32_t count, uint32_t bitset,
+                              int shared)
 {
     uint64_t futex_flags = 0;
     futex_ensure_init();
@@ -328,14 +388,16 @@ int64_t syscall_futex_wake(uint64_t uaddr, int32_t count, uint32_t bitset)
         return -14;
     }
 
-    int32_t owner_pid = process_get_current_pid();
+    int32_t owner_pid;
+    uint64_t key_addr;
+    futex_key_for(uaddr, shared, &owner_pid, &key_addr);
     int32_t tids[FUTEX_WAIT_QUEUE_SIZE];
     int32_t woken = 0;
     futex_flags = futex_lock_irq();
     for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE && woken < count; ++i) {
         if (g_futex_waiters[i].used &&
             g_futex_waiters[i].owner_pid == owner_pid &&
-            g_futex_waiters[i].uaddr == uaddr &&
+            g_futex_waiters[i].uaddr == key_addr &&
             (g_futex_waiters[i].bitset & bitset) != 0) {
             tids[woken] = g_futex_waiters[i].tid;
             g_futex_waiters[i].used = 0;
@@ -390,7 +452,7 @@ void syscall_futex_on_timer_tick(void)
  * operation is aborted with EAGAIN (matches Linux semantics). */
 static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
                                      int32_t nr_requeue, uint64_t uaddr2,
-                                     const int32_t *expected)
+                                     const int32_t *expected, int shared)
 {
     uint64_t futex_flags = 0;
     futex_ensure_init();
@@ -399,7 +461,12 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
         return -14;
     }
 
-    int32_t owner_pid = process_get_current_pid();
+    int32_t owner_pid;
+    uint64_t key1;
+    futex_key_for(uaddr, shared, &owner_pid, &key1);
+    int32_t owner2;
+    uint64_t key2;
+    futex_key_for(uaddr2, shared, &owner2, &key2);
     int32_t tids[FUTEX_WAIT_QUEUE_SIZE];
     int32_t woken = 0;
     int32_t moved = 0;
@@ -421,7 +488,7 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
     for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE && woken < nr_wake; ++i) {
         if (g_futex_waiters[i].used &&
             g_futex_waiters[i].owner_pid == owner_pid &&
-            g_futex_waiters[i].uaddr == uaddr) {
+            g_futex_waiters[i].uaddr == key1) {
             tids[woken] = g_futex_waiters[i].tid;
             g_futex_waiters[i].used = 0;
             ++woken;
@@ -430,8 +497,9 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
     for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE && moved < nr_requeue; ++i) {
         if (g_futex_waiters[i].used &&
             g_futex_waiters[i].owner_pid == owner_pid &&
-            g_futex_waiters[i].uaddr == uaddr) {
-            g_futex_waiters[i].uaddr = uaddr2;
+            g_futex_waiters[i].uaddr == key1) {
+            g_futex_waiters[i].owner_pid = owner2;
+            g_futex_waiters[i].uaddr = key2;
             ++moved;
         }
     }
@@ -449,7 +517,7 @@ static int64_t syscall_futex_requeue(uint64_t uaddr, int32_t nr_wake,
  * on uaddr2 too. Used by glibc's futex-based rwlocks/condvars. */
 static int64_t syscall_futex_wake_op(uint64_t uaddr, int32_t nr_wake,
                                      int32_t nr_wake2, uint64_t uaddr2,
-                                     uint32_t val3)
+                                     uint32_t val3, int shared)
 {
     uint64_t futex_flags = 0;
     futex_ensure_init();
@@ -505,13 +573,13 @@ static int64_t syscall_futex_wake_op(uint64_t uaddr, int32_t nr_wake,
         default: cmp_result = 0; break;
     }
 
-    int64_t woken1 = syscall_futex_wake(uaddr, nr_wake, 0xFFFFFFFFu);
+    int64_t woken1 = futex_wake_key(uaddr, nr_wake, 0xFFFFFFFFu, shared);
     if (woken1 < 0) {
         return woken1;
     }
     int64_t woken2 = 0;
     if (cmp_result && nr_wake2 > 0) {
-        woken2 = syscall_futex_wake(uaddr2, nr_wake2, 0xFFFFFFFFu);
+        woken2 = futex_wake_key(uaddr2, nr_wake2, 0xFFFFFFFFu, shared);
         if (woken2 < 0) {
             woken2 = 0;
         }
@@ -564,6 +632,13 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
     if (tid < 0 || owner_pid < 0) {
         return -3;
     }
+    /* The word holds TIDs the way the process sees them: glibc writes its
+     * own (gettid()) value there, and inside a PID namespace -- every
+     * Chromium renderer and the zygote -- that is not the kernel's number.
+     * Comparing against the global TID made UNLOCK_PI fail with EPERM,
+     * which glibc answers with "The futex facility returned an unexpected
+     * error code." and abort(). */
+    uint32_t self_word = (uint32_t)process_pid_as_seen_by_current(tid);
 
     futex_flags = futex_lock_irq();
     uint32_t word = 0;
@@ -574,7 +649,7 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
     uint32_t cur_owner = word & FUTEX_TID_MASK;
 
     if (cur_owner == 0u) {
-        uint32_t newword = (uint32_t)tid;
+        uint32_t newword = self_word;
         if (futex_uaddr_has_waiter_locked(owner_pid, uaddr, -1)) {
             newword |= FUTEX_WAITERS;
         }
@@ -584,7 +659,7 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
         if (rc) return -14;
         return died ? FUTEX_EOWNERDEAD : 0;
     }
-    if (cur_owner == (uint32_t)tid) {
+    if (cur_owner == self_word) {
         futex_unlock_irq(futex_flags);
         return FUTEX_EDEADLK;
     }
@@ -620,6 +695,7 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
     g_futex_waiters[slot].uaddr       = uaddr;
     g_futex_waiters[slot].bitset      = 0xFFFFFFFFu;
     g_futex_waiters[slot].deadline_ms = 0;
+    g_futex_waiters[slot].word_tid    = self_word;
     futex_unlock_irq(futex_flags);
 
     if (process_block_current() < 0) {
@@ -639,13 +715,153 @@ static int64_t syscall_futex_lock_pi(uint64_t uaddr, int try_only)
         futex_unlock_irq(futex_flags);
         return -14;
     }
-    int owned = ((word & FUTEX_TID_MASK) == (uint32_t)tid);
+    int owned = ((word & FUTEX_TID_MASK) == self_word);
     int died = (word & FUTEX_OWNER_DIED) != 0u;
     futex_unlock_irq(futex_flags);
     if (owned) {
         return died ? FUTEX_EOWNERDEAD : 0;
     }
     return FUTEX_EAGAIN_;
+}
+
+/* The PI futex a Linux task is waiting on across restarts of its LOCK_PI,
+ * or 0. Indexed by tid. */
+static uint64_t g_futex_pi_pending[FUTEX_WAIT_QUEUE_SIZE];
+
+/* FUTEX_LOCK_PI / LOCK_PI2 / TRYLOCK_PI for a Linux task.
+ *
+ * glibc's pthread_mutex_lock() only goes to the kernel when the word is
+ * owned by someone else, and whatever FUTEX_LOCK_PI returns other than
+ * ESRCH/EDEADLK it takes to mean "you own it now". The old implementation
+ * queued the waiter, called process_block_current() -- which only marks the
+ * task blocked; the sleep happens on the way out of the syscall -- then
+ * looked at the word straight away, found it still owned, and returned
+ * EAGAIN. So every contended lock_pi "succeeded" without the lock: two
+ * threads in the critical section, and the unlock that followed read a word
+ * that was not its own and got EPERM, which glibc reports as "The futex
+ * facility returned an unexpected error code." and aborts on.
+ *
+ * Like FUTEX_WAIT, this now finishes across restarts of the syscall: a pass
+ * that has to wait queues the task, blocks it and asks to be re-run. A later
+ * pass sees either the word handed to it by FUTEX_UNLOCK_PI (success), a
+ * free word (take it), or still someone else's (sleep again). */
+int64_t syscall_futex_lock_pi_linux(uint64_t uaddr, int try_only,
+                                    int *restart_out)
+{
+    *restart_out = 0;
+    futex_ensure_init();
+
+    int32_t *ptr = (int32_t *)(uintptr_t)uaddr;
+    if (uaddr == 0u || (uaddr & 3u) != 0u ||
+        !process_user_buffer_is_valid(ptr, sizeof(int32_t))) {
+        return -14;
+    }
+    int32_t tid = process_get_current_tid();
+    int32_t owner_pid = process_get_current_pid();
+    if (tid < 0 || owner_pid < 0 || tid >= FUTEX_WAIT_QUEUE_SIZE) {
+        return -3;
+    }
+    uint32_t self_word = (uint32_t)process_pid_as_seen_by_current(tid);
+    int resuming = g_futex_pi_pending[tid] == uaddr;
+
+    uint64_t futex_flags = futex_lock_irq();
+    int slot = -1;
+    for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+        if (g_futex_waiters[i].used && g_futex_waiters[i].tid == tid &&
+            g_futex_waiters[i].uaddr == uaddr) {
+            slot = i;
+            break;
+        }
+    }
+    uint32_t word = 0;
+    if (copy_from_user_trusted(&word, ptr, sizeof(word)) != 0u) {
+        if (slot >= 0) g_futex_waiters[slot].used = 0;
+        g_futex_pi_pending[tid] = 0u;
+        futex_unlock_irq(futex_flags);
+        return -14;
+    }
+    uint32_t cur_owner = word & FUTEX_TID_MASK;
+
+    if (cur_owner == self_word && resuming) {
+        /* FUTEX_UNLOCK_PI handed it over and woke us. */
+        if (slot >= 0) g_futex_waiters[slot].used = 0;
+        g_futex_pi_pending[tid] = 0u;
+        futex_unlock_irq(futex_flags);
+        return 0; /* OWNER_DIED, if set, stays in the word for glibc to see */
+    }
+    if (cur_owner == self_word) {
+        futex_unlock_irq(futex_flags);
+        return FUTEX_EDEADLK;
+    }
+    if (cur_owner == 0u) {
+        if (slot >= 0) g_futex_waiters[slot].used = 0;
+        uint32_t newword = self_word;
+        if (futex_uaddr_has_waiter_locked(owner_pid, uaddr, -1)) {
+            newword |= FUTEX_WAITERS;
+        }
+        int rc = (copy_to_user_trusted(ptr, &newword, sizeof(newword)) != 0u);
+        g_futex_pi_pending[tid] = 0u;
+        futex_unlock_irq(futex_flags);
+        if (rc) return -14;
+        return 0; /* OWNER_DIED, if set, stays in the word for glibc to see */
+    }
+    if (try_only) {
+        if (slot >= 0) g_futex_waiters[slot].used = 0;
+        g_futex_pi_pending[tid] = 0u;
+        futex_unlock_irq(futex_flags);
+        return FUTEX_EAGAIN_;
+    }
+
+    /* Owned by someone else: (stay) queued and sleep. */
+    if ((word & FUTEX_WAITERS) == 0u) {
+        uint32_t newword = word | FUTEX_WAITERS;
+        if (copy_to_user_trusted(ptr, &newword, sizeof(newword)) != 0u) {
+            if (slot >= 0) g_futex_waiters[slot].used = 0;
+            g_futex_pi_pending[tid] = 0u;
+            futex_unlock_irq(futex_flags);
+            return -14;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+            if (!g_futex_waiters[i].used) { slot = i; break; }
+        }
+        if (slot < 0) {
+            futex_gc_locked();
+            for (int i = 0; i < FUTEX_WAIT_QUEUE_SIZE; ++i) {
+                if (!g_futex_waiters[i].used) { slot = i; break; }
+            }
+        }
+        if (slot < 0) {
+            /* No room to queue: go round again rather than fail. */
+            futex_unlock_irq(futex_flags);
+            (void)process_sleep_current_ms(1u);
+            g_futex_pi_pending[tid] = uaddr;
+            *restart_out = 1;
+            return 0;
+        }
+        g_futex_waiters[slot].used        = 1;
+        g_futex_waiters[slot].tid         = tid;
+        g_futex_waiters[slot].owner_pid   = owner_pid;
+        g_futex_waiters[slot].uaddr       = uaddr;
+        g_futex_waiters[slot].bitset      = 0xFFFFFFFFu;
+        g_futex_waiters[slot].deadline_ms = 0;
+        g_futex_waiters[slot].word_tid    = self_word;
+    }
+    g_futex_pi_pending[tid] = uaddr;
+    futex_unlock_irq(futex_flags);
+
+    if (process_block_current() < 0) {
+        futex_flags = futex_lock_irq();
+        if (g_futex_waiters[slot].used && g_futex_waiters[slot].tid == tid) {
+            g_futex_waiters[slot].used = 0;
+        }
+        g_futex_pi_pending[tid] = 0u;
+        futex_unlock_irq(futex_flags);
+        return FUTEX_EINTR;
+    }
+    *restart_out = 1;
+    return 0;
 }
 
 static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
@@ -662,6 +878,13 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
     if (tid < 0 || owner_pid < 0) {
         return -3;
     }
+    /* The word holds TIDs the way the process sees them: glibc writes its
+     * own (gettid()) value there, and inside a PID namespace -- every
+     * Chromium renderer and the zygote -- that is not the kernel's number.
+     * Comparing against the global TID made UNLOCK_PI fail with EPERM,
+     * which glibc answers with "The futex facility returned an unexpected
+     * error code." and abort(). */
+    uint32_t self_word = (uint32_t)process_pid_as_seen_by_current(tid);
 
     futex_flags = futex_lock_irq();
     uint32_t word = 0;
@@ -669,7 +892,7 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
         futex_unlock_irq(futex_flags);
         return -14;
     }
-    if ((word & FUTEX_TID_MASK) != (uint32_t)tid) {
+    if ((word & FUTEX_TID_MASK) != self_word) {
         futex_unlock_irq(futex_flags);
         return FUTEX_EPERM;
     }
@@ -691,7 +914,7 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
     } else {
         wake_tid = g_futex_waiters[next].tid;
         g_futex_waiters[next].used = 0;
-        newword = (uint32_t)wake_tid;
+        newword = g_futex_waiters[next].word_tid;
         if (futex_uaddr_has_waiter_locked(owner_pid, uaddr, next)) {
             newword |= FUTEX_WAITERS;
         }
@@ -708,37 +931,70 @@ static int64_t syscall_futex_unlock_pi(uint64_t uaddr)
     return 0;
 }
 
+static int64_t syscall_futex_impl(uint64_t uaddr, uint64_t op, uint64_t val,
+                                  uint64_t timeout_or_val2, uint64_t uaddr2,
+                                  uint64_t val3);
+
 int64_t syscall_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                       uint64_t timeout_or_val2, uint64_t uaddr2,
                       uint64_t val3)
 {
+    int64_t rc = syscall_futex_impl(uaddr, op, val, timeout_or_val2, uaddr2,
+                                    val3);
+    /* glibc treats anything but EAGAIN/EINTR/ETIMEDOUT from a futex wait as
+     * "The futex facility returned an unexpected error code." and aborts
+     * the process; report those (rate limited) so the cause can be found. */
+    if (rc < 0 && rc != -11 && rc != -4 && rc != -110) {
+        static volatile uint32_t reported;
+        if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 32u) {
+            serial_write_string("[futex] error rc=");
+            serial_write_uint64((uint64_t)rc);
+            serial_write_string(" op=");
+            serial_write_uint64(op);
+            serial_write_string(" uaddr=");
+            serial_write_uint64(uaddr);
+            serial_write_string(" tid=");
+            serial_write_uint64((uint64_t)(uint32_t)process_get_current_tid());
+            serial_write_string("\n");
+        }
+    }
+    return rc;
+}
+
+static int64_t syscall_futex_impl(uint64_t uaddr, uint64_t op, uint64_t val,
+                                  uint64_t timeout_or_val2, uint64_t uaddr2,
+                                  uint64_t val3)
+{
     int cmd = (int)(op & FUTEX_CMD_MASK);
+    int shared = (op & 128u /* FUTEX_PRIVATE_FLAG */) == 0u;
 
     switch (cmd) {
         case FUTEX_WAIT:
-            return syscall_futex_wait(uaddr, (int32_t)val,
-                                      timeout_or_val2, 0xFFFFFFFFu);
+            futex_ensure_init();
+            return futex_wait_common(uaddr, (int32_t)val, timeout_or_val2,
+                                     0xFFFFFFFFu, NULL, shared);
         case FUTEX_WAKE:
-            return syscall_futex_wake(uaddr, (int32_t)val, 0xFFFFFFFFu);
+            return futex_wake_key(uaddr, (int32_t)val, 0xFFFFFFFFu, shared);
         case FUTEX_WAIT_BITSET:
-            return syscall_futex_wait(uaddr, (int32_t)val,
-                                      timeout_or_val2, (uint32_t)val3);
+            futex_ensure_init();
+            return futex_wait_common(uaddr, (int32_t)val, timeout_or_val2,
+                                     (uint32_t)val3, NULL, shared);
         case FUTEX_WAKE_BITSET:
-            return syscall_futex_wake(uaddr, (int32_t)val, (uint32_t)val3);
+            return futex_wake_key(uaddr, (int32_t)val, (uint32_t)val3, shared);
         case FUTEX_REQUEUE:
             return syscall_futex_requeue(uaddr, (int32_t)val,
                                          (int32_t)timeout_or_val2, uaddr2,
-                                         NULL);
+                                         NULL, shared);
         case FUTEX_CMP_REQUEUE: {
             int32_t expected = (int32_t)val3;
             return syscall_futex_requeue(uaddr, (int32_t)val,
                                          (int32_t)timeout_or_val2, uaddr2,
-                                         &expected);
+                                         &expected, shared);
         }
         case FUTEX_WAKE_OP:
             return syscall_futex_wake_op(uaddr, (int32_t)val,
                                          (int32_t)timeout_or_val2, uaddr2,
-                                         (uint32_t)val3);
+                                         (uint32_t)val3, shared);
         case FUTEX_LOCK_PI:
         case FUTEX_LOCK_PI2:
             return syscall_futex_lock_pi(uaddr, 0);

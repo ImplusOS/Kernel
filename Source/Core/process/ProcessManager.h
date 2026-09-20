@@ -148,6 +148,11 @@ int32_t process_fork_with_stack(uint64_t child_user_rsp);
 #define PROCESS_FORK_NEWPID   0x1u  /* child is the init of a new pid namespace */
 #define PROCESS_FORK_SHARE_FS 0x2u  /* CLONE_FS: child shares the caller's root */
 int32_t process_fork_ex(uint64_t child_user_rsp, uint32_t opts);
+/* process_fork_ex() plus CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID: the
+ * child's TID is stored at `child_settid` in the child's memory before it
+ * runs, and `child_cleartid` becomes its clear-child-tid address (0 = none). */
+int32_t process_fork_ex_tid(uint64_t child_user_rsp, uint32_t opts,
+                            uint64_t child_settid, uint64_t child_cleartid);
 void process_retire_current_thread(void);
 /* Quiesce the caller's sibling threads around a fork -- see the definitions. */
 int process_fork_hold_acquire(void);
@@ -238,6 +243,19 @@ int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
                                      uint64_t fault_addr,
                                      uint64_t *kernel_regs,
                                      uint64_t *cpu_frame);
+/* Same, for any synchronous CPU exception: builds the Linux signal frame for
+ * `signum` (siginfo si_code/si_addr, uc_mcontext trapno/err) and rewrites the
+ * ISR's register window and CPU frame so its iretq enters the handler.
+ * Returns 1 when delivered, 0 when the caller must terminate the task. */
+int process_signal_deliver_trap_now(int32_t pid, int32_t signum,
+                                    int32_t si_code, uint64_t si_addr,
+                                    uint64_t trapno,
+                                    uint64_t *kernel_regs,
+                                    uint64_t *cpu_frame);
+/* Timer-interrupt preemption of a task running user code; called from the
+ * timer ISR with its saved-register window (see IDT.asm isr_irq0). Returns
+ * if the task keeps the CPU, otherwise switches away and never returns. */
+void process_preempt_from_user_irq(uint64_t *isr_regs);
 #endif
 uint64_t process_signal_get_mask(void);
 int process_signal_set_mask(uint64_t mask);
@@ -265,6 +283,10 @@ void process_mark_pidns_init(int32_t pid);
 int process_get_credentials(int32_t pid, uint32_t *uid, uint32_t *gid);
 int process_set_current_credentials(uint32_t uid, uint32_t gid);
 int32_t process_pid_as_seen_by_current(int32_t real);
+/* sched_setscheduler/getscheduler state of thread `tid` (kernel tid):
+ * policy 0 = SCHED_OTHER, 1 = SCHED_FIFO, 2 = SCHED_RR. */
+int process_set_rt_policy(int32_t tid, uint8_t policy, uint8_t priority);
+int process_get_rt_policy(int32_t tid, uint8_t *policy, uint8_t *priority);
 int32_t process_pid_from_current_view(int32_t seen);
 int process_current_is_pidns_init(void);
 int32_t process_waitpid(int32_t pid, int32_t *status_out, int32_t options);

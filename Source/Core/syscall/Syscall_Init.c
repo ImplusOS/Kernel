@@ -65,9 +65,22 @@ static void syscall_init_fpu_for_cpu(void)
 #endif
 }
 
+/* Read by the assembly exit paths through %gs (Syscall_Entry.asm): keep the
+ * field offsets in step with it. */
 typedef struct {
-    uint64_t user_rsp;
-    uint64_t kernel_rsp;
+    uint64_t user_rsp;     /* gs:0 */
+    uint64_t kernel_rsp;   /* gs:8 */
+    /* gs:16/24/32 -- set by syscall_set_full_restore() when the task about to
+     * return to user mode must get back every register, RCX and R11
+     * included: one preempted by the timer in the middle of its own code, or
+     * one resuming from a signal handler through rt_sigreturn. SYSRET cannot
+     * do that (it takes RIP from RCX and RFLAGS from R11), so the exit path
+     * sees the flag, clears it, and leaves through IRETQ with these two
+     * values loaded instead. */
+    uint64_t full_restore;
+    uint64_t full_rcx;
+    uint64_t full_r11;
+    uint64_t cpu_index_plus1; /* gs:40 -- smp_get_current_cpu_id() */
 } syscall_cpu_state_t;
 
 static syscall_cpu_state_t g_syscall_cpu_state[SYSCALL_MAX_CPUS];
@@ -97,6 +110,8 @@ static void syscall_init_cpu(uint32_t cpu_id)
     uint64_t kernel_rsp = (uint64_t)(g_syscall_kernel_stack[cpu_id] + SYSCALL_KERNEL_STACK_SIZE);
     g_syscall_cpu_state[cpu_id].user_rsp = 0;
     g_syscall_cpu_state[cpu_id].kernel_rsp = kernel_rsp & ~0xFULL;
+    g_syscall_cpu_state[cpu_id].full_restore = 0;
+    g_syscall_cpu_state[cpu_id].cpu_index_plus1 = (uint64_t)cpu_id + 1u;
     syscall_init_fpu_for_cpu();
 }
 
@@ -120,6 +135,25 @@ uint64_t syscall_get_kernel_rsp(void)
 void syscall_set_kernel_rsp(uint64_t kernel_rsp)
 {
     syscall_cpu_state_current()->kernel_rsp = kernel_rsp & ~0xFULL;
+}
+
+void syscall_percpu_bind(uint32_t cpu_id)
+{
+    if (cpu_id >= SYSCALL_MAX_CPUS) {
+        return;
+    }
+    g_syscall_cpu_state[cpu_id].cpu_index_plus1 = (uint64_t)cpu_id + 1u;
+#if !defined(__aarch64__)
+    wrmsr(IA32_GS_BASE, (uint64_t)&g_syscall_cpu_state[cpu_id]);
+#endif
+}
+
+void syscall_set_full_restore(int enabled, uint64_t rcx, uint64_t r11)
+{
+    syscall_cpu_state_t *st = syscall_cpu_state_current();
+    st->full_rcx = rcx;
+    st->full_r11 = r11;
+    st->full_restore = enabled ? 1u : 0u;
 }
 
 void syscall_init_per_cpu(void) {

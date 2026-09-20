@@ -81,6 +81,11 @@ static void lapic_timer_handler(void) {
     }
 #endif
     if (smp_get_current_cpu_id() != 0u) {
+        /* Not counted in g_ticks (CPU0 keeps time), but the core handler
+         * still has per-CPU scheduling work to do on an AP. */
+        if (g_timer_callback) {
+            g_timer_callback();
+        }
         return;
     }
     __atomic_fetch_add(&g_ticks, 1u, __ATOMIC_RELAXED);

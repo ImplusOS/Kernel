@@ -445,6 +445,38 @@ int shared_memory_addr_is_mapped(uint64_t addr)
     return hit;
 }
 
+uint64_t shared_memory_addr_key(uint64_t addr)
+{
+    int32_t caller = shm_current_asid();
+    if (caller < 0) {
+        return 0u;
+    }
+    shared_memory_init_once();
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_shared_memory_lock);
+    uint64_t key = 0u;
+    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX && key == 0u; ++o) {
+        const shared_object_t *object = &g_shared_objects[o];
+        if (!object->used) continue;
+        for (uint32_t i = 0u; i < object->mapping_count; ++i) {
+            const shared_mapping_t *mapping = &object->mappings[i];
+            if (mapping->pid != caller) continue;
+            if (addr >= mapping->address &&
+                addr < mapping->address + (uint64_t)object->size) {
+                /* Object slot + generation + offset: the same for every
+                 * process that maps the object, wherever it maps it. */
+                key = (1ull << 63) | ((uint64_t)o << 48) |
+                      ((uint64_t)(object->generation & 0xFFFFu) << 32) |
+                      (addr - mapping->address);
+                break;
+            }
+        }
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+    irq_restore(irq);
+    return key;
+}
+
 int32_t shared_memory_close(int32_t handle)
 {
     int32_t caller = shm_current_asid();

@@ -12,6 +12,7 @@
 #include "Core/process/ProcessManager.h"
 #include "Core/process/ProcessScheduler.h"
 #include "Platform/interrupt/Interrupts.h"
+#include "Platform/interrupt/LAPIC.h"
 #include "smp/SMP_Main.h"
 #include "Debug/serial/Serial.h"
 #include "Core/debug/FlightRec.h"
@@ -374,6 +375,17 @@ void general_protection_fault_handler(const uint64_t *gpregs,
      * user-space RIP. If the thread cannot be named it cannot be killed
      * either, but this CPU can still go find other work instead of taking the
      * machine down. */
+    if (from_user && pid >= 0 &&
+        process_signal_deliver_trap_now(pid, 11 /* SIGSEGV */,
+                                        0x80 /* SI_KERNEL */, 0, 13u,
+                                        (uint64_t *)(uintptr_t)gpregs,
+                                        (uint64_t *)(uintptr_t)frame)) {
+        /* Linux turns a user #GP (a non-canonical access, a privileged
+         * instruction) into SIGSEGV, and programs rely on catching it: V8's
+         * sandbox and wasm trap handling, and Chromium's crash reporter.
+         * The ISR's IRETQ now enters the handler. */
+        return;
+    }
     if (from_user) {
         extern const char *process_get_current_name_str(void);
         extern void process_debug_dump_pid(int32_t pid);
@@ -464,7 +476,7 @@ void general_protection_fault_handler(const uint64_t *gpregs,
         }
 
         if (pid >= 0 || tid >= 0) {
-            process_exit_current_signaled(4 /* SIGILL: int3/ud2/priv-insn */);
+            process_exit_current_signaled(11 /* SIGSEGV, as on Linux */);
         } else {
             serial_write_string("[OS] [#GP] no current thread on this CPU; "
                                 "parking instead of panicking\n");
@@ -479,6 +491,115 @@ void general_protection_fault_handler(const uint64_t *gpregs,
 
     panic_exception("general_protection", 13, error_code, rip,
                     (uint64_t)(uintptr_t)frame, rbp, 0);
+}
+
+static const char *cpu_exception_name(uint64_t vector)
+{
+    switch (vector) {
+    case 0:  return "divide_error";
+    case 1:  return "debug";
+    case 3:  return "breakpoint";
+    case 4:  return "overflow";
+    case 5:  return "bound_range";
+    case 6:  return "invalid_opcode";
+    case 7:  return "device_not_available";
+    case 10: return "invalid_tss";
+    case 11: return "segment_not_present";
+    case 12: return "stack_segment";
+    case 16: return "x87_fpu_error";
+    case 17: return "alignment_check";
+    case 19: return "simd_fp_error";
+    default: return "cpu_exception";
+    }
+}
+
+/* si_code for SIGFPE from an SSE exception: the unmasked flag that is set. */
+static int32_t simd_fpe_code(void)
+{
+    uint32_t mxcsr = 0;
+    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));
+    uint32_t pending = mxcsr & ~(mxcsr >> 7) & 0x3Fu;
+    if (pending & 0x01u) return 7; /* FPE_FLTINV */
+    if (pending & 0x04u) return 3; /* FPE_FLTDIV */
+    if (pending & 0x08u) return 4; /* FPE_FLTOVF */
+    if (pending & 0x10u) return 5; /* FPE_FLTUND */
+    if (pending & 0x20u) return 6; /* FPE_FLTRES */
+    if (pending & 0x02u) return 7; /* denormal: report as invalid */
+    return 0;
+}
+
+/* See isr_exc_common (IDT.asm). gpregs: SAVE_REGS window (r15 at [0] ...
+ * rax at [14]); frame: [0]=error [1]=rip [2]=cs [3]=rflags [4]=rsp [5]=ss.
+ * Returns only when the interrupted context is to resume. */
+void cpu_exception_handler(uint64_t *gpregs, uint64_t vector, uint64_t *frame)
+{
+    flight_rec(FR_TAG_GP, frame[1], vector);
+    if ((frame[2] & 0x3ULL) != 0x3ULL) {
+        panic_exception(cpu_exception_name(vector), vector, frame[0], frame[1],
+                        (uint64_t)(uintptr_t)frame, gpregs[8], 0);
+    }
+
+    /* The Linux mapping (arch/x86/kernel/traps.c). */
+    int32_t signum;
+    int32_t si_code;
+    uint64_t si_addr = frame[1];
+    switch (vector) {
+    case 0:  signum = 8;  si_code = 1;    break; /* SIGFPE FPE_INTDIV */
+    case 1:  signum = 5;  si_code = 2;    break; /* SIGTRAP TRAP_TRACE */
+    case 3:  signum = 5;  si_code = 0x80; si_addr = 0; break; /* SIGTRAP SI_KERNEL */
+    case 6:  signum = 4;  si_code = 2;    break; /* SIGILL ILL_ILLOPN */
+    case 16: signum = 8;  si_code = 0;    break; /* SIGFPE */
+    case 19: signum = 8;  si_code = simd_fpe_code(); break;
+    case 17: signum = 7;  si_code = 1;    break; /* SIGBUS BUS_ADRALN */
+    case 12: signum = 7;  si_code = 0x80; si_addr = 0; break; /* SIGBUS */
+    default: signum = 11; si_code = 0x80; si_addr = 0; break; /* SIGSEGV */
+    }
+    if (vector == 1) {
+        frame[3] &= ~0x100ULL; /* TF: do not trap again on the way back */
+    }
+
+    int32_t pid = process_get_current_pid();
+    if (pid >= 0 &&
+        process_signal_deliver_trap_now(pid, signum, si_code, si_addr, vector,
+                                        gpregs, frame)) {
+        return;
+    }
+
+    {
+        extern const char *process_get_current_name_str(void);
+        extern void process_exit_current_signaled(int32_t signum);
+        const char *pn = process_get_current_name_str();
+        serial_write_string("[OS] [EXC] user ");
+        serial_write_string(cpu_exception_name(vector));
+        serial_write_string(" -> signal ");
+        serial_write_uint32((uint32_t)signum);
+        serial_write_string(" pid=");
+        serial_write_uint64((uint64_t)(uint32_t)pid);
+        serial_write_string(" tid=");
+        serial_write_uint64((uint64_t)(uint32_t)process_get_current_tid());
+        serial_write_string(" name=");
+        serial_write_string(pn ? pn : "?");
+        serial_write_string(" rip=");
+        serial_write_uint64(frame[1]);
+        serial_write_string(" rsp=");
+        serial_write_uint64(frame[4]);
+        serial_write_string("\n");
+        if (pid >= 0 || process_get_current_tid() >= 0) {
+            process_exit_current_signaled(signum);
+        }
+    }
+
+    while (!process_run_next_on_current_cpu()) {
+        hal_cpu_enable_interrupts();
+        hal_cpu_halt();
+    }
+}
+
+void resched_ipi_handler(void)
+{
+    lapic_eoi();
+    /* Whatever this CPU was doing, have it look for other work. */
+    process_scheduler_request_reschedule();
 }
 
 void machine_check_handler(uint64_t rip, uint64_t rsp, uint64_t rbp)
@@ -539,9 +660,38 @@ void init_idt(void)
     set_interrupt_handler_with_ist(2, isr_nmi, 2);
     set_interrupt_handler_with_ist(8, isr_double_fault, 1);
     set_interrupt_handler(13, isr_general_protection);
+    {
+        extern void isr_exc_0(void);  extern void isr_exc_1(void);
+        extern void isr_exc_3(void);  extern void isr_exc_4(void);
+        extern void isr_exc_5(void);  extern void isr_exc_6(void);
+        extern void isr_exc_7(void);  extern void isr_exc_10(void);
+        extern void isr_exc_11(void); extern void isr_exc_12(void);
+        extern void isr_exc_16(void); extern void isr_exc_17(void);
+        extern void isr_exc_19(void);
+        set_interrupt_handler(0, isr_exc_0);
+        set_interrupt_handler(1, isr_exc_1);
+        set_interrupt_handler(3, isr_exc_3);
+        /* int3 is a user instruction (Chromium's CHECK is `int3; ud2`):
+         * with a DPL-0 gate it arrived as #GP instead of #BP. */
+        idt[3].type_attr = 0xEE;
+        set_interrupt_handler(4, isr_exc_4);
+        set_interrupt_handler(5, isr_exc_5);
+        set_interrupt_handler(6, isr_exc_6);
+        set_interrupt_handler(7, isr_exc_7);
+        set_interrupt_handler(10, isr_exc_10);
+        set_interrupt_handler(11, isr_exc_11);
+        set_interrupt_handler(12, isr_exc_12);
+        set_interrupt_handler(16, isr_exc_16);
+        set_interrupt_handler(17, isr_exc_17);
+        set_interrupt_handler(19, isr_exc_19);
+    }
     set_interrupt_handler(14, isr_page_fault);
     set_interrupt_handler(18, isr_machine_check);
     set_interrupt_handler(VECTOR_TLB_SHOOTDOWN, isr_tlb_shootdown);
+    {
+        extern void isr_resched(void);
+        set_interrupt_handler(VECTOR_RESCHED, isr_resched);
+    }
 
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint64_t)&idt;
@@ -669,6 +819,17 @@ int32_t page_fault_handler(uint64_t error_code,
                                                   uint64_t rip, uint32_t error_code,
                                                   int is_guard);
             process_record_page_fault(pid, cr2, rip, (uint32_t)error_code, 0);
+            pf_serviced = 1;
+        }
+        /* Once more, after the handlers: a sibling thread can finish mapping
+         * the page between the check above (still absent) and the demand-zero
+         * handler's first look (present now), which then declines it as
+         * "nothing to fill in". Chromium's renderers died of exactly this --
+         * a user write fault on a page whose PTE, by the time it was dumped,
+         * was present and writable. */
+        if (!pf_serviced &&
+            paging_access_is_now_permitted(cr3, cr2, error_code)) {
+            paging_invalidate_page(cr2);
             pf_serviced = 1;
         }
     }

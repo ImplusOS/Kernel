@@ -65,6 +65,12 @@ syscall_entry:
     sub rsp, 8
     call process_scheduler_clear_leaving_pid
     add rsp, 8
+
+    ; The task being resumed may need RCX and R11 back as well (it was
+    ; preempted in its own code, or is returning from a signal handler):
+    ; SYSRET cannot give it that, IRETQ can. See syscall_set_full_restore().
+    cmp qword [gs:16], 0
+    jne .full_restore
     
     pop rax
     pop rdx
@@ -87,10 +93,53 @@ syscall_entry:
     swapgs
     o64 sysret
 
+; Frame at RSP: [0]=rax [1]=rdx [2]=rsi [3]=rdi [4]=r8 [5]=r9 [6]=r10
+; [7]=r12 [8]=r13 [9]=r14 [10]=r15 [11]=rbx [12]=rbp [13]=rip [14]=rflags.
+; Slots 10..14 are reused in place as the IRETQ frame once their contents
+; are in registers.
+.full_restore:
+    mov qword [gs:16], 0
+    mov r15, [rsp + 10 * 8]
+    mov rbx, [rsp + 11 * 8]
+    mov rbp, [rsp + 12 * 8]
+    mov rcx, [rsp + 13 * 8]         ; rip
+    mov r11, [rsp + 14 * 8]         ; rflags
+    mov rax, [gs:0]                 ; user rsp
+    mov [rsp + 10 * 8], rcx
+    mov qword [rsp + 11 * 8], (0x28 | 3)   ; user cs
+    mov [rsp + 12 * 8], r11
+    mov [rsp + 13 * 8], rax
+    mov qword [rsp + 14 * 8], (0x20 | 3)   ; user ss
+    mov rax, [rsp + 0 * 8]
+    mov rdx, [rsp + 1 * 8]
+    mov rsi, [rsp + 2 * 8]
+    mov rdi, [rsp + 3 * 8]
+    mov r8,  [rsp + 4 * 8]
+    mov r9,  [rsp + 5 * 8]
+    mov r10, [rsp + 6 * 8]
+    mov r12, [rsp + 7 * 8]
+    mov r13, [rsp + 8 * 8]
+    mov r14, [rsp + 9 * 8]
+    mov rcx, [gs:24]
+    mov r11, [gs:32]
+    add rsp, 10 * 8
+    swapgs
+    iretq
+
 syscall_enter_user_from_frame:
     cli
     cld
     mov rbx, rdi
+    mov r12, rsi
+
+    ; RSP is on the next task's kernel stack now; the previous task's stack
+    ; (which the caller was running on) is no longer in use, so it may be
+    ; picked by another CPU -- same as syscall_entry does after its switch.
+    mov rsp, rbx
+    and rsp, ~0xF
+    call process_scheduler_clear_leaving_pid
+    mov rsp, rbx
+    mov rsi, r12
 
     mov rax, [rbx + (13 * 8)]
     mov rdx, [rbx + (14 * 8)]
@@ -115,6 +164,12 @@ syscall_enter_user_from_frame:
     mov rbp, [rbx + (12 * 8)]
     mov rcx, [rbx + (13 * 8)]
     mov r11, [rbx + (14 * 8)]
+    cmp qword [gs:16], 0
+    je .enter_plain
+    mov qword [gs:16], 0
+    mov rcx, [gs:24]
+    mov r11, [gs:32]
+.enter_plain:
     mov rbx, [rbx + (11 * 8)]
     
     swapgs

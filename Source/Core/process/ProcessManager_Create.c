@@ -654,6 +654,10 @@ static void reset_process_slot(process_t *proc)
     process_clear_sleep_deadline_for_proc_locked(proc);
 
     proc->state = PROCESS_STATE_UNUSED;
+    proc->full_restore = 0;
+    proc->rt_policy = 0;
+    proc->rt_priority = 0;
+    proc->wake_boost = 0;
     proc->is_thread = 0;
     proc->thread_detached = 0;
     proc->user_stack_exchanged = 0;
@@ -928,7 +932,7 @@ typedef struct {
     uint64_t trapno;
     uint64_t oldmask;
     uint64_t cr2;
-    uint64_t fpstate; /* always 0 here: no FPU/XSAVE state is captured */
+    uint64_t fpstate; /* user address of the 512-byte FXSAVE image, or 0 */
     uint64_t reserved1[8];
 } linux_sigcontext_t; /* 256 bytes, matches Linux asm/sigcontext.h */
 
@@ -970,12 +974,18 @@ typedef struct {
  * on success, <0 on failure (bad handler/mask copy, corrupt stack, OOM
  * of stack space) - the caller should then fall back to terminating the
  * process, exactly like the pre-existing "no handler" behavior. */
+/* Size of the FXSAVE image stored above the rt_sigframe and pointed to by
+ * uc_mcontext.fpstate (Linux's struct _fpstate_64 without the XSAVE tail). */
+#define LINUX_SIGFRAME_FPSTATE_SIZE 512u
+
 static int write_signal_frame_locked(process_t *proc, int32_t signum,
                                      uint64_t handler,
                                      const linux_gpregs_t *regs,
                                      uint64_t old_rip, uint64_t old_rsp,
                                      uint64_t old_rflags, uint64_t si_addr,
                                      int32_t si_code,
+                                     const uint8_t *fxstate,
+                                     uint64_t trapno, uint64_t err,
                                      uint64_t *out_new_rip,
                                      uint64_t *out_new_rsp)
 {
@@ -999,14 +1009,25 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
         base = old_rsp - 128ULL; /* skip the SysV red zone */
     }
 
-    uint64_t sp = base - sizeof(linux_rt_sigframe_t);
+    /* Linux layout: the FPU image sits above the frame, 64-byte aligned.
+     * The interrupted code's vector registers and MXCSR have to survive the
+     * handler: glibc and the compiler assume a signal never changes them,
+     * and Chromium's handlers (and the code they call) use SSE freely. */
+    uint64_t fp_addr = 0;
+    uint64_t sp = base;
+    if (fxstate != NULL) {
+        sp -= LINUX_SIGFRAME_FPSTATE_SIZE;
+        sp &= ~0x3FULL;
+        fp_addr = sp;
+    }
+    sp -= sizeof(linux_rt_sigframe_t);
     sp &= ~0xFULL;
     sp -= 8ULL; /* land at sp%16==8, matching "just after a call" ABI state */
 
     uint64_t stack_low = use_altstack ? proc->altstack_sp : proc->user_stack_base;
     uint64_t stack_high = use_altstack ?
         (proc->altstack_sp + proc->altstack_size) : proc->user_stack_top;
-    if (sp < stack_low || sp + sizeof(linux_rt_sigframe_t) > stack_high) {
+    if (sp < stack_low || base > stack_high) {
         return -1; /* Would overflow the target stack. */
     }
 
@@ -1030,10 +1051,10 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
     mc->rcx = regs->rcx; mc->rsp = old_rsp;    mc->rip = old_rip;
     mc->eflags = old_rflags;
     mc->cs = 0; mc->gs = 0; mc->fs = 0; mc->ss = 0;
-    mc->err = 0; mc->trapno = (uint64_t)(signum == LINUX_SIGSEGV ? 14 : 0);
+    mc->err = err; mc->trapno = trapno;
     mc->oldmask = proc->signal_mask;
-    mc->cr2 = (signum == LINUX_SIGSEGV) ? si_addr : 0;
-    mc->fpstate = 0;
+    mc->cr2 = (trapno == 14u) ? si_addr : 0;
+    mc->fpstate = fp_addr;
 
     memcpy(frame.uc.uc_sigmask, &proc->signal_mask, sizeof(proc->signal_mask));
 
@@ -1045,14 +1066,34 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
     uint64_t old_cr3 = paging_get_active_cr3();
     paging_switch_cr3(proc->cr3);
     int copy_ok = process_user_buffer_is_valid((void *)(uintptr_t)sp,
-                                               sizeof(frame));
+                                               (size_t)(base - sp));
+    /* Make every page of the frame present first. The memcpy below runs
+     * with g_process_table_lock held, and a demand fault taken inside it
+     * would enter the page-fault handler, which takes that same lock: the
+     * CPU deadlocks on itself and the rest follow it (a sigaltstack or a
+     * deep thread stack is lazily committed, so this is the common case,
+     * not a corner). paging_handle_swap_fault() is what that handler would
+     * have done, and it needs only its own lock. */
+    if (copy_ok) {
+        for (uint64_t pg = sp & ~0xFFFULL; pg < base; pg += 0x1000u) {
+            if (paging_virt_to_phys(proc->cr3, pg) == 0u &&
+                paging_handle_swap_fault(proc->cr3, pg) <= 0) {
+                copy_ok = 0;
+                break;
+            }
+        }
+    }
     if (copy_ok) {
 #if KERNEL_COW_FORK
         /* The target's stack may still be shared with its fork parent, and
          * this memcpy does not trap. */
-        (void)paging_user_range_break_cow(proc->cr3, sp, sizeof(frame));
+        (void)paging_user_range_break_cow(proc->cr3, sp, base - sp);
 #endif
         memcpy((void *)(uintptr_t)sp, &frame, sizeof(frame));
+        if (fp_addr != 0u) {
+            memcpy((void *)(uintptr_t)fp_addr, fxstate,
+                   LINUX_SIGFRAME_FPSTATE_SIZE);
+        }
     }
     paging_switch_cr3(old_cr3);
     if (!copy_ok) {
@@ -1134,15 +1175,25 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
     regs.rdx = frame[SYSCALL_FRAME_RDX];
     regs.rax = frame[SYSCALL_FRAME_RAX];
     /* regs.rcx / regs.r11: unrecoverable at a syscall boundary (SYSCALL
-     * itself clobbers them with the return RIP/RFLAGS) - left as 0. */
+     * itself clobbers them with the return RIP/RFLAGS) - left as 0. A task
+     * preempted in user mode, though, still has them (full_restore); they
+     * go into the frame so rt_sigreturn can put them back. */
+    if (proc->full_restore) {
+        regs.rcx = proc->full_rcx;
+        regs.r11 = proc->full_r11;
+        proc->full_restore = 0;
+    }
 
     uint64_t old_rip = frame[SYSCALL_FRAME_RCX];
     uint64_t old_rflags = frame[SYSCALL_FRAME_R11];
     uint64_t old_rsp = proc->saved_user_rsp;
 
+    /* proc is off the CPU (or its registers were just saved by the
+     * scheduler), so fpu_state is its live FPU/SSE state. */
     uint64_t new_rip = 0, new_rsp = 0;
     if (write_signal_frame_locked(proc, signum, handler, &regs, old_rip,
                                   old_rsp, old_rflags, 0, 0 /* SI_USER */,
+                                  proc->fpu_state, 0, 0,
                                   &new_rip, &new_rsp) < 0) {
         proc->exit_status = 128 + signum;
         proc->exit_by_signal = 1u;
@@ -1152,6 +1203,8 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
     }
 
     frame[SYSCALL_FRAME_RCX] = new_rip;
+    /* The handler starts with DF and TF clear, as on Linux. */
+    frame[SYSCALL_FRAME_R11] = old_rflags & ~(0x400ULL | 0x100ULL);
     frame[SYSCALL_FRAME_RDI] = (uint64_t)(uint32_t)signum;
     if ((proc->signal_flags[(uint32_t)signum] & LINUX_SA_SIGINFO) != 0u) {
         /* &frame->uc / &frame->info within the rt_sigframe just written
@@ -1236,10 +1289,11 @@ static void process_deliver_pending_signals_locked(process_t *proc)
  * directly in the signal handler; the ISR itself needs no changes.
  * Returns 1 if the frame was built (caller should resume), 0 otherwise
  * (caller should fall back to terminating the process as before). */
-int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
-                                     uint64_t fault_addr,
-                                     uint64_t *kernel_regs,
-                                     uint64_t *cpu_frame)
+int process_signal_deliver_trap_now(int32_t pid, int32_t signum,
+                                    int32_t si_code, uint64_t si_addr,
+                                    uint64_t trapno,
+                                    uint64_t *kernel_regs,
+                                    uint64_t *cpu_frame)
 {
     if (kernel_regs == NULL || cpu_frame == NULL || signum <= 0 ||
         signum >= PROCESS_SIGNAL_MAX) {
@@ -1256,6 +1310,12 @@ int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
     /* cpu_frame layout: [0]=error_code [1]=rip [2]=cs [3]=rflags [4]=rsp [5]=ss */
     enum { CF_ERR = 0, CF_RIP, CF_CS, CF_RFLAGS, CF_RSP, CF_SS };
 
+    /* The faulting thread is the one on this CPU and the kernel never
+     * touches the FPU (-mgeneral-regs-only), so the registers are still
+     * exactly what the faulting code left in them. */
+    uint8_t fxstate[512] __attribute__((aligned(16)));
+    hal_cpu_save_fpu(fxstate);
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -1267,10 +1327,15 @@ int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
     process_t *proc = &g_processes[pid];
     uint64_t handler = (signum > 0 && signum < PROCESS_SIGNAL_MAX) ?
         proc->signal_handlers[(uint32_t)signum] : 0;
-    if (handler == 0 || handler == 1u) {
-        /* No handler (default = terminate) or explicitly ignored: SIGSEGV
-         * cannot be ignored (matches Linux - an ignored SIGSEGV still
-         * kills the process), so either way the caller should terminate. */
+    /* A synchronous fault that is blocked cannot be deferred (the
+     * instruction would just fault again): Linux kills the task, and so do
+     * we, by reporting "not delivered". */
+    int blocked = (proc->signal_mask & (1ULL << ((uint32_t)signum - 1u))) != 0u;
+    if (handler == 0 || handler == 1u || blocked) {
+        /* No handler (default = terminate) or explicitly ignored: a
+         * synchronous fault cannot be ignored (matches Linux - an ignored
+         * SIGSEGV still kills the process), so either way the caller should
+         * terminate. */
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
         return 0;
@@ -1291,9 +1356,9 @@ int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
     uint64_t old_rsp = cpu_frame[CF_RSP];
 
     uint64_t new_rip = 0, new_rsp = 0;
-    int32_t si_code = 1; /* SEGV_MAPERR: we do not distinguish MAPERR/ACCERR. */
     if (write_signal_frame_locked(proc, signum, handler, &regs, old_rip,
-                                  old_rsp, old_rflags, fault_addr, si_code,
+                                  old_rsp, old_rflags, si_addr, si_code,
+                                  fxstate, trapno, cpu_frame[CF_ERR],
                                   &new_rip, &new_rsp) < 0) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
@@ -1307,11 +1372,23 @@ int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
     }
     cpu_frame[CF_RIP] = new_rip;
     cpu_frame[CF_RSP] = new_rsp;
+    /* The handler starts with DF and TF clear, as on Linux. */
+    cpu_frame[CF_RFLAGS] = old_rflags & ~(0x400ULL | 0x100ULL);
     proc->pending_signals &= ~(1u << (uint32_t)signum);
 
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
     return 1;
+}
+
+int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
+                                     uint64_t fault_addr,
+                                     uint64_t *kernel_regs,
+                                     uint64_t *cpu_frame)
+{
+    /* SEGV_MAPERR: we do not distinguish MAPERR/ACCERR. Page fault = 14. */
+    return process_signal_deliver_trap_now(pid, signum, 1, fault_addr, 14u,
+                                           kernel_regs, cpu_frame);
 }
 #endif
 
@@ -1364,6 +1441,47 @@ int64_t process_signal_rt_sigreturn(uint64_t saved_rsp)
     }
 
     const linux_sigcontext_t *mc = &uc.uc_mcontext;
+
+    /* A handler may point the context anywhere (V8's wasm trap handler
+     * redirects RIP to a landing pad), but returning to a non-canonical RIP
+     * would fault on the kernel's own IRETQ/SYSRET. Linux delivers SIGSEGV
+     * for this; terminating is the same outcome for every real program. */
+    {
+        uint64_t top = mc->rip >> 47;
+        if (top != 0u) {
+            process_exit_current_signaled(11 /* SIGSEGV */);
+            return -1;
+        }
+    }
+
+    /* The FPU/SSE state the frame was built with (or the handler's edits to
+     * it). The task is the one on this CPU and the kernel does not use the
+     * FPU, so loading it here is what the task resumes with. MXCSR's
+     * reserved bits make FXRSTOR fault, so they are masked off first. */
+    if (mc->fpstate != 0u) {
+        uint8_t fx[512] __attribute__((aligned(16)));
+        int fp_ok = 0;
+        paging_switch_cr3(cr3);
+        if (process_user_buffer_is_valid((const void *)(uintptr_t)mc->fpstate,
+                                         sizeof(fx))) {
+            memcpy(fx, (const void *)(uintptr_t)mc->fpstate, sizeof(fx));
+            fp_ok = 1;
+        }
+        paging_switch_cr3(old_cr3);
+        if (fp_ok) {
+            uint32_t mxcsr;
+            memcpy(&mxcsr, fx + 24, sizeof(mxcsr));
+            mxcsr &= 0x0000FFFFu;
+            memcpy(fx + 24, &mxcsr, sizeof(mxcsr));
+            hal_cpu_restore_fpu(fx);
+        }
+    }
+
+    /* Linux's FIX_EFLAGS: only the arithmetic/direction/alignment flags come
+     * from the frame; IF and the reserved bit 1 are forced on. TF is left
+     * out since single-step traps are not supported. */
+    uint64_t user_rflags = (mc->eflags & 0x50CD5ULL) | 0x202ULL;
+
     frame[SYSCALL_FRAME_R8]  = mc->r8;
     frame[SYSCALL_FRAME_R9]  = mc->r9;
     frame[SYSCALL_FRAME_R10] = mc->r10;
@@ -1378,7 +1496,7 @@ int64_t process_signal_rt_sigreturn(uint64_t saved_rsp)
     frame[SYSCALL_FRAME_RDX] = mc->rdx;
     frame[SYSCALL_FRAME_RAX] = mc->rax;
     frame[SYSCALL_FRAME_RCX] = mc->rip;    /* RCX slot doubles as return RIP */
-    frame[SYSCALL_FRAME_R11] = mc->eflags; /* R11 slot doubles as RFLAGS */
+    frame[SYSCALL_FRAME_R11] = user_rflags; /* R11 slot doubles as RFLAGS */
     syscall_set_user_rsp(mc->rsp);
 
     uint64_t restored_mask;
@@ -1388,7 +1506,14 @@ int64_t process_signal_rt_sigreturn(uint64_t saved_rsp)
     irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
     if (is_valid_pid(current_pid_get())) {
-        g_processes[current_pid_get()].signal_mask = restored_mask & ~unmaskable;
+        process_t *self = &g_processes[current_pid_get()];
+        self->signal_mask = restored_mask & ~unmaskable;
+        /* The interrupted code may have been anywhere -- in the middle of
+         * its own instructions for a fault or a preemption -- so it gets
+         * RCX and R11 back too, through the IRETQ exit. */
+        self->full_restore = 1;
+        self->full_rcx = mc->rcx;
+        self->full_r11 = mc->r11;
     }
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
@@ -1514,6 +1639,13 @@ static void activate_process_context(process_t *proc)
 
     wrmsr_fs_base(proc->fs_base);
     wrmsr_kernel_gs_base(proc->gs_base);
+#if defined(__x86_64__)
+    /* Always written, so a stale request from a previous task can never be
+     * applied to this one. Consumed (cleared) by the exit path. */
+    syscall_set_full_restore(proc->full_restore, proc->full_rcx,
+                             proc->full_r11);
+    proc->full_restore = 0;
+#endif
 }
 
 static void mark_process_runnable(process_t *proc, uint64_t entry, int32_t parent_pid)
@@ -2122,19 +2254,14 @@ uint64_t process_get_current_fs_base(void)
     return val;
 }
 
+/* Lock-free for the same reason as process_get_current_pid(). */
 uint8_t process_get_current_abi_mode(void)
 {
-    uint64_t irq_flags = irq_save_disable();
-    spinlock_lock(&g_process_table_lock);
-
-    uint8_t mode = PROCESS_ABI_IMPLUS;
-    if (is_valid_pid(current_pid_get())) {
-        mode = g_processes[current_pid_get()].abi_mode;
+    int32_t cur = current_pid_get();
+    if (!is_valid_pid(cur)) {
+        return PROCESS_ABI_IMPLUS;
     }
-
-    spinlock_unlock(&g_process_table_lock);
-    irq_restore(irq_flags);
-    return mode;
+    return __atomic_load_n(&g_processes[cur].abi_mode, __ATOMIC_RELAXED);
 }
 
 void process_set_current_abi_mode(uint8_t mode)
@@ -2668,7 +2795,9 @@ void process_rseq_update_on_preempt_locked(int32_t pid, uint32_t cpu_id)
     }
     uint64_t area = proc->rseq_area;
     uint64_t cr3 = proc->cr3;
-    if (cr3 == 0u ||
+    /* The writes below go through whatever address space is live: if that
+     * is not this task's, they would land in another process's memory. */
+    if (cr3 == 0u || paging_get_active_cr3() != cr3 ||
         !paging_is_user_range_mapped(cr3, area, PROCESS_RSEQ_AREA_SIZE)) {
         return;
     }
@@ -3519,11 +3648,13 @@ void process_register_lifecycle_hooks(process_lifecycle_hook_t on_fork,
     g_exit_hook = on_exit;
 }
 
-static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts);
+static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts,
+                                 uint64_t child_settid,
+                                 uint64_t child_cleartid);
 
 int32_t process_fork(void)
 {
-    return process_fork_impl(0u, 0u);
+    return process_fork_impl(0u, 0u, 0u, 0u);
 }
 
 /* fork() whose child starts on `child_user_rsp` (clone() with a stack). The
@@ -3533,7 +3664,7 @@ int32_t process_fork(void)
  * parent's frame with RBP 0 and faulted, failing ChrootToSafeEmptyDir(). */
 int32_t process_fork_with_stack(uint64_t child_user_rsp)
 {
-    return process_fork_impl(child_user_rsp, 0u);
+    return process_fork_impl(child_user_rsp, 0u, 0u, 0u);
 }
 
 /* clone(): stack plus the per-child properties the Linux flags ask for
@@ -3541,10 +3672,43 @@ int32_t process_fork_with_stack(uint64_t child_user_rsp)
  * can run -- see process_fork_with_stack(). */
 int32_t process_fork_ex(uint64_t child_user_rsp, uint32_t opts)
 {
-    return process_fork_impl(child_user_rsp, opts);
+    return process_fork_impl(child_user_rsp, opts, 0u, 0u);
 }
 
-static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts)
+int32_t process_fork_ex_tid(uint64_t child_user_rsp, uint32_t opts,
+                            uint64_t child_settid, uint64_t child_cleartid)
+{
+    return process_fork_impl(child_user_rsp, opts, child_settid,
+                             child_cleartid);
+}
+
+/* Store a 32-bit value at user address `addr` in the address space `cr3`,
+ * which is not the one running: a fork child's, before it runs. The page is
+ * given its own frame first if it is still shared copy-on-write with the
+ * parent -- writing the shared frame would change the parent's copy too. */
+static int process_poke_user_u32(uint64_t cr3, uint64_t addr, uint32_t value)
+{
+    if (cr3 == 0u || addr < 0x1000u || (addr & 3u) != 0u) {
+        return -1;
+    }
+    if (paging_virt_to_phys(cr3, addr) == 0u &&
+        paging_handle_swap_fault(cr3, addr) <= 0) {
+        return -1;
+    }
+#if KERNEL_COW_FORK
+    (void)paging_user_range_break_cow(cr3, addr, sizeof(value));
+#endif
+    uint64_t phys = paging_virt_to_phys(cr3, addr);
+    if (phys == 0u) {
+        return -1;
+    }
+    *(volatile uint32_t *)(uintptr_t)phys = value;
+    return 0;
+}
+
+static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts,
+                                 uint64_t child_settid,
+                                 uint64_t child_cleartid)
 {
     if (!process_table_ready()) return -1;
 
@@ -3677,6 +3841,21 @@ static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts)
     child->saved_user_rsp = child_user_rsp != 0u ? child_user_rsp
                                                  : syscall_get_user_rsp();
 
+    /* CLONE_CHILD_SETTID: the child's own TID, written into its memory
+     * before it runs. glibc's fork passes &THREAD_SELF->tid here and never
+     * sets it any other way, so without this a forked child went on
+     * believing it was its parent -- harmless for fork+exec, but Chromium's
+     * zygote children never exec, and glibc writes that TID into every PI
+     * mutex it takes: the kernel's FUTEX_UNLOCK_PI then saw someone else's
+     * lock (EPERM) and glibc aborted the process ("The futex facility
+     * returned an unexpected error code." in the audio service). The value is
+     * the TID as the child sees it: 1 for the init of a new PID namespace. */
+    if (child_settid != 0u) {
+        uint32_t tid_seen = (opts & PROCESS_FORK_NEWPID) ? 1u
+                                                          : (uint32_t)child_pid;
+        (void)process_poke_user_u32(child->cr3, child_settid, tid_seen);
+    }
+
     irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -3701,6 +3880,8 @@ static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts)
                               ? (int32_t)(caller - g_processes) : -1;
     child->uid = parent->uid;
     child->gid = parent->gid;
+    /* CLONE_CHILD_CLEARTID: zeroed and futex-woken when the child exits. */
+    child->clear_child_tid = child_cleartid;
     memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
     memcpy(child->launch_argument, parent->launch_argument,
            sizeof(child->launch_argument));
@@ -3942,6 +4123,25 @@ int32_t process_execve(const char *path, const char *const *argv,
         }
     }
 
+    /* Everything that can make the exec fail cleanly has to be checked
+     * before the point of no return below, because after it the caller has
+     * no image left to return to and is killed instead. That included a
+     * target that does not exist -- which is the normal case for execvp()
+     * and posix_spawnp() walking $PATH: glibc tries /bin/<name>, expects
+     * ENOENT, then /usr/bin/<name>. Killing the caller at the first miss
+     * meant no Linux program could ever run anything found later in PATH
+     * (Chromium's xdg-open for "Open" / "Show in folder" among them). */
+    {
+        vfs_file_t probe;
+        memset(&probe, 0, sizeof(probe));
+        if (!vfs_find_file(path_buf, &probe)) {
+            return -2; /* ENOENT */
+        }
+        if (probe.size < 4u) {
+            return -8; /* ENOEXEC: not an ELF, not a script */
+        }
+    }
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -4144,6 +4344,45 @@ int32_t process_execve(const char *path, const char *const *argv,
     proc->main_phdr_vaddr = image_info.phdr_vaddr;
     proc->main_phent = image_info.phent;
     proc->main_phnum = image_info.phnum;
+    if (!image_info.linux_abi) {
+        /* A native program reads its arguments through
+         * process_get_launch_argument(), not argv: give it argv[1..], joined
+         * with spaces, the same string process_spawn_with_arg() would have
+         * passed. Otherwise it saw whatever its Linux parent was launched
+         * with (e.g. /usr/bin/xdg-open run by Chromium got Chromium's own
+         * command line). */
+        uint32_t at = 0;
+        for (uint32_t ai = 1; ai < (uint32_t)argc && argv_ptrs[ai] != NULL; ++ai) {
+            const char *a = argv_ptrs[ai];
+            if (ai > 1 && at + 1u < sizeof(proc->launch_argument)) {
+                proc->launch_argument[at++] = ' ';
+            }
+            /* Native programs have no notion of the working directory they
+             * were started in, so a relative path is made absolute here.
+             * Chromium's "Show in folder" runs `xdg-open .` from inside the
+             * folder. Options and URLs are passed through. */
+            if (a[0] != '/' && a[0] != '-' && a[0] != '\0' &&
+                strstr(a, "://") == NULL && proc->cwd[0] == '/') {
+                const char *c = proc->cwd;
+                while (*c != '\0' && at + 1u < sizeof(proc->launch_argument)) {
+                    proc->launch_argument[at++] = *c++;
+                }
+                if (strcmp(a, ".") == 0) {
+                    a += 1;
+                } else {
+                    if (at > 0 && proc->launch_argument[at - 1u] != '/' &&
+                        at + 1u < sizeof(proc->launch_argument)) {
+                        proc->launch_argument[at++] = '/';
+                    }
+                    if (a[0] == '.' && a[1] == '/') a += 2;
+                }
+            }
+            while (*a != '\0' && at + 1u < sizeof(proc->launch_argument)) {
+                proc->launch_argument[at++] = *a++;
+            }
+        }
+        proc->launch_argument[at] = '\0';
+    }
     foreign_launch_log_start((int32_t)(proc - g_processes), "exec", path_buf,
                              NULL, image_info.linux_abi);
 
@@ -4667,7 +4906,9 @@ void process_thread_exit_current(int32_t exit_status)
     irq_restore(irq_flags);
 
     if (robust_head != 0u && is_valid_pid(tid)) {
-        process_run_robust_list_current(robust_head, tid);
+        /* Mutex words hold TIDs as the process sees them (PID namespace). */
+        process_run_robust_list_current(robust_head,
+                                        process_pid_as_seen_by_current(tid));
     }
 
     if (clear_child_tid != 0u) {
@@ -4784,21 +5025,22 @@ void process_stall_dump_tick(void)
 }
 #endif
 
+/* Lock-free on purpose. It reads only the running task's own slot and its
+ * memory owner, neither of which can be torn down while the task runs (a group
+ * exit reaps only once every thread is off its CPU). Taking
+ * g_process_table_lock here made every caller that already holds another
+ * subsystem's lock order that lock before the process table -- the reverse of
+ * process_execve(), which holds the process table while it closes
+ * close-on-exec descriptors -- and the file table deadlocked against execve
+ * (all CPUs spinning, interrupts off). It is also on nearly every syscall. */
 int32_t process_get_current_pid(void)
 {
-    uint64_t irq_flags = irq_save_disable();
-    spinlock_lock(&g_process_table_lock);
-    int32_t pid = -1;
-    if (is_valid_pid(current_pid_get())) {
-        process_t *owner =
-            process_memory_owner_locked(&g_processes[current_pid_get()]);
-        if (owner != NULL) {
-            pid = (int32_t)(owner - g_processes);
-        }
+    int32_t cur = current_pid_get();
+    if (!is_valid_pid(cur)) {
+        return -1;
     }
-    spinlock_unlock(&g_process_table_lock);
-    irq_restore(irq_flags);
-    return pid;
+    process_t *owner = process_memory_owner_locked(&g_processes[cur]);
+    return owner != NULL ? (int32_t)(owner - g_processes) : -1;
 }
 
 int32_t process_get_current_tid(void)
@@ -5205,9 +5447,8 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
     while (next_pid < 0) {
         uint32_t ecpu = smp_get_current_cpu_id();
         spinlock_unlock(&g_process_table_lock);
-        hal_cpu_enable_interrupts();
         uint64_t idle_start_ns = timer_monotonic_ns();
-        process_cpu_halt();
+        process_scheduler_idle_wait();
         process_scheduler_add_idle_ns(timer_monotonic_ns() - idle_start_ns);
         hal_cpu_disable_interrupts();
         spinlock_lock(&g_process_table_lock);
@@ -5343,6 +5584,172 @@ int process_timeslice_expired(void)
     irq_restore(irq_flags);
     return pending;
 }
+
+#if defined(__x86_64__)
+/* Timer preemption of user code.
+ *
+ * Until this existed, a task only ever left the CPU inside a syscall
+ * (process_schedule_on_syscall): a thread computing in user mode -- V8
+ * running a script, a video decoder, SwiftShader rasterising -- kept its CPU
+ * until it happened to make a syscall, however many other threads were
+ * ready. With four CPUs and a browser that runs dozens of threads that is
+ * the difference between "slow" and "stuck".
+ *
+ * isr_regs is the timer ISR's register window: SAVE_REGS (r15 at [0] ...
+ * rax at [14]) followed by the CPU frame ([15]=rip [16]=cs [17]=rflags
+ * [18]=rsp [19]=ss). The interrupted state is rewritten as an ordinary
+ * saved syscall frame at the top of the task's own kernel stack -- the same
+ * place syscall_entry builds one -- plus the two registers such a frame
+ * cannot hold (full_rcx/full_r11). Whichever exit path resumes the task
+ * later sees full_restore and leaves through IRETQ with all of them. */
+void process_preempt_from_user_irq(uint64_t *isr_regs)
+{
+    enum {
+        IR_R15 = 0, IR_R14, IR_R13, IR_R12, IR_R11, IR_R10, IR_R9, IR_R8,
+        IR_RBP, IR_RDI, IR_RSI, IR_RDX, IR_RCX, IR_RBX, IR_RAX,
+        IR_RIP, IR_CS, IR_RFLAGS, IR_RSP, IR_SS, IR_COUNT
+    };
+
+    if (isr_regs == NULL || !process_table_ready() ||
+        (isr_regs[IR_CS] & 3u) != 3u) {
+        return;
+    }
+    if (!process_scheduler_consume_reschedule()) {
+        return;
+    }
+
+    /* The window is about to be overwritten (it overlaps the frame built
+     * below), so take a copy first. */
+    uint64_t r[IR_COUNT];
+    memcpy(r, isr_regs, sizeof(r));
+
+    /* rseq: a thread preempted inside a registered critical section must
+     * resume at its abort handler (Linux rseq_ip_fixup). This touches user
+     * memory, which can fault -- and the fault handler takes the process
+     * table lock -- so it runs before that lock is taken, on this thread's
+     * own address space, through the fault-tolerant user-copy helpers. */
+    {
+        int32_t self = current_pid_get();
+        uint64_t area = is_valid_pid(self) ? g_processes[self].rseq_area : 0u;
+        uint64_t cs_ptr = 0;
+        if (area != 0u &&
+            copy_from_user(&cs_ptr,
+                           (const void *)(uintptr_t)(area + PROCESS_RSEQ_CS),
+                           sizeof(cs_ptr)) == 0u &&
+            cs_ptr != 0u) {
+            struct {
+                uint32_t version, flags;
+                uint64_t start_ip, post_commit_offset, abort_ip;
+            } cs;
+            if (copy_from_user(&cs, (const void *)(uintptr_t)cs_ptr,
+                               sizeof(cs)) == 0u &&
+                r[IR_RIP] - cs.start_ip < cs.post_commit_offset) {
+                uint32_t sig = 0;
+                if (cs.abort_ip >= 4u &&
+                    copy_from_user(&sig,
+                                   (const void *)(uintptr_t)(cs.abort_ip - 4u),
+                                   sizeof(sig)) == 0u &&
+                    sig == g_processes[self].rseq_sig) {
+                    r[IR_RIP] = cs.abort_ip;
+                }
+            }
+            uint64_t zero = 0;
+            (void)copy_to_user((void *)(uintptr_t)(area + PROCESS_RSEQ_CS),
+                               &zero, sizeof(zero));
+        }
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    int32_t cur = current_pid_get();
+    if (!is_valid_pid(cur) ||
+        g_processes[cur].state != PROCESS_STATE_RUNNING ||
+        g_processes[cur].kernel_stack_top == 0u ||
+        scheduler_pid_held_for_fork(g_processes, g_process_capacity, cur)) {
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return;
+    }
+    process_t *current = &g_processes[cur];
+
+    int32_t next_pid = process_scheduler_pick_next(g_processes,
+                                                   g_process_capacity, cur);
+    if (next_pid < 0 || next_pid == cur) {
+        /* Nobody else wants this CPU: keep running, with a fresh slice. */
+        process_scheduler_prepare_run(current);
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return;
+    }
+
+    uint64_t now_ns = process_perf_now_ns();
+
+    {
+        static volatile uint64_t preempt_count;
+        uint64_t n = __atomic_add_fetch(&preempt_count, 1u, __ATOMIC_RELAXED);
+        if ((n % 20000u) == 0u) {
+            serial_write_string("[sched] user-mode preemptions: ");
+            serial_write_uint64(n);
+            serial_write_string("\n");
+        }
+    }
+
+    uint64_t *frame = (uint64_t *)(uintptr_t)
+        ((current->kernel_stack_top & ~0xFULL) -
+         (uint64_t)SYSCALL_FRAME_QWORDS * sizeof(uint64_t));
+    frame[SYSCALL_FRAME_RAX] = r[IR_RAX];
+    frame[SYSCALL_FRAME_RDX] = r[IR_RDX];
+    frame[SYSCALL_FRAME_RSI] = r[IR_RSI];
+    frame[SYSCALL_FRAME_RDI] = r[IR_RDI];
+    frame[SYSCALL_FRAME_R8]  = r[IR_R8];
+    frame[SYSCALL_FRAME_R9]  = r[IR_R9];
+    frame[SYSCALL_FRAME_R10] = r[IR_R10];
+    frame[SYSCALL_FRAME_R12] = r[IR_R12];
+    frame[SYSCALL_FRAME_R13] = r[IR_R13];
+    frame[SYSCALL_FRAME_R14] = r[IR_R14];
+    frame[SYSCALL_FRAME_R15] = r[IR_R15];
+    frame[SYSCALL_FRAME_RBX] = r[IR_RBX];
+    frame[SYSCALL_FRAME_RBP] = r[IR_RBP];
+    frame[SYSCALL_FRAME_RCX] = r[IR_RIP];
+    frame[SYSCALL_FRAME_R11] = r[IR_RFLAGS];
+
+    current->saved_rsp = (uint64_t)(uintptr_t)frame;
+    current->saved_user_rsp = r[IR_RSP];
+    current->user_stack_exchanged = 0;
+    current->full_restore = 1;
+    current->full_rcx = r[IR_RCX];
+    current->full_r11 = r[IR_R11];
+    process_fpu_save(current->fpu_state);
+    current->fs_base = rdmsr_fs_base();
+    current->gs_base = rdmsr_kernel_gs_base();
+
+    process_perf_account_runtime_locked(current, now_ns);
+    current->state = PROCESS_STATE_READY;
+    process_perf_mark_ready_locked(current, now_ns);
+
+    /* Still on cur's kernel stack until syscall_enter_user_from_frame
+     * switches: keep other CPUs off it until then. */
+    process_scheduler_set_leaving_pid(cur);
+
+    current_pid_set(next_pid);
+    process_t *next = &g_processes[next_pid];
+    process_deliver_pending_signals_locked(next);
+    process_perf_prepare_run_locked(next, now_ns, 1);
+    process_scheduler_prepare_run(next);
+
+    uint64_t next_saved_rsp = next->saved_rsp;
+    uint64_t next_user_rsp = next->saved_user_rsp;
+    uint64_t next_cr3 = next->cr3;
+    process_fpu_restore(next->fpu_state);
+    activate_process_context(next);
+    spinlock_unlock(&g_process_table_lock);
+    (void)irq_flags; /* interrupts stay off until the IRETQ into next */
+
+    const arch_ops_t *ops = arch_ops_get();
+    ops->enter_user_mode(next_saved_rsp, next_user_rsp, next_cr3);
+}
+#endif
 
 int process_run_next_on_current_cpu(void)
 {
@@ -6553,6 +6960,7 @@ int process_block_current(void)
 
 int process_wake_pid(int32_t pid)
 {
+    int kick = 0;
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -6574,8 +6982,10 @@ int process_wake_pid(int32_t pid)
         proc->blocked_since_ns = 0u;
         proc->wake_count++;
         proc->state = PROCESS_STATE_READY;
+        proc->wake_boost = 1u;
         process_perf_mark_ready_locked(proc, now_ns);
         process_scheduler_request_reschedule();
+        kick = proc->rt_policy != 0u ? 2 : 1;
     } else if (proc->state != PROCESS_STATE_UNUSED &&
                proc->state != PROCESS_STATE_DEAD &&
                proc->state != PROCESS_STATE_ZOMBIE) {
@@ -6594,6 +7004,49 @@ int process_wake_pid(int32_t pid)
         proc->wake_pending = 1u;
     }
 
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    /* The woken task is only READY; if a CPU is idle, wake it now instead of
+     * leaving the task for whichever CPU next reaches the scheduler -- up to
+     * a timer tick for an idle CPU, a whole slice for a busy one. Chromium's
+     * audio renderer has ~10 ms to answer each request before the audio
+     * service gives up on it and plays silence. */
+    if (kick == 2) {
+        process_scheduler_kick_for_rt(g_processes, g_process_capacity);
+    } else if (kick) {
+        process_scheduler_kick_idle_cpu();
+    }
+    return 0;
+}
+
+/* sched_setscheduler(2) for thread `tid` (a kernel tid). */
+int process_set_rt_policy(int32_t tid, uint8_t policy, uint8_t priority)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    if (!is_valid_pid(tid) || g_processes[tid].state == PROCESS_STATE_UNUSED) {
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return -3; /* ESRCH */
+    }
+    g_processes[tid].rt_policy = policy;
+    g_processes[tid].rt_priority = priority;
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return 0;
+}
+
+int process_get_rt_policy(int32_t tid, uint8_t *policy, uint8_t *priority)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    if (!is_valid_pid(tid) || g_processes[tid].state == PROCESS_STATE_UNUSED) {
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return -3;
+    }
+    if (policy) *policy = g_processes[tid].rt_policy;
+    if (priority) *priority = g_processes[tid].rt_priority;
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
     return 0;

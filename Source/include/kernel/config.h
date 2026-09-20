@@ -63,7 +63,11 @@
 #ifdef PROCESS_MAX_COUNT_CONFIG
 #define OS_CONFIG_PROCESS_MAX_COUNT PROCESS_MAX_COUNT_CONFIG
 #else
-#define OS_CONFIG_PROCESS_MAX_COUNT 256
+/* Tasks, not processes: every thread takes a slot. 256 ran out while
+ * browsing -- each Chromium renderer has ~25 threads, and a few tabs plus the
+ * GPU/network/audio/storage processes crossed it; pthread_create() then
+ * failed and the new process died on CHECK(io_thread_->StartWithOptions()). */
+#define OS_CONFIG_PROCESS_MAX_COUNT 512
 #endif
 #endif
 
@@ -72,9 +76,11 @@
 #define OS_CONFIG_FILE_MAX_FD FILE_MAX_FD_CONFIG
 #else
 /* NOTE: this is a *global*, system-wide fd table (Syscall_File.c), shared
- * by every process, not a per-process limit. Keep it comfortably below
- * Syscall_Socket.c's SOCKET_FD_BASE (socket fds live in a disjoint numeric
- * range starting there) - see OS_CONFIG_FILE_MAX_FD_MAX below.
+ * by every process, not a per-process limit. The socket ranges (inet
+ * 512..767, AF_UNIX 768..1023) sit inside its numeric span and are skipped,
+ * so files are 0..511 plus 1024..OS_CONFIG_FILE_MAX_FD-1; the upper part is
+ * handed only to Linux-ABI processes, which see per-process numbers (native
+ * programs and the POSIX layer index 1024-entry tables by the raw number).
  *
  * The AF_UNIX range used to live inside this table (192..255, under the X
  * server's 256-client limit), so the table skipped it. Linux programs now see
@@ -83,8 +89,12 @@
  * 0..511 range is files again. 192 slots were not enough for Chromium alone
  * -- ~130 open files plus ~40 shared-memory regions -- and once they ran out
  * it could not create the buffer for its next frame and terminated itself
- * ("Creating shared memory in /dev/shm/... failed: Too many open files"). */
-#define OS_CONFIG_FILE_MAX_FD 512
+ * ("Creating shared memory in /dev/shm/... failed: Too many open files").
+ * 512 ran out the same way once Chromium was multi-process for real: a
+ * YouTube tab plus the GPU, network and audio processes held ~490 -- every
+ * child keeps its own descriptors for the resource packs and ICU data, on
+ * top of its shared-memory regions -- and new renderers failed to start. */
+#define OS_CONFIG_FILE_MAX_FD 2048
 #endif
 #endif
 
@@ -110,13 +120,12 @@
 #endif
 
 #define OS_CONFIG_PROCESS_MAX_COUNT_MIN   1
-#define OS_CONFIG_PROCESS_MAX_COUNT_MAX   256
+#define OS_CONFIG_PROCESS_MAX_COUNT_MAX   1024
 #define OS_CONFIG_FILE_MAX_FD_MIN         4
-/* Must stay <= Syscall_Socket.c's SOCKET_FD_BASE (disjoint fd numeric
- * range for sockets) and <= Userland/POSIX/include/posix_fdtable.h's
- * POSIX_FD_TABLE_SIZE / posix_io.h's FD_SETSIZE (both 1024, indexed
- * directly by raw fd value with no indirection). */
-#define OS_CONFIG_FILE_MAX_FD_MAX         512
+/* Must stay below Syscall_Epoll.c's epoll numbering (0x4000). Numbers from
+ * 1024 up are given to Linux-ABI processes only (see above), so the POSIX
+ * layer's 1024-entry tables never see them. */
+#define OS_CONFIG_FILE_MAX_FD_MAX         4096
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE_MIN 4
 #define OS_CONFIG_FILE_MAX_DIR_HANDLE_MAX 256
 

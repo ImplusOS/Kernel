@@ -408,16 +408,17 @@ static uint32_t epoll_fd_ready_seq(int32_t fd)
 
 static uint32_t epoll_poll_fd(int32_t fd, uint32_t requested)
 {
-    /* AF_UNIX first: its range sits inside the file table's numeric span. */
+    /* Sockets first: both socket ranges sit inside the file table's numeric
+     * span (files are 0..511 and 1024..OS_CONFIG_FILE_MAX_FD-1). */
     if (unix_socket_fd_in_range(fd)) {
         return unix_socket_poll(fd, requested);
-    }
-    if (fd >= 0 && fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
-        return syscall_file_poll(fd, requested);
     }
     if (fd >= EPOLL_SOCKET_FD_BASE &&
         fd < EPOLL_SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
         return syscall_socket_poll(fd, requested);
+    }
+    if (fd >= 0 && fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
+        return syscall_file_poll(fd, requested);
     }
     if (fd >= EPOLL_EVENTFD_FD_BASE &&
         fd < EPOLL_EVENTFD_FD_BASE + EVENTFD_MAX_INSTANCES) {

@@ -28,6 +28,14 @@ int shared_memory_unmap_any(void *address);
  * mapped. Shared pages are not private anonymous memory, so
  * madvise(MADV_DONTNEED) must leave them alone. */
 int shared_memory_addr_is_mapped(uint64_t addr);
+
+/* A process-independent identity for a user address inside a shared-memory
+ * mapping of the calling process (object + offset), or 0 when the address is
+ * not in one. Shared (non-PRIVATE) futexes are keyed on this so that a waiter
+ * and a waker in different processes -- which map the object at different
+ * addresses -- find each other. */
+uint64_t shared_memory_addr_key(uint64_t addr);
+
 void shared_memory_cleanup_process(int32_t pid);
 
 /* Bump the reference count on an existing object without mapping it. Used

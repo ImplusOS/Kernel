@@ -1,3 +1,4 @@
+#include "Core/sound/ALSA.h"
 #include "DevFS.h"
 
 #include <string.h>
@@ -40,6 +41,8 @@ typedef enum {
      * carries its own position in the log, packed into driver_data. */
     DEVFS_KIND_KMSG,          /* /dev/kmsg      -> Debug/serial ring */
     DEVFS_KIND_APPLOG,        /* /dev/applog    -> launch-log ring only */
+    DEVFS_KIND_SND_CTL,       /* /dev/snd/controlC0 -> ALSA control (Core/sound) */
+    DEVFS_KIND_SND_PCM,       /* /dev/snd/pcmC0D0p  -> ALSA playback */
     DEVFS_KIND_COUNT
 } devfs_kind_t;
 
@@ -109,6 +112,8 @@ static const devfs_entry_t g_devfs_entries[] = {
     { "/dev/ptmx",             DEVFS_KIND_PTMX,         0u, 1u },
     { "/dev/kmsg",             DEVFS_KIND_KMSG,         0u, 1u },
     { "/dev/applog",           DEVFS_KIND_APPLOG,       0u, 1u },
+    { "/dev/snd/controlC0",    DEVFS_KIND_SND_CTL,      0u, 1u },
+    { "/dev/snd/pcmC0D0p",     DEVFS_KIND_SND_PCM,      0u, 1u },
 };
 
 #define DEVFS_ENTRY_COUNT (sizeof(g_devfs_entries) / sizeof(g_devfs_entries[0]))
@@ -384,6 +389,19 @@ static bool devfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
             devfs_set_pty_index(file, k, index);
             return true;
         }
+        /* No card (no audio device with continuous playback) or every
+         * playback substream taken: refuse, and alsa-lib reports the device
+         * as missing/busy. The substream index rides in driver_data. */
+        case DEVFS_KIND_SND_CTL:
+            return alsa_ctl_open() == 0;
+        case DEVFS_KIND_SND_PCM: {
+            int index = alsa_pcm_open();
+            if (index < 0) {
+                return false;
+            }
+            devfs_set_pty_index(file, DEVFS_KIND_SND_PCM, index);
+            return true;
+        }
         default:
             return true;
     }
@@ -566,6 +584,10 @@ static bool devfs_vfs_close_file(vfs_file_t *file)
             pty_slave_release(devfs_pty_index_of(file));
         } else if (kind == DEVFS_KIND_KMSG || kind == DEVFS_KIND_APPLOG) {
             devfs_kmsg_close(devfs_pty_index_of(file));
+        } else if (kind == DEVFS_KIND_SND_CTL) {
+            alsa_ctl_close();
+        } else if (kind == DEVFS_KIND_SND_PCM) {
+            alsa_pcm_close(devfs_pty_index_of(file));
         }
     }
     return true;
@@ -595,6 +617,10 @@ static int64_t devfs_vfs_dev_ioctl(vfs_file_t *file, uint64_t request, uint64_t 
         case DEVFS_KIND_PTS:
             return pty_ioctl(devfs_pty_index_of(file), kind == DEVFS_KIND_PTMX,
                              request, arg);
+        case DEVFS_KIND_SND_CTL:
+            return alsa_ctl_ioctl(request, arg);
+        case DEVFS_KIND_SND_PCM:
+            return alsa_pcm_ioctl(devfs_pty_index_of(file), request, arg);
         default:
             return -25; /* ENOTTY */
     }
@@ -687,6 +713,8 @@ static uint32_t devfs_vfs_dev_poll(vfs_file_t *file, uint32_t events)
         case DEVFS_KIND_KMSG:
         case DEVFS_KIND_APPLOG:
             return devfs_kmsg_poll(devfs_pty_index_of(file), events);
+        case DEVFS_KIND_SND_PCM:
+            return alsa_pcm_poll(devfs_pty_index_of(file), events);
         default:
             return 0;
     }

@@ -1,3 +1,4 @@
+#include "Core/sound/ALSA.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -109,6 +110,7 @@ static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
 #define LINUX_EBUSY  (-16LL)
 #define LINUX_ENODEV (-19LL)
 #define LINUX_EINVAL (-22LL)
+#define LINUX_ESPIPE (-29LL)
 #define LINUX_ESRCH  (-3LL)
 #define LINUX_ENOTSUP (-95LL)
 #define LINUX_ENOTTY (-25LL)
@@ -624,6 +626,29 @@ int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
         return syscall_file_ioctl(fd, request, arg);
     }
     if (arg == 0u) return LINUX_EFAULT;
+    /* AF_UNIX sockets live outside both the file table and the inet socket
+     * table, so neither branch below knew them: FIONREAD failed, and
+     * Chromium's SyncSocket::Peek() -- which it calls between poll() and
+     * read() -- took the failure for "nothing to read". The audio service
+     * then never collected the renderer's "buffer ready" reply and played
+     * silence for every buffer. */
+    if (unix_socket_fd_in_range(fd)) {
+        if (request == LINUX_FIONREAD) {
+            int64_t available = unix_socket_available(fd);
+            if (available < 0) return available;
+            int32_t value = available > INT32_MAX ? INT32_MAX : (int32_t)available;
+            return copy_to_user((void *)(uintptr_t)arg, &value, sizeof(value)) == 0u ?
+                0 : LINUX_EFAULT;
+        }
+        if (request == LINUX_FIONBIO) {
+            int32_t enabled = 0;
+            if (copy_from_user(&enabled, (const void *)(uintptr_t)arg,
+                               sizeof(enabled)) != 0u) {
+                return LINUX_EFAULT;
+            }
+            return unix_socket_set_nonblock(fd, enabled != 0) < 0 ? LINUX_EBADF : 0;
+        }
+    }
     if (request == LINUX_FIONBIO) {
         int32_t enabled = 0;
         if (copy_from_user(&enabled, (const void *)(uintptr_t)arg,
@@ -1800,10 +1825,16 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
      * (the GPU thread crashed on its first new frame after a click, and pages
      * could stay blank for good). */
 #ifndef LINUX_TMPFS_SHARED_MMAP
-/* Off: mapping tmpfs files through shared-memory objects deadlocked
- * Chromium at startup (every thread parked in futex before the profile
- * loaded). Kept switchable while that is investigated. */
-#define LINUX_TMPFS_SHARED_MMAP 0
+/* On. It was off because it "deadlocked Chromium at startup (every thread
+ * parked in futex before the profile loaded)": futexes were matched on
+ * (process, virtual address) only, so once a futex word really was shared
+ * between processes -- each mapping it at its own address -- a FUTEX_WAKE
+ * from one side could never find the waiter on the other. Shared futexes
+ * are now keyed on the shared object (Syscall_Futex.c futex_key_for()).
+ * With it off, every /dev/shm mapping was a private snapshot: the renderer
+ * wrote its audio into its own copy and the audio service played the
+ * zeros in its copy -- Chromium was silent. */
+#define LINUX_TMPFS_SHARED_MMAP 1
 #endif
     if (LINUX_TMPFS_SHARED_MMAP &&
         (flags & LINUX_MAP_SHARED) != 0u && offset == 0u &&
@@ -1813,6 +1844,16 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             void *p = shared_memory_map_new(tmpfs_handle);
             if (p != NULL) {
                 return (int64_t)(uintptr_t)p;
+            }
+        }
+        if (syscall_file_is_tmpfs((int32_t)fd)) {
+            /* Falling back to a private copy silently breaks whoever shares
+             * this file; say so. */
+            static volatile uint32_t reported;
+            if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 16u) {
+                serial_write_string("[mmap] tmpfs MAP_SHARED fell back to a private copy, len=");
+                serial_write_uint64(length);
+                serial_write_string("\n");
             }
         }
     }
@@ -1831,13 +1872,12 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if ((offset & (PAGE_SIZE - 1u)) != 0u) {
         return LINUX_EINVAL;
     }
-    int64_t saved_offset = -1;
-    if (offset < (uint64_t)vf.size) {
-        saved_offset = syscall_file_seek((int32_t)fd, 0, LINUX_SEEK_CUR);
-        if (saved_offset < 0 ||
-            syscall_file_seek((int32_t)fd, (int64_t)offset, LINUX_SEEK_SET) < 0) {
-            return LINUX_ENODEV;
-        }
+    /* The contents are read with positional reads (syscall_file_pread):
+     * seeking the shared descriptor there and back raced with any other
+     * thread using it. The seek here only asks whether it is seekable. */
+    if (offset < (uint64_t)vf.size &&
+        syscall_file_seek((int32_t)fd, 0, LINUX_SEEK_CUR) < 0) {
+        return LINUX_ENODEV;
     }
     uint64_t read_len = 0;
     if (offset < (uint64_t)vf.size) {
@@ -1889,10 +1929,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                                            (uint64_t)(uintptr_t)reserved,
                                            length, offset);
 #endif
-                if (saved_offset >= 0) {
-                    (void)syscall_file_seek((int32_t)fd, saved_offset,
-                                            LINUX_SEEK_SET);
-                }
                 return (int64_t)(uintptr_t)reserved;
             }
             /* Table full or no address space: fall through to the eager path
@@ -1925,20 +1961,14 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     while (total < read_len) {
         uint64_t want = read_len - total;
         if (want > sizeof(chunk)) want = sizeof(chunk);
-        int64_t count = syscall_file_read((int32_t)fd, chunk, want);
+        int64_t count = syscall_file_pread((int32_t)fd, chunk, want,
+                                           offset + total);
         if (count <= 0) break;
         if (copy_to_user_trusted((uint8_t *)(uintptr_t)mapped + total,
                                  chunk, (uint64_t)count) != 0u) {
-            if (saved_offset >= 0) {
-                (void)syscall_file_seek((int32_t)fd, saved_offset,
-                                        LINUX_SEEK_SET);
-            }
             return LINUX_EFAULT;
         }
         total += (uint64_t)count;
-    }
-    if (saved_offset >= 0) {
-        (void)syscall_file_seek((int32_t)fd, saved_offset, LINUX_SEEK_SET);
     }
 
     /* A writable MAP_SHARED file mapping: remember it so its contents are
@@ -1978,6 +2008,59 @@ static int64_t linux_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
                                       (const epoll_event_t *)(uintptr_t)event_ptr);
 }
 
+/* Finite-timeout waits (poll/ppoll/epoll_wait) that span syscall restarts.
+ *
+ * These calls cannot sleep in the middle of the kernel and resume, so a wait
+ * is "park for a slice, then run the syscall again". A wait with no deadline
+ * always did that; one with a deadline used to return 0 after the first
+ * slice instead -- a timeout, as far as the caller can tell, long before the
+ * timeout it asked for. Most callers shrug that off as a spurious wakeup,
+ * but not all: Chromium's audio service waits for the renderer with
+ * poll(fd, timeout) on a sync socket and takes 0 to mean "the renderer
+ * missed its deadline", playing silence in its place -- every time.
+ *
+ * So the deadline of the wait in progress is kept per thread, keyed on the
+ * call's arguments, and the call is re-run until it is due. A different call
+ * from the same thread (a signal handler's own wait) starts afresh. */
+#define LX_WAIT_SLOTS OS_CONFIG_PROCESS_MAX_COUNT
+static uint64_t g_lxw_deadline_ns[LX_WAIT_SLOTS];
+static uint64_t g_lxw_key[LX_WAIT_SLOTS][3];
+
+/* Remaining milliseconds of the caller's finite wait (establishing its
+ * deadline on the first pass); 0 once it is due. */
+static int64_t lx_wait_remaining_ms(uint64_t k0, uint64_t k1, uint64_t k2,
+                                    int64_t timeout_ms)
+{
+    int32_t tid = process_get_current_tid();
+    uint64_t now = timer_monotonic_ns();
+    if (tid < 0 || tid >= (int32_t)LX_WAIT_SLOTS) {
+        return timeout_ms;
+    }
+    if (g_lxw_deadline_ns[tid] == 0u || g_lxw_key[tid][0] != k0 ||
+        g_lxw_key[tid][1] != k1 || g_lxw_key[tid][2] != k2) {
+        g_lxw_key[tid][0] = k0;
+        g_lxw_key[tid][1] = k1;
+        g_lxw_key[tid][2] = k2;
+        g_lxw_deadline_ns[tid] = now + (uint64_t)timeout_ms * 1000000ull;
+        return timeout_ms;
+    }
+    if (now >= g_lxw_deadline_ns[tid]) {
+        return 0;
+    }
+    return (int64_t)((g_lxw_deadline_ns[tid] - now + 999999ull) / 1000000ull);
+}
+
+static void lx_wait_done(void)
+{
+    int32_t tid = process_get_current_tid();
+    if (tid >= 0 && tid < (int32_t)LX_WAIT_SLOTS) {
+        g_lxw_deadline_ns[tid] = 0u;
+    }
+}
+
+/* Longest single park of a restarted wait before it rescans. */
+#define LX_WAIT_SLICE_MS 8u
+
 static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
                                 uint64_t maxevents, uint64_t timeout_ms,
                                 int *should_switch_out, int *restart_out)
@@ -1989,11 +2072,26 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
                                       maxevents * sizeof(epoll_event_t))) {
         return LINUX_EFAULT;
     }
+    int32_t tmo = (int32_t)timeout_ms;
+    int finite = tmo > 0;
+    if (finite) {
+        int64_t left = lx_wait_remaining_ms(0xE9u, epfd, events, tmo);
+        tmo = (int32_t)(left > (int64_t)LX_WAIT_SLICE_MS ? (int64_t)LX_WAIT_SLICE_MS
+                                                         : left);
+    }
     int64_t rc = (int64_t)syscall_epoll_wait_ex((int32_t)epfd,
                                                 (epoll_event_t *)(uintptr_t)events,
                                                 (int32_t)maxevents,
-                                                (int32_t)timeout_ms,
+                                                tmo,
                                                 should_switch_out);
+    if (finite) {
+        if (rc == 0 && tmo > 0 && restart_out != NULL) {
+            /* Not due yet: go round again (see lx_wait_remaining_ms()). */
+            *restart_out = 1;
+            return 0;
+        }
+        lx_wait_done();
+    }
     /* A wait with no deadline may not report a timeout. syscall_epoll_wait_ex()
      * degrades "block" to "sleep a slice and report nothing ready", which is a
      * legal spurious wakeup for a finite timeout but a lie for timeout < 0 --
@@ -2100,8 +2198,14 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     }
 
     uint32_t slice_ms = LINUX_POLL_SLICE_MS;
-    if (timeout_ms > 0 && (uint64_t)timeout_ms < slice_ms) {
-        slice_ms = (uint32_t)timeout_ms;
+    int finite = timeout_ms > 0;
+    if (finite) {
+        timeout_ms = lx_wait_remaining_ms(0x507Eu, fds_ptr, nfds, timeout_ms);
+        slice_ms = timeout_ms > (int64_t)LX_WAIT_SLICE_MS ? LX_WAIT_SLICE_MS
+                                                          : (uint32_t)timeout_ms;
+        if (timeout_ms == 0) {
+            lx_wait_done(); /* due: one last scan, then report the timeout */
+        }
     }
 
     /* Taken before the readiness scan below so an event that lands during the
@@ -2114,7 +2218,8 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
             should_switch_out != NULL) {
             *should_switch_out = 1;
         }
-        if (timeout_ms < 0 && restart_out != NULL) {
+        if ((timeout_ms < 0 || (finite && timeout_ms > 0)) &&
+            restart_out != NULL) {
             *restart_out = 1;
         }
         return 0;
@@ -2164,6 +2269,9 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
         return LINUX_EFAULT;
     }
     if (ready_count > 0 || timeout_ms == 0) {
+        if (finite) {
+            lx_wait_done();
+        }
         return ready_count;
     }
 #if PROCESS_STALL_DUMP
@@ -2172,7 +2280,7 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     if (poll_wait_park(generation, slice_ms) != 0 && should_switch_out != NULL) {
         *should_switch_out = 1;
     }
-    if (timeout_ms < 0 && restart_out != NULL) {
+    if ((timeout_ms < 0 || finite) && restart_out != NULL) {
         *restart_out = 1;
     }
     return 0;
@@ -2564,7 +2672,10 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         uint32_t fork_opts = 0u;
         if ((flags & 0x20000000u) != 0u) fork_opts |= PROCESS_FORK_NEWPID;
         if ((flags & LINUX_CLONE_FS) != 0u) fork_opts |= PROCESS_FORK_SHARE_FS;
-        int32_t child_pid = process_fork_ex(stack, fork_opts);
+        int32_t child_pid = process_fork_ex_tid(
+            stack, fork_opts,
+            (flags & LINUX_CLONE_CHILD_SETTID) != 0u ? child_tid : 0u,
+            (flags & LINUX_CLONE_CHILD_CLEARTID) != 0u ? child_tid : 0u);
         if (child_pid < 0) {
             return LINUX_EAGAIN;
         }
@@ -2609,14 +2720,9 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
             (void)copy_to_user_trusted((void *)(uintptr_t)parent_tid,
                                        &pid32, sizeof(pid32));
         }
-        /* CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID are deliberately NOT
-         * honoured on this path. Both write through `child_tid` in the
-         * *child's* address space, and process_fork() returns with us still
-         * running as the parent -- writing here would clobber the parent's own
-         * TCB instead. glibc only uses them to refresh THREAD_SELF->tid, which
-         * the child does not consult before it execs (and execve clears both
-         * on Linux too). Doing it properly needs a cross-address-space write;
-         * see Docs/Others/TODO_Doom_Xorg_MethodA.md M9. */
+        /* CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID were applied to the
+         * child's own address space inside process_fork_ex_tid(), before it
+         * could run (see the comment there for why they matter). */
         if (should_switch != NULL) {
             *should_switch = 1;
         }
@@ -4198,14 +4304,21 @@ static int64_t linux_socket_setsockopt(uint64_t fd, uint64_t level,
                        sizeof(value)) != 0u) {
         return LINUX_EFAULT;
     }
-    int32_t mapped_option = 0;
-    switch (option) {
-        case LINUX_SO_REUSEADDR: mapped_option = 1; break;
-        case LINUX_SO_KEEPALIVE: mapped_option = 2; break;
-        default: return 0; /* accept-and-ignore rather than ENOPROTOOPT */
+    /* Only SO_REUSEADDR is modelled by the socket layer, as its own option
+     * number 2 (Syscall_Socket.c SOCKET_SO_REUSEADDR). This used to pass 1,
+     * which the socket layer rejects as unsupported, so every
+     * setsockopt(SO_REUSEADDR) failed with ENOTSUP -- and a TCP server that
+     * sets it before bind() (Chromium's DevTools HTTP server, any
+     * net::TCPServerSocket) could never start. AF_UNIX sockets have no such
+     * state. */
+    if (option != LINUX_SO_REUSEADDR || !syscall_socket_fd_in_range((int32_t)fd)) {
+        return 0; /* accept-and-ignore rather than ENOPROTOOPT */
     }
-    return (int64_t)syscall_socket_set_option((int32_t)fd, (int32_t)level,
-                                              mapped_option, value);
+    int64_t rc = (int64_t)syscall_socket_set_option((int32_t)fd, 1 /* SOL_SOCKET */,
+                                                    2 /* SO_REUSEADDR */, value);
+    /* Setting it after bind()/connect() is legal on Linux (it just has no
+     * effect any more); the socket layer only records it before. */
+    return rc < 0 ? 0 : rc;
 }
 
 static int64_t linux_socket_getsockopt(uint64_t fd, uint64_t level,
@@ -4838,17 +4951,17 @@ static int64_t linux_mincore(uint64_t addr, uint64_t length, uint64_t vec_ptr)
 static int64_t linux_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offset_ptr,
                               uint64_t count)
 {
-    int64_t saved_offset = -1;
+    /* With an offset pointer the input is read at that position and its file
+     * offset is left alone -- positional reads, not a seek there and back,
+     * which raced with other threads sharing the descriptor. */
+    int64_t pos = -1;
     if (offset_ptr != 0u) {
-        int64_t requested = 0;
-        if (copy_from_user(&requested, (const void *)(uintptr_t)offset_ptr,
-                           sizeof(requested)) != 0u) {
+        if (copy_from_user(&pos, (const void *)(uintptr_t)offset_ptr,
+                           sizeof(pos)) != 0u) {
             return LINUX_EFAULT;
         }
-        saved_offset = syscall_file_seek((int32_t)in_fd, 0, LINUX_SEEK_CUR);
-        if (saved_offset < 0 ||
-            syscall_file_seek((int32_t)in_fd, requested, LINUX_SEEK_SET) < 0) {
-            return LINUX_EBUSY;
+        if (pos < 0) {
+            return LINUX_EINVAL;
         }
     }
     uint8_t chunk[4096];
@@ -4856,7 +4969,9 @@ static int64_t linux_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offset_p
     while (total < count) {
         uint64_t want = count - total;
         if (want > sizeof(chunk)) want = sizeof(chunk);
-        int64_t got = syscall_file_read((int32_t)in_fd, chunk, want);
+        int64_t got = pos >= 0
+            ? syscall_file_pread((int32_t)in_fd, chunk, want, (uint64_t)pos)
+            : syscall_file_read((int32_t)in_fd, chunk, want);
         if (got <= 0) break;
         /* out_fd is a kernel fd, not a userspace fd; use the fd-table
          * writer directly rather than the syscall_write() wrapper (which
@@ -4868,17 +4983,12 @@ static int64_t linux_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offset_p
             break;
         }
         total += (uint64_t)put;
+        if (pos >= 0) pos += put;
         if (put < got) break;
     }
     if (offset_ptr != 0u) {
-        int64_t new_pos = syscall_file_seek((int32_t)in_fd, 0, LINUX_SEEK_CUR);
-        if (new_pos >= 0) {
-            (void)copy_to_user_trusted((void *)(uintptr_t)offset_ptr, &new_pos,
-                                       sizeof(new_pos));
-        }
-        if (saved_offset >= 0) {
-            (void)syscall_file_seek((int32_t)in_fd, saved_offset, LINUX_SEEK_SET);
-        }
+        (void)copy_to_user_trusted((void *)(uintptr_t)offset_ptr, &pos,
+                                   sizeof(pos));
     }
     return (int64_t)total;
 }
@@ -4942,6 +5052,9 @@ static int64_t linux_setitimer(uint64_t which, uint64_t new_value_ptr,
 static int64_t linux_pread64(uint64_t fd, uint64_t buf, uint64_t count,
                              uint64_t offset)
 {
+    if ((int64_t)offset < 0) {
+        return LINUX_EINVAL;
+    }
     if (count == 0u) {
         return 0;
     }
@@ -4951,21 +5064,23 @@ static int64_t linux_pread64(uint64_t fd, uint64_t buf, uint64_t count,
     if (!process_user_buffer_is_valid((void *)(uintptr_t)buf, count)) {
         return LINUX_EFAULT;
     }
-    int64_t saved = syscall_file_seek((int32_t)fd, 0, LINUX_SEEK_CUR);
-    if (saved < 0) {
-        return saved;
+    /* A true positional read: emulating it as seek+read+seek let two threads
+     * sharing the descriptor move each other's offset between the calls, and
+     * Chromium's parkable-image store then read back another image's bytes. */
+    int64_t rc = syscall_file_pread((int32_t)fd, (uint8_t *)(uintptr_t)buf,
+                                    count, offset);
+    if (rc == (int64_t)OS_STATUS_NOT_SUPPORTED) {
+        return LINUX_ESPIPE;
     }
-    if (syscall_file_seek((int32_t)fd, (int64_t)offset, LINUX_SEEK_SET) < 0) {
-        return LINUX_EINVAL;
-    }
-    int64_t rc = syscall_file_read((int32_t)fd, (uint8_t *)(uintptr_t)buf, count);
-    (void)syscall_file_seek((int32_t)fd, saved, LINUX_SEEK_SET);
     return rc;
 }
 
 static int64_t linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
                               uint64_t offset)
 {
+    if ((int64_t)offset < 0) {
+        return LINUX_EINVAL;
+    }
     if (count == 0u) {
         return 0;
     }
@@ -4974,13 +5089,6 @@ static int64_t linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
     }
     if (!process_user_buffer_is_valid((const void *)(uintptr_t)buf, count)) {
         return LINUX_EFAULT;
-    }
-    int64_t saved = syscall_file_seek((int32_t)fd, 0, LINUX_SEEK_CUR);
-    if (saved < 0) {
-        return saved;
-    }
-    if (syscall_file_seek((int32_t)fd, (int64_t)offset, LINUX_SEEK_SET) < 0) {
-        return LINUX_EINVAL;
     }
     uint8_t chunk[4096];
     uint64_t total = 0;
@@ -4994,15 +5102,16 @@ static int64_t linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
             error = LINUX_EFAULT;
             break;
         }
-        int64_t put = syscall_file_write((int32_t)fd, chunk, want);
+        int64_t put = syscall_file_pwrite((int32_t)fd, chunk, want,
+                                          offset + total);
         if (put < 0) {
-            error = put;
+            error = (put == (int64_t)OS_STATUS_NOT_SUPPORTED) ? LINUX_ESPIPE
+                                                              : put;
             break;
         }
         total += (uint64_t)put;
         if ((uint64_t)put < want) break;
     }
-    (void)syscall_file_seek((int32_t)fd, saved, LINUX_SEEK_SET);
     return total != 0u ? (int64_t)total : error;
 }
 
@@ -5600,8 +5709,9 @@ static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1,
  * connected, received every global, and then never spoke again. */
 #define LINUX_MSG_DONTWAIT 0x40u
 
-static void linux_unix_block_retry(int32_t fd, int64_t *result,
-                                   int *should_switch, int *restart_out)
+static void linux_unix_block_retry(uint64_t generation, int32_t fd,
+                                   int64_t *result, int *should_switch,
+                                   int *restart_out)
 {
     if (*result != LINUX_EAGAIN) {
         return;
@@ -5634,7 +5744,16 @@ static void linux_unix_block_retry(int32_t fd, int64_t *result,
     } else {
         return;
     }
-    if (process_sleep_current_ms(LINUX_WAIT_POLL_SLICE_MS) == 0 &&
+    /* Parked, not just asleep: the writer's poll_wait_notify() ends the
+     * wait the moment data (or room) arrives. A plain timed sleep here made
+     * every blocking read of a socket or pipe take a whole slice to notice
+     * its data -- and Chromium's audio renderer thread, which blocks in
+     * recv() on the sync socket for each "render the next buffer" request,
+     * answered every one too late: the audio service, which waits for the
+     * reply only a few milliseconds, played silence in its place. The
+     * generation was taken before the read was attempted (at syscall entry),
+     * so a write that landed in between cancels the park. */
+    if (poll_wait_park(generation, LINUX_WAIT_POLL_SLICE_MS) != 0 &&
         should_switch != NULL) {
         *should_switch = 1;
     }
@@ -6245,6 +6364,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
     LINUX_TRACE_ENTER(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
+    /* Before anything is checked for readiness: a blocking read that finds
+     * nothing parks against this, so a wakeup between the check and the
+     * park is not lost (linux_unix_block_retry()). */
+    uint64_t lx_gen = poll_wait_generation();
+
     /* Descriptor and pid numbers arrive in the caller's terms; see
      * lx_fd_pre(). The originals are kept for lx_fd_post(). */
     const uint64_t lx_orig[6] = { arg1, arg2, arg3, arg4, arg5, arg6 };
@@ -6264,11 +6388,34 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         goto lx_fd_finished;
     }
 
+    /* Socket calls on a descriptor that is not a socket fail with ENOTSOCK
+     * on Linux, and callers probe with exactly that: libpulse's pa_write()
+     * tries send() first and falls back to write() only on ENOTSOCK. Any
+     * other error there (this used to be EINVAL/ENOTSUP) makes it give up --
+     * "pa_write() failed while trying to wake up the mainloop". */
+    switch (num) {
+        case LINUX_SYS_SENDTO: case LINUX_SYS_RECVFROM:
+        case LINUX_SYS_SENDMSG: case LINUX_SYS_RECVMSG:
+        case LINUX_SYS_SHUTDOWN: case LINUX_SYS_SETSOCKOPT:
+        case LINUX_SYS_GETSOCKOPT: case LINUX_SYS_GETSOCKNAME:
+        case LINUX_SYS_GETPEERNAME: case LINUX_SYS_SENDMMSG:
+        case LINUX_SYS_RECVMMSG: case LINUX_SYS_ACCEPT: case 288u:
+        case LINUX_SYS_LISTEN: case LINUX_SYS_BIND: case LINUX_SYS_CONNECT:
+            if (!syscall_socket_fd_in_range((int32_t)arg1) &&
+                !unix_socket_fd_in_range((int32_t)arg1)) {
+                result = -88; /* ENOTSOCK */
+                goto lx_fd_finished;
+            }
+            break;
+        default:
+            break;
+    }
+
     switch (num) {
         case LINUX_SYS_READ: {
             int should_switch = 0;
             result = linux_read(arg1, arg2, arg3);
-            linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
+            linux_unix_block_retry(lx_gen, (int32_t)arg1, &result, &should_switch,
                                    &request_restart);
             if (should_switch) {
                 request_switch = 1;
@@ -6282,7 +6429,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                            arg3);
             /* Same rule as read(): a blocking write to a full pipe waits, it
              * does not report EAGAIN. */
-            linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
+            linux_unix_block_retry(lx_gen, (int32_t)arg1, &result, &should_switch,
                                    &request_restart);
             if (should_switch) {
                 request_switch = 1;
@@ -6440,6 +6587,22 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
         case LINUX_SYS_IOCTL:
             result = syscall_ioctl_ex(arg1, arg2, arg3);
+            if (result == ALSA_WOULD_BLOCK) {
+                /* A sound device with no room (WRITEI) or still draining:
+                 * EAGAIN for a non-blocking descriptor, otherwise wait a
+                 * little and run the ioctl again -- the kernel cannot sleep
+                 * in the middle of a syscall and resume it. */
+                int32_t fl = syscall_file_get_status_flags((int32_t)arg1);
+                if (fl < 0 || ((uint32_t)fl & LINUX_O_NONBLOCK) != 0u) {
+                    result = LINUX_EAGAIN;
+                } else {
+                    if (process_sleep_current_ms(4u) == 0) {
+                        request_switch = 1;
+                    }
+                    request_restart = 1;
+                    result = 0;
+                }
+            }
             break;
 
         case LINUX_SYS_READV:
@@ -6892,7 +7055,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
              * arguments -- in particular before the timeout below would be
              * re-derived from them. See syscall_futex_linux_resume(). */
             if ((futex_cmd == 0u || futex_cmd == 9u) &&
-                syscall_futex_linux_resume(&result, &futex_restart)) {
+                syscall_futex_linux_resume(arg1, &result, &futex_restart)) {
                 futex_done = 1;
             }
             if (!futex_done && (futex_cmd == 0u || futex_cmd == 9u) && arg4 != 0u) {
@@ -6929,9 +7092,36 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 result = syscall_futex_wait_linux(
                     arg1, (int32_t)arg3, futex_timeout,
                     futex_cmd == 9u ? (uint32_t)arg6 : 0xFFFFFFFFu,
-                    &futex_restart);
+                    &futex_restart, (arg2 & 0x80u) == 0u /* !PRIVATE */);
+            } else if (!futex_done &&
+                       (futex_cmd == 6u || futex_cmd == 13u || futex_cmd == 8u)) {
+                /* LOCK_PI / LOCK_PI2 / TRYLOCK_PI */
+                result = syscall_futex_lock_pi_linux(arg1, futex_cmd == 8u,
+                                                     &futex_restart);
             } else if (!futex_done) {
                 result = syscall_futex(arg1, arg2, arg3, futex_timeout, arg5, arg6);
+            }
+            if ((result < 0 && result != LINUX_EAGAIN && result != -4 &&
+                 result != -110) ||
+                (result == -110 && arg4 == 0u) ||
+                (result > 0 && (futex_cmd == 0u || futex_cmd == 9u))) {
+                /* glibc aborts on anything else ("The futex facility returned
+                 * an unexpected error code."); leave a trace of what it was. */
+                static volatile uint32_t futex_err_reported;
+                if (__atomic_fetch_add(&futex_err_reported, 1u,
+                                       __ATOMIC_RELAXED) < 32u) {
+                    serial_write_string("[lxfutex] rc=");
+                    serial_write_uint64((uint64_t)result);
+                    serial_write_string(" op=");
+                    serial_write_uint64(arg2);
+                    serial_write_string(" uaddr=");
+                    serial_write_uint64(arg1);
+                    serial_write_string(" val=");
+                    serial_write_uint64(arg3);
+                    serial_write_string(" tid=");
+                    serial_write_uint64((uint64_t)(uint32_t)process_get_current_tid());
+                    serial_write_string("\n");
+                }
             }
             if (futex_restart) {
                 request_restart = 1;
@@ -7219,7 +7409,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             int should_switch = 0;
             result = linux_socket_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6);
             if ((arg4 & LINUX_MSG_DONTWAIT) == 0u) {
-                linux_unix_block_retry((int32_t)arg1, &result, &should_switch,
+                linux_unix_block_retry(lx_gen, (int32_t)arg1, &result, &should_switch,
                                        &request_restart);
             }
             if (should_switch) {
@@ -7259,7 +7449,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             } else {
                 result = unix_socket_recvmsg((int32_t)arg1, arg2);
                 if ((arg3 & LINUX_MSG_DONTWAIT) == 0u) {
-                    linux_unix_block_retry((int32_t)arg1, &result,
+                    linux_unix_block_retry(lx_gen, (int32_t)arg1, &result,
                                            &should_switch, &request_restart);
                 }
             }
@@ -7600,22 +7790,69 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = 0;
             break;
 
-        case LINUX_SYS_SCHED_GETSCHEDULER:
-            result = 0; /* SCHED_OTHER */
+        /* Scheduling policy. SCHED_FIFO/SCHED_RR are real state now: the
+         * scheduler runs such threads ahead of everything else and preempts
+         * for them on wakeup (Core/process/ProcessScheduler.c). Chromium puts
+         * its audio threads there, and they have a few milliseconds to answer
+         * the audio service each time. Other policies are SCHED_OTHER. */
+        case LINUX_SYS_SCHED_GETSCHEDULER: {
+            int32_t tid = (int32_t)arg1 == 0 ? process_get_current_tid()
+                                             : process_pid_from_current_view((int32_t)arg1);
+            uint8_t pol = 0;
+            result = process_get_rt_policy(tid, &pol, NULL) < 0 ? -3 /* ESRCH */
+                                                               : (int64_t)pol;
             break;
+        }
 
         case LINUX_SYS_SCHED_SETSCHEDULER:
-        case LINUX_SYS_SCHED_SETPARAM:
-            result = 0;
+        case LINUX_SYS_SCHED_SETPARAM: {
+            int32_t tid = (int32_t)arg1 == 0 ? process_get_current_tid()
+                                             : process_pid_from_current_view((int32_t)arg1);
+            uint64_t param_ptr = num == LINUX_SYS_SCHED_SETPARAM ? arg2 : arg3;
+            int32_t prio = 0;
+            if (param_ptr != 0u &&
+                copy_from_user(&prio, (const void *)(uintptr_t)param_ptr,
+                               sizeof(prio)) != 0u) {
+                result = LINUX_EFAULT;
+                break;
+            }
+            uint8_t pol;
+            if (num == LINUX_SYS_SCHED_SETPARAM) {
+                uint8_t cur = 0;
+                if (process_get_rt_policy(tid, &cur, NULL) < 0) {
+                    result = -3;
+                    break;
+                }
+                pol = cur;
+            } else {
+                uint32_t want = (uint32_t)arg2 & ~0x40000000u; /* RESET_ON_FORK */
+                if (want > 6u || want == 4u) {
+                    result = LINUX_EINVAL;
+                    break;
+                }
+                pol = (want == 1u || want == 2u) ? (uint8_t)want : 0u;
+            }
+            if (pol != 0u && (prio < 1 || prio > 99)) {
+                result = LINUX_EINVAL;
+                break;
+            }
+            result = process_set_rt_policy(tid, pol,
+                                           pol != 0u ? (uint8_t)prio : 0u) < 0
+                         ? -3 : 0;
             break;
+        }
 
         case LINUX_SYS_SCHED_GETPARAM:
             if (arg2 != 0u) {
-                int32_t prio = 0;
+                int32_t tid = (int32_t)arg1 == 0 ? process_get_current_tid()
+                                                 : process_pid_from_current_view((int32_t)arg1);
+                uint8_t rp = 0;
+                (void)process_get_rt_policy(tid, NULL, &rp);
+                int32_t prio = rp;
                 result = copy_to_user((void *)(uintptr_t)arg2, &prio,
                                       sizeof(prio)) != 0u ? LINUX_EFAULT : 0;
             } else {
-                result = 0;
+                result = LINUX_EINVAL;
             }
             break;
 
@@ -7741,7 +7978,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         result = lx_fd_post(num, lx_orig, result, lx_cloexec);
     }
 lx_fd_finished:
-
     /* Name every syscall this layer does not implement, once each. An
      * external Linux binary that dies for want of a syscall otherwise says
      * nothing useful: glibc turns ENOSYS into an ordinary errno and the

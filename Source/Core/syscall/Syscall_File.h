@@ -17,6 +17,12 @@ int32_t syscall_memfd_get_seals(int32_t fd);
 int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len);
 int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence);
+/* Positional read/write (pread/pwrite): the descriptor's offset is left
+ * alone, and concurrent callers on one open file are serialised. */
+int64_t syscall_file_pread(int32_t fd, uint8_t *buffer, uint64_t len,
+                           uint64_t position);
+int64_t syscall_file_pwrite(int32_t fd, const uint8_t *buffer, uint64_t len,
+                            uint64_t position);
 int32_t syscall_file_close(int32_t fd);
 int32_t syscall_file_mkdir(const char *path);
 int32_t syscall_file_opendir(const char *path);
@@ -104,6 +110,10 @@ int32_t syscall_file_signalfd_set_mask(int32_t fd, uint64_t mask);
 int64_t syscall_timerfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_memfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_memfd_write(int32_t fd, const uint8_t *buffer, uint64_t len);
+int64_t syscall_memfd_pread(int32_t fd, uint8_t *buffer, uint64_t len,
+                            uint64_t position);
+int64_t syscall_memfd_pwrite(int32_t fd, const uint8_t *buffer, uint64_t len,
+                             uint64_t position);
 int64_t syscall_signalfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
 
 /* mmap(2) references on the open file description. A mapping must survive the
@@ -114,6 +124,7 @@ int64_t syscall_signalfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int32_t syscall_file_mmap_acquire(int32_t fd);
 /* Shared-memory handle backing a tmpfs file for mmap(MAP_SHARED), or <= 0
  * when `fd` is not such a file. See tmpfs_share_mapping(). */
+int syscall_file_is_tmpfs(int32_t fd);
 int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length);
 int32_t syscall_file_mmap_reacquire(int32_t handle);
 int64_t syscall_file_mmap_read(int32_t handle, uint64_t offset,

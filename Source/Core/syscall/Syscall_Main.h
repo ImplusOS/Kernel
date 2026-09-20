@@ -273,6 +273,9 @@ uint64_t syscall_get_user_rsp(void);
 void     syscall_set_user_rsp(uint64_t user_rsp);
 uint64_t syscall_get_kernel_rsp(void);
 void     syscall_set_kernel_rsp(uint64_t kernel_rsp);
+void     syscall_set_full_restore(int enabled, uint64_t rcx, uint64_t r11);
+/* Point this CPU's GS base at its per-CPU area for `cpu_id` (x86_64). */
+void     syscall_percpu_bind(uint32_t cpu_id);
 
 uint64_t syscall_dispatch(uint64_t saved_rsp,
                           uint64_t num,

@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #define VECTOR_TLB_SHOOTDOWN 0xFE
+#define VECTOR_RESCHED       0xFD
 
 void     smp_init(void);
 uint32_t smp_get_cpu_count(void);
@@ -26,6 +27,7 @@ void     smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages);
 void     smp_tlb_shootdown(uint64_t vaddr, uint64_t pages);
 void     smp_tlb_shootdown_all(void);
 void     smp_tlb_shootdown_handler(void);
+void     smp_send_resched_ipi(uint32_t cpu);
 
 /* Publish the address space this CPU has just loaded, so shootdowns for other
  * address spaces need not wait for it. Called from paging_switch_cr3(). */

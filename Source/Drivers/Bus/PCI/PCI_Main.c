@@ -1,3 +1,4 @@
+#include <string.h>
 #include "Drivers/Module/PCI_Main.h"
 
 #include <stdint.h>
@@ -564,6 +565,51 @@ static int32_t pci_find_in_list(const pci_device_t *devices,
     return -1;
 }
 
+/* Reads one present function into *dev. On a rescan, a function that is
+ * already known (same slot, same vendor/device) is taken from the table
+ * instead of being read again: pci_read_bars() sizes each BAR by writing
+ * all-ones to it and restoring it, which briefly turns the BAR off -- doing
+ * that once a second to devices other CPUs are driving (virtio-net, xHCI,
+ * NVMe) is a way to lose MMIO accesses, and it was two VM exits per dword. */
+static void pci_read_function(pci_device_t *dev, uint8_t bus, uint8_t device,
+                              uint8_t func, uint32_t vendor_device)
+{
+    uint16_t vendor_id = (uint16_t)(vendor_device & 0xFFFFu);
+    uint16_t device_id = (uint16_t)((vendor_device >> 16) & 0xFFFFu);
+
+    if (g_pci_scan_done != 0u) {
+        for (uint32_t i = 0u; i < g_pci_device_count; ++i) {
+            const pci_device_t *known = &g_pci_devices[i];
+            if (known->bus == bus && known->device == device &&
+                known->func == func && known->vendor_id == vendor_id &&
+                known->device_id == device_id) {
+                *dev = *known;
+                return;
+            }
+        }
+    }
+
+    uint32_t class_reg = pci_read_config(bus, device, func, 0x08);
+    dev->bus = bus;
+    dev->device = device;
+    dev->func = func;
+    dev->vendor_id = vendor_id;
+    dev->device_id = device_id;
+    dev->class_code = (uint8_t)((class_reg >> 24) & 0xFFu);
+    dev->subclass = (uint8_t)((class_reg >> 16) & 0xFFu);
+    dev->prog_if = (uint8_t)((class_reg >> 8) & 0xFFu);
+    dev->revision = (uint8_t)(class_reg & 0xFFu);
+    uint32_t irq_reg = pci_read_config(bus, device, func, 0x3Cu);
+    dev->interrupt_line = (uint8_t)(irq_reg & 0xFFu);
+    dev->interrupt_pin = (uint8_t)((irq_reg >> 8u) & 0xFFu);
+    pci_read_bars(dev);
+}
+
+/* Enumerates every function. The first (boot) scan probes all 256 buses;
+ * later ones -- the once-a-second hot-plug poll -- follow the bridges from
+ * bus 0 instead, which on a typical machine is one bus rather than 8192
+ * vendor-id reads (16384 port I/O exits under a hypervisor, every second,
+ * inside some unlucky process's syscall). */
 static uint32_t pci_collect_devices(pci_device_t *devices, uint32_t max_devices)
 {
     uint32_t count = 0u;
@@ -572,12 +618,27 @@ static uint32_t pci_collect_devices(pci_device_t *devices, uint32_t max_devices)
         return 0u;
     }
 
-    for (uint16_t bus = 0; bus < 256 && count < max_devices; bus++) {
+    uint8_t queued[256];
+    uint16_t queue[256];
+    uint32_t qhead = 0u, qtail = 0u;
+    int all_buses = (g_pci_scan_done == 0u);
+    memset(queued, 0, sizeof(queued));
+    if (all_buses) {
+        for (uint32_t b = 0u; b < 256u; ++b) {
+            queue[qtail++] = (uint16_t)b;
+            queued[b] = 1u;
+        }
+    } else {
+        queue[qtail++] = 0u;
+        queued[0] = 1u;
+    }
+
+    while (qhead < qtail && count < max_devices) {
+        uint8_t bus = (uint8_t)queue[qhead++];
         for (uint8_t device = 0; device < 32 && count < max_devices; device++) {
             for (uint8_t func = 0; func < 8 && count < max_devices; func++) {
-                uint32_t vendor_device = pci_read_config((uint8_t)bus, device, func, 0x00);
+                uint32_t vendor_device = pci_read_config(bus, device, func, 0x00);
                 uint16_t vendor_id = (uint16_t)(vendor_device & 0xFFFFu);
-                uint16_t device_id = (uint16_t)((vendor_device >> 16) & 0xFFFFu);
 
                 if (vendor_id == 0xFFFFu) {
                     if (func == 0u) {
@@ -586,28 +647,21 @@ static uint32_t pci_collect_devices(pci_device_t *devices, uint32_t max_devices)
                     continue;
                 }
 
-                uint32_t class_reg = pci_read_config((uint8_t)bus, device, func, 0x08);
                 pci_device_t *dev = &devices[count++];
-                dev->bus = (uint8_t)bus;
-                dev->device = device;
-                dev->func = func;
-                dev->vendor_id = vendor_id;
-                dev->device_id = device_id;
-                dev->class_code = (uint8_t)((class_reg >> 24) & 0xFFu);
-                dev->subclass = (uint8_t)((class_reg >> 16) & 0xFFu);
-                dev->prog_if = (uint8_t)((class_reg >> 8) & 0xFFu);
-                dev->revision = (uint8_t)(class_reg & 0xFFu);
-                uint32_t irq_reg = pci_read_config((uint8_t)bus, device,
-                                                   func, 0x3Cu);
-                dev->interrupt_line = (uint8_t)(irq_reg & 0xFFu);
-                dev->interrupt_pin = (uint8_t)((irq_reg >> 8u) & 0xFFu);
-                pci_read_bars(dev);
+                pci_read_function(dev, bus, device, func, vendor_device);
 
-                if (func == 0u) {
-                    uint32_t header_type = pci_read_config((uint8_t)bus, device, func, 0x0C);
-                    if (((header_type >> 16) & 0x80u) == 0u) {
-                        break;
+                uint32_t header_type = pci_read_config(bus, device, func, 0x0C);
+                /* PCI-to-PCI / CardBus bridge: queue its secondary bus. */
+                if (!all_buses && ((header_type >> 16) & 0x7Fu) != 0u) {
+                    uint32_t buses = pci_read_config(bus, device, func, 0x18);
+                    uint8_t secondary = (uint8_t)((buses >> 8) & 0xFFu);
+                    if (secondary != 0u && !queued[secondary] && qtail < 256u) {
+                        queued[secondary] = 1u;
+                        queue[qtail++] = secondary;
                     }
+                }
+                if (func == 0u && ((header_type >> 16) & 0x80u) == 0u) {
+                    break;
                 }
             }
         }
