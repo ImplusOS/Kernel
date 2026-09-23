@@ -642,7 +642,6 @@ static void save_syscall_frame_to_process(process_t *proc, uint64_t current_save
 {
     if (proc == NULL || current_saved_rsp == 0) return;
     proc->saved_rsp = current_saved_rsp;
-    proc->gs_base = hal_cpu_read_gs_base();
 }
 
 static void reset_process_slot(process_t *proc)
@@ -2254,6 +2253,40 @@ uint64_t process_get_current_fs_base(void)
     return val;
 }
 
+/* GS differs from FS: the syscall/exception entry paths swapgs, so while the
+ * kernel runs, the user-visible GS base is parked in IA32_KERNEL_GS_BASE
+ * (activate_process_context restores it from proc->gs_base on every switch-in).
+ * Writing IA32_GS_BASE here would clobber the kernel's own per-CPU base. */
+void process_set_current_gs_base(uint64_t gs_base)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    if (is_valid_pid(current_pid_get())) {
+        g_processes[current_pid_get()].gs_base = gs_base;
+    }
+
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+
+    wrmsr_kernel_gs_base(gs_base);
+}
+
+uint64_t process_get_current_gs_base(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    uint64_t val = 0;
+    if (is_valid_pid(current_pid_get())) {
+        val = g_processes[current_pid_get()].gs_base;
+    }
+
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return val;
+}
+
 /* Lock-free for the same reason as process_get_current_pid(). */
 uint8_t process_get_current_abi_mode(void)
 {
@@ -3183,7 +3216,7 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
 
     elf_load_policy_t policy = {
         .max_file_size = PROCESS_ELF_MAX_SIZE,
-        .min_vaddr = 0x1000,
+        .min_vaddr = USER_FOREIGN_BASE,
         .max_vaddr = USER_CODE_LIMIT,
     };
     elf_loaded_image_info_t image_info = {0};
@@ -3509,7 +3542,8 @@ static int process_clone_address_space(process_t *child, process_t *parent)
          * faulted on its first instruction back in user space. That is the
          * "COW makes boot unstable" this was turned off for. */
         if (paging_cow_clone_user_range(child->cr3, parent->cr3,
-                                        0x1000, USER_STACK_TOP) == 0 &&
+                                        USER_FOREIGN_BASE,
+                                        USER_STACK_TOP) == 0 &&
             paging_cow_clone_user_range(child->cr3, parent->cr3,
                                         USER_MMAP_BASE, USER_MMAP_LIMIT) == 0) {
             clone_rc = 0;
@@ -3517,7 +3551,8 @@ static int process_clone_address_space(process_t *child, process_t *parent)
         }
 #endif
         clone_rc = paging_copy_present_user_range(child->cr3, parent->cr3,
-                                                  0x1000, USER_STACK_TOP);
+                                                  USER_FOREIGN_BASE,
+                                                  USER_STACK_TOP);
         if (clone_rc == 0) {
             /* The USER_MMAP arena sits far above the stack, so it needs its
              * own pass. Shared objects live there now that large file
@@ -3826,7 +3861,9 @@ static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts,
     child->rseq_area = caller->rseq_area;
     child->rseq_sig = caller->rseq_sig;
     child->fs_base = caller->fs_base;
-    child->gs_base = hal_cpu_read_gs_base();
+    /* hal_cpu_read_gs_base() would read the kernel's per-CPU GS (swapgs is
+     * already done in syscall context); inherit the user GS like FS. */
+    child->gs_base = caller->gs_base;
     memcpy(child->fpu_state, caller->fpu_state, PROCESS_FPU_STATE_SIZE);
 
     uint64_t *parent_kstack = (uint64_t *)(uintptr_t)caller->saved_rsp;
@@ -4311,7 +4348,7 @@ int32_t process_execve(const char *path, const char *const *argv,
 
     elf_load_policy_t elf_policy = {
         .max_file_size = PROCESS_ELF_MAX_SIZE,
-        .min_vaddr = 0x1000,
+        .min_vaddr = USER_FOREIGN_BASE,
         .max_vaddr = USER_CODE_LIMIT,
     };
     elf_loaded_image_info_t image_info = {0};
@@ -4754,6 +4791,14 @@ void process_exit_current(void)
 
 void process_exit_current_signaled(int32_t signum)
 {
+    /* TEMPORARY DIAGNOSTIC (revert): which of the several kill paths took a
+     * process down, and as whom it is recorded. */
+    serial_write_string("[exit-cause] signaled pid=");
+    serial_write_uint32((uint32_t)current_pid_get());
+    serial_write_string(" signum=");
+    serial_write_uint32((uint32_t)signum);
+    serial_write_char('\n');
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
     if (is_valid_pid(current_pid_get())) {
@@ -4773,6 +4818,14 @@ void process_exit_current_signaled(int32_t signum)
 
 void process_exit_current_with_status(int32_t exit_status)
 {
+    /* TEMPORARY DIAGNOSTIC (revert): a process that leaves through exit_group
+     * rather than by signal -- the status is its own argument. */
+    serial_write_string("[exit-cause] status pid=");
+    serial_write_uint32((uint32_t)current_pid_get());
+    serial_write_string(" status=");
+    serial_write_uint32((uint32_t)exit_status);
+    serial_write_char('\n');
+
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
     if (is_valid_pid(current_pid_get())) {
@@ -5896,7 +5949,7 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len)
     }
 
     if (abi_mode == PROCESS_ABI_LINUX) {
-        if (addr < 0x1000) {
+        if (addr < USER_FOREIGN_BASE) {
             return 0;
         }
         /* One window over everything below the top of the stack area rather
@@ -5907,7 +5960,7 @@ int process_user_buffer_is_valid(const void *ptr, uint64_t len)
          * both address the creator's stack, both came back EFAULT, and the
          * browser then sat in poll(-1) forever waiting for a thread that had
          * failed to hand itself over. */
-        if (range_within(addr, len, 0x1000, USER_STACK_TOP)) {
+        if (range_within(addr, len, USER_FOREIGN_BASE, USER_STACK_TOP)) {
             return paging_is_user_range_mapped(process_cr3, addr, len);
         }
         return 0;

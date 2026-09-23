@@ -2799,8 +2799,26 @@ pre_schedule:
                                                               request_switch,
                                                               &next_user_rsp);
         if (!request_switch && current_pid_get() == scheduled_from_pid) {
+            /* Same task, no switch: its frame is the one this syscall was
+             * entered on.
+             *
+             * The user stack pointer is NOT restored the same way.
+             * process_schedule_on_syscall() delivers pending signals on this
+             * path too, and a delivered signal moves the task's user stack to
+             * the rt_sigframe it just built (process_push_signal_frame_locked
+             * sets saved_user_rsp along with the frame's RIP slot). Putting
+             * current_user_rsp back here kept the new RIP and threw the new
+             * RSP away, so the handler ran on the *interrupted* stack: its
+             * first `ret` popped whatever the interrupted code had left at
+             * [rsp] -- a data pointer, or 0 -- and the process died with
+             * "RIP=0" or an instruction fetch inside its own .data. A shell
+             * reaping a background job (SIGCHLD) hit this every time the
+             * signal happened to land on a syscall that did not switch, which
+             * is what stopped xterm and /bin/sh from coming up. */
             next_saved_rsp = saved_rsp;
-            next_user_rsp = current_user_rsp;
+            if (next_user_rsp == 0u) {
+                next_user_rsp = current_user_rsp;
+            }
         }
 
         syscall_set_user_rsp(next_user_rsp);

@@ -203,6 +203,13 @@
 #define OS_CONFIG_FOREIGN_TRACE 0
 #endif
 
+/* TEMPORARY (Firefox bring-up): shared-memory handshake trace -- memfd_create,
+ * fcntl(F_GETFL), and [shm2] which branch of linux_mmap() each mapping took.
+ * Set back to 0 before this goes in. */
+#ifndef CHROME_SHM_TRACE
+#define CHROME_SHM_TRACE 0
+#endif
+
 /* Always-on, one-line-per-event log of foreign (Linux-ABI) program launches:
  * exec, the interpreter that will run it, and the exit status. This is what
  * OS_CONFIG_FOREIGN_TRACE's per-syscall firehose is not -- a handful of lines

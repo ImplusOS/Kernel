@@ -94,6 +94,8 @@ int32_t syscall_file_timerfd_gettime(int32_t fd,
                                      uint64_t *it_interval_sec_out,
                                      uint64_t *it_interval_nsec_out);
 int32_t syscall_file_create_memfd(const char *name);
+/* True when `fd` names a memfd, promoted to shared memory or not. */
+int syscall_file_is_memfd(int32_t fd);
 /* Shared-memory handle backing an shm-promoted memfd, or -1. */
 int32_t syscall_memfd_shm_handle(int32_t fd);
 /* Install a memfd fd in the current process wrapping an existing shared

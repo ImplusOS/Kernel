@@ -610,6 +610,14 @@ static int64_t usock_dequeue(unix_sock_t *s, uint8_t *dst, uint64_t len,
         }
     }
     spinlock_unlock(&s->lock);
+    /* TEMPORARY DIAGNOSTIC (revert): fds that arrived with no room in the
+     * caller's control buffer are destroyed here, silently losing them. */
+    if (ndropped != 0u) {
+        char t[64];
+        snprintf(t, sizeof(t), "[scm]   DROPPED-noroom n=%u\n",
+                 (unsigned)ndropped);
+        serial_write_string(t);
+    }
     for (uint32_t i = 0; i < ndropped; ++i) usock_release_passed(dropped[i]);
 
     if (!have) {
@@ -640,6 +648,15 @@ int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
     int64_t rc = usock_dequeue(s, (uint8_t *)buf, len, objs, &nobjs,
                                UNIX_SOCK_FD_MAX);
     /* A plain read() has nowhere to put descriptors: Linux closes them. */
+    /* TEMPORARY DIAGNOSTIC (revert): a descriptor destroyed by a plain read()
+     * on the same socket IPDL reads with recvmsg is invisible from both
+     * sides otherwise. */
+    if (nobjs != 0u) {
+        char t[64];
+        snprintf(t, sizeof(t), "[scm]   DESTROYED-by-read n=%u rc=%lld\n",
+                 (unsigned)nobjs, (long long)rc);
+        serial_write_string(t);
+    }
     for (uint32_t i = 0; i < nobjs; ++i) usock_release_passed(objs[i]);
     usock_trace2(rc > 0 ? "rx" : (rc == 0 ? "rx-EOF" : "rx-EAGAIN"), fd, rc);
     return rc;
@@ -709,8 +726,11 @@ static int usock_capture(int32_t global, unix_sock_t *peer,
 /* One line per sendmsg/recvmsg: who, which endpoint, how many bytes and
  * descriptors. The zygote's fork handshake is a handful of these, and a
  * mismatch in either count is invisible from anywhere else. Off by default. */
+/* TEMPORARY DIAGNOSTIC (revert): SCM_RIGHTS tx/rx line per sendmsg/recvmsg,
+ * used to find which side of the IPDL fd handshake drops a descriptor
+ * ("File handle not found in message!"). Revert to 0 when done. */
 #ifndef UNIX_SCM_TRACE
-#define UNIX_SCM_TRACE 0
+#define UNIX_SCM_TRACE 1
 #endif
 static void usock_scm_trace(const char *dir, int32_t fd, int64_t bytes,
                             uint32_t nobjs, int seqpacket) {
@@ -977,11 +997,18 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
             int32_t *out = (int32_t *)(ctl + used + sizeof(struct _kernel_cmsghdr));
             for (uint32_t i = 0; i < nobjs; ++i) {
                 if (written >= max_fds) {
+                    /* TEMPORARY DIAGNOSTIC (revert): cmsg room ran out. */
+                    serial_write_string("[scm]   CMSG-TRUNC\n");
                     usock_release_passed(objs[i]);
                     continue;
                 }
                 int32_t g = usock_adopt(objs[i]);
-                if (g < 0) continue;
+                if (g < 0) {
+                    /* TEMPORARY DIAGNOSTIC (revert): an fd the sender handed
+                     * over that cannot be adopted vanishes from the cmsg. */
+                    serial_write_string("[scm]   ADOPT-FAIL kind=\n");
+                    continue;
+                }
                 int32_t u = g_usock_install ? g_usock_install(g) : g;
                 if (UNIX_SCM_TRACE) {
                     char t[96];
@@ -990,7 +1017,14 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
                              (int)g, (int)u);
                     serial_write_string(t);
                 }
-                if (u < 0) continue;
+                if (u < 0) {
+                    /* TEMPORARY DIAGNOSTIC (revert): install into this
+                     * process's fd table failed; the handle is dropped. */
+                    char t[64];
+                    snprintf(t, sizeof(t), "[scm]   INSTALL-FAIL global=%d\n", (int)g);
+                    serial_write_string(t);
+                    continue;
+                }
                 out[written++] = u;
             }
             if (written > 0) {

@@ -93,7 +93,7 @@ static void linux_syscall_profile(uint64_t nr)
 static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
                               uint64_t bv, const char *c, uint64_t cv)
 {
-    static uint32_t budget = 400u;
+    static uint32_t budget = 2000u;
     if (budget == 0u) return;
     --budget;
     serial_write_string("[shmtr] ");
@@ -102,6 +102,30 @@ static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
     if (c[0]) { serial_write_string(c); serial_write_uint64(cv); }
     serial_write_string("\n");
 }
+#endif
+
+#if CHROME_SHM_TRACE
+/* Which branch of linux_mmap() a file-backed mapping actually took. The memfd
+ * and tmpfs paths map live shared pages; anything that falls through to the
+ * eager read-in below gets a private snapshot that never writes back until
+ * msync, which is invisible from userland until it loses data. */
+static void shm2(const char *what, uint64_t a, uint64_t b, uint64_t c)
+{
+    static uint32_t budget = 2000u;
+    if (budget == 0u) return;
+    --budget;
+    serial_write_string("[shm2] ");
+    serial_write_string(what);
+    serial_write_string(" a=");
+    serial_write_uint64(a);
+    serial_write_string(" b=");
+    serial_write_uint64(b);
+    serial_write_string(" c=");
+    serial_write_uint64(c);
+    serial_write_string("\n");
+}
+#else
+#define shm2(what, a, b, c) ((void)0)
 #endif
 
 
@@ -118,8 +142,10 @@ static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
 
 #define LINUX_RSEQ_FLAG_UNREGISTER 1u
 
+#define LINUX_ARCH_SET_GS 0x1001u
 #define LINUX_ARCH_SET_FS 0x1002u
 #define LINUX_ARCH_GET_FS 0x1003u
+#define LINUX_ARCH_GET_GS 0x1004u
 
 #define LINUX_RLIMIT_CPU     0u
 #define LINUX_RLIMIT_FSIZE   1u
@@ -206,6 +232,19 @@ int64_t syscall_arch_prctl(uint64_t code, uint64_t addr)
     }
     if (code == LINUX_ARCH_GET_FS) {
         uint64_t value = process_get_current_fs_base();
+        return copy_to_user((void *)(uintptr_t)addr, &value, sizeof(value)) == 0u ?
+            0 : LINUX_EFAULT;
+    }
+    /* Firefox's wasm engine sets a "segue" base in GS and aborts the whole
+     * process if arch_prctl rejects it, so GS needs the same SET/GET pair FS
+     * already has. GS is parked in IA32_KERNEL_GS_BASE while in kernel mode;
+     * process_set_current_gs_base handles that. */
+    if (code == LINUX_ARCH_SET_GS) {
+        process_set_current_gs_base(addr);
+        return 0;
+    }
+    if (code == LINUX_ARCH_GET_GS) {
+        uint64_t value = process_get_current_gs_base();
         return copy_to_user((void *)(uintptr_t)addr, &value, sizeof(value)) == 0u ?
             0 : LINUX_EFAULT;
     }
@@ -743,6 +782,7 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
              * falls back to a temp file -- a path that then trips its own
              * fcntl(F_GETFL) access-mode CHECK. So this has to work. */
             int32_t rc = syscall_memfd_add_seals(fd, (uint32_t)arg);
+            shm2("memfd-seal", (uint64_t)(uint32_t)fd, arg, (uint64_t)(uint32_t)rc);
             if (rc == (int32_t)OS_STATUS_ACCESS_DENIED) return -1LL; /* EPERM */
             return (rc < 0) ? LINUX_EINVAL : 0;
         }
@@ -1170,6 +1210,8 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_PPOLL        271u
 #define LINUX_SYS_FACCESSAT    269u
 #define LINUX_SYS_FACCESSAT2   439u
+#define LINUX_SYS_CLOSE_RANGE  436u
+#define LINUX_SYS_OPENAT2      437u
 #define LINUX_SYS_PIPE2        293u
 #define LINUX_SYS_DUP3         292u
 #define LINUX_SYS_WAITID       247u
@@ -1799,8 +1841,7 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (shm_handle >= 0) {
             if (offset != 0u) {
                 return LINUX_EINVAL;
-            }
-            /* Whoever holds a descriptor for a memfd may map it -- that is
+            }            /* Whoever holds a descriptor for a memfd may map it -- that is
              * the whole access model on Linux, and the descriptor layer has
              * already checked this caller holds one. The per-object grant
              * (one pid) cannot describe a region handed through the zygote
@@ -1814,7 +1855,15 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if (p == NULL) {
                 return LINUX_ENOMEM;
             }
+            shm2("mmap-memfd", (uint64_t)(uint32_t)fd,
+                 (uint64_t)(uint32_t)shm_handle, (uint64_t)(uintptr_t)p);
             return (int64_t)(uintptr_t)p;
+        }
+        /* Not promoted yet: ftruncate/posix_fallocate never ran (or failed)
+         * on this memfd, so a map would fall through to the private snapshot
+         * path below and silently diverge from the fd. */
+        if (syscall_file_is_memfd((int32_t)fd)) {
+            shm2("mmap-memfd-unpromoted", (uint64_t)(uint32_t)fd, offset, length);
         }
     }
 
@@ -1843,6 +1892,8 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (tmpfs_handle > 0) {
             void *p = shared_memory_map_new(tmpfs_handle);
             if (p != NULL) {
+                shm2("mmap-tmpfs", (uint64_t)(uint32_t)fd,
+                     (uint64_t)(uint32_t)tmpfs_handle, (uint64_t)(uintptr_t)p);
                 return (int64_t)(uintptr_t)p;
             }
         }
@@ -1855,6 +1906,7 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 serial_write_uint64(length);
                 serial_write_string("\n");
             }
+            shm2("mmap-tmpfs-share-failed", (uint64_t)(uint32_t)fd, length, offset);
         }
     }
 
@@ -1981,6 +2033,13 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                                    offset, read_len,
                                    (prot & 0x2u /* PROT_WRITE */) != 0u);
         }
+    }
+    /* Only worth recording when the file is something a shared mapping
+     * should have covered: a memfd or a tmpfs file. A plain file mapping
+     * through here is normal. */
+    if (syscall_file_is_memfd((int32_t)fd) ||
+        syscall_file_is_tmpfs((int32_t)fd)) {
+        shm2("mmap-private-snapshot", (uint64_t)(uint32_t)fd, length, offset);
     }
 #if LINUX_MODULE_MAP_TRACE
     /* Also on the eager path: an X input/video driver is well under the
@@ -6024,6 +6083,74 @@ static int32_t lx_procfs_next(int32_t pid, int32_t after)
     return lxfd_next_open(pid, after);
 }
 
+#define LINUX_CLOSE_RANGE_UNSHARE  (1u << 1)
+#define LINUX_CLOSE_RANGE_CLOEXEC  (1u << 2)
+#define LINUX_CLOSE_RANGE_KNOWN \
+    (LINUX_CLOSE_RANGE_UNSHARE | LINUX_CLOSE_RANGE_CLOEXEC)
+
+static int64_t lx_close_range(uint32_t first, uint32_t last, uint32_t flags)
+{
+    if ((flags & ~LINUX_CLOSE_RANGE_KNOWN) != 0u) {
+        return LINUX_EINVAL;
+    }
+    if (first > last) {
+        return 0;
+    }
+
+    int32_t after = (first == 0u) ? -1 : (int32_t)(first - 1u);
+    for (;;) {
+        int32_t u = lxfd_next_open(process_memory_owner_pid_of(
+                                       process_get_current_pid()), after);
+        if (u < 0 || (uint32_t)u > last) {
+            break;
+        }
+        after = u;
+        if ((flags & LINUX_CLOSE_RANGE_CLOEXEC) != 0u) {
+            (void)lxfd_set_cloexec(u, 1);
+            continue;
+        }
+        int32_t g = -1;
+        int last_ref = lxfd_remove(u, &g);
+        if (last_ref == 1) {
+            (void)linux_close_global(g);
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+} linux_open_how_t;
+
+static int64_t linux_openat2(uint64_t dirfd, uint64_t path_ptr,
+                             uint64_t how_ptr, uint64_t size)
+{
+    if (how_ptr == 0u || size < sizeof(linux_open_how_t)) {
+        return LINUX_EINVAL;
+    }
+    linux_open_how_t how;
+    if (copy_from_user(&how, (const void *)(uintptr_t)how_ptr,
+                       sizeof(how)) != 0u) {
+        return LINUX_EFAULT;
+    }
+    (void)how.mode;
+    (void)how.resolve; /* openat2 resolve flags are advisory in this VFS. */
+
+    char path[256];
+    int64_t rc = linux_copy_cstring(path, sizeof(path),
+                                    (const char *)(uintptr_t)path_ptr);
+    if (rc < 0) {
+        return rc;
+    }
+    rc = linux_resolve_at(dirfd, path, sizeof(path));
+    if (rc < 0) {
+        return rc;
+    }
+    return linux_open_resolved(path, how.flags & ~(uint64_t)LX_CLOEXEC_FLAG);
+}
+
 /* Rewrite one descriptor argument; EBADF if it names nothing. */
 static int lx_xlate(uint64_t *arg)
 {
@@ -6120,6 +6247,10 @@ static int lx_fd_pre(uint64_t num, uint64_t *a, int64_t *res, int32_t *cloexec)
             if (lx_xlate(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
             return 0;
         }
+        case LINUX_SYS_CLOSE_RANGE:
+            *res = lx_close_range((uint32_t)a[0], (uint32_t)a[1],
+                                  (uint32_t)a[2]);
+            return 1;
 
         /* ---- one plain descriptor in arg1 ---- */
         case LINUX_SYS_READ: case LINUX_SYS_WRITE: case LINUX_SYS_FSTAT:
@@ -6188,6 +6319,21 @@ static int lx_fd_pre(uint64_t num, uint64_t *a, int64_t *res, int32_t *cloexec)
             a[2] &= ~(uint64_t)LX_CLOEXEC_FLAG;
             if (lx_xlate_dirfd(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
             return 0;
+        case LINUX_SYS_OPENAT2: {
+            linux_open_how_t how;
+            if (a[2] == 0u || a[3] < sizeof(how)) {
+                *res = LINUX_EINVAL;
+                return 1;
+            }
+            if (copy_from_user(&how, (const void *)(uintptr_t)a[2],
+                               sizeof(how)) != 0u) {
+                *res = LINUX_EFAULT;
+                return 1;
+            }
+            *cloexec = (how.flags & LX_CLOEXEC_FLAG) != 0u;
+            if (lx_xlate_dirfd(&a[0]) < 0) { *res = LINUX_EBADF; return 1; }
+            return 0;
+        }
         case LINUX_SYS_RENAMEAT: case LINUX_SYS_RENAMEAT2:
         case LINUX_SYS_LINKAT:
             if (lx_xlate_dirfd(&a[0]) < 0 || lx_xlate_dirfd(&a[2]) < 0) {
@@ -6294,7 +6440,8 @@ static int64_t lx_fd_post(uint64_t num, const uint64_t *orig, int64_t result,
                           int32_t cloexec)
 {
     switch (num) {
-        case LINUX_SYS_OPEN: case LINUX_SYS_OPENAT: case LINUX_SYS_CREAT:
+        case LINUX_SYS_OPEN: case LINUX_SYS_OPENAT: case LINUX_SYS_OPENAT2:
+        case LINUX_SYS_CREAT:
         case LINUX_SYS_SOCKET: case LINUX_SYS_ACCEPT: case 288u:
         case LINUX_SYS_TIMERFD_CREATE: case LINUX_SYS_MEMFD_CREATE:
         case LINUX_SYS_EVENTFD: case LINUX_SYS_EVENTFD2:
@@ -6802,6 +6949,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
         case LINUX_SYS_FTRUNCATE:
             result = syscall_ftruncate((int32_t)arg1, (int64_t)arg2);
+            shm2("ftruncate", arg1, arg2, (uint64_t)result);
             /* A memfd seal refuses the resize with EPERM on Linux, not EACCES,
              * and Mojo's seal self-check only accepts EINVAL/ENOSYS/EPERM. */
             if (result == (int64_t)OS_STATUS_ACCESS_DENIED) {
@@ -6812,6 +6960,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_FALLOCATE:
             result = linux_fallocate((int32_t)arg1, (uint32_t)arg2,
                                      (int64_t)arg3, (int64_t)arg4);
+            shm2("fallocate", arg1, (uint64_t)arg4, (uint64_t)result);
             break;
 
         case LINUX_SYS_GETCWD:
@@ -7214,6 +7363,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = linux_open_resolved(oa_path, arg3);
             break;
         }
+
+        case LINUX_SYS_OPENAT2:
+            result = linux_openat2(arg1, arg2, arg3, arg4);
+            break;
 
         case LINUX_SYS_SET_ROBUST_LIST:
             result = (int64_t)process_set_robust_list(arg1, arg2);

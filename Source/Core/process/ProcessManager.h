@@ -3,6 +3,19 @@
 #include <stdint.h>
 #include "kernel/config.h"
 
+/*
+ * The lowest address a foreign (Linux-ABI) image may be loaded at. Such a
+ * binary keeps the addresses it was linked for -- the static busybox behind
+ * /bin/sh is non-PIE at 0x400000 -- so its image sits far below the native
+ * windows defined underneath this one. Everything from here to
+ * USER_STACK_TOP is one window to fork() (paging_cow_clone_user_range), to
+ * usercopy (process_user_buffer_is_valid) and to the COW fault handler
+ * (is_user_cow_address); the loader's policy for a foreign ELF starts here
+ * too. One page is left unmapped at the bottom so a NULL dereference still
+ * faults.
+ */
+#define USER_FOREIGN_BASE 0x0000000000001000ULL
+
 #define USER_CODE_BASE    0x0000004000000000ULL
 #define USER_CODE_LIMIT   0x0000004080000000ULL
 #define USER_HEAP_BASE    0x0000004100000000ULL
@@ -173,6 +186,8 @@ int process_thread_join(int32_t tid);
 int process_thread_detach(int32_t tid);
 void process_set_current_fs_base(uint64_t fs_base);
 uint64_t process_get_current_fs_base(void);
+void process_set_current_gs_base(uint64_t gs_base);
+uint64_t process_get_current_gs_base(void);
 int64_t process_get_main_image_info(uint64_t *phdr_vaddr,
                                     uint64_t *phent,
                                     uint64_t *phnum);

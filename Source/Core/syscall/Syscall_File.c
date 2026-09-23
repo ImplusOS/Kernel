@@ -53,7 +53,23 @@ enum {
 #define FILE_SEAL_ALL          0x001Fu
 #define FILE_FD_CLOEXEC      0x0001u
 
-#define PIPE_MAX_COUNT       16
+/* System-wide pipes, not per-process: every pipe() in the machine takes one
+ * slot and gives it back when both ends close.
+ *
+ * 16 was enough for one GUI process plus a shell, and it is not enough for a
+ * browser. Firefox gives each of its processes a GLib main loop (a wakeup pipe
+ * apiece), wraps GTK's init pipe in a GIOChannel, and runs Breakpad on top --
+ * the parent alone held ten slots, and when a freshly spawned Socket process
+ * asked for one it got EMFILE back. That is not an errno its caller can
+ * handle: the pipe goes into
+ *
+ *   MOZ_RELEASE_ASSERT(!NS_FAILED(rv))
+ *
+ * inside libxul's GTK init, so a full table turned into an assertion in a
+ * foreign binary with no way to report it. Each slot costs PIPE_BUF_SIZE of
+ * BSS, so 256 costs ~1 MiB -- the same trade OS_CONFIG_FILE_MAX_FD already
+ * made when Chromium's descriptor count outgrew that table. */
+#define PIPE_MAX_COUNT       256
 #define PIPE_BUF_SIZE        4096u
 
 /* Extra owners of a descriptor slot, beyond `owner_pid`.
@@ -143,7 +159,6 @@ typedef struct {
 
 typedef struct {
     uint8_t used;
-    int32_t owner_pid;
     uint8_t *data;         /* legacy heap backing (only if shm_handle < 0) */
     uint32_t size;
     uint32_t capacity;
@@ -152,9 +167,9 @@ typedef struct {
      * (Kernel/Core/memory/SharedMemory.c) instead of `data`. This is what
      * makes mmap(MAP_SHARED) coherent between processes and lets the fd be
      * handed to another process via SCM_RIGHTS - the path Wayland's wl_shm
-     * needs. Promoted on the first non-zero ftruncate(). Each fd referencing
-     * the object holds one shared_memory reference (create/addref on dup,
-     * release on close). */
+     * needs. Promoted on the first non-zero ftruncate(). The object holds
+     * one shared_memory reference for as long as any descriptor names it
+     * (released when the last one closes). */
     int32_t shm_handle;
     /* F_ADD_SEALS state (F_SEAL_SEAL/SHRINK/GROW/WRITE/FUTURE_WRITE). Chromium
      * seals every shared-memory region right after ftruncate() and treats a
@@ -162,6 +177,11 @@ typedef struct {
      * file. Only SEAL_SEAL and SHRINK/GROW are enforced here; the WRITE seals
      * are recorded and reported so callers see what they set. */
     uint32_t seals;
+    /* Descriptors currently naming this object. One memfd is one Linux
+     * inode: memfd_create(), a /proc/self/fd read-only reopen of it and any
+     * dup all share size, seals and the shm promotion, so the state lives
+     * here rather than being copied per descriptor. */
+    uint32_t refs;
 } kernel_memfd_t;
 
 typedef struct {
@@ -198,8 +218,58 @@ static kernel_open_file_t g_open_files[FILE_MAX_FD];
 static kernel_dir_t g_dirs[FILE_MAX_DIR_HANDLE];
 static kernel_pipe_t g_pipes[PIPE_MAX_COUNT];
 static kernel_timerfd_t g_timerfds[FILE_MAX_FD];
-static kernel_memfd_t g_memfds[FILE_MAX_FD];
+static kernel_memfd_t *g_memfds[FILE_MAX_FD];
 static kernel_signalfd_t g_signalfds[FILE_MAX_FD];
+
+/* A fresh memfd object: one Linux inode's worth of state, owned jointly by
+ * every descriptor that names it. Allocating outside the file-table lock
+ * (the callers are in irq-disabled sections) and failing cleanly when the
+ * heap cannot give us one. */
+static kernel_memfd_t *memfd_new(void)
+{
+    kernel_memfd_t *m = (kernel_memfd_t *)malloc(sizeof(*m));
+    if (m == NULL) {
+        return NULL;
+    }
+    memset(m, 0, sizeof(*m));
+    m->used = 1u;
+    m->shm_handle = -1;
+    m->refs = 1u;
+    return m;
+}
+
+/* Bind `m` to another descriptor (dup, /proc/self/fd reopen). Returns it, so
+ * a caller can write `g_memfds[newfd] = memfd_alias(g_memfds[oldfd]);`. */
+static kernel_memfd_t *memfd_alias(kernel_memfd_t *m)
+{
+    if (m != NULL) {
+        ++m->refs;
+    }
+    return m;
+}
+
+/* Drop one descriptor's claim. The object -- and with it the heap buffer or
+ * the shared-memory reference, whichever backs it -- goes away with the last
+ * descriptor that names it, which is what makes a promotion survive every
+ * alias taken around it. */
+static void memfd_release_obj(kernel_memfd_t *m)
+{
+    if (m == NULL) {
+        return;
+    }
+    if (m->refs > 0u) {
+        --m->refs;
+    }
+    if (m->refs != 0u) {
+        return;
+    }
+    if (m->shm_handle >= 0) {
+        (void)shared_memory_release(m->shm_handle);
+    } else if (m->data != NULL) {
+        free(m->data);
+    }
+    free(m);
+}
 static spinlock_t g_file_table_lock;
 static spinlock_t g_dir_table_lock;
 
@@ -540,14 +610,8 @@ static void release_fd_locked(int32_t fd)
     } else if (g_files[fd].used == 5) {
         memset(&g_timerfds[fd], 0, sizeof(g_timerfds[fd]));
     } else if (g_files[fd].used == 6) {
-        kernel_memfd_t *memfd = &g_memfds[fd];
-        if (memfd->shm_handle >= 0) {
-            (void)shared_memory_release(memfd->shm_handle);
-        } else if (memfd->data != NULL) {
-            free(memfd->data);
-        }
-        memset(memfd, 0, sizeof(*memfd));
-        memfd->shm_handle = -1;
+        memfd_release_obj(g_memfds[fd]);
+        g_memfds[fd] = NULL;
     } else if (g_files[fd].used == 7) {
         memset(&g_signalfds[fd], 0, sizeof(g_signalfds[fd]));
     }
@@ -687,12 +751,30 @@ int32_t syscall_file_reopen_fd(int32_t oldfd, uint64_t flags)
     if (g_files[newfd].used == FILE_USED_TIMERFD) {
         g_timerfds[newfd] = g_timerfds[oldfd];
     } else if (g_files[newfd].used == FILE_USED_MEMFD) {
-        g_memfds[newfd] = g_memfds[oldfd];
-        if (g_memfds[newfd].shm_handle >= 0) {
-            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
-        }
+        /* Same object, not a copy of it: a reopen taken before the first
+         * ftruncate must still see the promotion afterwards (this is the
+         * read-only half of Firefox's SharedStringMap, which is frozen
+         * before it is sized -- on Linux all of these are one inode). */
+        g_memfds[newfd] = memfd_alias(g_memfds[oldfd]);
     } else if (g_files[newfd].used == FILE_USED_SIGNALFD) {
         g_signalfds[newfd] = g_signalfds[oldfd];
+    }
+
+    if (OS_CONFIG_FOREIGN_TRACE) {
+        /* Which descriptor a /proc/self/fd/<n> reopen really aliased, and
+         * whether that carried the shared-memory promotion with it. */
+        serial_write_string("[fd] reopen old=");
+        serial_write_uint32((uint32_t)oldfd);
+        serial_write_string(" used=");
+        serial_write_uint32((uint32_t)g_files[newfd].used);
+        serial_write_string(" new=");
+        serial_write_uint32((uint32_t)newfd);
+        serial_write_string(" shm=");
+        serial_write_uint32(g_memfds[newfd] != NULL ?
+                            (uint32_t)g_memfds[newfd]->shm_handle : 0xFFFFFFFFu);
+        serial_write_string(" flags=");
+        serial_write_uint64(flags);
+        serial_write_string("\n");
     }
 
     if (open_file != NULL) {
@@ -1129,7 +1211,10 @@ int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence)
     }
 
     if (g_files[fd].used == 6) {
-        kernel_memfd_t *memfd = &g_memfds[fd];
+        kernel_memfd_t *memfd = g_memfds[fd];
+        if (memfd == NULL) {
+            return (int64_t)OS_STATUS_INVALID_ARG;
+        }
         int64_t base = 0;
         switch (whence) {
             case FILE_SEEK_SET:
@@ -1508,6 +1593,81 @@ void syscall_file_close_cloexec_for_pid(int32_t pid)
     irq_restore(irq_flags);
 }
 
+/* TEMPORARY DIAGNOSTIC (revert): who holds the system-wide pipe slots.
+ *
+ * Firefox's GTK init does `pipe()` and MOZ_RELEASE_ASSERTs the result, so a
+ * slot shortage there is an assertion in libxul rather than an errno a caller
+ * could handle. Dumping every descriptor that names an in-use pipe -- with
+ * the process that owns it -- says at a glance whether the table is simply
+ * too small for a multi-process browser or whether slots are leaking. */
+static void pipe_diag_dump(const char *why, int32_t pid)
+{
+    static uint32_t budget = 12u;
+    if (budget == 0u) {
+        return;
+    }
+    --budget;
+    uint32_t in_use = 0;
+    for (int32_t i = 0; i < PIPE_MAX_COUNT; ++i) {
+        if (g_pipes[i].in_use != 0u) ++in_use;
+    }
+    serial_write_string("[pipe] ");
+    serial_write_string(why);
+    serial_write_string(" pid=");
+    serial_write_uint32((uint32_t)pid);
+    serial_write_string(" in_use=");
+    serial_write_uint32(in_use);
+    for (int32_t i = 0; i < PIPE_MAX_COUNT; ++i) {
+        if (g_pipes[i].in_use == 0u) continue;
+        serial_write_string(" p");
+        serial_write_uint32((uint32_t)i);
+        serial_write_string(":");
+        for (int32_t fd = 3; fd < FILE_MAX_FD; ++fd) {
+            if ((g_files[fd].used == FILE_USED_PIPE_R ||
+                 g_files[fd].used == FILE_USED_PIPE_W) &&
+                g_files[fd].open_index == i) {
+                serial_write_string(" ");
+                serial_write_uint32((uint32_t)fd);
+                serial_write_string(g_files[fd].used == FILE_USED_PIPE_R ?
+                                     "r/" : "w/");
+                serial_write_uint32((uint32_t)g_files[fd].owner_pid);
+            }
+        }
+    }
+    serial_write_string("\n");
+}
+
+/* TEMPORARY DIAGNOSTIC (revert): the high-water mark of live pipes.
+ *
+ * Budget is 0: ff9 already recorded it (17 live, one more than the old limit
+ * of 16), and these lines are long enough to interleave into the page-fault
+ * dump on the next boot, which is the thing that has to stay readable. Set
+ * the budget back up to see the curve again. */
+static void pipe_diag_ok(int32_t idx, int32_t read_fd, int32_t write_fd,
+                         int32_t pid)
+{
+    static uint32_t budget = 0u;
+    if (budget == 0u) {
+        return;
+    }
+    --budget;
+    uint32_t in_use = 0;
+    for (int32_t i = 0; i < PIPE_MAX_COUNT; ++i) {
+        if (g_pipes[i].in_use != 0u) ++in_use;
+    }
+    serial_write_string("[pipe] ok idx=");
+    serial_write_uint32((uint32_t)idx);
+    serial_write_string(" r=");
+    serial_write_uint32((uint32_t)read_fd);
+    serial_write_string(" w=");
+    serial_write_uint32((uint32_t)write_fd);
+    serial_write_string(" pid=");
+    serial_write_uint32((uint32_t)pid);
+    serial_write_string(" in_use=");
+    serial_write_uint32(in_use);
+    serial_write_string("\n");
+}
+
 int32_t syscall_file_pipe(int32_t fds_out[2])
 {
     if (fds_out == NULL) {
@@ -1522,6 +1682,7 @@ int32_t syscall_file_pipe(int32_t fds_out[2])
         }
     }
     if (pipe_idx < 0) {
+        pipe_diag_dump("FAIL slots", process_get_current_pid());
         return (int32_t)OS_STATUS_LIMIT_REACHED;
     }
 
@@ -1543,6 +1704,7 @@ int32_t syscall_file_pipe(int32_t fds_out[2])
     if (read_fd < 0 || write_fd < 0) {
         spinlock_unlock(&g_file_table_lock);
         irq_restore(irq_flags);
+        pipe_diag_dump("FAIL fds", current_pid);
         return (int32_t)OS_STATUS_LIMIT_REACHED;
     }
 
@@ -1571,6 +1733,7 @@ int32_t syscall_file_pipe(int32_t fds_out[2])
     fds_out[0] = read_fd;
     fds_out[1] = write_fd;
 
+    pipe_diag_ok(pipe_idx, read_fd, write_fd, current_pid);
     return 0;
 }
 
@@ -2028,12 +2191,7 @@ int32_t syscall_file_dup(int32_t oldfd)
     g_files[newfd].descriptor_flags &= ~(uint32_t)FILE_FD_CLOEXEC;
     std_fd_mark_open(newfd, self_pid);
     if (g_files[newfd].used == 5) g_timerfds[newfd] = g_timerfds[oldfd];
-    else if (g_files[newfd].used == 6) {
-        g_memfds[newfd] = g_memfds[oldfd];
-        if (g_memfds[newfd].shm_handle >= 0) {
-            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
-        }
-    }
+    else if (g_files[newfd].used == 6) g_memfds[newfd] = memfd_alias(g_memfds[oldfd]);
     else if (g_files[newfd].used == 7) g_signalfds[newfd] = g_signalfds[oldfd];
     if (open_file != NULL) {
         open_file->refcount++;
@@ -2128,12 +2286,7 @@ int32_t syscall_file_dup2(int32_t oldfd, int32_t newfd)
         fd_extra_owner_set(&g_files[newfd], inherited_primary);
     }
     if (g_files[newfd].used == 5) g_timerfds[newfd] = g_timerfds[oldfd];
-    else if (g_files[newfd].used == 6) {
-        g_memfds[newfd] = g_memfds[oldfd];
-        if (g_memfds[newfd].shm_handle >= 0) {
-            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
-        }
-    }
+    else if (g_files[newfd].used == 6) g_memfds[newfd] = memfd_alias(g_memfds[oldfd]);
     else if (g_files[newfd].used == 7) g_signalfds[newfd] = g_signalfds[oldfd];
     if (open_file != NULL) {
         open_file->refcount++;
@@ -2207,15 +2360,11 @@ int32_t syscall_file_dup_at_least(int32_t oldfd, int32_t minimum_fd)
     } else if (g_files[newfd].used == FILE_USED_MEMFD) {
         /* A memfd keeps its state in a parallel table, so the copy above
          * duplicated the descriptor and left the duplicate with no file
-         * behind it. Carry the memfd over and take a reference on its
-         * shared-memory object, since either descriptor's close() releases
-         * one. Without this the dup that libwayland passes over SCM_RIGHTS
-         * was not recognisable as shm-backed at the far end. */
-        memcpy(&g_memfds[newfd], &g_memfds[oldfd], sizeof(g_memfds[newfd]));
-        g_memfds[newfd].owner_pid = process_get_current_pid();
-        if (g_memfds[newfd].shm_handle >= 0) {
-            (void)shared_memory_addref(g_memfds[newfd].shm_handle);
-        }
+         * behind it. Bind the same object: either descriptor's close()
+         * drops one reference and the last one frees it. Without this the
+         * dup that libwayland passes over SCM_RIGHTS was not recognisable
+         * as shm-backed at the far end. */
+        g_memfds[newfd] = memfd_alias(g_memfds[oldfd]);
     } else {
         kernel_pipe_t *pipe = find_pipe_for_fd(newfd, NULL);
         if (pipe != NULL) {
@@ -2236,7 +2385,10 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
     if (g_files[fd].used == 6) {
-        kernel_memfd_t *memfd = &g_memfds[fd];
+        kernel_memfd_t *memfd = g_memfds[fd];
+        if (memfd == NULL) {
+            return (int32_t)OS_STATUS_INVALID_ARG;
+        }
         uint32_t new_size = (uint32_t)length;
         if ((new_size < memfd->size && (memfd->seals & FILE_SEAL_SHRINK) != 0u) ||
             (new_size > memfd->size && (memfd->seals & FILE_SEAL_GROW) != 0u)) {
@@ -2287,9 +2439,19 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
         }
         int32_t handle = shared_memory_create(reservation);
         if (handle < 0) {
+            if (OS_CONFIG_FOREIGN_TRACE) {
+                serial_write_string("[memfd] promote failed fd=");
+                serial_write_uint32((uint32_t)fd);
+                serial_write_string(" reserve=");
+                serial_write_uint64(reservation);
+                serial_write_string("\n");
+            }
             return (int32_t)OS_STATUS_LIMIT_REACHED;
         }
         if (memfd->data != NULL) {
+            /* Anything written before the promotion is dropped here: a memfd
+             * is sized (ftruncate/fallocate) before it is filled on every
+             * path that reaches us, and shared pages start zeroed. */
             free(memfd->data);
             memfd->data = NULL;
             memfd->capacity = 0u;
@@ -2297,6 +2459,15 @@ int32_t syscall_file_truncate(int32_t fd, uint64_t length)
         memfd->shm_handle = handle;
         memfd->size = new_size;
         memfd->offset = 0u;
+        if (OS_CONFIG_FOREIGN_TRACE) {
+            serial_write_string("[memfd] promote fd=");
+            serial_write_uint32((uint32_t)fd);
+            serial_write_string(" reserve=");
+            serial_write_uint64(reservation);
+            serial_write_string(" handle=");
+            serial_write_uint32((uint32_t)handle);
+            serial_write_string("\n");
+        }
         return 0;
     }
     if (g_files[fd].used != 1) {
@@ -2330,10 +2501,10 @@ int32_t syscall_memfd_add_seals(int32_t fd, uint32_t seals)
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
     int32_t rc = 0;
-    if ((g_memfds[fd].seals & FILE_SEAL_SEAL) != 0u) {
+    if ((g_memfds[fd]->seals & FILE_SEAL_SEAL) != 0u) {
         rc = (int32_t)OS_STATUS_ACCESS_DENIED;
     } else {
-        g_memfds[fd].seals |= seals;
+        g_memfds[fd]->seals |= seals;
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
@@ -2347,7 +2518,7 @@ int32_t syscall_memfd_get_seals(int32_t fd)
         !fd_is_owned_by_current_process(fd)) {
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
-    return (int32_t)g_memfds[fd].seals;
+    return (int32_t)g_memfds[fd]->seals;
 }
 
 int32_t syscall_file_get_status_flags(int32_t fd)
@@ -2412,7 +2583,10 @@ int64_t syscall_file_available(int32_t fd)
         return 0;
     }
     if (g_files[fd].used == 6) {
-        kernel_memfd_t *memfd = &g_memfds[fd];
+        kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
         return memfd->offset < memfd->size ? (int64_t)(memfd->size - memfd->offset) : 0;
     }
     if (g_files[fd].used == 7) {
@@ -2459,10 +2633,20 @@ int64_t syscall_timerfd_read(int32_t fd, uint8_t *buffer, uint64_t len)
 
 int64_t syscall_memfd_read(int32_t fd, uint8_t *buffer, uint64_t len)
 {
-    kernel_memfd_t *memfd = &g_memfds[fd];
+    kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
     if (memfd->shm_handle >= 0) {
         /* shm-backed memfds are meant to be mmap'd, not read()/write()'n.
          * No consumer does this today (Wayland's wl_shm always mmaps). */
+        if (OS_CONFIG_FOREIGN_TRACE) {
+            serial_write_string("[memfd] read on shm-backed fd=");
+            serial_write_uint32((uint32_t)fd);
+            serial_write_string(" len=");
+            serial_write_uint64(len);
+            serial_write_string("\n");
+        }
         return (int64_t)OS_STATUS_NOT_SUPPORTED;
     }
     if (memfd->offset >= memfd->size) {
@@ -2480,13 +2664,23 @@ int64_t syscall_memfd_write(int32_t fd, const uint8_t *buffer, uint64_t len)
     /* A memfd sealed against writes must refuse them. Linux answers EPERM, and
      * Mojo depends on it: mojo::core::CreateSealedMemFD() seals the buffer and
      * then CHECKs that the seal actually bites (channel_linux.cc:947). */
-    if (fd >= 0 && fd < FILE_MAX_FD &&
-        (g_memfds[fd].seals & (FILE_SEAL_WRITE | FILE_SEAL_FUTURE_WRITE)) != 0u) {
+    if (fd >= 0 && fd < FILE_MAX_FD && g_memfds[fd] != NULL &&
+        (g_memfds[fd]->seals & (FILE_SEAL_WRITE | FILE_SEAL_FUTURE_WRITE)) != 0u) {
         return (int64_t)OS_STATUS_ACCESS_DENIED;
     }
 
-    kernel_memfd_t *memfd = &g_memfds[fd];
+    kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
     if (memfd->shm_handle >= 0) {
+        if (OS_CONFIG_FOREIGN_TRACE) {
+            serial_write_string("[memfd] write on shm-backed fd=");
+            serial_write_uint32((uint32_t)fd);
+            serial_write_string(" len=");
+            serial_write_uint64(len);
+            serial_write_string("\n");
+        }
         return (int64_t)OS_STATUS_NOT_SUPPORTED;
     }
     uint64_t end = (uint64_t)memfd->offset + len;
@@ -2517,8 +2711,18 @@ int64_t syscall_memfd_write(int32_t fd, const uint8_t *buffer, uint64_t len)
 int64_t syscall_memfd_pread(int32_t fd, uint8_t *buffer, uint64_t len,
                             uint64_t position)
 {
-    kernel_memfd_t *memfd = &g_memfds[fd];
+    kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
     if (memfd->shm_handle >= 0) {
+        if (OS_CONFIG_FOREIGN_TRACE) {
+            serial_write_string("[memfd] pread on shm-backed fd=");
+            serial_write_uint32((uint32_t)fd);
+            serial_write_string(" pos=");
+            serial_write_uint64(position);
+            serial_write_string("\n");
+        }
         return (int64_t)OS_STATUS_NOT_SUPPORTED;
     }
     if (position >= (uint64_t)memfd->size) {
@@ -2536,10 +2740,14 @@ int64_t syscall_memfd_pwrite(int32_t fd, const uint8_t *buffer, uint64_t len,
     if (position > 0xFFFFFFFFull) {
         return (int64_t)OS_STATUS_INVALID_ARG;
     }
-    uint32_t saved = g_memfds[fd].offset;
-    g_memfds[fd].offset = (uint32_t)position;
+    kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
+    uint32_t saved = memfd->offset;
+    memfd->offset = (uint32_t)position;
     int64_t rc = syscall_memfd_write(fd, buffer, len);
-    g_memfds[fd].offset = saved;
+    memfd->offset = saved;
     return rc;
 }
 
@@ -2675,7 +2883,10 @@ int32_t syscall_file_get_file_info(int32_t fd, vfs_file_t *file_out,
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
     if (g_files[fd].used == FILE_USED_MEMFD) {
-        kernel_memfd_t *memfd = &g_memfds[fd];
+        kernel_memfd_t *memfd = g_memfds[fd];
+    if (memfd == NULL) {
+        return (int64_t)OS_STATUS_INVALID_ARG;
+    }
         if (file_out != NULL) {
             memset(file_out, 0, sizeof(*file_out));
             file_out->size = memfd->size;
@@ -2771,6 +2982,12 @@ int32_t syscall_file_timerfd_gettime(int32_t fd,
 int32_t syscall_file_create_memfd(const char *name)
 {
     (void)name;
+    /* Allocated outside the table lock: this call arrives with interrupts
+     * off, and the kernel heap has no business being reached from there. */
+    kernel_memfd_t *obj = memfd_new();
+    if (obj == NULL) {
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
     int32_t current_pid = process_get_current_pid();
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
@@ -2782,17 +2999,23 @@ int32_t syscall_file_create_memfd(const char *name)
             g_files[fd].open_index = -1;
             g_files[fd].status_flags = FILE_O_RDWR;
             g_files[fd].descriptor_flags = 0;
-            memset(&g_memfds[fd], 0, sizeof(g_memfds[fd]));
-            g_memfds[fd].used = 1;
-            g_memfds[fd].owner_pid = current_pid;
-            g_memfds[fd].shm_handle = -1;
+            g_memfds[fd] = obj;
             result = fd;
             break;
         }
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
+    if (result < 0) {
+        memfd_release_obj(obj); /* no descriptor took it */
+    }
     return result;
+}
+
+/* True when `fd` names a memfd, promoted to shared memory or not. */
+int syscall_file_is_memfd(int32_t fd)
+{
+    return fd >= 0 && fd < FILE_MAX_FD && g_files[fd].used == FILE_USED_MEMFD;
 }
 
 /* Handle of the shared-memory object backing memfd `fd` (owned by the
@@ -2812,7 +3035,7 @@ int32_t syscall_memfd_shm_handle(int32_t fd)
      * passes it over AF_UNIX from another. */
     if (g_files[fd].used == FILE_USED_MEMFD &&
         fd_is_owned_by_current_process(fd)) {
-        handle = g_memfds[fd].shm_handle;
+        handle = g_memfds[fd]->shm_handle;
     }
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
@@ -2863,6 +3086,13 @@ void syscall_file_report_full(const char *where)
 
 int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
 {
+    kernel_memfd_t *obj = memfd_new();
+    if (obj == NULL) {
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
+    /* Already shm-backed from birth: there is no promotion to wait for. */
+    obj->shm_handle = handle;
+    obj->size = shared_memory_size(handle);
     int32_t current_pid = process_get_current_pid();
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_file_table_lock);
@@ -2875,11 +3105,7 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
             /* As given: O_RDONLY is 0 and must survive (see UnixSocket.c). */
             g_files[fd].status_flags = status_flags;
             g_files[fd].descriptor_flags = 0;
-            memset(&g_memfds[fd], 0, sizeof(g_memfds[fd]));
-            g_memfds[fd].used = 1;
-            g_memfds[fd].owner_pid = current_pid;
-            g_memfds[fd].shm_handle = handle;
-            g_memfds[fd].size = shared_memory_size(handle);
+            g_memfds[fd] = obj;
             result = fd;
             break;
         }
@@ -2887,6 +3113,10 @@ int32_t syscall_memfd_install_shm(int32_t handle, uint32_t status_flags)
     spinlock_unlock(&g_file_table_lock);
     irq_restore(irq_flags);
     if (result < 0) {
+        /* The shared-memory reference this object adopted is the caller's
+         * to hand over, so drop it here -- and let go of the object. */
+        obj->shm_handle = -1;
+        memfd_release_obj(obj);
         syscall_file_report_full("memfd_install_shm");
     }
     return result;

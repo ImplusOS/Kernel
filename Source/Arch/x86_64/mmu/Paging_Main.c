@@ -354,6 +354,29 @@ static int is_user_virtual_address(uint64_t virt_addr)
             (virt_addr >= USER_MMAP_BASE  && virt_addr < USER_MMAP_LIMIT));
 }
 
+/* The windows above are where a *native* process is laid out. A Linux-ABI
+ * image keeps its own link addresses instead: the loader's policy for one
+ * accepts anything from USER_FOREIGN_BASE up (process_spawn_user_elf_with_arg
+ * / process_execve), and the static busybox behind /bin/sh is non-PIE at
+ * 0x400000. fork() shares that whole window copy-on-write, and
+ * process_user_buffer_is_valid() accepts pointers into it, so the COW paths
+ * have to recognise it too -- without this a forked busybox died on the first
+ * write to its own .data (SIGSEGV, error 0x7, PTE COW=1: the break was
+ * declined because the address was not "user"), which is what stopped the
+ * shell, and with it xterm, from coming up.
+ *
+ * Deliberately not folded into is_user_virtual_address(): the kernel
+ * identity-maps physical memory over the same range, so a low address is NOT
+ * user memory by virtue of its value, and the demand-zero handler must go on
+ * refusing it. Only callers that then require PAGE_USER (and PAGE_COW) on the
+ * leaf may use this -- resolve_fault_leaf_entry() rejects a non-user walk, and
+ * the kernel never marks its own mappings COW. */
+static int is_user_cow_address(uint64_t virt_addr)
+{
+    return is_user_virtual_address(virt_addr) ||
+           (virt_addr >= USER_FOREIGN_BASE && virt_addr < USER_CODE_BASE);
+}
+
 static int copy_present_page(uint64_t child_cr3, uint64_t vaddr,
                              uint64_t parent_phys)
 {
@@ -622,7 +645,7 @@ int paging_handle_cow_fault(uint64_t cr3, uint64_t fault_addr)
     if (cr3 == 0) return 0;
 
     uint64_t v = fault_addr & PAGE_MASK;
-    if (!is_user_virtual_address(v)) {
+    if (!is_user_cow_address(v)) {
         return 0;
     }
 
@@ -1021,7 +1044,7 @@ int paging_user_range_break_cow(uint64_t cr3, uint64_t start, uint64_t len)
     if (last < first) {
         return 0; /* wrapped: not a range worth touching */
     }
-    if (!is_user_virtual_address(first)) {
+    if (!is_user_cow_address(first)) {
         return 0;
     }
 

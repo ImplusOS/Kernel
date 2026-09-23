@@ -246,16 +246,69 @@ typedef struct {
     uint32_t width, height, pitch;
 } drm_fb_t;
 
-static drm_dumb_t g_dumbs[DRM_MAX_DUMB];
-static drm_fb_t   g_fbs[DRM_MAX_FB];
-static uint32_t   g_next_handle = 1;
-static uint32_t   g_next_fb_id  = 1;
-static uint64_t   g_next_map_off = DRM_MMAP_OFFSET_BASE;
-static uint32_t   g_scanout_fb_id = 0;
-static uint32_t   g_flip_seq = 0;
+/*
+ * One DRM session per X server.
+ *
+ * Everything below used to be a single set of file-scope globals, which
+ * meant exactly one Xorg could ever be alive: a second server opening
+ * /dev/dri/card0 would collide with the first on dumb-buffer handles (both
+ * start at 1), on the framebuffer table, on the scanout id and on the event
+ * queue. That is why a second Linux application had to join the running
+ * server and draw inside the first one's window instead of getting a window
+ * of its own.
+ *
+ * A session is claimed by the launcher that registers a redirection surface
+ * (drm_kms_set_mirror), and bound to the first DRM client that is a
+ * descendant of that launcher -- which is the Xorg it goes on to spawn. Every
+ * ioctl is then served out of that server's own state, so N launchers run N
+ * servers that never see each other.
+ */
+/* 8 MiB of redirection surface: 1600x1200x4 with room over. */
+#define DRM_MIRROR_MAX_PAGES 2048u
 
-static struct drm_event_vblank g_evq[DRM_EVQ_MAX];
-static uint32_t g_evq_head, g_evq_tail;
+#define DRM_MAX_SESSIONS 4
+
+/* Each session's mmap tokens live in their own slice of the fake offset
+ * space, so an offset identifies a session as well as a buffer. */
+#define DRM_MMAP_OFFSET_STRIDE 0x40000000ull
+
+typedef struct {
+    uint8_t  used;
+    int32_t  owner_pid;      /* launcher that registered the mirror, or -1  */
+    int32_t  client_pid;     /* the DRM client (Xorg) bound to it, or -1    */
+
+    drm_dumb_t dumbs[DRM_MAX_DUMB];
+    drm_fb_t   fbs[DRM_MAX_FB];
+    uint32_t   next_handle;
+    uint32_t   next_fb_id;
+    uint64_t   next_map_off;
+    uint32_t   scanout_fb_id;
+    uint32_t   flip_seq;
+
+    struct drm_event_vblank evq[DRM_EVQ_MAX];
+    uint32_t evq_head, evq_tail;
+
+    /* Scanout redirection, described by physical pages rather than by a
+     * virtual address: the blit runs in whatever process issued the flip
+     * (Xorg), while the buffer belongs to the launcher, and the two do not
+     * share an address space. The pages come from a shared-memory object
+     * whose frames are allocated once and never moved, so caching them is
+     * sound. */
+    uint64_t mirror_pages[DRM_MIRROR_MAX_PAGES];
+    uint32_t mirror_page_count;
+    uint32_t mirror_w, mirror_h;
+    volatile uint32_t mirror_dirty;
+    /* Set once a redirection surface has been withdrawn, cleared when a new
+     * one is registered. While set, flips are dropped instead of falling
+     * back to the panel: the X server behind a closing session does not stop
+     * the instant its mirror is released -- it regenerates when its last
+     * client leaves and keeps presenting until it is killed -- and each of
+     * those frames would otherwise be blitted straight over the window
+     * manager. */
+    uint8_t  mirror_released;
+} drm_session_t;
+
+static drm_session_t g_sessions[DRM_MAX_SESSIONS];
 
 static spinlock_t g_lock;
 static int g_inited;
@@ -263,78 +316,136 @@ static int g_inited;
 void drm_kms_init(void)
 {
     spinlock_init(&g_lock);
-    memset(g_dumbs, 0, sizeof(g_dumbs));
-    memset(g_fbs, 0, sizeof(g_fbs));
-    memset(g_evq, 0, sizeof(g_evq));
-    g_evq_head = g_evq_tail = 0;
-    g_next_handle = 1; g_next_fb_id = 1;
-    g_next_map_off = DRM_MMAP_OFFSET_BASE;
-    g_scanout_fb_id = 0; g_flip_seq = 0;
+    memset(g_sessions, 0, sizeof(g_sessions));
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
+        g_sessions[i].owner_pid = -1;
+        g_sessions[i].client_pid = -1;
+    }
     g_inited = 1;
 }
 
 static void ensure_init(void) { if (!g_inited) drm_kms_init(); }
 
-static drm_dumb_t *dumb_by_handle(uint32_t h)
+static drm_dumb_t *dumb_by_handle(drm_session_t *s, uint32_t h)
 {
     for (int i = 0; i < DRM_MAX_DUMB; i++)
-        if (g_dumbs[i].used && g_dumbs[i].handle == h) return &g_dumbs[i];
+        if (s->dumbs[i].used && s->dumbs[i].handle == h) return &s->dumbs[i];
     return NULL;
 }
-static drm_dumb_t *dumb_by_offset(uint64_t off)
+static drm_dumb_t *dumb_by_offset(drm_session_t *s, uint64_t off)
 {
     for (int i = 0; i < DRM_MAX_DUMB; i++)
-        if (g_dumbs[i].used && g_dumbs[i].map_offset == off) return &g_dumbs[i];
+        if (s->dumbs[i].used && s->dumbs[i].map_offset == off) return &s->dumbs[i];
     return NULL;
 }
-static drm_fb_t *fb_by_id(uint32_t id)
+static drm_fb_t *fb_by_id(drm_session_t *s, uint32_t id)
 {
     for (int i = 0; i < DRM_MAX_FB; i++)
-        if (g_fbs[i].used && g_fbs[i].fb_id == id) return &g_fbs[i];
+        if (s->fbs[i].used && s->fbs[i].fb_id == id) return &s->fbs[i];
     return NULL;
 }
 
-/* ---- Scanout redirection ------------------------------------------------
- *
- * The destination is described by its physical pages, not by a virtual
- * address: the blit runs in whatever process happened to issue the flip
- * ioctl (Xorg), while the buffer belongs to the launcher, and the two do not
- * share an address space. The pages come from a shared-memory object whose
- * frames are allocated once and never moved, so caching them is sound.
- * alloc_page() hands back kernel-usable pointers that double as physical
- * addresses, which is what makes the plain memcpy below legal. */
-#define DRM_MIRROR_MAX_PAGES 2048u   /* 8 MiB: 1600x1200x4 with room over */
+/* ---- session lookup ----------------------------------------------------- */
 
-static uint64_t g_mirror_pages[DRM_MIRROR_MAX_PAGES];
-static uint32_t g_mirror_page_count;
-static uint32_t g_mirror_w, g_mirror_h;
-static volatile uint32_t g_mirror_dirty;
-/* Owner of the surface. The frames belong to a shared-memory object the
- * window manager frees when the window goes away, so a mirror that outlived
- * its client would have the next flip memcpy into pages that now belong to
- * something else. */
-static int32_t  g_mirror_pid = -1;
-/* Set once a redirection surface has been withdrawn, cleared when a new one
- * is registered or the DRM client goes away. While set, flips are dropped
- * instead of falling back to the panel: the X server behind a closing
- * session does not stop the instant its mirror is released -- it regenerates
- * when its last client leaves and keeps presenting until it is killed -- and
- * each of those frames used to be blitted straight over the window manager,
- * leaving a black rectangle the size of the old window on the desktop. A
- * server that never had a mirror still drives the panel as before. */
-static uint8_t  g_mirror_released;
+static drm_session_t *session_alloc(int32_t owner_pid)
+{
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
+        if (g_sessions[i].used) continue;
+        drm_session_t *s = &g_sessions[i];
+        memset(s, 0, sizeof(*s));
+        s->used = 1u;
+        s->owner_pid = owner_pid;
+        s->client_pid = -1;
+        s->next_handle = 1u;
+        s->next_fb_id = 1u;
+        s->next_map_off = DRM_MMAP_OFFSET_BASE +
+                          (uint64_t)i * DRM_MMAP_OFFSET_STRIDE;
+        return s;
+    }
+    return NULL;
+}
+
+static void session_free(drm_session_t *s)
+{
+    if (!s || !s->used) return;
+    for (int i = 0; i < DRM_MAX_DUMB; i++) {
+        if (s->dumbs[i].used && s->dumbs[i].kva)
+            pmm_free_pages(s->dumbs[i].kva, s->dumbs[i].npages);
+    }
+    memset(s, 0, sizeof(*s));
+    s->owner_pid = -1;
+    s->client_pid = -1;
+}
+
+/* The session an unowned client (no launcher above it) draws through: one
+ * shared slot that scans out to the panel, which is what a bare Xorg started
+ * outside a launcher used to get and still does. */
+static drm_session_t *session_panel(void)
+{
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++)
+        if (g_sessions[i].used && g_sessions[i].owner_pid < 0)
+            return &g_sessions[i];
+    return session_alloc(-1);
+}
+
+/*
+ * Which server is calling.
+ *
+ * A bound client is matched by pid. An unbound one is matched by ancestry:
+ * the launcher registered its mirror before it spawned Xorg, so the first
+ * DRM client whose parent chain reaches that launcher is that launcher's
+ * server, and claims the session. Everything else falls back to the panel
+ * session.
+ */
+static drm_session_t *session_for_current(void)
+{
+    int32_t pid = process_get_current_pid();
+    if (pid <= 0) return session_panel();
+
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++)
+        if (g_sessions[i].used && g_sessions[i].client_pid == pid)
+            return &g_sessions[i];
+
+    /* Walk up the process tree, bounded: a cycle in parent pids would
+     * otherwise hang the ioctl path. */
+    int32_t ancestor = pid;
+    for (uint32_t depth = 0u; depth < 16u && ancestor > 0; ++depth) {
+        for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
+            drm_session_t *s = &g_sessions[i];
+            if (!s->used || s->client_pid >= 0) continue;
+            if (s->owner_pid != ancestor) continue;
+            s->client_pid = pid;
+            return s;
+        }
+        ancestor = process_get_parent_pid(ancestor);
+    }
+    return session_panel();
+}
+
+/* The session a launcher owns, for the calls it makes itself. */
+static drm_session_t *session_for_owner(int32_t owner_pid)
+{
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++)
+        if (g_sessions[i].used && g_sessions[i].owner_pid == owner_pid)
+            return &g_sessions[i];
+    return NULL;
+}
 
 int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
 {
+    ensure_init();
+    int32_t owner = process_get_current_pid();
+    drm_session_t *s = session_for_owner(owner);
+
     if (pixels == 0u) {
-        if (g_mirror_page_count != 0u) {
-            g_mirror_released = 1u;
-        }
-        g_mirror_page_count = 0u;
-        g_mirror_w = g_mirror_h = 0u;
-        g_mirror_pid = -1;
+        if (!s) return 0;
+        if (s->mirror_page_count != 0u) s->mirror_released = 1u;
+        s->mirror_page_count = 0u;
+        s->mirror_w = s->mirror_h = 0u;
         return 0;
     }
+    if (!s) s = session_alloc(owner);
+    if (!s) return E_NOMEM;
     if (width == 0u || height == 0u) return E_INVAL;
     if ((pixels & (PAGE_SIZE - 1u)) != 0u) return E_INVAL;
 
@@ -351,48 +462,55 @@ int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
     for (uint64_t i = 0; i < pages; ++i) {
         uint64_t phys = paging_virt_to_phys(cr3, pixels + i * PAGE_SIZE);
         if (phys == 0u) {
-            g_mirror_page_count = 0u;
+            s->mirror_page_count = 0u;
             return E_FAULT;
         }
-        g_mirror_pages[i] = phys & ~((uint64_t)PAGE_SIZE - 1u);
+        s->mirror_pages[i] = phys & ~((uint64_t)PAGE_SIZE - 1u);
     }
-    g_mirror_w = width;
-    g_mirror_h = height;
-    g_mirror_pid = process_get_current_pid();
-    g_mirror_page_count = (uint32_t)pages;
-    g_mirror_released = 0u;
+    s->mirror_w = width;
+    s->mirror_h = height;
+    s->mirror_page_count = (uint32_t)pages;
+    s->mirror_released = 0u;
     return 0;
 }
 
 void drm_kms_notify_process_exit(int32_t pid)
 {
-    if (pid >= 0 && pid == g_mirror_pid) {
-        if (g_mirror_page_count != 0u) {
-            g_mirror_released = 1u;
-        }
-        g_mirror_page_count = 0u;
-        g_mirror_w = g_mirror_h = 0u;
-        g_mirror_pid = -1;
+    if (pid < 0) return;
+    for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
+        drm_session_t *s = &g_sessions[i];
+        if (!s->used) continue;
+        /* The launcher going away takes the whole session with it: the
+         * surface it registered belongs to a shared-memory object the
+         * window manager frees with the window, and a flip landing in
+         * those pages afterwards would write over whatever now owns them. */
+        if (s->owner_pid == pid) { session_free(s); continue; }
+        /* The server going away leaves the session for the next one the
+         * launcher starts, but unbinds it so that one can claim it. */
+        if (s->client_pid == pid) s->client_pid = -1;
     }
 }
 
 int drm_kms_mirror_take_dirty(void)
 {
-    uint32_t d = g_mirror_dirty;
-    g_mirror_dirty = 0u;
+    drm_session_t *s = session_for_owner(process_get_current_pid());
+    if (!s) return 0;
+    uint32_t d = s->mirror_dirty;
+    s->mirror_dirty = 0u;
     return d != 0u;
 }
 
 /* memcpy into the page-scattered mirror at a byte offset. */
-static void mirror_write(uint64_t offset, const uint8_t *src, uint32_t len)
+static void mirror_write(drm_session_t *s, uint64_t offset,
+                         const uint8_t *src, uint32_t len)
 {
     while (len > 0u) {
         uint32_t page = (uint32_t)(offset / PAGE_SIZE);
-        if (page >= g_mirror_page_count) return;
+        if (page >= s->mirror_page_count) return;
         uint32_t in_page = (uint32_t)(offset % PAGE_SIZE);
         uint32_t chunk = (uint32_t)PAGE_SIZE - in_page;
         if (chunk > len) chunk = len;
-        memcpy((uint8_t *)(uintptr_t)g_mirror_pages[page] + in_page, src, chunk);
+        memcpy((uint8_t *)(uintptr_t)s->mirror_pages[page] + in_page, src, chunk);
         offset += chunk;
         src += chunk;
         len -= chunk;
@@ -401,31 +519,31 @@ static void mirror_write(uint64_t offset, const uint8_t *src, uint32_t len)
 
 /* Blit a dumb buffer to the hardware framebuffer (XRGB8888, 32bpp assumed),
  * or into the redirection surface when one is registered. */
-static void blit_fb_to_display(drm_fb_t *fb)
+static void blit_fb_to_display(drm_session_t *s, drm_fb_t *fb)
 {
     if (!fb) return;
-    drm_dumb_t *bo = dumb_by_handle(fb->handle);
+    drm_dumb_t *bo = dumb_by_handle(s, fb->handle);
     if (!bo || !bo->kva) return;
     uint32_t src_pitch = fb->pitch ? fb->pitch : (bo->pitch ? bo->pitch : fb->width * 4u);
 
-    if (g_mirror_page_count != 0u) {
-        uint32_t cw = (fb->width  < g_mirror_w) ? fb->width  : g_mirror_w;
-        uint32_t ch = (fb->height < g_mirror_h) ? fb->height : g_mirror_h;
-        uint32_t dst_pitch = g_mirror_w * 4u;
+    if (s->mirror_page_count != 0u) {
+        uint32_t cw = (fb->width  < s->mirror_w) ? fb->width  : s->mirror_w;
+        uint32_t ch = (fb->height < s->mirror_h) ? fb->height : s->mirror_h;
+        uint32_t dst_pitch = s->mirror_w * 4u;
         for (uint32_t y = 0; y < ch; y++) {
-            mirror_write((uint64_t)y * dst_pitch,
+            mirror_write(s, (uint64_t)y * dst_pitch,
                          (const uint8_t *)bo->kva + (size_t)y * src_pitch,
                          cw * 4u);
         }
-        g_mirror_dirty = 1u;
+        s->mirror_dirty = 1u;
         /* No display_present(): the window manager owns the panel now and
          * will composite this surface on its own schedule. */
         return;
     }
 
-    if (g_mirror_released) {
-        return;   /* see g_mirror_released */
-    }
+    /* A server that never had a mirror drives the panel as before; one
+     * whose mirror has been withdrawn draws nowhere. */
+    if (s->mirror_released) return;
 
     void *hw = display_get_framebuffer();
     if (!hw) return;
@@ -442,11 +560,12 @@ static void blit_fb_to_display(drm_fb_t *fb)
     display_present();
 }
 
-static void queue_flip_event(uint64_t user_data, uint32_t crtc_id)
+static void queue_flip_event(drm_session_t *s, uint64_t user_data,
+                             uint32_t crtc_id)
 {
-    uint32_t next = (g_evq_head + 1u) % DRM_EVQ_MAX;
-    if (next == g_evq_tail) return; /* drop on overflow */
-    struct drm_event_vblank *e = &g_evq[g_evq_head];
+    uint32_t next = (s->evq_head + 1u) % DRM_EVQ_MAX;
+    if (next == s->evq_tail) return; /* drop on overflow */
+    struct drm_event_vblank *e = &s->evq[s->evq_head];
     memset(e, 0, sizeof(*e));
     e->base.type = DRM_EVENT_FLIP_COMPLETE;
     e->base.length = (uint32_t)sizeof(*e);
@@ -455,9 +574,9 @@ static void queue_flip_event(uint64_t user_data, uint32_t crtc_id)
     uint64_t ms = (timer_ticks() * 1000ull) / hz;
     e->tv_sec = (uint32_t)(ms / 1000ull);
     e->tv_usec = (uint32_t)((ms % 1000ull) * 1000ull);
-    e->sequence = ++g_flip_seq;
+    e->sequence = ++s->flip_seq;
     e->crtc_id = crtc_id;
-    g_evq_head = next;
+    s->evq_head = next;
 }
 
 /* Append decimal `v` to buf at *pos (buf is >= 32); no NUL. */
@@ -481,20 +600,20 @@ static void append_u32(char *buf, int *pos, uint32_t v)
  * client surface, not the panel: X reads the connector's mode once at
  * startup, so advertising the window size here is what makes it render at
  * exactly that size instead of full-screen and clipped. */
-static uint32_t mode_width(void)
+static uint32_t mode_width(const drm_session_t *s)
 {
-    return g_mirror_page_count != 0u ? g_mirror_w : display_width();
+    return s->mirror_page_count != 0u ? s->mirror_w : display_width();
 }
-static uint32_t mode_height(void)
+static uint32_t mode_height(const drm_session_t *s)
 {
-    return g_mirror_page_count != 0u ? g_mirror_h : display_height();
+    return s->mirror_page_count != 0u ? s->mirror_h : display_height();
 }
 
 /* Fill a single 60Hz mode sized to the current display. */
-static void fill_mode(struct drm_mode_modeinfo *m)
+static void fill_mode(const drm_session_t *s, struct drm_mode_modeinfo *m)
 {
-    uint32_t w = mode_width();
-    uint32_t h = mode_height();
+    uint32_t w = mode_width(s);
+    uint32_t h = mode_height(s);
     if (w == 0u) {
         w = 1024u;
     }
@@ -538,6 +657,9 @@ static int64_t write_id_array(uint64_t uptr, uint32_t cap, const uint32_t *ids,
 int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
 {
     ensure_init();
+    ensure_init();
+    drm_session_t *sess = session_for_current();
+    if (!sess) return E_NOMEM;
     if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
     uint32_t nr = IOC_NR(request);
     void *uarg = (void *)(uintptr_t)arg;
@@ -617,7 +739,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if ((e = write_id_array(c.encoders_ptr, c.count_encoders, &enc, 1)) < 0) return e;
         if (c.modes_ptr && c.count_modes >= 1u) {
             struct drm_mode_modeinfo m;
-            fill_mode(&m);
+            fill_mode(sess, &m);
             if (copy_to_user((void *)(uintptr_t)c.modes_ptr, &m, sizeof(m)) != 0u)
                 return E_FAULT;
         }
@@ -648,11 +770,11 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_crtc cc;
         if (!uarg || copy_from_user(&cc, uarg, sizeof(cc)) != 0u) return E_FAULT;
         cc.crtc_id = DRM_CRTC_ID;
-        cc.fb_id = g_scanout_fb_id;
+        cc.fb_id = sess->scanout_fb_id;
         cc.x = cc.y = 0;
         cc.gamma_size = 0;
-        cc.mode_valid = g_scanout_fb_id ? 1u : 0u;
-        if (g_scanout_fb_id) fill_mode(&cc.mode);
+        cc.mode_valid = sess->scanout_fb_id ? 1u : 0u;
+        if (sess->scanout_fb_id) fill_mode(sess, &cc.mode);
         else memset(&cc.mode, 0, sizeof(cc.mode));
         return copy_to_user(uarg, &cc, sizeof(cc)) == 0u ? 0 : E_FAULT;
     }
@@ -660,9 +782,9 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_crtc cc;
         if (!uarg || copy_from_user(&cc, uarg, sizeof(cc)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        g_scanout_fb_id = cc.fb_id;
-        drm_fb_t *fb = fb_by_id(cc.fb_id);
-        if (fb) blit_fb_to_display(fb);
+        sess->scanout_fb_id = cc.fb_id;
+        drm_fb_t *fb = fb_by_id(sess, cc.fb_id);
+        if (fb) blit_fb_to_display(sess, fb);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -677,20 +799,20 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         uint32_t npages = (uint32_t)((size + 4095u) / 4096u);
         spinlock_lock(&g_lock);
         drm_dumb_t *slot = NULL;
-        for (int i = 0; i < DRM_MAX_DUMB; i++) if (!g_dumbs[i].used) { slot = &g_dumbs[i]; break; }
+        for (int i = 0; i < DRM_MAX_DUMB; i++) if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
         void *kva = pmm_alloc_pages(npages);
         if (!kva) { spinlock_unlock(&g_lock); return E_NOMEM; }
         memset(kva, 0, (size_t)npages * 4096u);
         slot->used = 1;
-        slot->handle = g_next_handle++;
+        slot->handle = sess->next_handle++;
         slot->width = d.width; slot->height = d.height;
         slot->bpp = bpp; slot->pitch = pitch;
         slot->size = size; slot->npages = npages;
         slot->kva = kva;
         slot->phys = paging_virt_to_phys(paging_get_kernel_cr3(), (uint64_t)(uintptr_t)kva);
-        slot->map_offset = g_next_map_off;
-        g_next_map_off += (uint64_t)npages * 4096u;
+        slot->map_offset = sess->next_map_off;
+        sess->next_map_off += (uint64_t)npages * 4096u;
         d.handle = slot->handle;
         d.pitch = pitch;
         d.size = size;
@@ -701,7 +823,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_map_dumb m;
         if (!uarg || copy_from_user(&m, uarg, sizeof(m)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        drm_dumb_t *bo = dumb_by_handle(m.handle);
+        drm_dumb_t *bo = dumb_by_handle(sess, m.handle);
         if (!bo) { spinlock_unlock(&g_lock); return E_INVAL; }
         m.offset = bo->map_offset;
         spinlock_unlock(&g_lock);
@@ -711,7 +833,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_destroy_dumb d;
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        drm_dumb_t *bo = dumb_by_handle(d.handle);
+        drm_dumb_t *bo = dumb_by_handle(sess, d.handle);
         if (bo) {
             if (bo->kva) pmm_free_pages(bo->kva, bo->npages);
             memset(bo, 0, sizeof(*bo));
@@ -724,10 +846,10 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&f, uarg, sizeof(f)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         drm_fb_t *slot = NULL;
-        for (int i = 0; i < DRM_MAX_FB; i++) if (!g_fbs[i].used) { slot = &g_fbs[i]; break; }
+        for (int i = 0; i < DRM_MAX_FB; i++) if (!sess->fbs[i].used) { slot = &sess->fbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
         slot->used = 1;
-        slot->fb_id = g_next_fb_id++;
+        slot->fb_id = sess->next_fb_id++;
         slot->handle = f.handle;
         slot->width = f.width; slot->height = f.height;
         slot->pitch = f.pitch ? f.pitch : f.width * 4u;
@@ -740,10 +862,10 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&f, uarg, sizeof(f)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         drm_fb_t *slot = NULL;
-        for (int i = 0; i < DRM_MAX_FB; i++) if (!g_fbs[i].used) { slot = &g_fbs[i]; break; }
+        for (int i = 0; i < DRM_MAX_FB; i++) if (!sess->fbs[i].used) { slot = &sess->fbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
         slot->used = 1;
-        slot->fb_id = g_next_fb_id++;
+        slot->fb_id = sess->next_fb_id++;
         slot->handle = f.handles[0];
         slot->width = f.width; slot->height = f.height;
         slot->pitch = f.pitches[0] ? f.pitches[0] : f.width * 4u;
@@ -755,7 +877,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         uint32_t id = 0;
         if (uarg && copy_from_user(&id, uarg, sizeof(id)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        drm_fb_t *fb = fb_by_id(id);
+        drm_fb_t *fb = fb_by_id(sess, id);
         if (fb) memset(fb, 0, sizeof(*fb));
         spinlock_unlock(&g_lock);
         return 0;
@@ -764,7 +886,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_fb_cmd f;
         if (!uarg || copy_from_user(&f, uarg, sizeof(f)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        drm_fb_t *fb = fb_by_id(f.fb_id);
+        drm_fb_t *fb = fb_by_id(sess, f.fb_id);
         if (fb) {
             f.width = fb->width; f.height = fb->height;
             f.pitch = fb->pitch; f.bpp = 32; f.depth = 24; f.handle = fb->handle;
@@ -776,11 +898,11 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_crtc_page_flip pf;
         if (!uarg || copy_from_user(&pf, uarg, sizeof(pf)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        g_scanout_fb_id = pf.fb_id;
-        drm_fb_t *fb = fb_by_id(pf.fb_id);
-        if (fb) blit_fb_to_display(fb);
+        sess->scanout_fb_id = pf.fb_id;
+        drm_fb_t *fb = fb_by_id(sess, pf.fb_id);
+        if (fb) blit_fb_to_display(sess, fb);
         if (pf.flags & DRM_MODE_PAGE_FLIP_EVENT)
-            queue_flip_event(pf.user_data, pf.crtc_id ? pf.crtc_id : DRM_CRTC_ID);
+            queue_flip_event(sess, pf.user_data, pf.crtc_id ? pf.crtc_id : DRM_CRTC_ID);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -788,8 +910,8 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_mode_fb_dirty_cmd d;
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
-        drm_fb_t *fb = fb_by_id(d.fb_id);
-        if (fb) blit_fb_to_display(fb);
+        drm_fb_t *fb = fb_by_id(sess, d.fb_id);
+        if (fb) blit_fb_to_display(sess, fb);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -807,7 +929,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&p, uarg, sizeof(p)) != 0u) return E_FAULT;
         p.plane_id = DRM_PLANE_ID;
         p.crtc_id = DRM_CRTC_ID;
-        p.fb_id = g_scanout_fb_id;
+        p.fb_id = sess->scanout_fb_id;
         p.possible_crtcs = 1u;
         p.gamma_size = 0;
         p.count_format_types = 0;
@@ -836,7 +958,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         struct drm_gem_close g;
         if (uarg && copy_from_user(&g, uarg, sizeof(g)) == 0u) {
             spinlock_lock(&g_lock);
-            drm_dumb_t *bo = dumb_by_handle(g.handle);
+            drm_dumb_t *bo = dumb_by_handle(sess, g.handle);
             if (bo) {
                 if (bo->kva) pmm_free_pages(bo->kva, bo->npages);
                 memset(bo, 0, sizeof(*bo));
@@ -857,15 +979,18 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
 int64_t drm_kms_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock)
 {
     ensure_init();
+    drm_session_t *sess = session_for_current();
+    if (!sess) return E_NOMEM;
+    ensure_init();
     (void)nonblock;
     spinlock_lock(&g_lock);
-    if (g_evq_tail == g_evq_head) {
+    if (sess->evq_tail == sess->evq_head) {
         spinlock_unlock(&g_lock);
         return E_AGAIN; /* caller (drmHandleEvent) polls first anyway */
     }
     uint64_t written = 0;
-    while (g_evq_tail != g_evq_head) {
-        struct drm_event_vblank *e = &g_evq[g_evq_tail];
+    while (sess->evq_tail != sess->evq_head) {
+        struct drm_event_vblank *e = &sess->evq[sess->evq_tail];
         uint64_t need = e->base.length;
         if (written + need > len) break;
         if (copy_to_user(user_buf + written, e, need) != 0u) {
@@ -873,7 +998,7 @@ int64_t drm_kms_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock)
             return written ? (int64_t)written : E_FAULT;
         }
         written += need;
-        g_evq_tail = (g_evq_tail + 1u) % DRM_EVQ_MAX;
+        sess->evq_tail = (sess->evq_tail + 1u) % DRM_EVQ_MAX;
     }
     spinlock_unlock(&g_lock);
     return written ? (int64_t)written : E_AGAIN;
@@ -882,9 +1007,12 @@ int64_t drm_kms_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock)
 uint32_t drm_kms_poll(uint32_t events)
 {
     ensure_init();
+    drm_session_t *sess = session_for_current();
+    if (!sess) return 0;
+    ensure_init();
     uint32_t r = 0;
     spinlock_lock(&g_lock);
-    if (g_evq_tail != g_evq_head) r |= 0x1u; /* POLLIN */
+    if (sess->evq_tail != sess->evq_head) r |= 0x1u; /* POLLIN */
     spinlock_unlock(&g_lock);
     return r & (events | 0x1u);
 }
@@ -894,9 +1022,12 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
                      uint64_t flags)
 {
     ensure_init();
+    drm_session_t *sess = session_for_current();
+    if (!sess) return E_NOMEM;
+    ensure_init();
     (void)prot; (void)flags;
     spinlock_lock(&g_lock);
-    drm_dumb_t *bo = dumb_by_offset(offset);
+    drm_dumb_t *bo = dumb_by_offset(sess, offset);
     if (!bo || !bo->kva) { spinlock_unlock(&g_lock); return E_INVAL; }
     uint64_t need = bo->size;
     uint64_t bo_phys = bo->phys;
@@ -924,17 +1055,20 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
 
 void drm_kms_close(void)
 {
+    ensure_init();
+    drm_session_t *sess = session_for_current();
+    if (!sess) return ;
     /* Xorg is the only DRM client; on its exit reclaim everything. */
     ensure_init();
     spinlock_lock(&g_lock);
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
-        if (g_dumbs[i].used && g_dumbs[i].kva)
-            pmm_free_pages(g_dumbs[i].kva, g_dumbs[i].npages);
-        memset(&g_dumbs[i], 0, sizeof(g_dumbs[i]));
+        if (sess->dumbs[i].used && sess->dumbs[i].kva)
+            pmm_free_pages(sess->dumbs[i].kva, sess->dumbs[i].npages);
+        memset(&sess->dumbs[i], 0, sizeof(sess->dumbs[i]));
     }
-    memset(g_fbs, 0, sizeof(g_fbs));
-    g_evq_head = g_evq_tail = 0;
-    g_scanout_fb_id = 0;
-    g_mirror_released = 0u;
+    memset(sess->fbs, 0, sizeof(sess->fbs));
+    sess->evq_head = sess->evq_tail = 0;
+    sess->scanout_fb_id = 0;
+    sess->mirror_released = 0u;
     spinlock_unlock(&g_lock);
 }
