@@ -91,10 +91,27 @@
 #define EPOLLHUP     0x010u
 #define EPOLLET      (1u << 31)
 
-/* Bounded slice a single epoll_wait() call sleeps for when nothing is
- * ready and the caller allows blocking (timeout_ms != 0). Small enough
- * to stay responsive, large enough to not dominate scheduling overhead. */
-#define EPOLL_POLL_SLICE_MS 1u
+/* Bounded slice a single epoll_wait() parks for when nothing is ready and
+ * the caller allows blocking (timeout_ms != 0).
+ *
+ * This is a ceiling on an *idle* wait, not a latency floor. Anything that
+ * makes an fd ready calls poll_wait_notify(), which ends the park on the
+ * spot, so an event-driven program never pays the slice -- that was the
+ * whole point of Poll_Wait.c. What an idle waiter does pay is a full
+ * readiness rescan every time the slice expires, and the slices were so
+ * short that they were the machine's dominant cost: profiling an idle
+ * Chromium on QEMU showed 95% of every syscall it made was a wait
+ * (epoll_wait 59%, ppoll 22%, poll 14%) -- roughly ten thousand parks a
+ * second, each one scanning its whole fd set, being scheduled, taking a
+ * timer interrupt and being scheduled again, for a system that had
+ * nothing whatever to wait for.
+ *
+ * 16 ms divides that by sixteen and still fits inside one 60 Hz frame.
+ * It is a ceiling and not 160 ms because a readiness source that has not
+ * been taught to call poll_wait_notify() can only be noticed at the end
+ * of a slice; those sources are the reason this is not larger. See
+ * Docs/Others/TODO_Performance_LinuxApps.md section 8 for the list. */
+#define EPOLL_POLL_SLICE_MS 16u
 
 
 

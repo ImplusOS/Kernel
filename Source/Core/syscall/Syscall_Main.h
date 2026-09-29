@@ -226,6 +226,13 @@
 /* set_credentials(uid, gid): the uid/gid Linux programs spawned by the caller
  * will run as (process_t.uid). (uint32_t)-1 leaves a value unchanged. */
 #define SYSCALL_SET_CREDENTIALS        276
+/* spawn_elf_env(path, argument, envp): SYSCALL_PROCESS_SPAWN_ELF_ARG plus an
+ * environment. `envp` is a NULL-terminated array of pointers to "NAME=VALUE"
+ * strings in the caller's address space; NULL means "kernel defaults alone".
+ * This is how a launcher gives a foreign binary its own variables --
+ * application- and service-specific environment lives in userland
+ * (Userland/API/Source/LinuxEnv.c), never in the kernel. */
+#define SYSCALL_PROCESS_SPAWN_ELF_ENV  277
 
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241

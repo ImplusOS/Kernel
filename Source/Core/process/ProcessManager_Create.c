@@ -1689,6 +1689,43 @@ static int initialize_raw_user_stack(process_t *proc)
 #define EXECVE_ARG_MAX 256
 #define EXECVE_STRTOTAL_MAX 8192
 
+/* Bounds on the environment a launcher may hand a spawn
+ * (SYSCALL_PROCESS_SPAWN_ELF_ENV). Smaller than the execve limits on purpose:
+ * this is a *merged* buffer -- the launcher's entries plus the kernel's own
+ * defaults -- and it lives on the spawning thread's kernel stack, which is
+ * also what process_execve's 8 KiB strings_buf sits on. */
+#define SPAWN_ENV_MAX 64
+#define SPAWN_ENV_STRTOTAL_MAX 4096
+/* Room for the launcher's entries plus every default below plus a terminator. */
+#define LINUX_ENV_DEFAULT_MAX 24
+#define LINUX_ENV_MERGED_MAX (SPAWN_ENV_MAX + LINUX_ENV_DEFAULT_MAX + 2)
+
+/* Length of the "NAME" part of a "NAME=VALUE" entry, or (uint32_t)-1 when the
+ * entry carries no '=' and so is not a variable at all. */
+static uint32_t linux_env_key_length(const char *entry)
+{
+    uint32_t i = 0;
+    while (entry[i] != '\0' && entry[i] != '=') {
+        ++i;
+    }
+    return (entry[i] == '=') ? i : (uint32_t)-1;
+}
+
+static int linux_env_same_key(const char *a, const char *b)
+{
+    uint32_t la = linux_env_key_length(a);
+    uint32_t lb = linux_env_key_length(b);
+    if (la == (uint32_t)-1 || la != lb) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < la; ++i) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int count_user_string_array(const char *const *user_array,
                                     uint64_t *count_out,
                                     uint64_t *total_strlen_out)
@@ -3168,6 +3205,46 @@ int32_t process_create_thread(uint64_t entry,
 int32_t process_spawn_user_elf_with_arg(const char *path,
                                         const char *launch_argument)
 {
+    return process_spawn_user_elf_with_env(path, launch_argument, NULL);
+}
+
+/* Spawn `path`, giving the child the environment the launcher supplied in
+ * `user_envp` (a NULL-terminated array of "NAME=VALUE" pointers in the
+ * caller's address space, or NULL for the kernel's defaults alone).
+ *
+ * The kernel never assembles an application's environment any more: it only
+ * appends its own generic defaults for keys the launcher did not name. See
+ * the default table further down and Userland/API/Source/LinuxEnv.c. */
+int32_t process_spawn_user_elf_with_env(const char *path,
+                                        const char *launch_argument,
+                                        const char *const *user_envp)
+{
+    /* Copied out of the caller's address space before anything else happens:
+     * initialize_elf_user_stack_ex() switches to the child's CR3 and only
+     * then reads these strings, by which time the caller's mappings are gone.
+     * Same technique, smaller budget, as process_execve's strings_buf. */
+    char env_strings[SPAWN_ENV_STRTOTAL_MAX];
+    uint64_t env_offsets[SPAWN_ENV_MAX];
+    const char *env_ptrs[SPAWN_ENV_MAX];
+    uint64_t user_envc = 0u;
+    memset(env_strings, 0, sizeof(env_strings));
+    if (user_envp != NULL) {
+        uint64_t env_strtotal = 0u;
+        if (count_user_string_array(user_envp, &user_envc, &env_strtotal) < 0 ||
+            user_envc > (uint64_t)SPAWN_ENV_MAX ||
+            env_strtotal > (uint64_t)SPAWN_ENV_STRTOTAL_MAX) {
+            return -1;
+        }
+        if (user_envc > 0u &&
+            copy_user_strings(user_envp, user_envc, env_strings,
+                              sizeof(env_strings), env_offsets) < 0) {
+            return -1;
+        }
+        for (uint64_t i = 0; i < user_envc; ++i) {
+            env_ptrs[i] = env_strings + env_offsets[i];
+        }
+    }
+
     if (!path || path[0] == '\0') {
         return -1;
     }
@@ -3277,189 +3354,107 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
                 }
             }
         }
-        /* Default environment for Linux-ABI processes (used by the
-           ld.so interpreter; ignored by static binaries).
+        /* Default environment for a Linux-ABI process, read by whichever
+           interpreter PT_INTERP named (a static binary ignores it).
 
-           Two interpreter families reach this path:
-             - the in-tree ImplusOS test ld.so (com.ImplusOS.dynmain /
-               com.ImplusOS.ldso), exercised by the dynmain test app, which
-               wants LD_LIBRARY_PATH pointed at its own lib dir + libpreload;
-             - real glibc /lib64/ld-linux-x86-64.so.2 (external Linux
-               binaries such as Chromium; Vendor/LinuxRuntime stages it at
-               /lib64 with its .so closure under /usr/lib/x86_64-linux-gnu).
-           The glibc loader chokes on the dynmain-specific vars, so pick the
-           environment from the PT_INTERP path. See
-           Docs/Others/TODO_glibc_Port.md G3. */
-        static const char *implus_ld_envp[] = {
+           ONLY WHAT IS NOT AN APPLICATION'S BUSINESS IS LISTED HERE. Every
+           entry below is either POSIX-generic -- identity, login shell,
+           locale, timezone, terminal type -- or one of the XDG base
+           directories that glibc's own GUI stacks (GTK, GLib/GIO) and
+           Chromium all assume. The single platform-specific entry is the
+           library search path, which only the kernel is in a position to
+           know: it is what the staged Linux runtime's layout requires, the
+           moral equivalent of the rpath a distro's ld.so is built with, and
+           it comes from OS_CONFIG_LINUX_RUNTIME_LIB_PATH.
+
+           Anything naming an application, a toolkit or a service -- DISPLAY,
+           LD_PRELOAD, DOOMWADDIR, GDK_*, FONTCONFIG_*, ALSOFT_DRIVERS, and
+           the in-tree test ld.so's own LD_LIBRARY_PATH -- is assembled by
+           the launcher in Userland/API/Source/LinuxEnv.c and handed over
+           through SYSCALL_PROCESS_SPAWN_ELF_ENV. A launcher entry and a
+           default naming the same key are never both emitted: the default
+           is dropped, so the child sees exactly one value regardless of
+           whether getenv() or glibc's ld.so reads it first- or last-match.
+
+           History of each line used to live here; it moved with the entries
+           it describes (Docs/Others/TODO_Doom_Xorg_MethodA.md,
+           TODO_GTK3_Wayland_LinuxABI.md, TODO_Terminal_xterm.md,
+           TODO_glibc_Port.md). */
+        static const char *linux_envp_defaults[] = {
             "PATH=/bin:/usr/bin",
-            "LD_LIBRARY_PATH=/Userland/Service/com.ImplusOS.dynmain/lib",
-            "LD_PRELOAD=libpreload.so",
-            NULL,
-        };
-        static const char *glibc_envp[] = {
-            "PATH=/bin:/usr/bin",
-            "LD_LIBRARY_PATH=/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib",
-            /* Xorg's modesetting_drv.so has 12 undefined gbm_* symbols and does
-               NOT list libgbm.so.1 in DT_NEEDED -- on a stock distro it only
-               resolves them because AccelMethod "glamor" pulls in
-               libglamoregl.so (-> libgbm). Our xorg.conf forces AccelMethod
-               "none" (no GPU), so nothing loads libgbm and the driver fails
-               relocation ("undefined symbol: gbm_bo_get_plane_count",
-               "No drivers available"). Preload libgbm.so.1 so its symbols sit
-               in the global scope before modesetting_drv.so is dlopen()ed.
-               TODO_Doom_Xorg_MethodA.md M6 (7th boot). */
-            /* NOTE: if you ever add another preload here, append it to this
-               entry with a colon. glibc's ld.so keeps only the LAST LD_PRELOAD
-               it sees, so a second line silently drops libgbm and Xorg dies
-               with "undefined symbol: gbm_bo_get_plane_count". */
-            "LD_PRELOAD=libgbm.so.1",
-            /* Bind every relocation at load time. Two reasons:
-               (1) boot 7 proved libglx.so resolves cleanly under eager
-                   binding but a *lazy* PLT fixup for one of its symbols dies
-                   at GlxExtensionInit() time with an un-printable name
-                   (process faults mid-message) -- eager binding sidesteps
-                   the broken lazy path;
-               (2) with LD_WARN=1 a load-time relocation miss is reported by
-                   name and made non-fatal, so any genuinely absent symbol is
-                   finally legible instead of racing off the console.
-               TODO_Doom_Xorg_MethodA.md M6 (9th boot). */
-            "LD_BIND_NOW=1",
-            /* NOTE: LD_WARN=1 was removed. With it, the unresolved
-               R_X86_64_GLOB_DAT for `glxServer` (a data symbol exported only
-               by the Xorg PIE) was demoted to a warning and the GOT slot left
-               0, so libglx.so later did `call *0x38(NULL)` -> SIGSEGV at 0x38.
-               Without LD_WARN the miss is fatal AND named at load time:
-               "Xorg: ... undefined symbol: glxServer", which is the real bug
-               to chase (dlopen'd modules can't resolve main-executable data
-               symbols). TODO_Doom_Xorg_MethodA.md M7. */
+            "HOME=/tmp",
+            "USER=root",
+            "LOGNAME=root",
+            "SHELL=/bin/sh",
             "LANG=C.UTF-8",
             "LC_ALL=C.UTF-8",
             "TZ=UTC",
-            "HOME=/tmp",
-            /* XDG base dirs: glibc GUI stacks (GTK, GLib/GIO) and Chromium all
-               expect these. No real per-user runtime dir exists, so point the
-               runtime/cache dirs at /tmp (TmpFS). See
-               Docs/Others/TODO_GTK3_Wayland_LinuxABI.md G4. */
+            "TERM=xterm",
             "XDG_RUNTIME_DIR=/tmp",
             "XDG_CACHE_HOME=/tmp/.cache",
             "XDG_CONFIG_HOME=/tmp/.config",
             "XDG_DATA_DIRS=/usr/share",
             "XDG_CONFIG_DIRS=/etc/xdg",
-            /* GTK3: try the Wayland backend, then X11. ImplusOS has neither a
-               Wayland compositor nor an X server yet, so gdk_display_open()
-               is expected to fail with "cannot open display" - reaching that
-               point already proves the whole glibc + GTK3 .so closure loaded
-               and initialised. Compositor: TODO_GTK3_Wayland_LinuxABI.md G5. */
-            "GDK_BACKEND=wayland,x11",
-            "GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas",
-            "GSETTINGS_BACKEND=memory",
-            /* There is no D-Bus on ImplusOS, and saying so is not optional.
-               With the variable unset, GDBus treats a session bus as merely
-               "not started yet" and autolaunches one: it reads
-               /etc/machine-id and posix_spawn()s dbus-launch, which is not on
-               the image. GTK3's startup reaches that path twice (GApplication
-               registration, then the atk-bridge a11y module) and a GTK3 client
-               got as far as binding every Wayland global and then stopped
-               dead, never creating a window. An address that cannot be
-               connected to makes the same call fail immediately instead, which
-               GApplication and atk-bridge both handle. NO_AT_BRIDGE keeps
-               atk-bridge out of the process altogether, so it never asks.
-               Docs/Others/TODO_GTK3_Wayland_LinuxABI.md G5 (W2'). */
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent",
-            "NO_AT_BRIDGE=1",
-            "FONTCONFIG_PATH=/etc/fonts",
-            "FONTCONFIG_FILE=/etc/fonts/fonts.conf",
-            /* gdk-pixbuf finds its loaders through a cache file whose path is
-               compiled into the library. Name it (and the loader directory)
-               explicitly, the same way the GSettings and fontconfig lookups
-               above are named, so the image's layout is what is used rather
-               than whatever the library was built against. Without a usable
-               cache GTK3 has no image loaders at all and aborts on the first
-               icon it draws:
-                 Gtk:ERROR:gtkiconhelper.c:495: Failed to load
-                 .../image-missing.png: Unrecognized image file format */
-            "GDK_PIXBUF_MODULE_FILE=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache",
-            "GDK_PIXBUF_MODULEDIR=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders",
-            /* Doom (Method A: TODO_Doom_Xorg_MethodA.md). The Xorg we spawn
-               runs modesetting on /dev/dri/card0 (kernel KMS shim); Mesa must
-               use the software rasteriser (llvmpipe) since there is no real
-               GPU; the X core keyboard needs xkb-data's rules root.
-
-               DISPLAY is NOT optional. Xlib does not fall back to :0 -- with
-               no DISPLAY in the environment, XOpenDisplay(NULL) hands a NULL
-               display name to xcb_connect(), which returns a connection
-               already in the error state, so every X client dies at startup
-               ("Couldn't connect to display!"). Name the socket the server
-               actually listens on: /tmp/.X11-unix/X0. */
-            "DISPLAY=:0",
-            "LIBGL_ALWAYS_SOFTWARE=1",
-            "GALLIUM_DRIVER=llvmpipe",
-            /* llvmpipe's scene/command-handoff worker threads race the main
-             * thread's JIT'd raster kernel under our SMP scheduler; the torn
-             * read showed up as a #GP er lang user-mode deref of garbage rax
-             * at the first frame (M24). Force one raster thread for now. TODO:
-             * find the real thread-handoff bug. */
-            "LP_NUM_THREADS=1",
-            /* NOTE: a second "GALLIUM_DRIVER=softpipe" used to sit here. It
-               never took effect -- getenv() returns the first match and
-               llvmpipe is above -- so it only read as if softpipe had been
-               tried and ruled out. Change the line above to switch drivers.
-               LIBGL_DEBUG=verbose was dropped with it: it is worth several
-               seconds of COM1 time on every boot and says nothing once direct
-               rendering is confirmed working. */
-            /* NOTE: LIBGL_ALWAYS_INDIRECT was removed. Indirect GLX makes the
-               *server* own the GL context, and its DoMakeCurrent() then dies
-               calling a NULL __GLXcontext::makeCurrent (M23). Direct rendering
-               keeps GL entirely inside the client: libGLX_mesa dlopens
-               swrast_dri.so -> libgallium (llvmpipe) and pushes finished frames
-               to X with PutImage, so nothing server-side has to render. The
-               old "the client's direct path cannot work" note was written while
-               libGLX_mesa.so.0 was still missing from the stage; it is staged
-               now, and the client does load libgallium + LLVM. */
-            "XKB_CONFIG_ROOT=/usr/share/X11/xkb",
-            /* Terminal emulator (Userland/Application/Terminal). xterm asks
-               $SHELL first and only falls back to getpwuid()'s shell field,
-               and it will not run a shell whose path is not absolute -- with
-               neither set it exits with "No absolute path found for shell".
-               TERM is what xterm hands its child; setting it here as well
-               covers a program started outside xterm that still expects the
-               variable to exist. XFILESEARCHPATH is where Xt looks for the
-               app-defaults resource files stage-xterm.sh installs. */
-            "SHELL=/bin/sh",
-            "TERM=xterm",
-            "XFILESEARCHPATH=/etc/X11/app-defaults/%N:/usr/share/X11/app-defaults/%N",
-            /* Doom pulls libopenal (+ SDL2 via libfluidsynth). ImplusOS has no
-               PipeWire/PulseAudio/ALSA device; letting OpenAL-soft probe them
-               makes libpulse's pa_make_fd_cloexec() abort the process. Force
-               the null / dummy backends -- audio is silent, Doom runs. */
-            "ALSOFT_DRIVERS=null",
-            "SDL_AUDIODRIVER=dummy",
-            "PULSE_SERVER=none",
-            /* Doom locates its IWAD relative to DOOMWADDIR (else "."); its
-               soundfont from SOUNDFONT. Both data files live beside the
-               binary in /Userland/Doom/Resource. */
-            "DOOMWADDIR=/Userland/Doom/Resource",
-            "SOUNDFONT=/Userland/Doom/Resource/soundfont.sf2",
             NULL,
         };
-        const char **linux_envp = implus_ld_envp;
+        static const char linux_envp_ld_path[] =
+            "LD_LIBRARY_PATH=" OS_CONFIG_LINUX_RUNTIME_LIB_PATH;
+
+        /* Two interpreter families reach this path (Docs/Others/
+           TODO_glibc_Port.md G3): real glibc /lib64/ld-linux-x86-64.so.2
+           used by external Linux binaries, and the in-tree test ld.so
+           (com.ImplusOS.ldso). Only glibc's loader needs the runtime's
+           library directory, and only the kernel can tell the two apart --
+           a launcher never sees PT_INTERP. */
+        const char *family_ld_path = NULL;
         {
             const char *ip = image_info.interp_path;
             for (uint32_t i = 0; i + 2 < sizeof(image_info.interp_path) &&
                                  ip[i] != '\0'; ++i) {
                 if (ip[i] == 'l' && ip[i + 1] == 'd' && ip[i + 2] == '-') {
-                    linux_envp = glibc_envp; /* ".../ld-linux-..." */
+                    family_ld_path = linux_envp_ld_path; /* ".../ld-linux-..." */
                     break;
                 }
             }
         }
-        uint64_t linux_envc = 0;
-        while (linux_envp[linux_envc] != NULL) {
-            ++linux_envc;
+
+        /* Launcher entries go in first: getenv() returns the first match, so
+           this is also how a launcher overrides a default below. */
+        const char *merged_env[LINUX_ENV_MERGED_MAX];
+        uint64_t merged_envc = 0u;
+        for (uint64_t i = 0; i < user_envc &&
+                            merged_envc < (uint64_t)LINUX_ENV_MERGED_MAX; ++i) {
+            merged_env[merged_envc++] = env_ptrs[i];
+        }
+
+        int ld_path_given = 0;
+        for (uint64_t u = 0; u < user_envc; ++u) {
+            if (family_ld_path != NULL &&
+                linux_env_same_key(family_ld_path, env_ptrs[u])) {
+                ld_path_given = 1;
+            }
+        }
+
+        for (uint64_t d = 0; linux_envp_defaults[d] != NULL &&
+                            merged_envc < (uint64_t)LINUX_ENV_MERGED_MAX; ++d) {
+            const char *candidate = linux_envp_defaults[d];
+            for (uint64_t u = 0; u < user_envc; ++u) {
+                if (linux_env_same_key(candidate, env_ptrs[u])) {
+                    candidate = NULL;
+                    break;
+                }
+            }
+            if (candidate != NULL) {
+                merged_env[merged_envc++] = candidate;
+            }
+        }
+        if (family_ld_path != NULL && !ld_path_given &&
+            merged_envc < (uint64_t)LINUX_ENV_MERGED_MAX) {
+            merged_env[merged_envc++] = family_ld_path;
         }
         if (initialize_elf_user_stack_ex(proc, &image_info, path,
                                          linux_argc, linux_argv,
-                                         linux_envc, linux_envp) < 0) {
+                                         merged_envc, merged_env) < 0) {
             ipc_cleanup_process_queue(pid);
             uint64_t irq_flags = irq_save_disable();
             spinlock_lock(&g_process_table_lock);
@@ -4621,7 +4616,7 @@ int32_t process_register_boot_process_from_memory(const void *data, uint64_t siz
     }
 
     process_t *proc = &g_processes[pid];
-    strncpy(proc->name, "Userland.ELF", sizeof(proc->name) - 1);
+    strncpy(proc->name, OS_CONFIG_USERLAND_INIT_NAME, sizeof(proc->name) - 1);
     proc->name[sizeof(proc->name) - 1] = '\0';
 
     elf_load_policy_t policy = {
@@ -4645,7 +4640,8 @@ int32_t process_register_boot_process_from_memory(const void *data, uint64_t siz
     proc->main_phent = image_info.phent;
     proc->main_phnum = image_info.phnum;
 
-    if (initialize_elf_user_stack(proc, &image_info, "/Userland/Userland.ELF") < 0) {
+    if (initialize_elf_user_stack(proc, &image_info,
+                                 OS_CONFIG_USERLAND_INIT_PATH) < 0) {
         ipc_cleanup_process_queue(pid);
         uint64_t irq_flags = irq_save_disable();
         spinlock_lock(&g_process_table_lock);
@@ -6683,6 +6679,15 @@ int process_signal_deliver(int32_t pid, int32_t signum)
     proc->pending_signals |= (1u << (uint32_t)signum);
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+    /* A signal is not an fd event, and nothing else would tell a process
+     * parked in poll()/epoll_wait()/ppoll() that one is waiting for it: it
+     * would otherwise sit out its whole park slice before coming back to
+     * userspace to take the signal. The park slice is a ceiling on an idle
+     * wait (Syscall_Epoll.c), and this is what keeps that ceiling from
+     * becoming the latency of every EINTR and every SIGCHLD. After the
+     * unlock, because poll_wait_notify() ends by taking the process table
+     * lock through process_wake_pid(). */
+    poll_wait_notify();
     return 0;
 }
 
@@ -6789,6 +6794,10 @@ int process_signal_deliver_group(int32_t pid, int32_t signum)
     }
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+    /* Same reason as process_signal_deliver(): a parked waiter has to be
+     * told, or the signal waits out its park slice. Done outside the table
+     * lock -- poll_wait_notify() takes it again in process_wake_pid(). */
+    poll_wait_notify();
     return 0;
 }
 

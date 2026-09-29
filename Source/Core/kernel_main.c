@@ -438,13 +438,13 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
     if (fs_ready) {
         phase_ns = boot_profile_begin();
         static const uint8_t userland_elf_magic[4] = {0x7Fu, 'E', 'L', 'F'};
-        if (!vfs_set_default_fs_for_file("/Userland/Userland.ELF",
+        if (!vfs_set_default_fs_for_file(OS_CONFIG_USERLAND_INIT_PATH,
                                          64u,
                                          userland_elf_magic,
                                          sizeof(userland_elf_magic))) {
             vfs_init();
             if (all_fs_initialize() &&
-                vfs_set_default_fs_for_file("/Userland/Userland.ELF",
+                vfs_set_default_fs_for_file(OS_CONFIG_USERLAND_INIT_PATH,
                                            64u,
                                            userland_elf_magic,
                                            sizeof(userland_elf_magic))) {
@@ -454,7 +454,7 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
             }
         }
 
-        if (process_register_boot_process("/Userland/Userland.ELF", &user_entry) < 0) {
+        if (process_register_boot_process(OS_CONFIG_USERLAND_INIT_PATH, &user_entry) < 0) {
             const char *elf_err = elf_loader_last_error();
             char panic_msg[128];
             if (elf_err) {

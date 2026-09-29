@@ -19,7 +19,6 @@
 #include "Core/memory/SharedMemory.h"
 #include "Debug/serial/Serial.h"
 #include "IPC/UnixSocket.h"
-#include "Core/vfs/TmpFS.h"
 
 enum {
     FILE_MAX_FD = FILE_MAX_FD_CONFIG,
@@ -1946,27 +1945,36 @@ int syscall_file_is_pipe(int32_t fd)
  * reference on the kernel_open_file_t rather than on the fd. See
  * Core/memory/FileMap.c. */
 
-int syscall_file_is_tmpfs(int32_t fd)
+/* A file whose bytes can be published as shared pages, so that every mapping
+ * of them -- in this process or another -- sees the same content. The
+ * capability is the filesystem's, declared by providing vfs_driver_t::
+ * share_map; nothing in this layer names a filesystem. A MAP_SHARED mapping
+ * of such a file without it falls back to a private snapshot, which silently
+ * breaks whoever was meant to share it (Compat/Linux/Syscall_LinuxCompat.c
+ * says so when it happens). */
+int syscall_file_is_shareable(int32_t fd)
 {
     if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_FILE) {
         return 0;
     }
     kernel_open_file_t *open_file = fd_open_file(fd);
-    return open_file != NULL &&
-           open_file->file.fs_driver == tmpfs_vfs_get_driver();
+    return open_file != NULL && open_file->file.fs_driver != NULL &&
+           open_file->file.fs_driver->share_map != NULL;
 }
 
-int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length)
+int32_t syscall_file_share_pages(int32_t fd, uint64_t length)
 {
     if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_FILE ||
         !fd_is_owned_by_current_process(fd)) {
         return -1;
     }
     kernel_open_file_t *open_file = fd_open_file(fd);
-    if (open_file == NULL || open_file->file.fs_driver != tmpfs_vfs_get_driver()) {
+    if (open_file == NULL || open_file->file.fs_driver == NULL ||
+        open_file->file.fs_driver->share_map == NULL) {
         return -1;
     }
-    int32_t handle = tmpfs_share_mapping(&open_file->file, length);
+    int32_t handle = open_file->file.fs_driver->share_map(&open_file->file,
+                                                          length);
     if (handle > 0) {
         /* Reads now go through the shared pages; a cached copy would be stale
          * the moment anything writes through a mapping. */

@@ -28,7 +28,21 @@
 #define ATA_CMD_READ_DMA_EXT  0x25u
 #define ATA_CMD_WRITE_DMA_EXT 0x35u
 #define ATA_CMD_FLUSH_CACHE_EXT 0xEAu
-#define AHCI_DMA_SECTORS 64u
+/* Largest single transfer one command can move: the DMA window the command
+ * table's one PRDT entry points at.
+ *
+ * This was 64 sectors (32 KiB) and that, not the media, is what an ELF load
+ * was limited by. A Chromium image is ~500 MB of PT_LOAD and the loader
+ * reads it in 256 KiB chunks, so every exec issued 16k ATAPI READ(10)
+ * commands -- each one two busy-wait loops on the task file, a CI poll loop
+ * that costs a VMEXIT per iteration, a DMA setup and an interrupt -- for a
+ * measured 7 s of reading per child exec (see [elfload] in the serial log).
+ * A 512 KiB window serves each of those chunks in one command, which is 16x
+ * fewer round trips for the same bytes; the transfer itself was never the
+ * cost. Small requests still issue small commands -- this is a ceiling, not
+ * a granularity -- and the buffer only exists once, from the 8 MiB DMA pool.
+ */
+#define AHCI_DMA_SECTORS 1024u
 #define AHCI_SECTOR_SIZE 512u
 #define AHCI_MAX_DEVICES 32u
 #define AHCI_CLB_BYTES   4096u

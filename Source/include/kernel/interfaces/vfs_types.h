@@ -115,4 +115,17 @@ typedef struct vfs_driver {
      * directory 0700 and then CHECK()s that stat() reports exactly 0700. */
     bool (*set_mode)(const char *path, uint32_t mode);
     int32_t (*get_mode)(const char *path);
+
+    /* Optional. Publish a file's bytes as shared pages so every mapping of
+     * the result -- in this process or any other -- sees the same content,
+     * instead of the private snapshot a plain read-into-a-new-mapping gives.
+     * A filesystem opts in simply by providing the hook; the syscall layer
+     * asks for it by capability and never names a filesystem (Core/syscall/
+     * Syscall_File.c: syscall_file_is_shareable / syscall_file_share_pages).
+     *   returns : a shared-memory handle (> 0) on success, <= 0 when this
+     *             file cannot be shared (not this driver's file, a directory,
+     *             no room, ...).
+     * tmpfs implements it, which is what makes Chromium's /dev/shm buffers
+     * actually shared; a driver whose nodes live in page cache could as well. */
+    int32_t (*share_map)(vfs_file_t *file, uint64_t length);
 } vfs_driver_t;

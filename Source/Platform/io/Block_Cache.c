@@ -50,11 +50,11 @@ static inline uint32_t readahead_slot(uint64_t key)
     return (uint32_t)((key ^ (key >> 32)) % BLOCK_CACHE_MAX_DEVICES);
 }
 
-/* How many lines one miss pulls in a single transfer. 8 lines = 32 KiB, which
- * is exactly the AHCI DMA window (AHCI_DMA_SECTORS) and 16 ATAPI blocks, so a
- * run of this size is one command on every transport here. Filling a run
- * rather than a line is what keeps the mmap read-ahead path (64 KiB at a
- * time) down to two commands instead of sixteen. */
+/* How many lines one miss pulls in a single transfer. 8 lines = 32 KiB,
+ * which is at most one command on every transport here: it is 16 ATAPI
+ * blocks and it is well inside the AHCI DMA window (AHCI_DMA_SECTORS). Filling
+ * a run rather than a line is what keeps the mmap read-ahead path (64 KiB at
+ * a time) down to two commands instead of sixteen. */
 #define BLOCK_CACHE_FILL_MAX_LINES 8u
 
 /* Staging for a line fill. Not on the stack: the kernel stack is 32 KiB

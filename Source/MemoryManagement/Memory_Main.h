@@ -47,7 +47,12 @@ uint64_t memory_free_pages(void);
  * outside the managed range. Diagnostic: a live page table whose frame reads
  * back as free was freed while still linked into an address space. */
 int pmm_page_is_allocated(uint64_t phys);
+/* RAM amount (E820 usable sum -- see get_physical_address_pages() for the
+ * distinction: on QEMU the two differ by the size of the PCI hole). */
 uint64_t get_total_memory_pages(void);
+/* Highest managed page index + 1: the physical *address* limit, which spans
+ * the PCI hole. Use this to bound an address, never to report a total. */
+uint64_t get_physical_address_pages(void);
 void     memory_dump_virtual(const void *addr, uint32_t bytes);
 void     memory_dump_physical(uint64_t phys_addr, uint32_t bytes);
 

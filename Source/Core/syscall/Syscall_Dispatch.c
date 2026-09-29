@@ -64,7 +64,6 @@ typedef struct __attribute__((packed)) {
 #define SYSCALL_UDP_MAX_RECV_BYTES (UDP_USER_HEADER_BYTES + 1472U)
 #define SYSCALL_MAX_DISPLAY_RECTS 128U
 #define SYSCALL_U32_MASK        0xFFFFFFFFULL
-#define WM_FILL_RECT_TRACE      0
 
 static int32_t g_audio_owner_pid = -1;
 
@@ -459,13 +458,6 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
     process_perf_note_syscall(current_pid);
     
     int request_switch = 0;
-#if WM_FILL_RECT_TRACE
-    int trace_wm_fill_rect = 0;
-    if (num == SYSCALL_DISPLAY_FILL_RECT) {
-        int32_t wm_pid = syscall_input_owner_get();
-        trace_wm_fill_rect = (wm_pid >= 0 && current_pid == wm_pid);
-    }
-#endif
 
     if (input_manager_check_poll()) {
         uint64_t poll_flags = irq_save_disable();
@@ -648,6 +640,27 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
             }
             set_syscall_i32(saved_rsp,
                 process_spawn_user_elf_with_arg(path, argument));
+            break;
+        }
+
+        case SYSCALL_PROCESS_SPAWN_ELF_ENV: {
+            char path[SYSCALL_MAX_PATH_LEN];
+            char argument[SYSCALL_MAX_PATH_LEN];
+            if (copy_user_cstring(path, sizeof(path),
+                                  (const char *)(uintptr_t)arg1) < 0 ||
+                copy_user_cstring(argument, sizeof(argument),
+                                  (const char *)(uintptr_t)arg2) < 0) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_spawn_argument");
+                break;
+            }
+            /* arg3 is a NULL-terminated array of pointers to "NAME=VALUE"
+             * strings in the caller's address space; 0 means "no extra
+             * environment". Validation and the copy both happen inside
+             * process_spawn_user_elf_with_env(), before the child's address
+             * space exists and could unmap the caller's. */
+            set_syscall_i32(saved_rsp, process_spawn_user_elf_with_env(
+                path, argument, (const char *const *)(uintptr_t)arg3));
             break;
         }
 

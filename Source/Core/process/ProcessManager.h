@@ -150,6 +150,14 @@ int32_t process_create_thread_ex(uint64_t entry,
 int32_t process_spawn_user_elf(const char *path);
 int32_t process_spawn_user_elf_with_arg(const char *path,
                                         const char *launch_argument);
+/* Same, with an environment the launcher supplies: `user_envp` is a
+ * NULL-terminated array of "NAME=VALUE" pointers in the *caller's* address
+ * space (SYSCALL_PROCESS_SPAWN_ELF_ENV). The kernel copies it out before the
+ * child's address space exists and appends only its own generic defaults for
+ * keys the launcher did not name. NULL means "kernel defaults alone". */
+int32_t process_spawn_user_elf_with_env(const char *path,
+                                        const char *launch_argument,
+                                        const char *const *user_envp);
 /* Hooks for per-ABI process state. on_fork(parent, child) runs inside
  * process_fork() before the child can be scheduled; on_exit(pid, -1) runs in
  * the exit cleanup. */

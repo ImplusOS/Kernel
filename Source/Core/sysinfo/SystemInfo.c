@@ -10,6 +10,9 @@
 extern uint64_t get_total_memory_pages(void);
 extern uint64_t get_used_memory(void);
 extern uint64_t get_free_memory(void);
+/* Physical free pages, from the PMM bitmap -- the only number here that is
+ * comparable with total_pages. See sysinfo_get_memory_info(). */
+extern uint64_t memory_free_pages(void);
 
 typedef struct {
     uint16_t vendor_id;
@@ -240,9 +243,14 @@ os_status_t sysinfo_get_memory_info(system_memory_info_t *out_info)
     }
     
     out_info->page_size = 4096;
+    /* Physical, from the PMM bitmap. The previous values came from the
+     * kernel heap's own bookkeeping (get_used_memory()/get_free_memory()),
+     * which counts bytes in the malloc arena -- a different quantity that
+     * cannot be compared with total_bytes, and that over-counted on top of
+     * that until realloc's shrink path was fixed. */
     out_info->total_bytes = get_total_memory_pages() * 4096;
-    out_info->used_bytes = get_used_memory();
-    out_info->free_bytes = get_free_memory();
+    out_info->free_bytes  = memory_free_pages() * 4096;
+    out_info->used_bytes  = out_info->total_bytes - out_info->free_bytes;
     out_info->cached_bytes = 0;
     out_info->buffers_bytes = 0;
     
@@ -257,8 +265,8 @@ os_status_t sysinfo_get_vmem_info(system_vmem_info_t *out_info)
     
     out_info->page_size = 4096;
     out_info->total_pages = get_total_memory_pages();
-    out_info->free_pages = get_total_memory_pages() - (get_used_memory() / 4096);
-    out_info->mapped_pages = get_used_memory() / 4096;
+    out_info->free_pages  = memory_free_pages();
+    out_info->mapped_pages = out_info->total_pages - out_info->free_pages;
     
     return OS_STATUS_OK;
 }

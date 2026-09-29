@@ -805,6 +805,7 @@ static const vfs_driver_t g_tmpfs_vfs_driver = {
     .readlink = tmpfs_vfs_readlink,
     .set_mode = tmpfs_vfs_set_mode,
     .get_mode = tmpfs_vfs_get_mode,
+    .share_map = tmpfs_share_mapping,
 };
 
 /* Directories that have to be there before anyone creates anything in them.

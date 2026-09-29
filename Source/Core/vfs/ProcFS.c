@@ -271,7 +271,7 @@ static uint32_t procfs_build_cmdline(int32_t pid, char *buf, uint32_t cap)
 {
     char arg[512];
     if (process_copy_launch_argument_of(pid, arg, sizeof(arg)) < 0 || arg[0] == '\0') {
-        strncpy(arg, "/Userland/Userland.ELF", sizeof(arg) - 1u);
+        strncpy(arg, OS_CONFIG_USERLAND_INIT_PATH, sizeof(arg) - 1u);
         arg[sizeof(arg) - 1u] = '\0';
     }
     uint32_t len = (uint32_t)strlen(arg);
@@ -339,11 +339,20 @@ static uint32_t procfs_build_mounts(char *buf, uint32_t cap)
 
 static uint32_t procfs_build_meminfo(char *buf, uint32_t cap)
 {
+    /* Physical, not kernel-heap. The old value here was get_free_memory(),
+     * which walks the heap's free list -- a number that says how much of the
+     * *kernel malloc arena* is spare, and that is not what "MemFree" means to
+     * any program reading /proc/meminfo (or to anyone comparing the machine
+     * against its 8 GiB of RAM). memory_free_pages() counts the PMM's own
+     * bitmap, which is what the machine actually has left. */
     uint64_t total_kb = get_total_memory_pages() * (PAGE_SIZE / 1024u);
-    uint64_t free_kb = get_free_memory() / 1024u;
+    uint64_t free_kb = memory_free_pages() * (PAGE_SIZE / 1024u);
     if (free_kb > total_kb) {
         free_kb = total_kb;
     }
+    /* No page cache and no reclaimable slab to add, so the honest answer for
+     * MemAvailable is MemFree. Reporting a number that would survive a
+     * reclamation nobody can perform is how OOM decisions go wrong. */
     return (uint32_t)snprintf(buf, cap,
         "MemTotal:       %llu kB\n"
         "MemFree:        %llu kB\n"
@@ -1084,7 +1093,7 @@ int procfs_readlink(const char *path, char *out, uint32_t capacity)
         if (process_copy_exe_path_of(pid, arg, sizeof(arg)) <= 0 || arg[0] == '\0') {
             if (process_copy_launch_argument_of(pid, arg, sizeof(arg)) < 0 ||
                 arg[0] == '\0') {
-                strncpy(arg, "/Userland/Userland.ELF", sizeof(arg) - 1u);
+                strncpy(arg, OS_CONFIG_USERLAND_INIT_PATH, sizeof(arg) - 1u);
                 arg[sizeof(arg) - 1u] = '\0';
             }
         }

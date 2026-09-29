@@ -13,6 +13,8 @@
 
 static uint8_t  *g_page_bitmap     = NULL;
 static uint64_t  g_max_pages       = 0;
+/* Sum of the E820 regions the PMM frees -- see init_physical_memory(). */
+static uint64_t  g_usable_pages    = 0;
 static uint32_t  g_alloc_page_recursion_depth[OS_CONFIG_SMP_MAX_CPUS] = {0};
 int paging_swap_reclaim_one_page(void);
 
@@ -310,6 +312,16 @@ void init_physical_memory(void *memory_map, size_t map_size, size_t desc_size,
 
     memset(g_page_bitmap, 0xFF, PAGE_BITMAP_STATIC_SIZE);
 
+    /* g_max_pages is the *address* limit, not the amount of RAM: it is the
+     * highest end address over every descriptor, so on QEMU's pc machine
+     * (-m 8192) it lands at 9,216 MiB because the 1,024 MiB PCI hole between
+     * the below-4G and above-4G chunks sits inside that range. Every report
+     * built on "total = g_max_pages" therefore showed 9,216 MiB of memory and
+     * counted the hole as used. g_usable_pages is the sum of the regions the
+     * PMM actually frees -- that is what "total" has to mean when it is
+     * subtracted from to get "used". g_max_pages stays as it is: page indices
+     * still have to be valid up to the top of the map. */
+    g_usable_pages = 0;
     if (memory_map != NULL && desc_size != 0) {
         uint8_t *map = (uint8_t *)memory_map;
         for (size_t offset = 0; offset + desc_size <= map_size; offset += desc_size) {
@@ -324,6 +336,7 @@ void init_physical_memory(void *memory_map, size_t map_size, size_t desc_size,
             if (is_usable_memory_type(desc->Type)) {
                 uint64_t start_page = desc->PhysicalStart / PAGE_SIZE;
                 mark_pages(start_page, desc->NumberOfPages, 0);
+                g_usable_pages += desc->NumberOfPages;
             }
         }
     }
@@ -517,7 +530,18 @@ void *realloc(void *ptr, uint64_t new_size) {
     uint64_t old_size    = block->size;
     uint8_t  was_sensitive = block->is_sensitive;
     if (new_size <= old_size) {
+        /* A shrink really is a shrink: split_block_if_needed() hands the tail
+         * back to the free list, but used_memory was credited with the whole
+         * old size at malloc() time and only free() ever debits it. Without
+         * the debit below every shrinking realloc() leaves (old - new) bytes
+         * counted forever, and Chromium shrinks vectors constantly -- which is
+         * how the kernel-heap figure the GUI and PerfProbe print reached
+         * 15 GB on an 8 GB machine. */
+        uint64_t before = block->size;
         split_block_if_needed(block, new_size);
+        if (block->size < before) {
+            used_memory -= (before - block->size);
+        }
         spinlock_unlock(&heap_lock);
         irq_restore(irq_flags);
         return ptr;
@@ -546,7 +570,16 @@ void *realloc(void *ptr, uint64_t new_size) {
             heap_search_hint = block;
         }
         used_memory += added;
-        split_block_if_needed(block, new_size);
+        {
+            /* Same debit as the shrink path above: the absorb may leave the
+             * block larger than requested, and the tail split off here would
+             * otherwise stay counted as in use. */
+            uint64_t before = block->size;
+            split_block_if_needed(block, new_size);
+            if (block->size < before) {
+                used_memory -= (before - block->size);
+            }
+        }
         spinlock_unlock(&heap_lock);
         irq_restore(irq_flags);
         return ptr;
@@ -564,7 +597,17 @@ void *realloc(void *ptr, uint64_t new_size) {
     return new_ptr;
 }
 
-uint64_t get_total_memory_pages(void) { return g_max_pages; }
+/* Amount of RAM, for reports. Falls back to the address limit when the boot
+ * path supplied no memory map (nothing was counted, so the limit is all we
+ * have). Use get_physical_address_pages() instead when the question is "how
+ * high can a physical address be" -- that one still has to include the PCI
+ * hole. */
+uint64_t get_total_memory_pages(void)
+{
+    return g_usable_pages != 0 ? g_usable_pages : g_max_pages;
+}
+
+uint64_t get_physical_address_pages(void) { return g_max_pages; }
 
 uint64_t get_free_memory(void) {
     if (!heap_initialized) return 0;

@@ -65,6 +65,21 @@ static swap_track_t g_swap_tracks[SWAP_TRACK_MAX];
 static uint8_t g_swap_enabled = 1;
 static spinlock_t g_swap_lock;
 
+/* Swap-out does not exist yet: swap_alloc_slot() has no caller, nothing ever
+ * sets PAGE_SWAP on a PTE, and paging_swap_reclaim_one_page() returns 0 -- so
+ * a track can never hold a swapped page and the table answers nothing.
+ *
+ * It was still being consulted on every map, every fault and every unmap, and
+ * worst of all once per PTE while an address space is torn down: each of those
+ * is a linear walk of all SWAP_TRACK_MAX (4096) entries, ~96 KB, twice for a
+ * page that has to be inserted (a miss scans the whole table, then the insert
+ * loop scans it again). Measured on QEMU that is ~10-20 us per page, i.e. about
+ * half of an ELF load's map phase (1.6-2.2 s of 3.6 s loading Chromium's
+ * 333 MB of PT_LOAD), the same again on every page fault, and a second full
+ * scan for every page of every process being reaped. Set this when an actual
+ * swap-out path lands; until then the walks are pure overhead. */
+static uint8_t g_swap_track_active = 0;
+
 #define SWAP_SLOT_COUNT 128
 static swap_slot_t g_swap_slots[SWAP_SLOT_COUNT];
 
@@ -799,6 +814,9 @@ static void swap_free_slot(uint32_t slot)
 
 static swap_track_t *swap_find_track(uint64_t cr3, uint64_t virt_addr)
 {
+    if (!g_swap_track_active) {
+        return NULL;
+    }
     for (uint32_t i = 0; i < SWAP_TRACK_MAX; ++i) {
         if (g_swap_tracks[i].used &&
             g_swap_tracks[i].cr3 == cr3 &&
@@ -827,6 +845,9 @@ static void swap_forget_track(uint64_t cr3, uint64_t virt_addr)
 
 static void swap_track_page(uint64_t cr3, uint64_t virt_addr)
 {
+    if (!g_swap_track_active) {
+        return;
+    }
     virt_addr &= PAGE_MASK;
     swap_track_t *existing = swap_find_track(cr3, virt_addr);
     if (existing != NULL) {
@@ -949,7 +970,9 @@ void init_paging(void)
     }
     g_mmio_slots_used = 0;
     g_kernel_identity_entries = PAGING_BOOT_IDENTITY_GB;
-    uint64_t total_pages = get_total_memory_pages();
+    /* Address bound, not an amount of RAM: the identity map has to cover the
+     * PCI hole too, which get_total_memory_pages() deliberately does not. */
+    uint64_t total_pages = get_physical_address_pages();
     if (total_pages > 0) {
         uint64_t total_bytes = total_pages * PAGE_SIZE_BYTES;
         uint64_t required_entries = (total_bytes + GB - 1ULL) / GB;

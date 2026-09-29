@@ -11,6 +11,7 @@
 #include "Drivers/Module/DriverManager.h"
 #include "MemoryManagement/Memory_Main.h"
 #include "Core/sync/Spinlock.h"
+#include "Core/timer/Timer.h" /* timer_monotonic_ns: the [elfload] timings */
 #include "Core/vfs/VFS.h"
 #include "Debug/serial/Serial.h"
 
@@ -1065,19 +1066,86 @@ static bool apply_relocations(const uint8_t     *image,
  * loaded at USER_CODE_BASE and must stay below this. */
 #define ELF_INTERP_BIAS_RESERVE 0x08000000ULL /* 128 MiB */
 
+/* ---- [elfload] timing ---------------------------------------------------
+ *
+ * This loader reads an image's PT_LOAD segments in, whole, before the child
+ * runs a single instruction -- and a Linux Chromium is ~500 MB of PT_LOAD,
+ * re-read on the spawn *and* on every child's exec. Measured on QEMU that
+ * one load was ~7 s of the 9 s it took to get the browser process started,
+ * so where the time goes (reading the file, copying it into the new address
+ * space, or allocating the pages) is the first thing to know about startup,
+ * and it is not knowable from the outside: the process is in one syscall
+ * with no output until it finishes.
+ *
+ * The counters hang off the load call rather than being file-scope: a
+ * Chromium spawn runs the parent's load and the children's execs at the same
+ * time on different CPUs, and a shared counter then reports one load's bytes
+ * against another's milliseconds (measured: "read_ms=36306" inside a load
+ * that took 20590 ms). One struct, filled in by exactly one load, with the
+ * PT_INTERP interpreter's nested load folded into the same struct. */
+typedef struct {
+    uint64_t read_ns;
+    uint64_t copy_ns;
+    uint64_t map_ns;
+    uint64_t bytes;
+    uint64_t chunks;
+} elf_load_stats_t;
+
 static bool elf_load_image_biased(uint64_t target_cr3,
                                   const char *path,
                                   const elf_load_policy_t *policy,
                                   uint64_t bias_override,
                                   int is_interp,
-                                  elf_loaded_image_info_t *image_out);
+                                  elf_loaded_image_info_t *image_out,
+                                  elf_load_stats_t *stats);
+
+/* serial_write_uint64() prints sixteen hexadecimal digits -- right for a
+ * register dump, useless in a line a human is meant to read. */
+static void elf_stats_dec(uint64_t v)
+{
+    char buf[21];
+    int n = 0;
+    if (v == 0u) {
+        serial_write_char('0');
+        return;
+    }
+    while (v != 0u && n < (int)sizeof(buf)) {
+        buf[n++] = (char)('0' + (char)(v % 10u));
+        v /= 10u;
+    }
+    while (n > 0) {
+        serial_write_char(buf[--n]);
+    }
+}
+
+static void elf_stats_dump(uint64_t total_ns, const char *path,
+                           const elf_load_stats_t *s)
+{
+    if (s->bytes < (8u * 1024u * 1024u)) {
+        return; /* Small image: nothing here costs anything worth printing. */
+    }
+    serial_write_string("[elfload] path=");
+    serial_write_string(path ? path : "?");
+    serial_write_string(" total_ms="); elf_stats_dec(total_ns / 1000000u);
+    serial_write_string(" read_ms=");  elf_stats_dec(s->read_ns / 1000000u);
+    serial_write_string(" copy_ms=");  elf_stats_dec(s->copy_ns / 1000000u);
+    serial_write_string(" map_ms=");   elf_stats_dec(s->map_ns / 1000000u);
+    serial_write_string(" mb=");       elf_stats_dec(s->bytes / (1024u * 1024u));
+    serial_write_string(" chunks=");   elf_stats_dec(s->chunks);
+    serial_write_string("\n");
+}
 
 bool elf_loader_load_from_path(uint64_t target_cr3,
                                const char *path,
                                const elf_load_policy_t *policy,
                                elf_loaded_image_info_t *image_out)
 {
-    return elf_load_image_biased(target_cr3, path, policy, 0u, 0, image_out);
+    uint64_t started = timer_monotonic_ns();
+    elf_load_stats_t stats = {0u, 0u, 0u, 0u, 0u};
+    bool ok = elf_load_image_biased(target_cr3, path, policy, 0u, 0,
+                                    image_out, &stats);
+    elf_stats_dump(timer_monotonic_ns() - started, path, &stats);
+    return ok;
 }
 
 static bool elf_load_image_biased(uint64_t target_cr3,
@@ -1085,11 +1153,12 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                                   const elf_load_policy_t *policy,
                                   uint64_t bias_override,
                                   int is_interp,
-                                  elf_loaded_image_info_t *image_out)
+                                  elf_loaded_image_info_t *image_out,
+                                  elf_load_stats_t *stats)
 {
     g_last_elf_error = NULL;
 
-    if (target_cr3 == 0 || !path || !policy || !image_out) {
+    if (target_cr3 == 0 || !path || !policy || !image_out || !stats) {
         ELF_SET_ERROR("invalid parameter");
         return false;
     }
@@ -1238,12 +1307,16 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             seg_flags |= PAGE_NX;
         }
 
-        if (paging_map_user_range_alloc(target_cr3,
-                                        seg_vaddr,
-                                        ph->p_memsz,
-                                        seg_flags) < 0) {
-            ELF_SET_ERROR("paging map failed");
-            goto fail;
+        {
+            uint64_t t = timer_monotonic_ns();
+            if (paging_map_user_range_alloc(target_cr3,
+                                            seg_vaddr,
+                                            ph->p_memsz,
+                                            seg_flags) < 0) {
+                ELF_SET_ERROR("paging map failed");
+                goto fail;
+            }
+            stats->map_ns += timer_monotonic_ns() - t;
         }
 
         bool executable = ((ph->p_flags & PF_X) != 0);
@@ -1267,6 +1340,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                 if (n > ELF_SEG_CHUNK) {
                     n = ELF_SEG_CHUNK;
                 }
+                uint64_t t = timer_monotonic_ns();
                 if (!vfs_read_at(&file,
                                  (uint32_t)(ph->p_offset + done),
                                  staging,
@@ -1275,6 +1349,9 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                     ELF_SET_ERROR("failed to read segment data");
                     goto fail;
                 }
+                stats->read_ns += timer_monotonic_ns() - t;
+
+                t = timer_monotonic_ns();
                 if (!copy_to_address_space(target_cr3,
                                            seg_vaddr + done,
                                            staging,
@@ -1284,6 +1361,9 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                     ELF_SET_ERROR("copy to address space failed");
                     goto fail;
                 }
+                stats->copy_ns += timer_monotonic_ns() - t;
+                stats->bytes += n;
+                ++stats->chunks;
                 done += n;
             }
             free(staging);
@@ -1373,7 +1453,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
         elf_loaded_image_info_t interp_info;
         memset(&interp_info, 0, sizeof(interp_info));
         if (!elf_load_image_biased(target_cr3, interp_path, policy,
-                                   interp_bias, 1, &interp_info)) {
+                                   interp_bias, 1, &interp_info, stats)) {
             ELF_SET_ERROR("interpreter load failed");
             goto fail;
         }

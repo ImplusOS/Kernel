@@ -610,14 +610,6 @@ static int64_t usock_dequeue(unix_sock_t *s, uint8_t *dst, uint64_t len,
         }
     }
     spinlock_unlock(&s->lock);
-    /* TEMPORARY DIAGNOSTIC (revert): fds that arrived with no room in the
-     * caller's control buffer are destroyed here, silently losing them. */
-    if (ndropped != 0u) {
-        char t[64];
-        snprintf(t, sizeof(t), "[scm]   DROPPED-noroom n=%u\n",
-                 (unsigned)ndropped);
-        serial_write_string(t);
-    }
     for (uint32_t i = 0; i < ndropped; ++i) usock_release_passed(dropped[i]);
 
     if (!have) {
@@ -647,16 +639,6 @@ int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
     uint32_t nobjs = 0;
     int64_t rc = usock_dequeue(s, (uint8_t *)buf, len, objs, &nobjs,
                                UNIX_SOCK_FD_MAX);
-    /* A plain read() has nowhere to put descriptors: Linux closes them. */
-    /* TEMPORARY DIAGNOSTIC (revert): a descriptor destroyed by a plain read()
-     * on the same socket IPDL reads with recvmsg is invisible from both
-     * sides otherwise. */
-    if (nobjs != 0u) {
-        char t[64];
-        snprintf(t, sizeof(t), "[scm]   DESTROYED-by-read n=%u rc=%lld\n",
-                 (unsigned)nobjs, (long long)rc);
-        serial_write_string(t);
-    }
     for (uint32_t i = 0; i < nobjs; ++i) usock_release_passed(objs[i]);
     usock_trace2(rc > 0 ? "rx" : (rc == 0 ? "rx-EOF" : "rx-EAGAIN"), fd, rc);
     return rc;
@@ -723,40 +705,6 @@ static int usock_capture(int32_t global, unix_sock_t *peer,
     return -1;
 }
 
-/* One line per sendmsg/recvmsg: who, which endpoint, how many bytes and
- * descriptors. The zygote's fork handshake is a handful of these, and a
- * mismatch in either count is invisible from anywhere else. Off by default. */
-/* TEMPORARY DIAGNOSTIC (revert): SCM_RIGHTS tx/rx line per sendmsg/recvmsg,
- * used to find which side of the IPDL fd handshake drops a descriptor
- * ("File handle not found in message!"). Revert to 0 when done. */
-#ifndef UNIX_SCM_TRACE
-#define UNIX_SCM_TRACE 1
-#endif
-static void usock_scm_trace(const char *dir, int32_t fd, int64_t bytes,
-                            uint32_t nobjs, int seqpacket) {
-    if (!UNIX_SCM_TRACE) return;
-    char line[128];
-    int n = 0;
-    const char *parts[] = { "[scm] ", dir, " pid=" };
-    for (unsigned k = 0; k < 3; ++k) {
-        for (const char *q = parts[k]; *q && n < 100; ++q) line[n++] = *q;
-    }
-    uint64_t vals[4] = { (uint64_t)(uint32_t)process_get_current_pid(),
-                         (uint64_t)(uint32_t)fd, (uint64_t)bytes, nobjs };
-    const char *names[4] = { "", " fd=", " bytes=", " fds=" };
-    for (unsigned k = 0; k < 4; ++k) {
-        for (const char *q = names[k]; *q && n < 110; ++q) line[n++] = *q;
-        char dig[24]; int d = 0; uint64_t v = vals[k];
-        if (k == 2 && bytes < 0) { line[n++] = '-'; v = (uint64_t)(-bytes); }
-        do { dig[d++] = (char)('0' + v % 10u); v /= 10u; } while (v && d < 22);
-        while (d > 0 && n < 120) line[n++] = dig[--d];
-    }
-    if (seqpacket && n < 124) { line[n++] = ' '; line[n++] = 'S'; }
-    line[n++] = '\n';
-    line[n] = '\0';
-    serial_write_string(line);
-}
-
 int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
     struct _kernel_msghdr *msg = (void*)(uintptr_t)msg_ptr;
     if (!msg) return -14;
@@ -787,16 +735,7 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
                         return -9; /* EBADF, as Linux reports a bad fd here */
                     }
                     if (usock_capture(global, peer, &objs[nobjs]) == 0) {
-                        if (UNIX_SCM_TRACE) {
-                            char t[96];
-                            snprintf(t, sizeof(t), "[scm]   capture #%u user=%d global=%d kind=%u h=%d\n",
-                                     (unsigned)nobjs, (int)fds[i], (int)global,
-                                     (unsigned)objs[nobjs].kind, (int)objs[nobjs].h);
-                            serial_write_string(t);
-                        }
                         ++nobjs;
-                    } else {
-                        serial_write_string("[unixsock] SCM_RIGHTS: descriptor kind cannot be passed, dropped\n");
                     }
                 }
             }
@@ -829,7 +768,6 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
             off += iov[i].len;
         }
         int64_t rc = usock_enqueue(s, gather, total, objs, nobjs);
-        usock_scm_trace("tx", fd, rc, nobjs, 1);
         free(gather);
         if (rc == -11) {
             /* Nothing was taken; the caller will retry with the same fds. */
@@ -851,7 +789,6 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
         total += r;
         if ((uint64_t)r < iov[i].len) break; /* ring full: partial */
     }
-    usock_scm_trace("tx", fd, total, nobjs, 0);
     if (first && nobjs != 0u) {
         /* Descriptors with no payload at all. */
         int64_t r = usock_enqueue(s, NULL, 0, objs, nobjs);
@@ -918,30 +855,6 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
         free(bounce);
         return rc;
     }
-    usock_scm_trace("rx", fd, rc, nobjs, s->seqpacket);
-    if (UNIX_SCM_TRACE && s->seqpacket && rc > 0) {
-        /* Printable bytes as themselves, the rest as \xx, whole message
-         * up to 1 KiB: enough for the zygote's fork request. */
-        char line[200];
-        int n = 0;
-        for (int64_t k = 0; k < rc && k < 1024; ++k) {
-            uint8_t c = bounce[k];
-            if (n > 180) {
-                line[n++] = '\n'; line[n] = '\0';
-                serial_write_string(line);
-                n = 0;
-            }
-            if (n == 0) { line[n++] = '['; line[n++] = '='; line[n++] = ']'; line[n++] = ' '; }
-            if (c >= 0x20 && c < 0x7f && c != '\\') {
-                line[n++] = (char)c;
-            } else {
-                const char *digits = "0123456789abcdef";
-                line[n++] = '\\'; line[n++] = digits[c >> 4]; line[n++] = digits[c & 0xF];
-            }
-        }
-        line[n++] = '\n'; line[n] = '\0';
-        serial_write_string(line);
-    }
     uint64_t off = 0;
     for (uint32_t i = 0; i < iovn && off < (uint64_t)rc; i++) {
         uint64_t n = iov[i].len;
@@ -997,32 +910,15 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
             int32_t *out = (int32_t *)(ctl + used + sizeof(struct _kernel_cmsghdr));
             for (uint32_t i = 0; i < nobjs; ++i) {
                 if (written >= max_fds) {
-                    /* TEMPORARY DIAGNOSTIC (revert): cmsg room ran out. */
-                    serial_write_string("[scm]   CMSG-TRUNC\n");
                     usock_release_passed(objs[i]);
                     continue;
                 }
                 int32_t g = usock_adopt(objs[i]);
                 if (g < 0) {
-                    /* TEMPORARY DIAGNOSTIC (revert): an fd the sender handed
-                     * over that cannot be adopted vanishes from the cmsg. */
-                    serial_write_string("[scm]   ADOPT-FAIL kind=\n");
                     continue;
                 }
                 int32_t u = g_usock_install ? g_usock_install(g) : g;
-                if (UNIX_SCM_TRACE) {
-                    char t[96];
-                    snprintf(t, sizeof(t), "[scm]   adopt #%u kind=%u h=%d global=%d user=%d\n",
-                             (unsigned)i, (unsigned)objs[i].kind, (int)objs[i].h,
-                             (int)g, (int)u);
-                    serial_write_string(t);
-                }
                 if (u < 0) {
-                    /* TEMPORARY DIAGNOSTIC (revert): install into this
-                     * process's fd table failed; the handle is dropped. */
-                    char t[64];
-                    snprintf(t, sizeof(t), "[scm]   INSTALL-FAIL global=%d\n", (int)g);
-                    serial_write_string(t);
                     continue;
                 }
                 out[written++] = u;

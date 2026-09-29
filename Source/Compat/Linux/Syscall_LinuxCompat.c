@@ -1867,12 +1867,12 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         }
     }
 
-    /* MAP_SHARED of a tmpfs file (Chromium's shared memory lives in /dev/shm
-     * files): map the file's shared pages, so every mapping -- in this process
-     * or another -- sees the same bytes. The snapshot copy below made each
-     * mapping private, so a buffer one side wrote was never seen by the other
-     * (the GPU thread crashed on its first new frame after a click, and pages
-     * could stay blank for good). */
+    /* MAP_SHARED of a file whose filesystem publishes shared pages (Chromium's
+     * shared memory lives in /dev/shm files, on tmpfs): map the file's shared
+     * pages, so every mapping -- in this process or another -- sees the same
+     * bytes. The snapshot copy below made each mapping private, so a buffer one
+     * side wrote was never seen by the other (the GPU thread crashed on its
+     * first new frame after a click, and pages could stay blank for good). */
 #ifndef LINUX_TMPFS_SHARED_MMAP
 /* On. It was off because it "deadlocked Chromium at startup (every thread
  * parked in futex before the profile loaded)": futexes were matched on
@@ -1888,25 +1888,25 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (LINUX_TMPFS_SHARED_MMAP &&
         (flags & LINUX_MAP_SHARED) != 0u && offset == 0u &&
         (flags & LINUX_MAP_FIXED) == 0u) {
-        int32_t tmpfs_handle = syscall_file_tmpfs_share((int32_t)fd, length);
-        if (tmpfs_handle > 0) {
-            void *p = shared_memory_map_new(tmpfs_handle);
+        int32_t share_handle = syscall_file_share_pages((int32_t)fd, length);
+        if (share_handle > 0) {
+            void *p = shared_memory_map_new(share_handle);
             if (p != NULL) {
                 shm2("mmap-tmpfs", (uint64_t)(uint32_t)fd,
-                     (uint64_t)(uint32_t)tmpfs_handle, (uint64_t)(uintptr_t)p);
+                     (uint64_t)(uint32_t)share_handle, (uint64_t)(uintptr_t)p);
                 return (int64_t)(uintptr_t)p;
             }
         }
-        if (syscall_file_is_tmpfs((int32_t)fd)) {
+        if (syscall_file_is_shareable((int32_t)fd)) {
             /* Falling back to a private copy silently breaks whoever shares
              * this file; say so. */
             static volatile uint32_t reported;
             if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 16u) {
-                serial_write_string("[mmap] tmpfs MAP_SHARED fell back to a private copy, len=");
+                serial_write_string("[mmap] shared MAP_SHARED fell back to a private copy, len=");
                 serial_write_uint64(length);
                 serial_write_string("\n");
             }
-            shm2("mmap-tmpfs-share-failed", (uint64_t)(uint32_t)fd, length, offset);
+            shm2("mmap-share-failed", (uint64_t)(uint32_t)fd, length, offset);
         }
     }
 
@@ -2035,10 +2035,10 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         }
     }
     /* Only worth recording when the file is something a shared mapping
-     * should have covered: a memfd or a tmpfs file. A plain file mapping
-     * through here is normal. */
+     * should have covered: a memfd, or a file whose filesystem publishes
+     * shared pages. A plain file mapping through here is normal. */
     if (syscall_file_is_memfd((int32_t)fd) ||
-        syscall_file_is_tmpfs((int32_t)fd)) {
+        syscall_file_is_shareable((int32_t)fd)) {
         shm2("mmap-private-snapshot", (uint64_t)(uint32_t)fd, length, offset);
     }
 #if LINUX_MODULE_MAP_TRACE
@@ -2117,8 +2117,16 @@ static void lx_wait_done(void)
     }
 }
 
-/* Longest single park of a restarted wait before it rescans. */
-#define LX_WAIT_SLICE_MS 8u
+/* Longest single park of a restarted wait before it rescans.
+ *
+ * A ceiling on an idle wait, not a latency floor: a ready fd ends the park
+ * through poll_wait_notify(), and a *finite* timeout is never overshot
+ * because every caller takes slice_ms = min(remaining, this). So raising it
+ * costs nothing in a busy system and divides the rescan rate of an idle one
+ * -- an idle Chromium spent 95% of its syscalls in wait calls, and they were
+ * waking ten thousand times a second to discover nothing had happened.
+ * See Syscall_Epoll.c's EPOLL_POLL_SLICE_MS for the same reasoning. */
+#define LX_WAIT_SLICE_MS 16u
 
 static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
                                 uint64_t maxevents, uint64_t timeout_ms,
@@ -2182,7 +2190,12 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
 #define LINUX_POLLHUP  0x0010
 #define LINUX_POLLNVAL 0x0020
 #define LINUX_POLL_MAX_FDS  256u
-#define LINUX_POLL_SLICE_MS 1u
+/* Park ceiling for poll/ppoll/select when there is no deadline to honour
+ * (timeout < 0): the wait is cut short by poll_wait_notify() the instant any
+ * fd becomes ready, so this only bounds how often an *idle* waiter rescans.
+ * At 1 ms it was a thousand rescan/s per parked thread, and wait calls were
+ * 95% of what an idle Chromium did in the kernel. */
+#define LINUX_POLL_SLICE_MS 16u
 
 typedef struct {
     int32_t fd;
@@ -3077,43 +3090,6 @@ static int64_t linux_open_resolved(char *path, uint64_t flags)
         }
 #endif
     }
-#if defined(XKB_READ_PROBE)
-    /* Focused probe: for any path containing "xkb", dump the fd, the file
-     * size the VFS reports, and the raw bytes syscall_file_read() returns at
-     * offset 300..360 - the region where libxkbcommon reports a parse error
-     * on keycodes/evdev even though the ISO copy is byte-identical to stock. */
-    {
-        int has_xkb = 0;
-        for (uint32_t i = 0; path[i] && i + 2 < sizeof(path); ++i) {
-            if (path[i] == 'x' && path[i+1] == 'k' && path[i+2] == 'b') { has_xkb = 1; break; }
-        }
-        if (has_xkb && result >= 0) {
-            vfs_file_t pvf;
-            int64_t szinfo = syscall_file_get_file_info((int32_t)result, &pvf, NULL);
-            serial_write_string("[xkbprobe] '");
-            serial_write_string(path);
-            serial_write_string("' fd=");
-            serial_write_uint64((uint64_t)result);
-            serial_write_string(" info_rc=");
-            serial_write_uint64((uint64_t)szinfo);
-            serial_write_string(" vf.size=");
-            serial_write_uint64(szinfo >= 0 ? (uint64_t)pvf.size : 0u);
-            int64_t sv = syscall_file_seek((int32_t)result, 0, LINUX_SEEK_CUR);
-            (void)syscall_file_seek((int32_t)result, 300, LINUX_SEEK_SET);
-            uint8_t region[64] = {0};
-            int64_t rn = syscall_file_read((int32_t)result, region, sizeof(region));
-            (void)syscall_file_seek((int32_t)result, sv >= 0 ? sv : 0, LINUX_SEEK_SET);
-            serial_write_string(" read@300 n=");
-            serial_write_uint64((uint64_t)rn);
-            serial_write_string(" [");
-            for (int i = 0; i < 48 && i < (int)rn; ++i) {
-                char c = (char)region[i];
-                serial_write_char((c >= 32 && c < 127) ? c : '.');
-            }
-            serial_write_string("]\n");
-        }
-    }
-#endif
 #ifdef LINUX_SYSCALL_TRACE
     serial_write_string("[lx] open '");
     serial_write_string(path);

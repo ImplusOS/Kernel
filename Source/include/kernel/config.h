@@ -263,3 +263,34 @@
 #ifndef OS_CONFIG_NET_IPV4_GATEWAY
 #define OS_CONFIG_NET_IPV4_GATEWAY 0x0A000202ULL
 #endif
+
+/* Where the init process lives inside the image, as the kernel sees it in
+ * the VFS. This is image layout rather than kernel behaviour, so it is named
+ * once here instead of being spelled out at every place that needs it
+ * (kernel_main's boot-process registration, and the /proc/<pid>/{cmdline,exe}
+ * fallbacks in Core/vfs/ProcFS.c). */
+#ifndef OS_CONFIG_USERLAND_INIT_PATH
+#define OS_CONFIG_USERLAND_INIT_PATH "/Userland/Userland.ELF"
+#endif
+
+/* Display name of the same process (process_t.name). Kept separate from the
+ * path above because it is a basename, not a path. */
+#ifndef OS_CONFIG_USERLAND_INIT_NAME
+#define OS_CONFIG_USERLAND_INIT_NAME "Userland.ELF"
+#endif
+
+/* Value of LD_LIBRARY_PATH the kernel gives a Linux-ABI process it starts
+ * itself (Core/process/ProcessManager_Create.c). This is the staged Linux
+ * runtime's library layout -- the moral equivalent of the rpath a distro's
+ * ld.so is built with -- so it belongs to the platform, beside the
+ * interpreter path the ELF loader found in PT_INTERP, and names no
+ * application or service.
+ *
+ * Everything application- or service-specific (DISPLAY, DOOMWADDIR, GDK_*,
+ * LD_PRELOAD, ...) lives in Userland instead: Userland/API/Source/LinuxEnv.c
+ * hands it to the launcher, which passes it in with
+ * SYSCALL_PROCESS_SPAWN_ELF_ENV. */
+#ifndef OS_CONFIG_LINUX_RUNTIME_LIB_PATH
+#define OS_CONFIG_LINUX_RUNTIME_LIB_PATH \
+    "/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib"
+#endif

@@ -124,10 +124,12 @@ int64_t syscall_signalfd_read(int32_t fd, uint8_t *buffer, uint64_t len);
  * `reacquire` takes another on a handle already held (fork), `read` fills a
  * KERNEL buffer from the mapped file, `release` drops one reference. */
 int32_t syscall_file_mmap_acquire(int32_t fd);
-/* Shared-memory handle backing a tmpfs file for mmap(MAP_SHARED), or <= 0
- * when `fd` is not such a file. See tmpfs_share_mapping(). */
-int syscall_file_is_tmpfs(int32_t fd);
-int32_t syscall_file_tmpfs_share(int32_t fd, uint64_t length);
+/* Whether this file's bytes can be published as shared pages, and the call
+ * that publishes them. Both key off vfs_driver_t::share_map -- a capability
+ * the filesystem declares -- so neither names a filesystem. Returns 0 / <= 0
+ * when `fd` is not such a file. See the Linux-ABI mmap MAP_SHARED path. */
+int syscall_file_is_shareable(int32_t fd);
+int32_t syscall_file_share_pages(int32_t fd, uint64_t length);
 int32_t syscall_file_mmap_reacquire(int32_t handle);
 int64_t syscall_file_mmap_read(int32_t handle, uint64_t offset,
                                uint8_t *kernel_buffer, uint32_t length);
