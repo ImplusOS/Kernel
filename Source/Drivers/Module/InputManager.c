@@ -1,5 +1,6 @@
 #include "InputManager.h"
 #include "Debug/serial/Serial.h"
+#include "Debug/KeyTrace.h"
 
 #include "DeviceRegistry.h"
 
@@ -88,6 +89,10 @@ int32_t input_manager_read_keyboard(driver_keyboard_event_t *out_event)
         if (g_drivers[i] != 0 && g_drivers[i]->read_keyboard != 0) {
             int32_t rc = g_drivers[i]->read_keyboard(out_event);
             if (rc > 0) {
+                /* [ktr] RD: the WM's raw-keyboard poll has the key. Everything
+                 * before this stamp is USB/xHCI completion plus the window
+                 * manager's loop interval; everything after it is routing. */
+                key_trace("RD", (uint32_t)out_event->keycode);
                 return rc;
             }
         }

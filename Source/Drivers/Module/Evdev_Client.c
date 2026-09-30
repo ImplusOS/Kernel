@@ -3,6 +3,7 @@
 #include "Core/timer/Timer.h"
 #include "Core/usercopy/Usercopy.h"
 #include "Core/syscall/Poll_Wait.h"
+#include "Debug/KeyTrace.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -76,6 +77,11 @@ int64_t evdev_inject(uint32_t device, uint16_t type, uint16_t code, int32_t valu
         g_abs_value[code] = value;
     }
     evdev_push(&g_devs[device], type, code, value);
+    /* [ktr] IN: the key is in the ring Xorg reads. From here the delay is
+     * Xorg noticing it (poll_wait_notify wakes select/poll readers). */
+    if (device == 0u && type == EV_KEY) {
+        key_trace("IN", (uint32_t)code);
+    }
     return 0;
 }
 
@@ -101,6 +107,16 @@ int64_t evdev_read(int32_t fd, void *buf, uint64_t len) {
         count += ev_size;
     }
     spinlock_unlock(&dev->lock);
+    /* [ktr] OUT: Xorg has the key. Everything until the next stamp is X
+     * delivering it to the client and the client painting it. */
+    if (fd == EVDEV_FD_BASE) {
+        for (uint64_t i = 0; i * ev_size < count; ++i) {
+            if (out[i].type == EV_KEY) {
+                key_trace("OUT", (uint32_t)out[i].code);
+                break;
+            }
+        }
+    }
     /* An empty ring is EAGAIN, never 0. read() returning 0 on a character
      * device means end-of-file, and xf86-input-evdev reads that as the device
      * having been unplugged: it disables the device and stops polling it. */

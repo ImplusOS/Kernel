@@ -106,12 +106,12 @@
  * timer interrupt and being scheduled again, for a system that had
  * nothing whatever to wait for.
  *
- * 16 ms divides that by sixteen and still fits inside one 60 Hz frame.
- * It is a ceiling and not 160 ms because a readiness source that has not
- * been taught to call poll_wait_notify() can only be noticed at the end
- * of a slice; those sources are the reason this is not larger. See
- * Docs/Others/TODO_Performance_LinuxApps.md section 8 for the list. */
-#define EPOLL_POLL_SLICE_MS 16u
+ * 4 ms keeps the rescan rate reasonable (250/s) while ensuring even
+ * un-notified readiness sources (timerfd, signalfd - see
+ * TODO_Performance_LinuxApps.md §8) add at most 4 ms of latency. This is
+ * well within one 60 Hz frame (16.6 ms) and brings the worst-case
+ * key-to-pixel path for un-notified sources down from ~16 ms to ~4 ms. */
+#define EPOLL_POLL_SLICE_MS 4u
 
 
 

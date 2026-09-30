@@ -2126,7 +2126,7 @@ static void lx_wait_done(void)
  * -- an idle Chromium spent 95% of its syscalls in wait calls, and they were
  * waking ten thousand times a second to discover nothing had happened.
  * See Syscall_Epoll.c's EPOLL_POLL_SLICE_MS for the same reasoning. */
-#define LX_WAIT_SLICE_MS 16u
+#define LX_WAIT_SLICE_MS 4u
 
 static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
                                 uint64_t maxevents, uint64_t timeout_ms,
@@ -2193,9 +2193,9 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
 /* Park ceiling for poll/ppoll/select when there is no deadline to honour
  * (timeout < 0): the wait is cut short by poll_wait_notify() the instant any
  * fd becomes ready, so this only bounds how often an *idle* waiter rescans.
- * At 1 ms it was a thousand rescan/s per parked thread, and wait calls were
- * 95% of what an idle Chromium did in the kernel. */
-#define LINUX_POLL_SLICE_MS 16u
+ * At 4 ms it bounds the rescan rate (250/s) while keeping un-notified source
+ * latency within a single frame. See EPOLL_POLL_SLICE_MS. */
+#define LINUX_POLL_SLICE_MS 4u
 
 typedef struct {
     int32_t fd;
