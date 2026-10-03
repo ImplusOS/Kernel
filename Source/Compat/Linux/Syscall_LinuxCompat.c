@@ -83,10 +83,10 @@ static void linux_syscall_profile(uint64_t nr)
 }
 #endif
 
-#ifndef CHROME_SHM_TRACE
-#define CHROME_SHM_TRACE 0
+#ifndef SHM_HANDSHAKE_TRACE
+#define SHM_HANDSHAKE_TRACE 0
 #endif
-#if CHROME_SHM_TRACE
+#if SHM_HANDSHAKE_TRACE
 /* Temporary bring-up trace for Chromium's shared-memory handshake (memfd ->
  * /proc/self/fd reopen -> fcntl(F_GETFL) access-mode check). Capped so a
  * stuck loop cannot bury the rest of the serial log. */
@@ -104,7 +104,7 @@ static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
 }
 #endif
 
-#if CHROME_SHM_TRACE
+#if SHM_HANDSHAKE_TRACE
 /* Which branch of linux_mmap() a file-backed mapping actually took. The memfd
  * and tmpfs paths map live shared pages; anything that falls through to the
  * eager read-in below gets a private snapshot that never writes back until
@@ -629,6 +629,81 @@ static int64_t linux_ioctl_tty(int32_t fd, uint64_t request, uint64_t arg)
     }
 }
 
+/* ---- DRM PRIME descriptors ----------------------------------------------
+ *
+ * A Linux process names descriptors by the private numbers in its lxfd table,
+ * and lx_fd_pre() rewrites them to the kernel's global numbers on the way in.
+ * DRM's PRIME ioctls hide a descriptor *inside their argument* instead of
+ * returning it as the call's result, so that rewrite never reaches one:
+ *
+ *   PRIME_HANDLE_TO_FD  mints a global fd and writes it back -> it has to be
+ *                       published into this process's table, and the caller
+ *                       given that number.
+ *   PRIME_FD_TO_HANDLE  is handed one -> it has to be rewritten as the global
+ *                       number the file layer underneath works in, and the
+ *                       caller's own number put back afterwards.
+ *
+ * The first direction is not a nicety. Skip it and close() looks the number up
+ * in the private table, finds nothing and answers EBADF -- which Chromium's
+ * base::ScopedFD turns into "Check failed: 0 == ret" and takes the whole GPU
+ * process down on the spot. */
+#define LX_DRM_IOCTL_BASE  0x64u  /* DRM_IOCTL_BASE, 'd' */
+#define LX_DRM_PRIME_H2F   0x2Du  /* DRM_IOCTL_PRIME_HANDLE_TO_FD */
+#define LX_DRM_PRIME_F2H   0x2Eu  /* DRM_IOCTL_PRIME_FD_TO_HANDLE */
+#define LX_PRIME_FD_OFF    8u     /* offsetof(struct drm_prime_handle, fd)   */
+#define LX_PRIME_FLAGS_OFF 4u     /* offsetof(struct drm_prime_handle, flags) */
+#define LX_PRIME_CLOEXEC   0x80000u  /* Linux O_CLOEXEC */
+
+static int64_t linux_close_global(int32_t g);
+
+static int lx_prime_is(uint64_t request, uint32_t nr)
+{
+    return (uint32_t)(request & 0xffu) == nr &&
+           (uint32_t)((request >> 8) & 0xffu) == LX_DRM_IOCTL_BASE;
+}
+
+static int lx_prime_get(uint64_t arg, uint32_t offset, uint32_t *out)
+{
+    if (arg == 0u) return -1;
+    return copy_from_user(out, (const void *)(uintptr_t)(arg + offset),
+                          sizeof(*out)) == 0u ? 0 : -1;
+}
+
+static int lx_prime_set(uint64_t arg, uint32_t offset, uint32_t value)
+{
+    if (arg == 0u) return -1;
+    return copy_to_user((void *)(uintptr_t)(arg + offset), &value,
+                        sizeof(value)) == 0u ? 0 : -1;
+}
+
+/* Publish a just-created global descriptor into the calling process's private
+ * table and write its number back. Rolls both halves back if either fails. */
+static int64_t lx_prime_publish(uint64_t arg)
+{
+    uint32_t gfd;
+    if (lx_prime_get(arg, LX_PRIME_FD_OFF, &gfd) < 0) return LINUX_EFAULT;
+    if ((int32_t)gfd < 0) return 0; /* the ioctl itself failed */
+
+    /* Honour O_CLOEXEC the way pipe()/accept()/SCM_RIGHTS do, so a descriptor
+     * that outlives an exec() does not quietly leak into the new image. */
+    uint32_t flags = 0u;
+    (void)lx_prime_get(arg, LX_PRIME_FLAGS_OFF, &flags);
+
+    int32_t u = lxfd_install((int32_t)gfd, (flags & LX_PRIME_CLOEXEC) != 0u, 0);
+    if (u < 0) {
+        (void)linux_close_global((int32_t)gfd);
+        return (u == -24) ? (-24LL) : LINUX_EBADF; /* -24 is EMFILE */
+    }
+    if (lx_prime_set(arg, LX_PRIME_FD_OFF, (uint32_t)u) < 0) {
+        int32_t back = -1;
+        if (lxfd_remove(u, &back) == 1 && back >= 0) {
+            (void)linux_close_global(back);
+        }
+        return LINUX_EFAULT;
+    }
+    return 0;
+}
+
 int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
 {
     /* A pseudo-terminal answers the terminal ioctls for real -- termios, the
@@ -662,7 +737,36 @@ int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
     /* Character devices (DRM/KMS, evdev) handle their own arg validation and
      * some requests legitimately pass arg == 0 (DRM_IOCTL_SET_MASTER etc.). */
     if (syscall_file_is_chardev(fd)) {
-        return syscall_file_ioctl(fd, request, arg);
+        /* PRIME's descriptor travels inside `arg`; bridge it across the
+         * private/global numbering gap both ways. See lx_prime_publish(). */
+        uint32_t prime_ufd = 0u;
+        int prime_import = lx_prime_is(request, LX_DRM_PRIME_F2H);
+        if (prime_import) {
+            uint32_t given;
+            if (lx_prime_get(arg, LX_PRIME_FD_OFF, &given) < 0) {
+                return LINUX_EFAULT;
+            }
+            int32_t g = lxfd_get((int32_t)given);
+            if (g < 0) return LINUX_EBADF;
+            prime_ufd = given;
+            if (lx_prime_set(arg, LX_PRIME_FD_OFF, (uint32_t)g) < 0) {
+                return LINUX_EFAULT;
+            }
+        }
+
+        int64_t rc = syscall_file_ioctl(fd, request, arg);
+
+        if (prime_import) {
+            /* Put the caller's own number back -- libdrm reads only `handle`
+             * out of the struct, but leaving a kernel-global descriptor in it
+             * would hand the caller a number that means nothing to it. */
+            (void)lx_prime_set(arg, LX_PRIME_FD_OFF, prime_ufd);
+            return rc;
+        }
+        if (rc == 0 && lx_prime_is(request, LX_DRM_PRIME_H2F)) {
+            return lx_prime_publish(arg);
+        }
+        return rc;
     }
     if (arg == 0u) return LINUX_EFAULT;
     /* AF_UNIX sockets live outside both the file table and the inet socket
@@ -751,7 +855,7 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
                 return r < 0 ? 0 : r;
             }
         case LINUX_F_GETFL:
-#if CHROME_SHM_TRACE
+#if SHM_HANDSHAKE_TRACE
             {
                 int64_t tr;
                 if (syscall_socket_fd_in_range(fd)) {
@@ -1089,6 +1193,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_GETPID        39u
 #define LINUX_SYS_SENDFILE      40u
 #define LINUX_SYS_CLONE         56u
+#define LINUX_SYS_CLONE3       435u
 #define LINUX_SYS_FORK          57u
 #define LINUX_SYS_VFORK         58u
 #define LINUX_SYS_EXECVE        59u
@@ -1655,7 +1760,7 @@ void linux_compat_mshared_release_pid(int32_t pid)
  * to turn "RIP 0x410087B004" into "libevdev.so.2+0x1234" is to guess the load
  * base. Records which fd a .so was opened on, then the base each file-backed
  * mmap of that fd got. Two lines per shared object, only for .so files. */
-#define LINUX_MODULE_MAP_TRACE 1
+#define LINUX_MODULE_MAP_TRACE 0
 
 #if LINUX_MODULE_MAP_TRACE
 static int linux_path_is_shared_object(const char *path)
@@ -1715,7 +1820,7 @@ static const char *linux_module_map_name(int32_t fd)
 static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
                                        uint64_t offset)
 {
-    if (!OS_CONFIG_FOREIGN_TRACE && !CHROME_SHM_TRACE) {
+    if (!OS_CONFIG_FOREIGN_TRACE && !SHM_HANDSHAKE_TRACE) {
         (void)base; (void)len; (void)offset;
         return;
     }
@@ -2707,7 +2812,8 @@ static void lx_newborn_note(uint64_t num, uint64_t a1, uint64_t a2,
 
 static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
                            uint64_t parent_tid, uint64_t child_tid,
-                           uint64_t tls, int *should_switch)
+                           uint64_t tls, uint64_t child_arg3,
+                           uint64_t child_arg4, int *should_switch)
 {
     /* fork()/vfork() reach the kernel as clone(), not as SYS_fork: glibc's
      * arch_fork() issues
@@ -2819,7 +2925,7 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
      * start on the raw kernel-picked stack, read a 0 fn pointer and #PF at
      * RIP=0. glibc's __clone already prepared this stack. */
     int32_t tid = process_create_thread_ex(return_rip, flags, stack,
-                                           parent_tid, child_tid,
+                                           child_arg3, child_arg4,
                                            has_tls, tls, stack);
     if (tid < 0) {
         /* EAGAIN is the errno glibc/Chromium expect for "couldn't spawn a
@@ -2829,13 +2935,7 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         return LINUX_EAGAIN;
     }
 #if LINUX_CLONE_TRACE
-    /* What glibc handed us for the new thread: its initial user RSP (which is
-     * the top of the stack block glibc allocated and recorded in the TCB) and
-     * its TLS base. V8 asks glibc for the running thread's stack bounds and
-     * CHECKs that its own stack pointer lies inside them
-     * (Isolate::IsOnCentralStack); when that fails, the question is whether
-     * the stack is where glibc thinks it is, so print both and compare
-     * against the RSP in the crash report. */
+    /* Optional clone diagnostics for foreign-thread bring-up. */
     serial_write_string("[clone] tid=");
     serial_write_uint32((uint32_t)tid);
     serial_write_string(" stack=");
@@ -2867,6 +2967,77 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         (void)process_set_clear_child_tid_for(tid, child_tid);
     }
     return (int64_t)tid;
+}
+
+/* x86-64 clone3(2) is the struct-based form of clone(2). Chromium uses it
+ * for thread and helper creation.  Returning ENOSYS is not harmless here:
+ * newer glibc/libc implementations only fall back to clone for a subset of
+ * callers, while Chromium's process launcher treats the failure as a startup
+ * stall.  Translate the fields supported by our existing clone path and
+ * reject only options that cannot be represented safely. */
+static int64_t linux_clone3(uint64_t saved_rsp, uint64_t args_ptr,
+                            uint64_t args_size, int *should_switch)
+{
+    struct linux_clone_args {
+        uint64_t flags;
+        uint64_t pidfd;
+        uint64_t child_tid;
+        uint64_t parent_tid;
+        uint64_t exit_signal;
+        uint64_t stack;
+        uint64_t stack_size;
+        uint64_t tls;
+        uint64_t set_tid;
+        uint64_t set_tid_size;
+        uint64_t cgroup;
+    } args;
+
+    if (args_ptr == 0u || args_size < 64u || args_size > sizeof(args) ||
+        copy_from_user(&args, (const void *)(uintptr_t)args_ptr,
+                       (size_t)args_size) != 0u) {
+        return LINUX_EFAULT;
+    }
+    /* pidfd, set_tid and cgroup are optional clone3 extensions.  The
+     * existing process/thread implementation has no equivalent objects, but
+     * rejecting them breaks ordinary pthread_create(): glibc/Chromium may
+     * provide these fields even when it only needs a thread.  Ignore the
+     * optional outputs/namespace hints and preserve the core clone flags. */
+
+    uint64_t flags = args.flags | (args.exit_signal & 0x7fu);
+    uint64_t child_stack = args.stack;
+    if (child_stack != 0u) {
+        /* Some libc clone3 wrappers leave stack_size zero and already pass
+         * the conventional top-of-stack value.  clone(2) has no size field,
+         * so preserve that form instead of turning a valid pthread request
+         * into EINVAL. */
+        if (args.stack_size == 0u) {
+            child_stack = args.stack;
+        } else if (child_stack > UINT64_MAX - args.stack_size) {
+            serial_write_string("[clone3] EINVAL stack overflow\n");
+            return LINUX_EINVAL;
+        } else {
+            /* clone3.stack is the low address; clone's child_stack is the
+             * top of the stack block. */
+            child_stack += args.stack_size;
+        }
+    }
+    /* glibc's internal clone3 wrapper keeps its child function in the
+     * syscall's RDX register and its argument in R8.  Those registers are
+     * not part of struct clone_args; parent_tid/child_tid are output
+     * addresses only.  The thread path must restore RDX/R8 from the saved
+     * syscall frame, otherwise it calls parent_tid as a function (the exact
+     * TLS+0x2d0 NULL-write seen in Chromium, Xorg and GTK). */
+#if defined(__x86_64__)
+    const uint64_t *frame = (const uint64_t *)(uintptr_t)saved_rsp;
+    uint64_t child_arg3 = frame[SYSCALL_FRAME_RDX];
+    uint64_t child_arg4 = frame[SYSCALL_FRAME_R8];
+#else
+    uint64_t child_arg3 = 0u;
+    uint64_t child_arg4 = 0u;
+#endif
+    return linux_clone(saved_rsp, flags, child_stack, args.parent_tid,
+                       args.child_tid, args.tls, child_arg3, child_arg4,
+                       should_switch);
 }
 
 static int64_t linux_socket_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
@@ -3054,7 +3225,7 @@ static int64_t linux_open_resolved(char *path, uint64_t flags)
         result = (int64_t)syscall_file_register_dir(path);
     } else {
         result = (int64_t)syscall_file_open(path, flags);
-#if CHROME_SHM_TRACE
+#if SHM_HANDSHAKE_TRACE
         if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
             path[3] == 'o' && path[4] == 'c') {
             serial_write_string("[shmtr] open '");
@@ -3228,7 +3399,7 @@ static int64_t linux_fill_stat_for_path(const char *path, linux_stat64_t *st)
         if (devfs_path_is_device(path)) {
             st->st_mode = LINUX_S_IFCHR | 0x1B6u; /* crw-rw-rw- */
             st->st_size = 0;
-            st->st_rdev = 0x0105u; /* arbitrary but stable device number */
+            st->st_rdev = devfs_path_rdev(path);
         } else {
             int32_t stored = vfs_get_mode(path);
             st->st_mode = LINUX_S_IFREG |
@@ -3317,7 +3488,19 @@ static int64_t linux_fill_stat_for_fd(int32_t fd, linux_stat64_t *st)
     uint32_t writable = 0;
     if (syscall_file_get_file_info(fd, &vf, &writable) == 0) {
         linux_stat_fill_common_ino(st, vf.size, vf.internal_id);
-        st->st_mode = LINUX_S_IFREG | (writable != 0u ? 0x1A4u : 0x124u);
+        /* Character devices (e.g. /dev/dri/card0) must report S_IFCHR, not
+         * S_IFREG: Mesa's gbm_create_device() checks S_ISCHR() on the fd and
+         * silently returns NULL for regular files, which is why glamor
+         * reported "couldn't get display device". */
+        if (syscall_file_is_chardev(fd)) {
+            st->st_mode = LINUX_S_IFCHR | 0x1B6u; /* crw-rw-rw- */
+            /* Must agree with what stat() answers for the same node's path:
+             * drm_device_has_rdev() stats /dev/dri/card0 and compares the
+             * result against the fstat() of the fd it was handed. */
+            st->st_rdev = devfs_file_rdev(&vf);
+        } else {
+            st->st_mode = LINUX_S_IFREG | (writable != 0u ? 0x1A4u : 0x124u);
+        }
         return 0;
     }
     if (syscall_file_is_dir(fd)) {
@@ -6709,7 +6892,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_IOCTL:
-            result = syscall_ioctl_ex(arg1, arg2, arg3);
+            result = syscall_ioctl_ex((int32_t)arg1, arg2, arg3);
             if (result == ALSA_WOULD_BLOCK) {
                 /* A sound device with no room (WRITEI) or still draining:
                  * EAGAIN for a non-blocking descriptor, otherwise wait a
@@ -6834,6 +7017,35 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = linux_sendfile(arg1, arg2, arg3, arg4);
             break;
 
+        case LINUX_SYS_CLONE3: {
+            uint64_t clone3_flags = 0u;
+            if (arg1 == 0u || arg2 < 8u ||
+                copy_from_user(&clone3_flags,
+                               (const void *)(uintptr_t)arg1,
+                               sizeof(clone3_flags)) != 0u) {
+                result = LINUX_EFAULT;
+                break;
+            }
+            int is_process = (clone3_flags & LINUX_CLONE_THREAD) == 0u;
+            if (is_process && !process_fork_hold_acquire()) {
+                if (process_sleep_current_ms(1) == 0) {
+                    request_switch = 1;
+                }
+                request_restart = 1;
+                result = 0;
+                break;
+            }
+            int should_switch = 0;
+            result = linux_clone3(saved_rsp, arg1, arg2, &should_switch);
+            if (is_process) {
+                process_fork_hold_release();
+            }
+            if (should_switch) {
+                request_switch = 1;
+            }
+            break;
+        }
+
         case LINUX_SYS_CLONE:
         case LINUX_SYS_FORK:
         case LINUX_SYS_VFORK: {
@@ -6854,10 +7066,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             int should_switch = 0;
             if (num == LINUX_SYS_CLONE) {
                 result = linux_clone(saved_rsp, arg1, arg2, arg3, arg4, arg5,
-                                     &should_switch);
+                                     arg3, arg4, &should_switch);
             } else {
                 result = linux_clone(saved_rsp, 0x11u, 0u, 0u, 0u, 0u,
-                                     &should_switch);
+                                     0u, 0u, &should_switch);
             }
             if (is_process) {
                 process_fork_hold_release();
@@ -7452,7 +7664,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                                                         LINUX_FD_CLOEXEC);
             }
         }
-#if CHROME_SHM_TRACE
+#if SHM_HANDSHAKE_TRACE
             chrome_shm_trace3("memfd_create flags=", arg2, " -> ", (uint64_t)result, "", 0);
 #endif
             break;

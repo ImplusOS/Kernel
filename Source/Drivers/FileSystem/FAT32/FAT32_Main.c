@@ -2356,6 +2356,31 @@ static int32_t fat32_ops_readdir(int32_t handle, vfs_dirent_t *out_entry)
     return result;
 }
 
+/* Probe for FAT32/FAT16/FAT12 at the given partition LBA.
+ * The read_sector callback reads one 512-byte sector from the device. */
+static bool fat32_probe_media(bool (*read_sector)(uint64_t lba, uint8_t *buffer),
+                              uint64_t partition_lba)
+{
+    if (!read_sector) return false;
+
+    uint8_t buffer[512];
+    if (!read_sector(partition_lba, buffer)) {
+        return false;
+    }
+
+    /* Check boot signature */
+    if (buffer[510] != 0x55u || buffer[511] != 0xAAu) {
+        return false;
+    }
+
+    /* Check for FAT32/FAT16/FAT12 BPB signature */
+    if (memcmp(buffer + 82, "FAT32   ", 8) == 0) return true;
+    if (memcmp(buffer + 54, "FAT16   ", 8) == 0) return true;
+    if (memcmp(buffer + 54, "FAT12   ", 8) == 0) return true;
+
+    return false;
+}
+
 static const fs_module_ops_t g_fat32_driver = {
     .fs_type            = "fat32",
     .media_kind         = VFS_MEDIA_KIND_DISK,
@@ -2373,10 +2398,11 @@ static const fs_module_ops_t g_fat32_driver = {
     .unlink             = fat32_unlink,
     .opendir            = fat32_opendir,
     .readdir            = fat32_ops_readdir,
-    .closedir          = fat32_closedir,
+    .closedir           = fat32_closedir,
     .list_root          = fat32_list_root_files,
     .set_case_sensitive = fat32_set_case_sensitive_lookup,
     .get_case_sensitive = fat32_get_case_sensitive_lookup,
+    .probe_media        = fat32_probe_media,
 };
 
 static void fat32_driver_shutdown(void)

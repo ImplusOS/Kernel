@@ -1363,6 +1363,71 @@ void paging_destroy_process_space(uint64_t cr3)
     }
 }
 
+/* Resident user pages owned by `cr3`, split into private (*priv_out) and
+ * shared/external (*ext_out) -- PAGE_EXTERNAL marks shared-memory frames that
+ * are charged to the object, not to this address space, and copy-on-write
+ * frames that another address space also maps.
+ *
+ * Exists so a memory report can attribute the PMM's usage per address space.
+ * "free_pages=0" alone says nothing about *which* process ate the machine,
+ * and this walk (same shape as paging_destroy_process_space()) is the only
+ * place that knows. Diagnostic only: it takes the paging lock for its whole
+ * run, so callers must not be on a hot path. */
+uint64_t paging_count_user_pages(uint64_t cr3, uint64_t *priv_out,
+                                 uint64_t *ext_out)
+{
+    uint64_t priv = 0;
+    uint64_t ext = 0;
+    if (cr3 == 0 || cr3 == (uint64_t)g_kernel_pml4) {
+        if (priv_out) *priv_out = 0;
+        if (ext_out) *ext_out = 0;
+        return 0;
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_paging_space_lock);
+    paging_space_t *space = find_space_by_cr3(cr3);
+    if (space == NULL) {
+        spinlock_unlock(&g_paging_space_lock);
+        irq_restore(irq_flags);
+        if (priv_out) *priv_out = 0;
+        if (ext_out) *ext_out = 0;
+        return 0;
+    }
+    paging_space_t snap = *space;
+    spinlock_unlock(&g_paging_space_lock);
+    irq_restore(irq_flags);
+
+    for (uint64_t i = 0; i < MAX_PDPT_ENTRIES; ++i) {
+        if (snap.pd_tables[i] == NULL) {
+            continue;
+        }
+        for (uint64_t j = 0; j < 512; ++j) {
+            uint64_t pde = snap.pd_tables[i][j];
+            if ((pde & PAGE_PRESENT) == 0 || (pde & PAGE_PS) != 0) {
+                continue;
+            }
+            uint64_t *pt = (uint64_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
+            for (uint64_t k = 0; k < 512; ++k) {
+                uint64_t pte = pt[k];
+                if ((pte & PAGE_USER) == 0) {
+                    continue;
+                }
+                if ((pte & PAGE_PRESENT) != 0) {
+                    if ((pte & PAGE_EXTERNAL) != 0) {
+                        ++ext;
+                    } else {
+                        ++priv;
+                    }
+                }
+            }
+        }
+    }
+    if (priv_out) *priv_out = priv;
+    if (ext_out) *ext_out = ext;
+    return priv + ext;
+}
+
 int paging_set_user_access(uint64_t cr3,
                            uint64_t start,
                            uint64_t size,
@@ -2100,22 +2165,24 @@ int paging_map_user_page(uint64_t cr3,
         return -1;
     }
 
-    /* Fast path: nothing structural to change, so the whole operation is one
-     * aligned 64-bit store into a table that already exists and cannot be
-     * replaced under us. Taking the global page-table lock here instead put
-     * every demand fault in the system through one lock with interrupts off,
-     * and Chromium faults from four CPUs continuously -- it cost roughly five
-     * times the throughput. Concurrent maps of the *same* page are still
-     * settled by the callers, which re-check presence under their own lock
-     * (filemap_handle_fault(), the demand-zero branch of
-     * paging_handle_swap_fault()). */
+    /* Fast path: nothing structural to change, so the operation is one
+     * aligned 64-bit store into an existing leaf table.  The table walk still
+     * has to be protected by g_page_table_lock, however.  A different CPU can
+     * concurrently clone a shared kernel PDPT/PD, or tear down an address
+     * space, while this walk is in progress.  Without the lock this code could
+     * write through a stale PT pointer after the live hierarchy had changed;
+     * that corrupts an unrelated user page and typically surfaces later as a
+     * NULL write from glibc/Xorg/Chromium. */
 #ifndef PAGING_LEAF_FASTPATH
 #define PAGING_LEAF_FASTPATH 1
 #endif
 #if PAGING_LEAF_FASTPATH
     {
         uint64_t *pt = NULL;
-        if (paging_leaf_table_ready(cr3, virt_addr, &pt)) {
+        uint64_t irq = irq_save_disable();
+        spinlock_lock(&g_page_table_lock);
+        int ready = paging_leaf_table_ready(cr3, virt_addr, &pt);
+        if (ready) {
             uint64_t i1 = PT_INDEX(virt_addr);
             uint64_t old = pt[i1];
             if ((old & PAGE_PRESENT) == 0) {
@@ -2127,11 +2194,15 @@ int paging_map_user_page(uint64_t cr3,
                 if (cr3 == read_cr3()) {
                     invlpg_addr(virt_addr & PAGE_MASK);
                 }
+                spinlock_unlock(&g_page_table_lock);
+                irq_restore(irq);
                 return 0;
             }
             /* Replacing a live mapping frees a frame: that needs the lock and
              * the shootdown, so fall through to the slow path. */
         }
+        spinlock_unlock(&g_page_table_lock);
+        irq_restore(irq);
     }
 #endif
 

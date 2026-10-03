@@ -25,3 +25,4 @@ bool display_get_monitor_mode_info(uint32_t monitor_index,
                                    display_mode_info_t *out_info);
 bool display_set_monitor_mode(uint32_t monitor_index, uint32_t mode_index);
 void display_driver_detached(const char *module_name);
+const char *display_main_get_active_driver_name(void);

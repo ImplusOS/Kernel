@@ -13,6 +13,7 @@
 #include "mmu/Paging_Main.h"
 #include "kernel/config.h"
 #include "Debug/serial/Serial.h"
+#include "Core/vfs/VFS.h"
 
 #define PROCFS_BUFFER_CAP 4096u
 
@@ -434,12 +435,32 @@ static uint32_t procfs_build_loadavg(char *buf, uint32_t cap)
 
 static uint32_t procfs_build_filesystems(char *buf, uint32_t cap)
 {
-    return (uint32_t)snprintf(buf, cap,
-        "nodev\ttmpfs\n"
-        "nodev\tproc\n"
-        "nodev\tdevfs\n"
-        "\tiso9660\n"
-        "\tvfat\n");
+    /* Build the list from the kernel's registered filesystem drivers.
+     * Format: "nodev\t<name>\n" for virtual/pseudo filesystems (no block device),
+     *         "\t<name>\n" for device-backed filesystems. */
+    uint32_t written = 0;
+    int count = vfs_driver_count_get();
+    for (int i = 0; i < count && written < cap; ++i) {
+        const vfs_driver_t *drv = vfs_driver_get_by_index(i);
+        if (drv == NULL || drv->fs_type == NULL) {
+            continue;
+        }
+        /* Pseudo filesystems (tmpfs, proc, devfs, etc.) have media_kind ==
+         * VFS_MEDIA_KIND_PSEUDO or VFS_MEDIA_KIND_UNKNOWN. The heuristic used
+         * in Linux /proc/filesystems is that filesystems requiring a block
+         * device are listed without "nodev". Here we treat OPTICAL and DISK
+         * as device-backed. */
+        const char *nodev_prefix =
+            (drv->media_kind == VFS_MEDIA_KIND_OPTICAL ||
+             drv->media_kind == VFS_MEDIA_KIND_DISK) ? "\t" : "nodev\t";
+        int n = snprintf(buf + written, cap > written ? cap - written : 0,
+                         "%s%s\n", nodev_prefix, drv->fs_type);
+        if (n < 0 || (uint32_t)n >= (cap > written ? cap - written : 0)) {
+            break;
+        }
+        written += (uint32_t)n;
+    }
+    return written;
 }
 
 static uint32_t procfs_build_self_limits(char *buf, uint32_t cap)
@@ -815,6 +836,11 @@ static bool procfs_vfs_write_at(vfs_file_t *file, uint32_t offset,
     (void)offset;
     (void)buffer;
     (void)size;
+    serial_write_string("[procfs] write_at offset=");
+    serial_write_uint64(offset);
+    serial_write_string(" size=");
+    serial_write_uint64(size);
+    serial_write_char('\n');
     return true; /* Writes to e.g. /proc/sys/... are accepted and discarded. */
 }
 

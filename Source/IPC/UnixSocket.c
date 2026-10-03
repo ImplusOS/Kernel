@@ -268,11 +268,12 @@ int64_t unix_socket_create(int32_t type) {
 
 /* Ascending walk of a process's AF_UNIX endpoints, in the same "-1 to start,
  * -1 when done" form as syscall_file_next_open_fd(). AF_UNIX fds live in
- * their own numeric range (UNIX_SOCK_FD_BASE..), so /proc/<pid>/fd has to ask
- * both tables to produce the complete list a Linux program expects there. */
+ * its own numeric range, so /proc/<pid>/fd has to merge both tables to
+ * produce the complete list a Linux program expects there. */
 int32_t unix_socket_next_open_fd(int32_t pid, int32_t after) {
     if (!g_usock_init_done) unix_socket_init();
-    int32_t start = (after < UNIX_SOCK_FD_BASE) ? 0 : (after - UNIX_SOCK_FD_BASE) + 1;
+    int32_t start = (after < UNIX_SOCK_FD_BASE) ? 0 :
+                    (after - UNIX_SOCK_FD_BASE) + 1;
     if (start < 0) start = 0;
     for (int32_t i = start; i < UNIX_SOCK_MAX; i++) {
         if (g_usocks[i].used && usock_owner_test(&g_usocks[i], pid)) {
@@ -531,7 +532,8 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
         return -11; /* EAGAIN: ring full */
     }
 #if PROCESS_STALL_DUMP
-    usock_wire_note_dir((int32_t)(s - g_usocks) + UNIX_SOCK_FD_BASE, s->peer_fd,
+        usock_wire_note_dir((int32_t)(s - g_usocks) + UNIX_SOCK_FD_BASE,
+                            s->peer_fd,
                         0u, data, written);
 #endif
     /* The peer is now readable. Cut short any poll()/select()/epoll_wait()
@@ -1026,7 +1028,8 @@ int64_t unix_socket_pair(int32_t out_fds[2]) {
 }
 
 int unix_socket_fd_in_range(int32_t fd) {
-    return fd >= UNIX_SOCK_FD_BASE && fd < UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX;
+    return fd >= UNIX_SOCK_FD_BASE &&
+           fd < UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX;
 }
 
 void unix_socket_trace_note(const char *tag, int32_t fd)

@@ -12,10 +12,17 @@
  *
  * Entry points are called from the devfs /dev/dri/card0 node (Kernel/Core/vfs/
  * DevFS.c) via the vfs_driver_t dev_* hooks.
+ *
+ * Two device nodes are exposed:
+ *   /dev/dri/card0      — full KMS: modeset, scanout, atomic, prime
+ *   /dev/dri/renderD128 — render-only: GEM buffers, prime import/export,
+ *                         syncobj. NO modesetting, no scanout, no CRTC.
+ *   Mesa opens the render node for GL contexts; Xorg opens card0 for display.
  */
 
 void    drm_kms_init(void);
 
+/* ---- card0 (full KMS) ------------------------------------------------- */
 /* Linux _IOC-encoded request. Returns 0 / >=0 on success, -errno on failure. */
 int64_t drm_kms_ioctl(uint64_t request, uint64_t arg);
 
@@ -33,6 +40,46 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
                      uint64_t flags);
 
 void    drm_kms_close(void);
+
+/* ---- renderD128 (render-only) ----------------------------------------- */
+/* Separate namespace: GEM handles, dumb buffers, prime fds, syncobj.
+ * Rejects all modeset ioctls (SETCRTC, PAGE_FLIP, ATOMIC, SETPLANE).
+ * Returns 0 / >=0 on success, -errno on failure. */
+int64_t drm_render_ioctl(uint64_t request, uint64_t arg);
+
+/* read(2) on render fd: no events on render node, always EAGAIN. */
+int64_t drm_render_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock);
+
+/* poll(2) on render fd: no event sources. */
+uint32_t drm_render_poll(uint32_t events);
+
+/* mmap(2) on render fd: maps dumb buffer pages (same as card0 path). */
+int64_t drm_render_mmap(uint64_t offset, uint64_t length, uint64_t prot,
+                        uint64_t flags);
+
+/* close(2) on render fd: frees render-node buffers. */
+void    drm_render_close(void);
+
+/* ---- PRIME dma-buf descriptors -----------------------------------------
+ *
+ * drmPrimeHandleToFD() does not open a node -- there is no path behind the
+ * descriptor it hands back -- so DevFS cannot build the vfs_file_t and the
+ * fd layer cannot open one either. DevFS makes the descriptor with
+ * syscall_file_install_dev() and then routes its three operations here,
+ * identifying the buffer by the prime slot packed into the descriptor's
+ * driver_data (the same carrier a pty pair uses for its index).
+ *
+ * The buffer itself is refcounted from the moment it is first exported: the
+ * GEM handle holds one reference, every descriptor another, and importing it
+ * back into a session one more. The last one out frees the pages. That is
+ * what lets a dma-buf fd outlive both DESTROY_DUMB and the close of
+ * /dev/dri/card0, which is exactly the order Mesa writes them in before
+ * passing the fd to the X server over DRI3. */
+int64_t  drm_prime_ioctl(int32_t slot, uint64_t request, uint64_t arg);
+int64_t  drm_prime_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                        uint64_t prot, uint64_t flags);
+void     drm_prime_close(int32_t slot);
+uint32_t drm_prime_size(int32_t slot);
 
 /* ---- Scanout redirection ("mirror") -------------------------------------
  *

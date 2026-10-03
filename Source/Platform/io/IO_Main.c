@@ -3,10 +3,12 @@
 #include "Protocol/ATA/Protocol_ATA.h"
 #include "Protocol/USB_MassStorage/Protocol_USB_MassStorage.h"
 #include "Drivers/Module/BlockManager.h"
+#include "Drivers/Module/DeviceRegistry.h"
+#include "Drivers/Module/DriverManager.h"
 #include "Core/sync/Spinlock.h"
 #include "Debug/serial/Serial.h"
-#include "Drivers/Module/DriverManager.h"
 #include "Core/timer/Timer.h"
+#include "kernel/interfaces/fs_module_ops.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -284,6 +286,43 @@ static bool check_fat_signature(const block_device_t *device,
     return false;
 }
 
+/* Probe the given block device using registered filesystem modules.
+ * Each FS module's probe_media() is called with a sector-read callback.
+ * Returns true if any FS recognizes the media. */
+static bool probe_media_via_fs_modules(const block_device_t *device,
+                                       uint64_t              partition_lba,
+                                       uint64_t             *out_partition_lba)
+{
+    if (!device || !device->read) {
+        return false;
+    }
+
+    /* Sector-read callback for FS module's probe_media */
+    auto bool read_sector_cb(uint64_t lba, uint8_t *buffer) {
+        return device->read(lba, buffer, 1u);
+    }
+
+    /* Iterate over registered filesystem modules */
+    for (uint32_t i = 0;; ++i) {
+        const device_t *fs_dev = device_registry_find_by_index(DEVICE_TYPE_FILESYSTEM, i);
+        if (fs_dev == NULL) {
+            break;
+        }
+        const fs_module_ops_t *ops = (const fs_module_ops_t *)fs_dev->ops;
+        if (ops == NULL || ops->probe_media == NULL) {
+            continue;
+        }
+        if (ops->probe_media(read_sector_cb, partition_lba)) {
+            if (out_partition_lba != NULL) {
+                *out_partition_lba = partition_lba;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool check_bootable_signature(const block_device_t *device,
                                      uint64_t              partition_lba,
                                      io_protocol_type_t    requested_protocol,
@@ -294,14 +333,32 @@ static bool check_bootable_signature(const block_device_t *device,
         requested_protocol == IO_PROTOCOL_TYPE_USB_MASS_STORAGE;
     bool found = false;
 
-    if (check_iso_signature(device, partition_lba, prefer_whole_disk_iso,
-                            &effective_lba) ||
-        check_fat_signature(device, partition_lba, &effective_lba)) {
+    /* Try ISO9660 whole-disk preference for USB (kept for compat) */
+    if (prefer_whole_disk_iso &&
+        check_iso_signature(device, 0u, true, &effective_lba)) {
         if (out_partition_lba != NULL) {
             *out_partition_lba = effective_lba;
         }
         found = true;
     }
+
+    /* Generic FS module probe (covers FAT, exFAT, UDF, ISO9660, etc.) */
+    if (!found && probe_media_via_fs_modules(device, partition_lba, &effective_lba)) {
+        if (out_partition_lba != NULL) {
+            *out_partition_lba = effective_lba;
+        }
+        found = true;
+    }
+
+    /* Legacy fallback for ISO9660 at non-zero partition LBA (compat) */
+    if (!found &&
+        check_iso_signature(device, partition_lba, false, &effective_lba)) {
+        if (out_partition_lba != NULL) {
+            *out_partition_lba = effective_lba;
+        }
+        found = true;
+    }
+
     return found;
 }
 

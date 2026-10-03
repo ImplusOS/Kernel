@@ -14,6 +14,9 @@
 #include "Core/sync/Spinlock.h"
 #include "Core/usercopy/Usercopy.h"
 #include "Core/timer/Timer.h"
+#include "Core/vfs/DevFS.h"
+#include "Core/vfs/SysFS.h"
+#include "Core/syscall/Syscall_File.h"
 #include "mmu/Paging_Main.h"
 #include "Debug/serial/Serial.h"
 
@@ -35,7 +38,9 @@
 
 /* command numbers (nr) */
 #define DRM_NR_VERSION            0x00
+#define DRM_NR_SET_VERSION        0x07
 #define DRM_NR_GET_MAGIC          0x02
+#define DRM_NR_AUTH_MAGIC         0x11 /* DRM_IOCTL_AUTH_MAGIC, *not* 0x03 */
 #define DRM_NR_GET_CAP            0x0c
 #define DRM_NR_SET_CLIENT_CAP     0x0d
 #define DRM_NR_GEM_CLOSE          0x09
@@ -68,9 +73,21 @@
 #define DRM_NR_MODE_ADDFB2        0xB8
 #define DRM_NR_MODE_OBJ_GETPROPS  0xB9
 #define DRM_NR_MODE_OBJ_SETPROP   0xBA
+#define DRM_NR_MODE_CURSOR2       0xBB
 #define DRM_NR_MODE_ATOMIC        0xBC
 #define DRM_NR_MODE_CREATEPROPBLOB  0xBD
 #define DRM_NR_MODE_DESTROYPROPBLOB 0xBE
+/* Lease enumeration. ImplusOS issues no leases, so the answer is always an
+ * empty list -- but it has to *be* an empty list: Xorg's DDX calls
+ * drmModeListLessees() while taking master and treats the ENOTTY we used to
+ * answer as a failure to establish the lease machinery at all. */
+#define DRM_NR_MODE_LIST_LESSEES  0xC7
+
+/* PRIME fd sharing (ioctl base 'd', so _IOWR('d', 0x2D, ...) etc.) */
+#define DRM_NR_PRIME_HANDLE_TO_FD  0x2D
+#define DRM_NR_PRIME_FD_TO_HANDLE  0x2E
+
+/* GEM names / open (legacy flink sharing) */
 
 /* DRM_IOCTL_GET_CAP capabilities */
 #define DRM_CAP_DUMB_BUFFER              0x1
@@ -89,11 +106,49 @@
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #define DRM_EVENT_FLIP_COMPLETE  0x02
 
-#define DRM_CONNECTOR_ID  1u
-#define DRM_ENCODER_ID    1u
+/* Distinct object IDs — atomic mode setting queries OBJ_GETPROPERTIES per
+ * object, so CRTC/PLANE/CONNECTOR must not collide. */
 #define DRM_CRTC_ID       1u
-#define DRM_PLANE_ID      1u
+#define DRM_PLANE_ID      2u
+#define DRM_CONNECTOR_ID  3u
+#define DRM_ENCODER_ID    4u
 #define DRM_MODE_CONNECTED 1u
+
+/* ---- Atomic property IDs (must match the ATOMIC handler below) --------- */
+#define DRM_PROP_CRTC_ACTIVE    0x100u  /* bool   */
+#define DRM_PROP_CRTC_MODE_ID   0x101u  /* blob   */
+#define DRM_PROP_CONN_CRTC_ID   0x102u  /* object */
+#define DRM_PROP_PLANE_FB_ID    0x103u  /* object */
+#define DRM_PROP_PLANE_CRTC_ID  0x104u  /* object */
+#define DRM_PROP_PLANE_SRC_X    0x105u  /* range  */
+#define DRM_PROP_PLANE_SRC_Y    0x106u  /* range  */
+#define DRM_PROP_PLANE_SRC_W    0x107u  /* range  */
+#define DRM_PROP_PLANE_SRC_H    0x108u  /* range  */
+#define DRM_PROP_PLANE_CRTC_X   0x109u  /* range  */
+#define DRM_PROP_PLANE_CRTC_Y   0x10Au  /* range  */
+#define DRM_PROP_PLANE_CRTC_W   0x10Bu  /* range  */
+#define DRM_PROP_PLANE_CRTC_H   0x10Cu  /* range  */
+#define DRM_PROP_PLANE_TYPE     0x10Du  /* enum   */
+
+/* DRM_MODE_PROP_* type bits — drm_mode.h. A wrong type bit makes the DDX
+ * mis-read a property (e.g. treat an object ID as a range), so mirror the
+ * kernel's values exactly: */
+#define DRM_MODE_PROP_ENUM      0x00000008u /* (1 << 3) */
+#define DRM_MODE_PROP_RANGE     0x00000002u /* (1 << 1) */
+#define DRM_MODE_PROP_BLOB      0x00000010u /* (1 << 4) */
+#define DRM_MODE_PROP_OBJECT    0x00000040u /* DRM_MODE_PROP_TYPE(1) */
+
+/* drm_plane.type values — must match DRM_PLANE_TYPE_* in drm_mode.h and the
+ * names modesetting looks for ("Primary"/"Cursor"/"Overlay"). Without this
+ * property the DDX rejects every plane, leaves crtc->plane_id == 0 and then
+ * every drmModeAtomicAddProperty() call returns -EINVAL, so no modeset ever
+ * reaches the driver. */
+#define DRM_PLANE_TYPE_PRIMARY  0u
+#define DRM_PLANE_TYPE_CURSOR   1u
+#define DRM_PLANE_TYPE_OVERLAY  2u
+
+/* Simple monotonic blob-id allocator for CREATEPROPBLOB. */
+static uint32_t g_next_blob_id = 1u;
 
 /* ---- Linux struct layouts (x86-64) ----------------------------------- */
 struct drm_version {
@@ -215,6 +270,16 @@ struct drm_mode_atomic {
 };
 struct drm_gem_close { uint32_t handle, pad; };
 
+/* PRIME fd passing */
+struct drm_prime_handle {
+    uint32_t handle;
+    uint32_t flags;
+    int32_t  fd;
+};
+#define DRM_PRIME_FLAG_IMPORT (1 << 0)
+#define DRM_PRIME_FLAG_EXPORT (1 << 1)
+
+/* Event structures */
 struct drm_event { uint32_t type, length; };
 struct drm_event_vblank {
     struct drm_event base;
@@ -228,6 +293,14 @@ struct drm_event_vblank {
 #define DRM_EVQ_MAX  16
 #define DRM_MMAP_OFFSET_BASE 0x100000000ull  /* fake mmap offset space */
 
+/* Declared with the rest of the state rather than down by the ioctl switch:
+ * the PRIME block below shares both. Serialises every session, framebuffer,
+ * dumb buffer and dma-buf block -- one lock, because they reference each
+ * other (a framebuffer names a dumb buffer, a dumb buffer may name a prime
+ * block) and split locking would let a free run between the two lookups. */
+static spinlock_t g_lock;
+static int g_inited;
+
 typedef struct {
     uint8_t  used;
     uint32_t handle;
@@ -237,7 +310,197 @@ typedef struct {
     void    *kva;        /* kernel virtual (pmm_alloc_pages) */
     uint64_t phys;       /* physical base */
     uint64_t map_offset; /* token returned by MAP_DUMB */
+    /* >= 0 once this buffer has been exported: the g_primes slot that now
+     * owns the pages, which this handle holds one reference on. < 0 means the
+     * handle owns them itself and freeing means pmm_free_pages() directly.
+     * Must be initialised to -1 on creation -- memset(0) would otherwise make
+     * every buffer look exported into slot 0. */
+    int32_t  prime;
 } drm_dumb_t;
+
+/* ---- PRIME (dma-buf) ----------------------------------------------------
+ *
+ * The moment a dumb buffer is exported, its pages are no longer private to
+ * the session that allocated them: drmPrimeHandleToFD() hands a descriptor to
+ * somebody else, who may well outlive the handle -- Mesa exports, then
+ * DESTROY_DUMBs, then passes the fd across DRI3 to the X server. So from that
+ * point the pages belong to a small refcounted block instead. The handle
+ * holds one reference and every exported descriptor another; importing it
+ * back into a session adds one per imported handle. The last reference out
+ * frees the pages, exactly once -- which is also what stops a close of
+ * /dev/dri/card0 from yanking memory out from under a dma-buf fd that is
+ * still mapped somewhere. */
+#define DRM_MAX_PRIME 128
+
+typedef struct {
+    uint8_t  used;
+    uint32_t refs;
+    void    *kva;
+    uint32_t npages;
+    uint64_t phys;
+    uint64_t size;
+    uint32_t width, height, bpp, pitch;
+} drm_prime_t;
+
+static drm_prime_t g_primes[DRM_MAX_PRIME];
+
+/* Take `bo`'s pages into a dma-buf block and hand the handle its reference.
+ * A handle whose `prime` is < 0 owns its pages outright, so there is never an
+ * existing block to collide with -- no lookup needed, and none wanted: a
+ * match on kva alone could mistake a recycled page frame for a live buffer.
+ * Caller holds g_lock. Returns the slot, or -1 when the table is full (in
+ * which case nothing changed and export simply fails). */
+static int32_t prime_adopt_locked(const drm_dumb_t *bo)
+{
+    for (int i = 0; i < DRM_MAX_PRIME; i++) {
+        drm_prime_t *p = &g_primes[i];
+        if (p->used) continue;
+        p->used = 1u;
+        p->refs = 1u;              /* the handle adopting it */
+        p->kva = bo->kva;
+        p->npages = bo->npages;
+        p->phys = bo->phys;
+        p->size = bo->size;
+        p->width = bo->width;
+        p->height = bo->height;
+        p->bpp = bo->bpp;
+        p->pitch = bo->pitch;
+        return i;
+    }
+    return -1;
+}
+
+/* Caller holds g_lock. */
+static void prime_put_locked(int32_t idx)
+{
+    if (idx < 0 || idx >= DRM_MAX_PRIME) return;
+    drm_prime_t *p = &g_primes[idx];
+    if (!p->used) return;
+    if (p->refs > 0u) p->refs--;
+    if (p->refs != 0u) return;
+    if (p->kva != NULL) pmm_free_pages(p->kva, p->npages);
+    memset(p, 0, sizeof(*p));
+}
+
+/* Drop one reference on the pages `bo` holds -- through the dma-buf block
+ * when it has been exported, directly when it has not -- and clear the slot.
+ * Caller holds g_lock. The single funnel every DESTROY_DUMB / GEM_CLOSE /
+ * session teardown path goes through. */
+static void dumb_release_locked(drm_dumb_t *bo)
+{
+    if (bo == NULL || !bo->used) return;
+    if (bo->prime >= 0) {
+        prime_put_locked(bo->prime);
+    } else if (bo->kva != NULL) {
+        pmm_free_pages(bo->kva, bo->npages);
+    }
+    memset(bo, 0, sizeof(*bo));
+}
+
+/* Handle lookup over a bare session buffer table (card and render sessions
+ * differ only in what surrounds theirs). Caller holds g_lock. */
+static drm_dumb_t *dumb_find(drm_dumb_t *dumbs, uint32_t handle)
+{
+    for (int i = 0; i < DRM_MAX_DUMB; i++) {
+        if (dumbs[i].used && dumbs[i].handle == handle) return &dumbs[i];
+    }
+    return NULL;
+}
+
+/* DRM_IOCTL_PRIME_HANDLE_TO_FD -- export a GEM handle as a dma-buf descriptor.
+ *
+ * Not a stub any more: the descriptor is a real object in the caller's fd
+ * table whose mmap/ioctl/close hooks reach back into g_primes. The first
+ * export moves the pages into a prime block (the handle keeping a reference),
+ * and this descriptor takes one of its own, so the buffer outlives
+ * DESTROY_DUMB and the close of /dev/dri/card0 -- which is precisely the
+ * window Mesa works in: allocate, export, destroy, hand the fd to the X
+ * server over DRI3. Before this it returned -EOPNOTSUPP and every one of
+ * those handoffs turned into gbm_wrapper's "Failed to export buffer to
+ * dma_buf" plus a slow path. */
+static int64_t prime_handle_to_fd(drm_dumb_t *dumbs, void *uarg)
+{
+    struct drm_prime_handle p;
+    if (!uarg || copy_from_user(&p, uarg, sizeof(p)) != 0u) return E_FAULT;
+
+    int32_t slot = -1;
+    uint32_t size = 0u;
+
+    spinlock_lock(&g_lock);
+    drm_dumb_t *bo = dumb_find(dumbs, p.handle);
+    if (bo == NULL || bo->kva == NULL) { spinlock_unlock(&g_lock); return E_INVAL; }
+    if (bo->prime < 0) {
+        bo->prime = prime_adopt_locked(bo);
+        if (bo->prime < 0) {
+            spinlock_unlock(&g_lock);
+            return E_NOMEM;
+        }
+    }
+    slot = bo->prime;
+    g_primes[slot].refs++;           /* the descriptor about to be installed */
+    size = (uint32_t)g_primes[slot].size;
+    spinlock_unlock(&g_lock);
+
+    /* Deliberately outside g_lock: installing an fd takes the file table lock
+     * with interrupts off, and DRM's lock is not in that ordering. The
+     * reference taken above keeps `slot` alive across the gap. */
+    int32_t fd = devfs_prime_fd(slot, size);
+    if (fd < 0) {
+        spinlock_lock(&g_lock);
+        prime_put_locked(slot);
+        spinlock_unlock(&g_lock);
+        return (int64_t)fd;
+    }
+
+    p.fd = fd;
+    return copy_to_user(uarg, &p, sizeof(p)) == 0u ? 0 : E_FAULT;
+}
+
+/* DRM_IOCTL_PRIME_FD_TO_HANDLE -- import a dma-buf descriptor as a GEM handle
+ * in this session. Shares the pages rather than copying them; the imported
+ * handle takes a reference on the same prime block. */
+static int64_t prime_fd_to_handle(drm_dumb_t *dumbs, void *uarg,
+                                  uint32_t *next_handle, uint64_t *next_map_off)
+{
+    struct drm_prime_handle p;
+    if (!uarg || copy_from_user(&p, uarg, sizeof(p)) != 0u) return E_FAULT;
+
+    /* The descriptor belongs to the calling process; resolve it there, before
+     * taking g_lock (syscall_file_get_file_info() takes the file table lock). */
+    vfs_file_t vf;
+    if (syscall_file_get_file_info(p.fd, &vf, NULL) != 0) return E_INVAL;
+    int32_t slot = devfs_prime_slot(&vf);
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return E_INVAL;
+
+    spinlock_lock(&g_lock);
+    if (!g_primes[slot].used) { spinlock_unlock(&g_lock); return E_INVAL; }
+    drm_dumb_t *bo = NULL;
+    for (int i = 0; i < DRM_MAX_DUMB; i++) {
+        if (!dumbs[i].used) { bo = &dumbs[i]; break; }
+    }
+    if (bo == NULL) { spinlock_unlock(&g_lock); return E_NOMEM; }
+
+    drm_prime_t *bp = &g_primes[slot];
+    bp->refs++;                       /* the importing handle */
+    memset(bo, 0, sizeof(*bo));
+    bo->used = 1u;
+    bo->handle = (*next_handle)++;
+    bo->width = bp->width;
+    bo->height = bp->height;
+    bo->bpp = bp->bpp;
+    bo->pitch = bp->pitch;
+    bo->size = bp->size;
+    bo->npages = bp->npages;
+    bo->kva = bp->kva;
+    bo->phys = bp->phys;
+    bo->prime = slot;
+    bo->map_offset = *next_map_off;
+    *next_map_off += (uint64_t)bp->npages * 4096u;
+    p.handle = bo->handle;
+    spinlock_unlock(&g_lock);
+
+    return copy_to_user(uarg, &p, sizeof(p)) == 0u ? 0 : E_FAULT;
+}
 
 typedef struct {
     uint8_t  used;
@@ -310,17 +573,26 @@ typedef struct {
 
 static drm_session_t g_sessions[DRM_MAX_SESSIONS];
 
-static spinlock_t g_lock;
-static int g_inited;
-
 void drm_kms_init(void)
 {
+    if (g_inited) return;
     spinlock_init(&g_lock);
     memset(g_sessions, 0, sizeof(g_sessions));
+    /* g_primes holds pages that exported descriptors may still be mapping,
+     * so it is cleared only on the very first init -- a re-entry must not
+     * orphan blocks whose dma-buf fds are alive. BSS already starts it zero. */
+    memset(g_primes, 0, sizeof(g_primes));
     for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
         g_sessions[i].owner_pid = -1;
         g_sessions[i].client_pid = -1;
     }
+    /* The /sys side of both DRM nodes: libdrm rebuilds a device from
+     * /sys/dev/char/<maj>:<min>... and drmGetDevice2() -- which Mesa's
+     * loader_is_device_render_capable() is a wrapper around -- fails outright
+     * without it. Runs here rather than from the sysfs driver so the PCI bus
+     * has definitely been enumerated (fs_init is after driver_module_critical)
+     * and the slot it reports is the machine's real display controller. */
+    sysfs_publish_drm_nodes();
     g_inited = 1;
 }
 
@@ -369,8 +641,7 @@ static void session_free(drm_session_t *s)
 {
     if (!s || !s->used) return;
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
-        if (s->dumbs[i].used && s->dumbs[i].kva)
-            pmm_free_pages(s->dumbs[i].kva, s->dumbs[i].npages);
+        dumb_release_locked(&s->dumbs[i]);
     }
     memset(s, 0, sizeof(*s));
     s->owner_pid = -1;
@@ -431,6 +702,330 @@ static drm_session_t *session_for_owner(int32_t owner_pid)
     return NULL;
 }
 
+/* ---- render node (renderD128) ------------------------------------------
+ *
+ * The render node has NO modesetting capability: it exposes only GEM
+ * buffer-object operations, PRIME import/export, and syncobj. Mesa opens
+ * this node for GL contexts; Xorg's DDX opens card0 for scanout. Keeping
+ * them separate matches Linux and prevents a GPU client from accidentally
+ * hijacking the display.
+ *
+ * Render nodes have their OWN session slot (not shared with card0's scanout
+ * session). The session is keyed by client pid only (no launcher binding).
+ */
+
+#define DRM_MAX_RENDER_SESSIONS 4
+
+typedef struct {
+    uint8_t  used;
+    int32_t  client_pid;
+
+    drm_dumb_t dumbs[DRM_MAX_DUMB];
+    uint32_t   next_handle;
+    uint64_t   next_map_off;
+} drm_render_session_t;
+
+static drm_render_session_t g_render_sessions[DRM_MAX_RENDER_SESSIONS];
+
+static drm_render_session_t *render_session_alloc(int32_t pid)
+{
+    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++) {
+        if (g_render_sessions[i].used) continue;
+        drm_render_session_t *s = &g_render_sessions[i];
+        memset(s, 0, sizeof(*s));
+        s->used = 1u;
+        s->client_pid = pid;
+        s->next_handle = 1u;
+        /* Separate mmap-offset space from card sessions (0x100000000 base,
+         * sessions at +0x40000000 stride; render uses 0x80000000000). */
+        s->next_map_off = 0x800000000ull + (uint64_t)i * DRM_MMAP_OFFSET_STRIDE;
+        return s;
+    }
+    return NULL;
+}
+
+static drm_render_session_t *render_session_for_current(void)
+{
+    int32_t pid = process_get_current_pid();
+    if (pid <= 0) return NULL;
+
+    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++)
+        if (g_render_sessions[i].used &&
+            g_render_sessions[i].client_pid == pid)
+            return &g_render_sessions[i];
+
+    return render_session_alloc(pid);
+}
+
+static void render_session_free(drm_render_session_t *s)
+{
+    if (!s || !s->used) return;
+    for (int i = 0; i < DRM_MAX_DUMB; i++) {
+        dumb_release_locked(&s->dumbs[i]);
+    }
+    memset(s, 0, sizeof(*s));
+}
+
+static drm_dumb_t *render_dumb_by_handle(drm_render_session_t *s, uint32_t h)
+{
+    for (int i = 0; i < DRM_MAX_DUMB; i++)
+        if (s->dumbs[i].used && s->dumbs[i].handle == h)
+            return &s->dumbs[i];
+    return NULL;
+}
+
+static drm_dumb_t *render_dumb_by_offset(drm_render_session_t *s, uint64_t off)
+{
+    for (int i = 0; i < DRM_MAX_DUMB; i++)
+        if (s->dumbs[i].used && s->dumbs[i].map_offset == off)
+            return &s->dumbs[i];
+    return NULL;
+}
+
+int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
+{
+    ensure_init();
+    drm_render_session_t *sess = render_session_for_current();
+    if (!sess) return E_NOMEM;
+    if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
+    uint32_t nr = IOC_NR(request);
+    void *uarg = (void *)(uintptr_t)arg;
+
+    /* Modeset ioctls are rejected on the render node (Linux returns EACCES). */
+    switch (nr) {
+    case DRM_NR_MODE_SETCRTC:
+    case DRM_NR_MODE_PAGE_FLIP:
+    case DRM_NR_MODE_DIRTYFB:
+    case DRM_NR_MODE_SETPLANE:
+    case DRM_NR_MODE_ATOMIC:
+    case DRM_NR_MODE_CURSOR:
+    case DRM_NR_MODE_CURSOR2:
+    case DRM_NR_MODE_SETGAMMA:
+    case DRM_NR_MODE_SETPROPERTY:
+    case DRM_NR_MODE_OBJ_SETPROP:
+    case DRM_NR_MODE_LIST_LESSEES:
+        return -13; /* -EACCES */
+    default:
+        break;
+    }
+
+    switch (nr) {
+    case DRM_NR_VERSION: {
+        struct drm_version v;
+        if (!uarg || copy_from_user(&v, uarg, sizeof(v)) != 0u) return E_FAULT;
+        static const char nm[] = "implusdrm";
+        static const char dt[] = "20261001";
+        static const char ds[] = "ImplusOS render node";
+        uint64_t nl = sizeof(nm) - 1, dl = sizeof(dt) - 1, sl = sizeof(ds) - 1;
+        if (v.name && v.name_len >= nl)
+            if (copy_to_user((void *)(uintptr_t)v.name, nm, nl) != 0u) return E_FAULT;
+        if (v.date && v.date_len >= dl)
+            if (copy_to_user((void *)(uintptr_t)v.date, dt, dl) != 0u) return E_FAULT;
+        if (v.desc && v.desc_len >= sl)
+            if (copy_to_user((void *)(uintptr_t)v.desc, ds, sl) != 0u) return E_FAULT;
+        v.version_major = 1; v.version_minor = 0; v.version_patchlevel = 0;
+        v.name_len = nl; v.date_len = dl; v.desc_len = sl;
+        if (copy_to_user(uarg, &v, sizeof(v)) != 0u) return E_FAULT;
+        return 0;
+    }
+    case DRM_NR_GET_MAGIC: {
+        uint32_t magic = 1;
+        if (uarg && copy_to_user(uarg, &magic, sizeof(magic)) != 0u) return E_FAULT;
+        return 0;
+    }
+    case DRM_NR_AUTH_MAGIC:
+        /* drmAuthMagic(): authentication is implicit on a render node (and
+         * Xorg's DRI3 open path needs this to *not* fail on card0 either),
+         * so accept whatever magic GET_MAGIC handed out. */
+        return 0;
+    case DRM_NR_GET_CAP: {
+        struct drm_get_cap c;
+        if (!uarg || copy_from_user(&c, uarg, sizeof(c)) != 0u) return E_FAULT;
+        switch (c.capability) {
+        case DRM_CAP_DUMB_BUFFER:            c.value = 1; break;
+        case DRM_CAP_DUMB_PREFERRED_DEPTH:   c.value = 24; break;
+        case DRM_CAP_DUMB_PREFER_SHADOW:     c.value = 1; break;
+        case DRM_CAP_TIMESTAMP_MONOTONIC:    c.value = 1; break;
+        case DRM_CAP_PRIME:                  c.value = 1; break;
+        case DRM_CAP_ADDFB2_MODIFIERS:       c.value = 1; break;
+        case DRM_CAP_SYNCOBJ:                c.value = 1; break;
+        default:                             c.value = 0; break;
+        }
+        return copy_to_user(uarg, &c, sizeof(c)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_SET_CLIENT_CAP: {
+        /* Render node accepts UNIVERSAL_PLANES and ATOMIC caps (they only
+         * matter for modesetting, which is rejected above anyway). */
+        struct drm_set_client_cap cap;
+        if (!uarg || copy_from_user(&cap, uarg, sizeof(cap)) != 0u) return E_FAULT;
+        return 0;
+    }
+    case DRM_NR_SET_MASTER:
+    case DRM_NR_DROP_MASTER:
+        return 0;
+
+    case DRM_NR_MODE_CREATE_DUMB: {
+        struct drm_mode_create_dumb d;
+        if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
+        /* Linux accepts any non-zero bpp here and rounds the bytes-per-pixel
+         * up, so an 8-bit (R8) allocation is as valid as a 32-bit scanout one.
+         * Refusing bpp=8 made Mesa's gbm fail its 64x64 luminance buffer. */
+        if (!d.width || !d.height || !d.bpp || d.bpp > 64u) {
+            return E_INVAL;
+        }
+        uint32_t bpp = d.bpp;
+        uint32_t pitch = d.width * ((d.bpp + 7u) / 8u);
+        uint64_t size = (uint64_t)pitch * d.height;
+        uint32_t npages = (uint32_t)((size + 4095u) / 4096u);
+        spinlock_lock(&g_lock);
+        drm_dumb_t *slot = NULL;
+        for (int i = 0; i < DRM_MAX_DUMB; i++)
+            if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
+        if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
+        void *kva = pmm_alloc_pages(npages);
+        if (!kva) { spinlock_unlock(&g_lock); return E_NOMEM; }
+        memset(kva, 0, (size_t)npages * 4096u);
+        slot->used = 1;
+        slot->handle = sess->next_handle++;
+        slot->width = d.width; slot->height = d.height;
+        slot->bpp = bpp; slot->pitch = pitch;
+        slot->size = size; slot->npages = npages;
+        slot->kva = kva;
+        slot->phys = paging_virt_to_phys(paging_get_kernel_cr3(),
+                                         (uint64_t)(uintptr_t)kva);
+        slot->map_offset = sess->next_map_off;
+        slot->prime = -1;
+        sess->next_map_off += (uint64_t)npages * 4096u;
+        d.handle = slot->handle;
+        d.pitch = pitch;
+        d.size = size;
+        spinlock_unlock(&g_lock);
+        return copy_to_user(uarg, &d, sizeof(d)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_MAP_DUMB: {
+        struct drm_mode_map_dumb m;
+        if (!uarg || copy_from_user(&m, uarg, sizeof(m)) != 0u) return E_FAULT;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, m.handle);
+        if (!bo) { spinlock_unlock(&g_lock); return E_INVAL; }
+        m.offset = bo->map_offset;
+        spinlock_unlock(&g_lock);
+        return copy_to_user(uarg, &m, sizeof(m)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_DESTROY_DUMB: {
+        struct drm_mode_destroy_dumb d;
+        if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, d.handle);
+        if (bo) dumb_release_locked(bo);
+        spinlock_unlock(&g_lock);
+        return 0;
+    }
+    case DRM_NR_GEM_CLOSE: {
+        struct drm_gem_close g;
+        if (uarg && copy_from_user(&g, uarg, sizeof(g)) == 0u) {
+            spinlock_lock(&g_lock);
+            drm_dumb_t *bo = render_dumb_by_handle(sess, g.handle);
+            if (bo) dumb_release_locked(bo);
+            spinlock_unlock(&g_lock);
+        }
+        return 0;
+    }
+    case DRM_NR_GEM_FLINK:
+    case DRM_NR_GEM_OPEN:
+        return E_INVAL; /* no flink name sharing yet */
+    case DRM_NR_PRIME_HANDLE_TO_FD:
+        /* The render node exports exactly as the KMS node does: the buffer's
+         * pages move into a refcounted dma-buf block and a descriptor naming
+         * them is installed in this process. */
+        return prime_handle_to_fd(sess->dumbs, uarg);
+    case DRM_NR_PRIME_FD_TO_HANDLE:
+        return prime_fd_to_handle(sess->dumbs, uarg, &sess->next_handle,
+                                  &sess->next_map_off);
+    default:
+        return E_NOTTY;
+    }
+}
+
+int64_t drm_render_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock)
+{
+    (void)user_buf; (void)len; (void)nonblock;
+    return E_AGAIN; /* render node has no event queue */
+}
+
+uint32_t drm_render_poll(uint32_t events)
+{
+    (void)events;
+    return 0; /* no pollable events on render node */
+}
+
+int64_t drm_render_mmap(uint64_t offset, uint64_t length, uint64_t prot,
+                        uint64_t flags)
+{
+    ensure_init();
+    drm_render_session_t *sess = render_session_for_current();
+    if (!sess) return E_NOMEM;
+    (void)prot; (void)flags;
+    spinlock_lock(&g_lock);
+    drm_dumb_t *bo = render_dumb_by_offset(sess, offset);
+    if (!bo || !bo->kva) { spinlock_unlock(&g_lock); return E_INVAL; }
+    uint64_t need = bo->size;
+    uint64_t bo_phys = bo->phys;
+    uint32_t np = bo->npages;
+    spinlock_unlock(&g_lock);
+
+    if (length > (uint64_t)np * 4096u) length = (uint64_t)np * 4096u;
+    if (length == 0) length = need;
+
+    uint64_t cr3 = process_get_current_cr3();
+    if (!cr3) return E_NODEV;
+    void *va = process_user_reserve((uint64_t)np * 4096u);
+    if (!va) return E_NOMEM;
+    uint64_t uva = (uint64_t)(uintptr_t)va;
+    for (uint32_t i = 0; i < np; i++) {
+        /* PAGE_EXTERNAL: these frames belong to the dumb buffer, not to this
+         * address space.  Without it the client's munmap -- and, on every
+         * exit, the sweep in paging_destroy_process_space() -- called
+         * free_page() on frames the session still owns, and DESTROY_DUMB /
+         * drm_kms_close() then freed them a second time.  That second free
+         * put a still-in-use frame back on the PMM free list, so the next
+         * two alloc_page() callers were handed the SAME frame and whichever
+         * lost the race had its data overwritten: Xorg died on
+         * "malloc(): corrupted top size" moments after Chromium exited.
+         * The session is the single owner and frees them exactly once. */
+        if (paging_map_user_page(cr3, uva + (uint64_t)i * 4096u,
+                                 bo_phys + (uint64_t)i * 4096u,
+                                 PAGE_PRESENT | PAGE_RW | PAGE_USER |
+                                 PAGE_EXTERNAL) < 0) {
+            (void)process_user_munmap(va, (uint64_t)np * 4096u);
+            return E_NOMEM;
+        }
+    }
+    return (int64_t)uva;
+}
+
+void drm_render_close(void)
+{
+    ensure_init();
+    drm_render_session_t *sess = render_session_for_current();
+    if (!sess) return;
+    {
+        uint32_t n = 0;
+        for (int i = 0; i < DRM_MAX_DUMB; i++)
+            if (sess->dumbs[i].used && sess->dumbs[i].kva) n++;
+        serial_write_string("[drm] render close pid=");
+        serial_write_uint32((uint32_t)process_get_current_pid());
+        serial_write_string(" sess=");
+        serial_write_uint64((uint64_t)(uintptr_t)sess);
+        serial_write_string(" dumbs=");
+        serial_write_uint32(n);
+        serial_write_string("\n");
+    }
+    spinlock_lock(&g_lock);
+    render_session_free(sess);
+    spinlock_unlock(&g_lock);
+}
+
 int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
 {
     ensure_init();
@@ -489,6 +1084,13 @@ void drm_kms_notify_process_exit(int32_t pid)
          * launcher starts, but unbinds it so that one can claim it. */
         if (s->client_pid == pid) s->client_pid = -1;
     }
+    /* Clean up render-node sessions for this pid. */
+    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++) {
+        if (g_render_sessions[i].used &&
+            g_render_sessions[i].client_pid == pid) {
+            render_session_free(&g_render_sessions[i]);
+        }
+    }
 }
 
 int drm_kms_mirror_take_dirty(void)
@@ -524,7 +1126,15 @@ static void blit_fb_to_display(drm_session_t *s, drm_fb_t *fb)
     if (!fb) return;
     drm_dumb_t *bo = dumb_by_handle(s, fb->handle);
     if (!bo || !bo->kva) return;
+    /* A framebuffer only ever reaches this as 32bpp (the copies below are
+     * fixed 4-byte rows). Mesa allocates non-32bpp buffers too -- an 8-bit R8
+     * texture, say -- so check the layout instead of assuming it: every row
+     * copied has to exist inside the buffer, or the last row reads past it. */
     uint32_t src_pitch = fb->pitch ? fb->pitch : (bo->pitch ? bo->pitch : fb->width * 4u);
+    if ((uint64_t)src_pitch < (uint64_t)fb->width * 4u ||
+        (uint64_t)src_pitch * (uint64_t)fb->height > bo->size) {
+        return;
+    }
 
     if (s->mirror_page_count != 0u) {
         uint32_t cw = (fb->width  < s->mirror_w) ? fb->width  : s->mirror_w;
@@ -657,7 +1267,6 @@ static int64_t write_id_array(uint64_t uptr, uint32_t cap, const uint32_t *ids,
 int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
 {
     ensure_init();
-    ensure_init();
     drm_session_t *sess = session_for_current();
     if (!sess) return E_NOMEM;
     if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
@@ -668,8 +1277,13 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_VERSION: {
         struct drm_version v;
         if (!uarg || copy_from_user(&v, uarg, sizeof(v)) != 0u) return E_FAULT;
-        static const char nm[] = "implusdrm";
-        static const char dt[] = "20260829";
+        /* Advertise "kms_swrast" so Mesa's loader maps this device to its
+         * kms_swrast DRI driver (dumb-buffer KMS + software rasterizer).
+         * Mesa's loader tries <kernel-driver-name>_dri.so; without a known
+         * name glamor's eglGetPlatformDisplay(GBM) has no vendor driver to
+         * bind and reports "couldn't get display device". */
+        static const char nm[] = "kms_swrast";
+        static const char dt[] = "20261001";
         static const char ds[] = "ImplusOS KMS shim";
         uint64_t nl = sizeof(nm) - 1, dl = sizeof(dt) - 1, sl = sizeof(ds) - 1;
         if (v.name && v.name_len >= nl)
@@ -688,6 +1302,18 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (uarg && copy_to_user(uarg, &magic, sizeof(magic)) != 0u) return E_FAULT;
         return 0;
     }
+    case DRM_NR_SET_VERSION: {
+        /* drmSetVersion(): Mesa/libdrm calls this during device init. */
+        struct { int32_t di_major, di_minor, dd_major, dd_minor; } sv;
+        if (!uarg || copy_from_user(&sv, uarg, sizeof(sv)) != 0u) return E_FAULT;
+        sv.di_major = 1; sv.di_minor = 4;
+        sv.dd_major = 1; sv.dd_minor = 0;
+        return copy_to_user(uarg, &sv, sizeof(sv)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_AUTH_MAGIC: {
+        (void)uarg;
+        return 0;
+    }
     case DRM_NR_GET_CAP: {
         struct drm_get_cap c;
         if (!uarg || copy_from_user(&c, uarg, sizeof(c)) != 0u) return E_FAULT;
@@ -699,18 +1325,27 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         case DRM_CAP_CRTC_IN_VBLANK_EVENT:   c.value = 1; break;
         case DRM_CAP_CURSOR_WIDTH:
         case DRM_CAP_CURSOR_HEIGHT:          c.value = 64; break;
+        case DRM_CAP_PRIME:                  c.value = 1; break; /* dma-buf */
+        case DRM_CAP_ADDFB2_MODIFIERS:       c.value = 1; break;
+        case DRM_CAP_SYNCOBJ:                c.value = 1; break;
         default:                             c.value = 0; break;
         }
         return copy_to_user(uarg, &c, sizeof(c)) == 0u ? 0 : E_FAULT;
     }
-    case DRM_NR_SET_CLIENT_CAP:
-        /* Refuse every client cap so the DDX stays on the fully legacy
-         * modeset path. Saying yes to UNIVERSAL_PLANES would make modesetting
-         * drive real planes through GETPLANERESOURCES/SETPLANE, and yes to
-         * ATOMIC would make it build atomic commits -- neither of which this
-         * shim implements. Failing here is a normal, handled case for the DDX
-         * (it is what a pre-3.15 kernel does). */
+    case DRM_NR_SET_CLIENT_CAP: {
+        /* Accept UNIVERSAL_PLANES and ATOMIC caps. The DDX/Mesa will then
+         * attempt atomic modesetting; we implement a simplified atomic path
+         * below (MODE_ATOMIC) that treats the whole state as one blob. */
+        struct drm_set_client_cap cap;
+        if (!uarg || copy_from_user(&cap, uarg, sizeof(cap)) != 0u) return E_FAULT;
+        /* DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2
+         * DRM_CLIENT_CAP_ATOMIC = 3
+         * DRM_CLIENT_CAP_ASPECT_RATIO = 4 (accepted, informational) */
+        if (cap.capability == 2 || cap.capability == 3 || cap.capability == 4)
+            return 0;
+        /* DRM_CLIENT_CAP_STEREO_3D = 1: not supported. */
         return -95; /* -EOPNOTSUPP */
+    }
     case DRM_NR_SET_MASTER:
     case DRM_NR_DROP_MASTER:
         return 0;
@@ -791,10 +1426,14 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_MODE_CREATE_DUMB: {
         struct drm_mode_create_dumb d;
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
-        if (!d.width || !d.height || (d.bpp != 32 && d.bpp != 24 && d.bpp != 16))
+        /* Linux accepts any non-zero bpp here and rounds the bytes-per-pixel
+         * up, so an 8-bit (R8) allocation is as valid as a 32-bit scanout one.
+         * Refusing bpp=8 made Mesa's gbm fail its 64x64 luminance buffer. */
+        if (!d.width || !d.height || !d.bpp || d.bpp > 64u) {
             return E_INVAL;
-        uint32_t bpp = d.bpp < 24 ? d.bpp : 32;
-        uint32_t pitch = d.width * (bpp / 8u);
+        }
+        uint32_t bpp = d.bpp;
+        uint32_t pitch = d.width * ((d.bpp + 7u) / 8u);
         uint64_t size = (uint64_t)pitch * d.height;
         uint32_t npages = (uint32_t)((size + 4095u) / 4096u);
         spinlock_lock(&g_lock);
@@ -812,6 +1451,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         slot->kva = kva;
         slot->phys = paging_virt_to_phys(paging_get_kernel_cr3(), (uint64_t)(uintptr_t)kva);
         slot->map_offset = sess->next_map_off;
+        slot->prime = -1;
         sess->next_map_off += (uint64_t)npages * 4096u;
         d.handle = slot->handle;
         d.pitch = pitch;
@@ -834,10 +1474,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = dumb_by_handle(sess, d.handle);
-        if (bo) {
-            if (bo->kva) pmm_free_pages(bo->kva, bo->npages);
-            memset(bo, 0, sizeof(*bo));
-        }
+        if (bo) dumb_release_locked(bo);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -938,39 +1575,241 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_MODE_OBJ_GETPROPS: {
         struct drm_mode_obj_get_properties o;
         if (!uarg || copy_from_user(&o, uarg, sizeof(o)) != 0u) return E_FAULT;
-        o.count_props = 0;
+        /* Return the property-ID list for the requested object. */
+        static const uint32_t crtc_props[] = { DRM_PROP_CRTC_ACTIVE,
+                                               DRM_PROP_CRTC_MODE_ID };
+        static const uint32_t conn_props[] = { DRM_PROP_CONN_CRTC_ID };
+        static const uint32_t plane_props[] = {
+            DRM_PROP_PLANE_TYPE,
+            DRM_PROP_PLANE_FB_ID, DRM_PROP_PLANE_CRTC_ID,
+            DRM_PROP_PLANE_SRC_X, DRM_PROP_PLANE_SRC_Y,
+            DRM_PROP_PLANE_SRC_W, DRM_PROP_PLANE_SRC_H,
+            DRM_PROP_PLANE_CRTC_X, DRM_PROP_PLANE_CRTC_Y,
+            DRM_PROP_PLANE_CRTC_W, DRM_PROP_PLANE_CRTC_H };
+        const uint32_t *plist = NULL;
+        uint32_t pcount = 0;
+        uint32_t obj_id = (uint32_t)o.obj_id;
+        if (obj_id == DRM_CRTC_ID) {
+            plist = crtc_props; pcount = 2;
+        } else if (obj_id == DRM_CONNECTOR_ID) {
+            plist = conn_props; pcount = 1;
+        } else if (obj_id == DRM_PLANE_ID) {
+            plist = plane_props; pcount = 11;
+        }
+        /* Write out property IDs if there is room, always report the count. */
+        if (pcount && o.props_ptr && o.count_props >= pcount) {
+            if (copy_to_user((void *)(uintptr_t)o.props_ptr, plist,
+                             (uint64_t)pcount * sizeof(uint32_t)) != 0u)
+                return E_FAULT;
+        }
+        o.count_props = pcount;
         return copy_to_user(uarg, &o, sizeof(o)) == 0u ? 0 : E_FAULT;
     }
-    case DRM_NR_MODE_GETPROPERTY:
-    case DRM_NR_MODE_GETPROPBLOB:
-    case DRM_NR_MODE_OBJ_SETPROP:
-    case DRM_NR_MODE_SETPROPERTY:
+    case DRM_NR_MODE_GETPROPERTY: {
+        /* Return property metadata by property-ID. The DDX looks up names to
+         * map "ACTIVE" / "MODE_ID" / "FB_ID" / ... to numeric IDs.
+         *
+         * uapi struct drm_mode_get_property (x86-64, 64 bytes):
+         *     u64 values_ptr;            u64 enum_blob_ptr;
+         *     u32 prop_id;               u32 flags;
+         *     char name[32];   <-- the name lives INLINE, there is no name_ptr
+         *     u32 count_values;          u32 count_enum_blobs;
+         * An empty name here silently breaks atomic modeset: the DDX finds no
+         * prop_id, crtc_add_prop() returns -1, and the atomic commit is
+         * skipped entirely (leaving "failed to set mode" with a stale errno).
+         */
+        struct {
+            uint64_t values_ptr;
+            uint64_t enum_blob_ptr;
+            uint32_t prop_id;
+            uint32_t flags;
+            char     name[32];
+            uint32_t count_values;
+            uint32_t count_enum_blobs;
+        } gp;
+        if (!uarg || copy_from_user(&gp, uarg, sizeof(gp)) != 0u) return E_FAULT;
+        const char *pname = NULL;
+        uint32_t pflags = 0;
+        switch (gp.prop_id) {
+        case DRM_PROP_CRTC_ACTIVE:   pname = "ACTIVE";   pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_CRTC_MODE_ID:  pname = "MODE_ID";  pflags = DRM_MODE_PROP_BLOB;   break;
+        case DRM_PROP_CONN_CRTC_ID:  pname = "CRTC_ID";  pflags = DRM_MODE_PROP_OBJECT; break;
+        case DRM_PROP_PLANE_FB_ID:   pname = "FB_ID";    pflags = DRM_MODE_PROP_OBJECT; break;
+        case DRM_PROP_PLANE_CRTC_ID: pname = "CRTC_ID";  pflags = DRM_MODE_PROP_OBJECT; break;
+        case DRM_PROP_PLANE_SRC_X:   pname = "SRC_X";    pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_SRC_Y:   pname = "SRC_Y";    pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_SRC_W:   pname = "SRC_W";    pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_SRC_H:   pname = "SRC_H";    pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_CRTC_X:  pname = "CRTC_X";   pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_CRTC_Y:  pname = "CRTC_Y";   pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_CRTC_W:  pname = "CRTC_W";   pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_CRTC_H:  pname = "CRTC_H";   pflags = DRM_MODE_PROP_RANGE;  break;
+        case DRM_PROP_PLANE_TYPE:    pname = "type";     pflags = DRM_MODE_PROP_ENUM;   break;
+        default: break;
+        }
+        /* Enum properties also carry their enum table (drm_mode_property_enum),
+         * delivered through enum_blob_ptr on a second pass.  modesetting
+         * matches the *names* below against its own table to learn that our
+         * primary plane is DRMMODE_PLANE_TYPE_PRIMARY. */
+        static const struct { uint64_t value; char name[32]; } plane_enums[3] = {
+            { DRM_PLANE_TYPE_PRIMARY, "Primary" },
+            { DRM_PLANE_TYPE_CURSOR,  "Cursor"  },
+            { DRM_PLANE_TYPE_OVERLAY, "Overlay" },
+        };
+        uint32_t n_enum = (gp.prop_id == DRM_PROP_PLANE_TYPE) ? 3u : 0u;
+        memset(gp.name, 0, sizeof(gp.name));
+        if (pname) {
+            uint32_t len = 0;
+            while (pname[len] != '\0') len++;
+            if (len >= (uint32_t)sizeof(gp.name))
+                len = (uint32_t)sizeof(gp.name) - 1u;
+            for (uint32_t i = 0; i < len; i++) gp.name[i] = pname[i];
+            gp.flags = pflags;
+        } else {
+            gp.flags = 0;
+            n_enum = 0;
+        }
+        if (n_enum && gp.enum_blob_ptr && gp.count_enum_blobs >= n_enum) {
+            if (copy_to_user((void *)(uintptr_t)gp.enum_blob_ptr, plane_enums,
+                             (uint64_t)n_enum * sizeof(plane_enums[0])) != 0u)
+                return E_FAULT;
+        }
+        gp.count_values = 0;
+        gp.count_enum_blobs = n_enum;
+        return copy_to_user(uarg, &gp, sizeof(gp)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_ATOMIC: {
+        /* Simplified atomic commit: parse the atomic request, find the
+         * framebuffer ID from any ACTIVE CRTC property, and apply it like
+         * a legacy SETCRTC. Real atomic would validate state transitions
+         * across all objects; this handles the common single-CRTC case. */
+        struct drm_mode_atomic a;
+        if (!uarg || copy_from_user(&a, uarg, sizeof(a)) != 0u) return E_FAULT;
+        if (a.count_objs == 0) return 0;
+
+        uint32_t new_fb_id = 0;
+        /* Walk objects: each has obj_id, then count_props entries of
+         * (prop_id, value). We look for FB_ID (prop id 4) on CRTC (id 1)
+         * or plane (id 1 simplified). */
+        uint64_t objs_ptr = a.objs_ptr;
+        uint64_t counts_ptr = a.count_props_ptr;
+        uint64_t props_ptr = a.props_ptr;
+        uint64_t values_ptr = a.prop_values_ptr;
+
+        uint32_t prop_cursor = 0;
+        for (uint32_t i = 0; i < a.count_objs; i++) {
+            uint32_t obj_id = 0, prop_count = 0;
+            if (copy_from_user(&obj_id, (void *)(uintptr_t)(objs_ptr +
+                                (uint64_t)i * 4), 4) != 0u) return E_FAULT;
+            if (copy_from_user(&prop_count, (void *)(uintptr_t)(counts_ptr +
+                                (uint64_t)i * 4), 4) != 0u) return E_FAULT;
+
+            for (uint32_t j = 0; j < prop_count; j++) {
+                uint32_t prop_id = 0;
+                uint64_t value = 0;
+                uint64_t poff = (uint64_t)(prop_cursor + j) * 4;
+                uint64_t voff = (uint64_t)(prop_cursor + j) * 8;
+                if (copy_from_user(&prop_id, (void *)(uintptr_t)(props_ptr + poff), 4) != 0u)
+                    return E_FAULT;
+                if (copy_from_user(&value, (void *)(uintptr_t)(values_ptr + voff), 8) != 0u)
+                    return E_FAULT;
+
+                /* Match against the property IDs defined above. */
+                if (prop_id == DRM_PROP_PLANE_FB_ID) {
+                    new_fb_id = (uint32_t)value;
+                } else if (prop_id == DRM_PROP_CRTC_ACTIVE && value == 0) {
+                    spinlock_lock(&g_lock);
+                    sess->scanout_fb_id = 0;
+                    spinlock_unlock(&g_lock);
+                }
+            }
+            prop_cursor += prop_count;
+        }
+
+        if (new_fb_id != 0) {
+            spinlock_lock(&g_lock);
+            sess->scanout_fb_id = new_fb_id;
+            drm_fb_t *fb = fb_by_id(sess, new_fb_id);
+            if (fb) blit_fb_to_display(sess, fb);
+            spinlock_unlock(&g_lock);
+
+            /* Queue flip event if requested. */
+            if (a.flags & DRM_MODE_PAGE_FLIP_EVENT) {
+                queue_flip_event(sess, a.user_data, DRM_CRTC_ID);
+            }
+        }
+        return 0;
+    }
+    case DRM_NR_MODE_CREATEPROPBLOB: {
+        struct { uint64_t data; uint32_t length, blob_id, pad; } cb;
+        if (!uarg || copy_from_user(&cb, uarg, sizeof(cb)) != 0u) return E_FAULT;
+        cb.blob_id = g_next_blob_id++;
+        if (g_next_blob_id == 0u) g_next_blob_id = 1u;
+        return copy_to_user(uarg, &cb, sizeof(cb)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_DESTROYPROPBLOB: {
+        struct { uint64_t pad; uint32_t blob_id, pad2; } db;
+        (void)db;
+        (void)uarg;
+        return 0;
+    }
+    case DRM_NR_MODE_GETPROPBLOB: {
+        /* Return blob metadata: length=0, data=NULL (mode blob content is
+         * carried in the MODE_ID property value in practice). */
+        struct { uint64_t blob_id, length, pad; uint64_t data; } gb;
+        if (!uarg || copy_from_user(&gb, uarg, sizeof(gb)) != 0u) return E_FAULT;
+        gb.length = 0;
+        gb.data = 0;
+        return copy_to_user(uarg, &gb, sizeof(gb)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_CURSOR:
+    case DRM_NR_MODE_CURSOR2:
+        /* struct drm_mode_cursor[2] -- no hardware cursor, and the surface is
+         * a plain framebuffer blit anyway, so the pointer is drawn in
+         * software. Accept the call rather than make the DDX retry with the
+         * older CURSOR (0xA3) and log a mode-setting failure. */
+        return 0;
+    case DRM_NR_MODE_LIST_LESSEES: {
+        /* uint32 pad, uint32 count, uint64 *lessees -- 16 bytes. We create no
+         * leases, so report none rather than ENOTTY. */
+        struct { uint32_t pad, count; uint64_t lessees; } ll;
+        if (!uarg || copy_from_user(&ll, uarg, sizeof(ll)) != 0u) return E_FAULT;
+        ll.count = 0;
+        ll.lessees = 0;
+        return copy_to_user(uarg, &ll, sizeof(ll)) == 0u ? 0 : E_FAULT;
+    }
     case DRM_NR_MODE_GETGAMMA:
     case DRM_NR_MODE_SETGAMMA:
-    case DRM_NR_MODE_CURSOR:
+        return 0; /* no gamma LUT; benign no-op */
+    case DRM_NR_MODE_SETPROPERTY:
+    case DRM_NR_MODE_OBJ_SETPROP:
+        return 0; /* legacy property set; accept as no-op */
     case DRM_NR_MODE_SETPLANE:
-    case DRM_NR_MODE_CREATEPROPBLOB:
-    case DRM_NR_MODE_DESTROYPROPBLOB:
-        return 0; /* benign no-op for the legacy modeset path */
-    case DRM_NR_MODE_ATOMIC:
-        return -95; /* -EOPNOTSUPP: force the DDX onto the legacy path */
+        return 0; /* single-plane config; no-op */
     case DRM_NR_GEM_CLOSE: {
         struct drm_gem_close g;
         if (uarg && copy_from_user(&g, uarg, sizeof(g)) == 0u) {
             spinlock_lock(&g_lock);
             drm_dumb_t *bo = dumb_by_handle(sess, g.handle);
-            if (bo) {
-                if (bo->kva) pmm_free_pages(bo->kva, bo->npages);
-                memset(bo, 0, sizeof(*bo));
-            }
+            if (bo) dumb_release_locked(bo);
             spinlock_unlock(&g_lock);
         }
         return 0;
     }
     case DRM_NR_GEM_FLINK:
     case DRM_NR_GEM_OPEN:
-        return E_INVAL; /* no PRIME / flink sharing */
+        return E_INVAL; /* no flink name sharing */
+    case DRM_NR_PRIME_HANDLE_TO_FD:
+        return prime_handle_to_fd(sess->dumbs, uarg);
+    case DRM_NR_PRIME_FD_TO_HANDLE:
+        return prime_fd_to_handle(sess->dumbs, uarg, &sess->next_handle,
+                                  &sess->next_map_off);
     default:
+        serial_write_string("[drm] unhandled ioctl nr=");
+        serial_write_uint64(nr);
+        serial_write_string(" type=");
+        serial_write_uint64(IOC_TYPE(request));
+        serial_write_string("\n");
         return E_NOTTY;
     }
 }
@@ -1043,9 +1882,20 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
     if (!va) return E_NOMEM;
     uint64_t uva = (uint64_t)(uintptr_t)va;
     for (uint32_t i = 0; i < np; i++) {
+        /* PAGE_EXTERNAL: these frames belong to the dumb buffer, not to this
+         * address space.  Without it the client's munmap -- and, on every
+         * exit, the sweep in paging_destroy_process_space() -- called
+         * free_page() on frames the session still owns, and DESTROY_DUMB /
+         * drm_kms_close() then freed them a second time.  That second free
+         * put a still-in-use frame back on the PMM free list, so the next
+         * two alloc_page() callers were handed the SAME frame and whichever
+         * lost the race had its data overwritten: Xorg died on
+         * "malloc(): corrupted top size" moments after Chromium exited.
+         * The session is the single owner and frees them exactly once. */
         if (paging_map_user_page(cr3, uva + (uint64_t)i * 4096u,
                                  bo_phys + (uint64_t)i * 4096u,
-                                 PAGE_PRESENT | PAGE_RW | PAGE_USER) < 0) {
+                                 PAGE_PRESENT | PAGE_RW | PAGE_USER |
+                                 PAGE_EXTERNAL) < 0) {
             (void)process_user_munmap(va, (uint64_t)np * 4096u);
             return E_NOMEM;
         }
@@ -1062,13 +1912,104 @@ void drm_kms_close(void)
     ensure_init();
     spinlock_lock(&g_lock);
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
-        if (sess->dumbs[i].used && sess->dumbs[i].kva)
-            pmm_free_pages(sess->dumbs[i].kva, sess->dumbs[i].npages);
-        memset(&sess->dumbs[i], 0, sizeof(sess->dumbs[i]));
+        /* Releases the handle's reference. A buffer that was exported keeps
+         * its pages -- and its mapping -- alive until the dma-buf fd that
+         * owns them closes too; only an unexported one is freed outright. */
+        dumb_release_locked(&sess->dumbs[i]);
     }
     memset(sess->fbs, 0, sizeof(sess->fbs));
     sess->evq_head = sess->evq_tail = 0;
     sess->scanout_fb_id = 0;
     sess->mirror_released = 0u;
     spinlock_unlock(&g_lock);
+}
+
+/* ---- dma-buf descriptor ------------------------------------------------
+ *
+ * A PRIME descriptor is not a device node: no path, no minor, no open(2)
+ * behind it, so DevFS does nothing but dispatch. Its identity is the prime
+ * slot packed into the descriptor's driver_data, exactly the way a pty pair
+ * carries its index, and these four are its entire surface. */
+int64_t drm_prime_ioctl(int32_t slot, uint64_t request, uint64_t arg)
+{
+    ensure_init();
+    (void)arg;
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return E_INVAL;
+    /* 'b' is DMA_BUF_BASE; anything else is a caller bug. */
+    if (IOC_TYPE(request) != 0x62u) return E_NOTTY;
+
+    int used;
+    spinlock_lock(&g_lock);
+    used = g_primes[slot].used != 0u;
+    spinlock_unlock(&g_lock);
+    if (!used) return E_INVAL;
+
+    switch (IOC_NR(request)) {
+    case 0:  /* DMA_BUF_IOCTL_SYNC: these mappings are coherent, nothing to
+              * flush; answering 0 is what keeps Mesa's explicit flush quiet. */
+    case 1:  /* DMA_BUF_SET_NAME_A / DMA_BUF_SET_NAME_B: a debug label. */
+        return 0;
+    default: /* sync_file export/import (nr 2/3): no sync objects on these. */
+        return -95;
+    }
+}
+
+int64_t drm_prime_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                       uint64_t prot, uint64_t flags)
+{
+    ensure_init();
+    (void)prot; (void)flags;
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return E_INVAL;
+    if ((offset & 4095u) != 0u) return E_INVAL;
+
+    spinlock_lock(&g_lock);
+    drm_prime_t *p = &g_primes[slot];
+    if (!p->used || p->kva == NULL || offset >= p->size) {
+        spinlock_unlock(&g_lock);
+        return E_INVAL;
+    }
+    uint64_t bo_phys = p->phys + offset;
+    uint32_t np = (uint32_t)(((p->size - offset) + 4095u) / 4096u);
+    spinlock_unlock(&g_lock);
+
+    if (length > (uint64_t)np * 4096u) length = (uint64_t)np * 4096u;
+    if (length == 0u) length = (uint64_t)np * 4096u;
+
+    uint64_t cr3 = process_get_current_cr3();
+    if (!cr3) return E_NODEV;
+    void *va = process_user_reserve((uint64_t)np * 4096u);
+    if (!va) return E_NOMEM;
+    uint64_t uva = (uint64_t)(uintptr_t)va;
+    for (uint32_t i = 0; i < np; i++) {
+        /* PAGE_EXTERNAL, for the same reason as drm_kms_mmap(): the frames
+         * belong to the prime block, which frees them once its last
+         * reference goes -- not to the address space being torn down. */
+        if (paging_map_user_page(cr3, uva + (uint64_t)i * 4096u,
+                                 bo_phys + (uint64_t)i * 4096u,
+                                 PAGE_PRESENT | PAGE_RW | PAGE_USER |
+                                 PAGE_EXTERNAL) < 0) {
+            (void)process_user_munmap(va, (uint64_t)np * 4096u);
+            return E_NOMEM;
+        }
+    }
+    return (int64_t)uva;
+}
+
+void drm_prime_close(int32_t slot)
+{
+    ensure_init();
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return;
+    spinlock_lock(&g_lock);
+    prime_put_locked(slot);
+    spinlock_unlock(&g_lock);
+}
+
+uint32_t drm_prime_size(int32_t slot)
+{
+    ensure_init();
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return 0u;
+    spinlock_lock(&g_lock);
+    uint32_t n = g_primes[slot].used ? (uint32_t)g_primes[slot].size : 0u;
+    spinlock_unlock(&g_lock);
+    return n;
 }

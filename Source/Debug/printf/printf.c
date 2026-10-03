@@ -264,21 +264,6 @@ void debug_putchar(char c)
     }
 }
 
-void debug_printf(const char *format, ...)
-{
-    if (format == NULL) {
-        return;
-    }
-
-    char buffer[512];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-
-    serial_write_string(buffer);
-}
-
 void debug_clear_screen(void)
 {
     if (!g_debugger.initialized) {
@@ -300,16 +285,5 @@ void debug_clear_screen(void)
     g_debugger.cursor_x = 0;
     g_debugger.cursor_y = 0;
 
-    debugger_present_if_needed();
-}
-
-void debug_reset_cursor(void)
-{
-    g_debugger.cursor_x = 0;
-    g_debugger.cursor_y = 0;
-}
-
-void debug_present(void)
-{
     debugger_present_if_needed();
 }

@@ -2,6 +2,12 @@
 
 #include <stdint.h>
 
+/* Socket table size (max concurrent sockets). Exposed for Syscall_Epoll. */
+#define SOCKET_TABLE_SIZE 256
+/* Global kernel descriptor range for AF_INET sockets.  Linux ABI callers
+ * translate this to their private per-process descriptor numbers. */
+#define SOCKET_FD_BASE 512
+
 typedef struct {
     uint32_t local_ip;
     uint32_t remote_ip;

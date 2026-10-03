@@ -390,3 +390,8 @@ void display_driver_detached(const char *module_name)
     g_fb_width = 0;
     g_fb_height = 0;
 }
+
+const char *display_main_get_active_driver_name(void)
+{
+    return g_active_display_module_name;
+}

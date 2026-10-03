@@ -79,6 +79,16 @@ typedef struct fs_module_ops {
     void (*list_root)(void);
     void (*set_case_sensitive)(bool enabled);
     bool (*get_case_sensitive)(void);
+
+    /* Media probing: called by the block layer (IO_Main.c) to ask whether
+     * this filesystem recognizes the given partition's on-disk format.
+     * `read_sector` is a callback to read one 512-byte sector from the
+     * device (LBA 0 = partition start). The implementation should read
+     * only what it needs to recognize its format and return true/false.
+     * May be NULL if the filesystem does not support on-disk detection
+     * (e.g., pseudo filesystems). */
+    bool (*probe_media)(bool (*read_sector)(uint64_t lba, uint8_t *buffer),
+                        uint64_t partition_lba);
 } fs_module_ops_t;
 
 /*

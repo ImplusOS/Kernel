@@ -34,6 +34,12 @@ uint64_t paging_get_active_cr3(void);
 void paging_switch_cr3(uint64_t cr3);
 uint64_t paging_create_process_space(void);
 void paging_destroy_process_space(uint64_t cr3);
+/* Diagnostic: count resident user pages of an address space. Returns the
+ * total; *priv_out gets frames only this address space maps, *ext_out gets
+ * PAGE_EXTERNAL (shared/COW) frames it merely participates in. Either output
+ * pointer may be NULL. */
+uint64_t paging_count_user_pages(uint64_t cr3, uint64_t *priv_out,
+                                 uint64_t *ext_out);
 int paging_set_user_access(uint64_t cr3, uint64_t start, uint64_t size, int enable_user);
 int paging_protect_user_range(uint64_t cr3, uint64_t start, uint64_t size,
                               uint64_t flags);

@@ -807,19 +807,50 @@ static int32_t iso9660_ops_readdir(int32_t handle, vfs_dirent_t *out_entry)
     return result;
 }
 
+/* Probe for ISO9660 at the given partition LBA.
+ * The read_sector callback reads one 512-byte sector from the device. */
+static bool iso9660_probe_media(bool (*read_sector)(uint64_t lba, uint8_t *buffer),
+                                uint64_t partition_lba)
+{
+    if (!read_sector) return false;
+
+    uint8_t buffer[512];
+    /* ISO9660 Primary Volume Descriptor is at LBA 16 (32KB) from start of partition.
+     * For whole-disk ISOs it may be at LBA 16 from disk start (partition_lba=0). */
+    if (!read_sector(partition_lba + 16u * 4u, buffer)) {
+        return false;
+    }
+    if (memcmp(buffer + 1, "CD001", 5) == 0) return true;
+
+    return false;
+}
+
+/* Forward declarations for case sensitivity hooks used in g_iso9660_driver. */
+static void iso9660_set_case_sensitive_lookup(bool enabled);
+static bool iso9660_get_case_sensitive_lookup(void);
+
 static const fs_module_ops_t g_iso9660_driver = {
-    .fs_type       = "iso9660",
-    .media_kind    = VFS_MEDIA_KIND_OPTICAL,
-    .handle_size   = (uint32_t)sizeof(ISO9660_FILE),
-    .init          = iso9660_init,
-    .find_file     = iso9660_ops_find_file,
-    .read_file     = iso9660_ops_read_file,
-    .read_at       = iso9660_ops_read_at,
-    .get_file_size = iso9660_ops_get_file_size,
-    .opendir       = iso9660_opendir,
-    .readdir       = iso9660_ops_readdir,
-    .closedir      = iso9660_closedir,
-    .list_root     = iso9660_list_root_files,
+    .fs_type            = "iso9660",
+    .media_kind         = VFS_MEDIA_KIND_OPTICAL,
+    .handle_size        = (uint32_t)sizeof(ISO9660_FILE),
+    .init               = iso9660_init,
+    .find_file          = iso9660_ops_find_file,
+    .read_file          = iso9660_ops_read_file,
+    .read_at            = iso9660_ops_read_at,
+    .write_file         = NULL,
+    .write_at           = NULL,
+    .truncate           = NULL,
+    .get_file_size      = iso9660_ops_get_file_size,
+    .creat              = NULL,
+    .mkdir              = NULL,
+    .unlink             = NULL,
+    .opendir            = iso9660_opendir,
+    .readdir            = iso9660_ops_readdir,
+    .closedir           = iso9660_closedir,
+    .list_root          = iso9660_list_root_files,
+    .set_case_sensitive = iso9660_set_case_sensitive_lookup,
+    .get_case_sensitive = iso9660_get_case_sensitive_lookup,
+    .probe_media        = iso9660_probe_media,
 };
 
 static void iso9660_driver_shutdown(void) {

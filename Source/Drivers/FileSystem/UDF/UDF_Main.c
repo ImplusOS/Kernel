@@ -772,20 +772,63 @@ static int32_t udf_ops_readdir(int32_t handle, vfs_dirent_t *out_entry) {
     return result;
 }
 
+/* Probe for UDF at the given partition LBA.
+ * The read_sector callback reads one 512-byte sector from the device. */
+static bool udf_probe_media(bool (*read_sector)(uint64_t lba, uint8_t *buffer),
+                            uint64_t partition_lba)
+{
+    if (!read_sector) return false;
+
+    uint8_t buffer[512];
+    /* UDF Anchor Volume Descriptor Pointer is typically at LBA 256 (or last LBA).
+     * Check for "BEA01" signature at offset 1 of the sector. */
+    if (!read_sector(partition_lba + 256u, buffer)) {
+        return false;
+    }
+    if (memcmp(buffer + 1, "BEA01", 5) == 0) return true;
+
+    return false;
+}
+
+void udf_list_root_files(void);
+static void udf_set_case_sensitive_lookup(bool enabled);
+static bool udf_get_case_sensitive_lookup(void);
+
 static const fs_module_ops_t g_udf_driver = {
-    .fs_type       = "udf",
-    .media_kind    = VFS_MEDIA_KIND_OPTICAL,
-    .handle_size   = (uint32_t)sizeof(UDF_FILE),
-    .init          = udf_init,
-    .find_file     = udf_ops_find_file,
-    .read_file     = udf_ops_read_file,
-    .read_at       = udf_ops_read_at,
-    .get_file_size = udf_ops_get_file_size,
-    .opendir       = udf_opendir,
-    .readdir       = udf_ops_readdir,
-    .closedir      = udf_closedir,
-    .list_root     = udf_list_root,
+    .fs_type            = "udf",
+    .media_kind         = VFS_MEDIA_KIND_OPTICAL,
+    .handle_size        = (uint32_t)sizeof(UDF_FILE),
+    .init               = udf_init,
+    .find_file          = udf_ops_find_file,
+    .read_file          = udf_ops_read_file,
+    .read_at            = udf_ops_read_at,
+    .write_file         = NULL,
+    .write_at           = NULL,
+    .truncate           = NULL,
+    .get_file_size      = udf_ops_get_file_size,
+    .creat              = NULL,
+    .mkdir              = NULL,
+    .unlink             = NULL,
+    .opendir            = udf_opendir,
+    .readdir            = udf_ops_readdir,
+    .closedir           = udf_closedir,
+    .list_root          = udf_list_root_files,
+    .set_case_sensitive = udf_set_case_sensitive_lookup,
+    .get_case_sensitive = udf_get_case_sensitive_lookup,
+    .probe_media        = udf_probe_media,
 };
+
+void udf_list_root_files(void) {
+    udf_list_root();
+}
+
+static void udf_set_case_sensitive_lookup(bool enabled) {
+    (void)enabled;
+}
+
+static bool udf_get_case_sensitive_lookup(void) {
+    return false;
+}
 
 static void udf_driver_shutdown(void) {
     for (uint32_t i = 0; i < UDF_DIR_HANDLE_MAX; ++i) {

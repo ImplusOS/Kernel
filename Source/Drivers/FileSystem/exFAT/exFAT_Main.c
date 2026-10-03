@@ -803,20 +803,63 @@ static int32_t exfat_ops_readdir(int32_t handle, vfs_dirent_t *out_entry)
     return result;
 }
 
+/* Probe for exFAT at the given partition LBA.
+ * The read_sector callback reads one 512-byte sector from the device. */
+static bool exfat_probe_media(bool (*read_sector)(uint64_t lba, uint8_t *buffer),
+                              uint64_t partition_lba)
+{
+    if (!read_sector) return false;
+
+    uint8_t buffer[512];
+    if (!read_sector(partition_lba, buffer)) {
+        return false;
+    }
+
+    /* exFAT boot sector has "EXFAT   " at offset 3 (bytes 3-10) */
+    if (memcmp(buffer + 3, "EXFAT   ", 8) == 0) return true;
+
+    return false;
+}
+
+void exfat_unlink(void);
+static void exfat_set_case_sensitive_lookup(bool enabled);
+static bool exfat_get_case_sensitive_lookup(void);
+
 static const fs_module_ops_t g_exfat_driver = {
-    .fs_type       = "exfat",
-    .media_kind    = VFS_MEDIA_KIND_DISK,
-    .handle_size   = (uint32_t)sizeof(exFAT_FILE),
-    .init          = exfat_init,
-    .find_file     = exfat_ops_find_file,
-    .read_file     = exfat_ops_read_file,
-    .read_at       = exfat_ops_read_at,
-    .get_file_size = exfat_ops_get_file_size,
-    .opendir       = exfat_opendir,
-    .readdir       = exfat_ops_readdir,
-    .closedir      = exfat_closedir,
-    .list_root     = exfat_list_root_files,
+    .fs_type            = "exfat",
+    .media_kind         = VFS_MEDIA_KIND_DISK,
+    .handle_size        = (uint32_t)sizeof(exFAT_FILE),
+    .init               = exfat_init,
+    .find_file          = exfat_ops_find_file,
+    .read_file          = exfat_ops_read_file,
+    .write_file         = exfat_ops_write_file,
+    .read_at            = exfat_ops_read_at,
+    .write_at           = exfat_ops_write_at,
+    .truncate           = exfat_ops_truncate,
+    .get_file_size      = exfat_ops_get_file_size,
+    .creat              = exfat_creat,
+    .mkdir              = exfat_mkdir,
+    .unlink             = exfat_unlink,
+    .opendir            = exfat_opendir,
+    .readdir            = exfat_ops_readdir,
+    .closedir           = exfat_closedir,
+    .list_root          = exfat_list_root_files,
+    .set_case_sensitive = exfat_set_case_sensitive_lookup,
+    .get_case_sensitive = exfat_get_case_sensitive_lookup,
+    .probe_media        = exfat_probe_media,
 };
+
+void exfat_unlink(void) {
+    /* Not implemented - exFAT is read-only in this build. */
+}
+
+static void exfat_set_case_sensitive_lookup(bool enabled) {
+    (void)enabled;
+}
+
+static bool exfat_get_case_sensitive_lookup(void) {
+    return false;
+}
 
 static void exfat_driver_shutdown(void) {
     g_driver_api = NULL;

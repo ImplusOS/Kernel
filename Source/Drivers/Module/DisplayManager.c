@@ -90,3 +90,8 @@ void display_manager_on_device_detached(const char *name)
 {
     display_driver_detached(name);
 }
+
+const char *display_manager_get_active_driver_name(void)
+{
+    return display_main_get_active_driver_name();
+}

@@ -84,3 +84,4 @@ void vfs_set_case_sensitive(bool enabled);
 bool vfs_get_case_sensitive(void);
 bool vfs_set_default_fs(const char *fs_type);
 int vfs_driver_count_get(void);
+const vfs_driver_t *vfs_driver_get_by_index(int index);

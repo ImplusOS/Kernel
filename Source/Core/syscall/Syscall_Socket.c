@@ -10,18 +10,6 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Raised from 64: a Chromium that is allowed to do its normal background
- * networking (Sync, GCM, variations, the component updater) holds far more
- * than 64 sockets at once. SOCKET_FD_BASE + SOCKET_TABLE_SIZE must stay
- * <= 1024 -- the POSIX layer and FD_SETSIZE both index by the raw fd. Kept in
- * step with Syscall_Epoll.c's EPOLL_SOCKET_FD_COUNT. */
-#define SOCKET_TABLE_SIZE 256
-/* Must stay >= OS_CONFIG_FILE_MAX_FD_MAX (kernel/config.h) so socket fds
- * (this disjoint numeric range) never collide with the regular file fd
- * table in Syscall_File.c, and SOCKET_FD_BASE + SOCKET_TABLE_SIZE must
- * stay <= POSIX_FD_TABLE_SIZE / FD_SETSIZE (both 1024) since the POSIX
- * layer indexes its per-fd tables directly by this raw kernel fd value. */
-#define SOCKET_FD_BASE    512
 /* Deliberately numerically identical to Linux's SOCK_STREAM/SOCK_DGRAM
  * (Syscall_LinuxCompat.c's LINUX_SOCK_STREAM/LINUX_SOCK_DGRAM) so that
  * syscall_socket_get_type()'s return value can be compared directly
@@ -84,7 +72,8 @@ static int32_t socket_index(int32_t fd)
 int32_t syscall_socket_next_open_fd(int32_t pid, int32_t after)
 {
     socket_ensure_initialized();
-    int32_t start = (after < SOCKET_FD_BASE) ? 0 : (after - SOCKET_FD_BASE) + 1;
+    int32_t start = (after < SOCKET_FD_BASE) ? 0 :
+                    (after - SOCKET_FD_BASE) + 1;
     if (start < 0) {
         start = 0;
     }

@@ -897,6 +897,59 @@ int32_t syscall_file_creat(const char *path)
     return syscall_file_creat_ex(path, 1ULL);
 }
 
+/* Install a driver-supplied vfs_file_t as a descriptor: syscall_file_open()
+ * without the lookup. Used for objects that have no path -- a PRIME dma-buf
+ * fd is one, and routing it through open() would mean inventing a /dev node
+ * that anybody could open and steal another process's buffer out of.
+ *
+ * Deliberately does NOT call the open_file hook: the caller has already built
+ * the node up (there is nothing to set up -- the prime table entry exists
+ * before this is called), and running DevFS's open switch on a kind that is
+ * not in the node table would only confuse it. close_file() runs as usual,
+ * once, from release_fd_locked_for(). */
+int32_t syscall_file_install_dev(const vfs_file_t *file)
+{
+    int32_t current_pid = process_get_current_pid();
+    if (file == NULL || file->fs_driver == NULL || current_pid < 0) {
+        return (int32_t)OS_STATUS_INVALID_ARG;
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_file_table_lock);
+
+    int32_t fd = allocate_fd_locked(0, current_pid);
+    if (fd < 0) {
+        spinlock_unlock(&g_file_table_lock);
+        irq_restore(irq_flags);
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
+
+    int32_t open_index = allocate_open_file_locked();
+    if (open_index < 0) {
+        spinlock_unlock(&g_file_table_lock);
+        irq_restore(irq_flags);
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
+
+    memset(&g_open_files[open_index], 0, sizeof(g_open_files[open_index]));
+    g_open_files[open_index].used = 1;
+    g_open_files[open_index].writable = 1u;
+    g_open_files[open_index].file = *file;
+    g_open_files[open_index].offset = 0;
+    g_open_files[open_index].refcount = 1;
+    open_file_cache_invalidate(&g_open_files[open_index]);
+
+    g_files[fd].used = 1;
+    g_files[fd].owner_pid = current_pid;
+    g_files[fd].open_index = open_index;
+    g_files[fd].status_flags = FILE_O_RDWR;
+    std_fd_mark_open(fd, current_pid);
+
+    spinlock_unlock(&g_file_table_lock);
+    irq_restore(irq_flags);
+    return fd;
+}
+
 /* Regular-file read at `position` through the open file's read cache.
  * Caller holds file->io_lock. *end_out receives the position after the read. */
 static int64_t open_file_read_at_locked(kernel_open_file_t *file,

@@ -254,7 +254,11 @@ _Static_assert(sizeof(card_info_t) == CTL_CARD_INFO_SIZE, "card_info layout");
  * State
  * ------------------------------------------------------------------------ */
 
-/* The device plays 48 kHz S16_LE stereo; hda.c's native format. */
+/* Compile-time fallback device format, used only when the audio driver
+ * reports nothing (a boot with no audio device, or a driver without get_info):
+ * 48 kHz S16_LE stereo, hda.c's native format. The live values are
+ * g_dev_rate / g_dev_frame_bytes / g_dev_target_bytes below, refreshed from
+ * audio_manager_get_info() at device-open time. */
 #define DEV_RATE        48000u
 #define DEV_FRAME_BYTES 4u
 /* How far ahead of the hardware the converted audio is kept: enough to ride
@@ -264,7 +268,9 @@ _Static_assert(sizeof(card_info_t) == CTL_CARD_INFO_SIZE, "card_info layout");
  * pulls up to 8 KiB (~43 ms) from the ring ahead of playback, so a 40 ms
  * target let the DMA read past the last written byte on every lap -- ~10 ms
  * of sound, then ~20 ms of the ring's silence, over and over. 80 ms keeps a
- * full prefetch plus margin queued and still fits the 160 ms ring. */
+ * full prefetch plus margin queued and still fits the 160 ms ring. The 80 ms
+ * policy is recomputed at runtime (rate * frame_bytes * 80 / 1000); this
+ * macro is only the compile-time seed for g_dev_target_bytes. */
 #define DEV_TARGET_BYTES (DEV_RATE * DEV_FRAME_BYTES * 80u / 1000u)
 
 typedef struct {
@@ -326,6 +332,17 @@ static int g_dev_open;
 static int g_dev_running;
 static uint64_t g_dev_written;  /* bytes handed to the device, ever */
 static spinlock_t g_open_lock;  /* serialises device open/close */
+
+/* The device format actually played, refreshed by alsa_refresh_device_format()
+ * every time the hardware stream is opened. These are runtime values because
+ * the format belongs to whichever audio driver the audio manager picked (see
+ * driver_audio_info_t); DEV_RATE/DEV_FRAME_BYTES/DEV_TARGET_BYTES above are
+ * only their compile-time seeds, so nothing here is 0 and no lookup can divide
+ * by zero when no driver reported anything. Every use below reads these, not
+ * the macros. */
+static uint32_t g_dev_rate = DEV_RATE;
+static uint32_t g_dev_frame_bytes = DEV_FRAME_BYTES;
+static uint32_t g_dev_target_bytes = DEV_TARGET_BYTES;
 
 static uint32_t alsa_cpu(void)
 {
@@ -777,11 +794,13 @@ static void frame_lr(uint64_t abs, int32_t *l, int32_t *r)
 }
 
 /* Converts client frames [pump, appl) into at most `max_out` device frames
- * at 48 kHz, linear interpolation. Returns the device frames produced. */
+ * at the device's own rate (g_dev_rate), linear interpolation. Returns the
+ * device frames produced. Always stereo S16 pairs -- the format every
+ * driver's get_info() reports today. */
 static uint32_t convert(int16_t *out, uint32_t max_out)
 {
     uint32_t produced = 0u;
-    uint64_t step = ((uint64_t)g_pcm.rate << 32) / DEV_RATE;
+    uint64_t step = ((uint64_t)g_pcm.rate << 32) / g_dev_rate;
     while (produced < max_out) {
         uint64_t idx = g_pcm.pump;
         /* Interpolation needs the next frame too, unless the rate matches. */
@@ -850,7 +869,7 @@ static void stream_update_locked(uint64_t dev_queued)
      * device still holds of this stream (scaled back to the client rate). */
     uint64_t dev_played = g_dev_written - dev_queued;
     uint64_t held_bytes = g_pcm.dev_end > dev_played ? g_pcm.dev_end - dev_played : 0u;
-    uint64_t held = (held_bytes / DEV_FRAME_BYTES) * g_pcm.rate / DEV_RATE;
+    uint64_t held = (held_bytes / g_dev_frame_bytes) * g_pcm.rate / g_dev_rate;
     uint64_t hw = g_pcm.pump > held ? g_pcm.pump - held : 0u;
     if (hw > g_pcm.appl) hw = g_pcm.appl;
     if (hw > g_pcm.hw) g_pcm.hw = hw;
@@ -888,11 +907,11 @@ static void pump_locked(void)
     int16_t tmp[256 * 2];
     int16_t mix[256 * 2];
     int32_t acc[256 * 2];
-    while (dev_queued < DEV_TARGET_BYTES) {
+    while (dev_queued < g_dev_target_bytes) {
         uint64_t space = audio_manager_stream_space();
-        uint64_t want = DEV_TARGET_BYTES - dev_queued;
+        uint64_t want = g_dev_target_bytes - dev_queued;
         if (want > space) want = space;
-        uint32_t frames = (uint32_t)(want / DEV_FRAME_BYTES);
+        uint32_t frames = (uint32_t)(want / g_dev_frame_bytes);
         if (frames > 256u) frames = 256u;
         if (frames == 0u) break;
         uint32_t produced = 0u;
@@ -902,10 +921,6 @@ static void pump_locked(void)
             g_cur = p;
             uint32_t got = convert(tmp, frames);
             if (got == 0u) continue;
-#ifdef ALSA_TONE
-            { static uint32_t ph; for (uint32_t k = 0; k < got; ++k, ++ph) {
-                int16_t v = ((ph / 55u) & 1u) ? 8000 : -8000; tmp[2*k] = v; tmp[2*k+1] = v; } }
-#endif
             if (produced == 0u) {
                 memset(acc, 0, sizeof(acc));
             } else if (got > produced) {
@@ -919,22 +934,22 @@ static void pump_locked(void)
             }
             if (cpk > g_stat_peak) g_stat_peak = cpk;
             if (cpk < 30) g_stat_quiet++; else g_stat_loud++;
-            p->dev_end = g_dev_written + (uint64_t)got * DEV_FRAME_BYTES;
-            p->dev_bytes += (uint64_t)got * DEV_FRAME_BYTES;
+            p->dev_end = g_dev_written + (uint64_t)got * g_dev_frame_bytes;
+            p->dev_bytes += (uint64_t)got * g_dev_frame_bytes;
             if (got > produced) produced = got;
         }
         if (produced == 0u) {
-            if (dev_queued < DEV_TARGET_BYTES / 2u) g_stat_short++;
+            if (dev_queued < g_dev_target_bytes / 2u) g_stat_short++;
             break;
         }
         for (uint32_t k = 0; k < produced * 2u; ++k) {
             int32_t v = acc[k];
             mix[k] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
-        uint64_t n = audio_manager_stream_write(mix, (uint64_t)produced * DEV_FRAME_BYTES);
+        uint64_t n = audio_manager_stream_write(mix, (uint64_t)produced * g_dev_frame_bytes);
         g_dev_written += n;
         dev_queued += n;
-        if (n < (uint64_t)produced * DEV_FRAME_BYTES) break;
+        if (n < (uint64_t)produced * g_dev_frame_bytes) break;
     }
     if (!g_dev_running && dev_queued != 0u) {
         g_dev_running = audio_manager_stream_start() ? 1 : 0;
@@ -1043,6 +1058,39 @@ static void free_buffer_locked(void)
     }
 }
 
+/* Ask the audio driver what it actually plays (rate, channels, frame size)
+ * and re-derive the device-side numbers from it. Called once per hardware
+ * stream open: audio_manager_get_info() only answers while the manager is
+ * open, i.e. straight after audio_manager_open() succeeded. A query that
+ * fails or reports 0 for a field leaves that field at its compile-time
+ * fallback (DEV_RATE / DEV_FRAME_BYTES), so boot with no audio driver still
+ * works. The 80 ms buffering policy is unchanged, just recomputed from the
+ * queried values. */
+static void alsa_refresh_device_format(void)
+{
+    driver_audio_info_t info;
+    uint32_t rate = DEV_RATE;
+    uint32_t frame_bytes = DEV_FRAME_BYTES;
+
+    memset(&info, 0, sizeof(info));
+    if (audio_manager_get_info(&info)) {
+        if (info.sample_rate != 0u) {
+            rate = info.sample_rate;
+        }
+        /* The driver ABI defines one sample format today (S16_LE, 2 bytes);
+         * frame bytes are that times the driver's channel count. Every driver
+         * reports stereo, which is also what the converter below emits. */
+        if (info.channels != 0u &&
+            info.format == DRIVER_AUDIO_FORMAT_S16_LE) {
+            frame_bytes = 2u * (uint32_t)info.channels;
+        }
+    }
+
+    g_dev_rate = rate;
+    g_dev_frame_bytes = frame_bytes;
+    g_dev_target_bytes = rate * frame_bytes * 80u / 1000u;
+}
+
 int alsa_pcm_open(void)
 {
     if (!alsa_card_present()) {
@@ -1073,6 +1121,9 @@ int alsa_pcm_open(void)
             spinlock_unlock(&g_open_lock);
             return E_NODEV;
         }
+        /* The manager is open now, so the driver's own format can replace the
+         * compile-time fallback for as long as this hardware stream lives. */
+        alsa_refresh_device_format();
         g_dev_running = 0;
         g_dev_written = 0u;
         g_dev_open = 1;

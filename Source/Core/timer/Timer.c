@@ -175,6 +175,12 @@ static void timer_core_handler(void) {
             process_stall_dump_tick();
         }
 #endif
+#if PROCESS_MEMORY_REPORT
+        {
+            extern void process_memory_report_tick(void);
+            process_memory_report_tick();
+        }
+#endif
     }
 
     g_tick_count++;

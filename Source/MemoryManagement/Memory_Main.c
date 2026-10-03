@@ -31,6 +31,13 @@ extern char _kernel_end[];
 #define PAGE_BITMAP_CAPACITY_PAGES ((uint64_t)PAGE_BITMAP_STATIC_SIZE * 8ULL)
 static uint8_t g_page_bitmap_static[PAGE_BITMAP_STATIC_SIZE] __attribute__((aligned(8)));
 
+/* Instrumentation: report a frame that goes back on the free list twice.
+ * Off by default (one bitmap read per free); enable with
+ * EXTRA_KERNEL_CFLAGS=-DPMM_DOUBLE_FREE_CHECK=1 while hunting corruption. */
+#ifndef PMM_DOUBLE_FREE_CHECK
+#define PMM_DOUBLE_FREE_CHECK 0
+#endif
+
 enum {
     EFI_LOADER_CODE        = 1,
     EFI_LOADER_DATA        = 2,
@@ -823,6 +830,21 @@ void free_page(void *addr) {
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&page_lock);
     if (page_num < g_max_pages) {
+#if PMM_DOUBLE_FREE_CHECK
+        /* A frame that is already free going back on the free list a second
+         * time is not a no-op: the next two alloc_page() calls then hand the
+         * SAME frame to two different owners and whichever loses the race
+         * gets its data overwritten -- which reads as a random heap
+         * corruption in whichever process that was.  Catch it at the source
+         * rather than three subsystems later. */
+        if (page_bitmap_get(page_num) == 0u) {
+            serial_write_string("[pmm] double-free page=0x");
+            serial_write_uint64(page_num);
+            serial_write_string(" pid=0x");
+            serial_write_uint64((uint64_t)(uint32_t)current_pid_get());
+            serial_write_char('\n');
+        }
+#endif
         page_bitmap_set(page_num, 0u);
         if (page_num < (uint64_t)page_alloc_hint) page_alloc_hint = (uint32_t)page_num;
     }

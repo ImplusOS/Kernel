@@ -12,7 +12,6 @@
 #include "Drivers/Module/Display_Main.h"
 #include "Core/vfs/VFS.h"
 #include "Drivers/Module/NIC.h"
-#include "Drivers/Module/PS2_Input.h"
 #include "IPC/PnP_Notifications.h"
 
 #include <stddef.h>
@@ -237,13 +236,6 @@ const pci_driver_t *driver_manager_get_pci_driver(void)
     return (const pci_driver_t *)driver_manager_get_by_kind(DEVICE_TYPE_PCI);
 }
 
-const driver_input_t *driver_manager_get_ps2_driver(void)
-{
-    /* First driver registered as DEVICE_TYPE_INPUT, whichever module that
-     * is -- the kernel no longer hard-codes a module filename here. */
-    return (const driver_input_t *)driver_manager_get_by_kind(DEVICE_TYPE_INPUT);
-}
-
 const usb_master_vtable_t *driver_manager_get_usb_driver(void)
 {
     return (const usb_master_vtable_t *)driver_manager_get_by_kind(DEVICE_TYPE_USB);
@@ -449,79 +441,6 @@ bool driver_manager_display_set_monitor_mode(uint32_t monitor_index,
                                              uint32_t mode_index)
 {
     return display_manager_set_monitor_mode(monitor_index, mode_index);
-}
-
-bool driver_manager_input_ps2_init(void)
-{
-    input_manager_init();
-    return true;
-}
-
-void driver_manager_input_ps2_poll(void)
-{
-    input_manager_poll();
-}
-
-int32_t driver_manager_input_ps2_read_keyboard(driver_keyboard_event_t *out_event)
-{
-    return input_manager_read_keyboard(out_event);
-}
-
-int32_t driver_manager_input_ps2_read_mouse(driver_mouse_event_t *out_event)
-{
-    return input_manager_read_mouse(out_event);
-}
-
-void driver_manager_input_usb_init(void)
-{
-    input_manager_init();
-}
-
-bool driver_manager_input_usb_read_sectors(uint64_t lba, uint8_t *buffer, uint32_t sectors)
-{
-    return block_manager_read_sectors(lba, buffer, sectors);
-}
-
-bool driver_manager_input_usb_write_sectors(uint64_t lba, const uint8_t *buffer, uint32_t sectors)
-{
-    return block_manager_write_sectors(lba, buffer, sectors);
-}
-
-int32_t driver_manager_input_usb_read_keyboard(driver_keyboard_event_t *out_event)
-{
-    return input_manager_read_keyboard(out_event);
-}
-
-int32_t driver_manager_input_usb_read_mouse(driver_mouse_event_t *out_event)
-{
-    return input_manager_read_mouse(out_event);
-}
-
-void driver_manager_input_usb_poll(void)
-{
-    input_manager_poll();
-}
-
-void driver_manager_input_usb_drain_keyboard(driver_keyboard_event_t *tmp,
-                                             void (*forward)(driver_keyboard_event_t *))
-{
-    input_manager_drain_keyboard(tmp, forward);
-}
-
-void driver_manager_input_usb_drain_mouse(driver_mouse_event_t *tmp,
-                                          void (*forward)(driver_mouse_event_t *))
-{
-    input_manager_drain_mouse(tmp, forward);
-}
-
-void driver_manager_input_usb_schedule_poll(void)
-{
-    input_manager_schedule_poll();
-}
-
-bool driver_manager_input_usb_check_poll(void)
-{
-    return input_manager_check_poll();
 }
 
 bool driver_manager_nic_init(void)

@@ -26,3 +26,4 @@ bool display_manager_get_monitor_mode_info(uint32_t monitor_index,
 bool display_manager_set_monitor_mode(uint32_t monitor_index,
                                       uint32_t mode_index);
 void display_manager_on_device_detached(const char *name);
+const char *display_manager_get_active_driver_name(void);

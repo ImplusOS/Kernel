@@ -45,6 +45,25 @@ void block_manager_set_boot_identity(const BOOT_INFO *boot_info)
     g_initialized = false;
 }
 
+/*
+ * Returns true if the boot info indicates that the storage transport reported
+ * by the firmware (BootStorageTransport) may not match the actual media
+ * transport (e.g., UEFI reports an AHCI controller but the boot media was
+ * a USB drive behind that controller). In that case, the BootDriveType enum
+ * (which the first-stage loader sets from the boot device path) is the more
+ * reliable hint for the media transport.
+ *
+ * Current heuristic: BootDriveType == USB && BootStorageTransport != USB.
+ * TODO: A generic BOOT_STORAGE_FLAG_MEDIA_TRANSPORT_FALLBACK flag in
+ * boot_info.h would make this portable and allow the bootloader to express
+ * the intent directly (see Docs/Others/TODO_OS_Refactor.md).
+ */
+static bool boot_media_transport_fallback(void)
+{
+    return g_boot_info.BootDriveType == BOOT_DRIVE_TYPE_USB &&
+           g_boot_info.BootStorageTransport != BOOT_DRIVE_TYPE_USB;
+}
+
 static bool block_transport_matches_boot(const block_device_entry_t *entry)
 {
     driver_block_transport_t boot_transport =
@@ -54,13 +73,9 @@ static bool block_transport_matches_boot(const block_device_entry_t *entry)
         return true;
     }
 
-    /*
-     * Some UEFI implementations report the second-stage image through a
-     * controller-level path even though the first-stage loader booted from
-     * removable USB media. In that case prefer the explicit boot-drive hint
-     * and avoid pinning the kernel to the wrong storage transport.
-     */
-    if (g_boot_info.BootDriveType == BOOT_DRIVE_TYPE_USB &&
+    /* Media-transport fallback: firmware reported one transport but media
+     * was another (e.g., USB drive behind an AHCI controller). */
+    if (boot_media_transport_fallback() &&
         entry->info.transport == DRIVER_BLOCK_TRANSPORT_USB) {
         return true;
     }
@@ -74,11 +89,8 @@ static bool block_device_matches_boot(const block_device_entry_t *entry)
         return false;
     }
 
-    bool usb_boot_hint =
-        g_boot_info.BootDriveType == BOOT_DRIVE_TYPE_USB &&
-        entry->info.transport == DRIVER_BLOCK_TRANSPORT_USB &&
-        entry->info.transport !=
-            (driver_block_transport_t)g_boot_info.BootStorageTransport;
+    bool usb_boot_hint = boot_media_transport_fallback() &&
+                         entry->info.transport == DRIVER_BLOCK_TRANSPORT_USB;
 
     if (!block_transport_matches_boot(entry)) {
         return false;

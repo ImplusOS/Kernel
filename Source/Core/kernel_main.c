@@ -401,7 +401,7 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
         kernel_panic("Filesystem initialization failed and diskless boot not enabled", "kernel_main");
     }
 
-    serial_enable_file_logging("/Kernel.log");
+    serial_enable_file_logging("/tmp/Kernel.log");
     phase_ns = boot_profile_begin();
     bool display_ready = driver_manager_display_init();
     bool debug_display_ready = debugger_display_init();

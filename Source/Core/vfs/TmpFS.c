@@ -104,19 +104,22 @@ static uint32_t g_tmpfs_slots_used;
 static uint32_t g_tmpfs_slots_peak;
 static bool g_tmpfs_full_reported;
 
-static void tmpfs_note_claim_locked(void)
+/* These notification helpers only update state while g_tmpfs_lock is held.
+ * Never write the serial log here: serial file logging appends to
+ * /tmp/Kernel.log and therefore re-enters this same lock. */
+static bool tmpfs_note_claim_locked(uint32_t *peak_out)
 {
     ++g_tmpfs_slots_used;
     if (g_tmpfs_slots_used > g_tmpfs_slots_peak) {
         g_tmpfs_slots_peak = g_tmpfs_slots_used;
         if ((g_tmpfs_slots_peak % 32u) == 0u) {
-            serial_write_string("[tmpfs] slots in use reached ");
-            serial_write_uint32(g_tmpfs_slots_peak);
-            serial_write_string(" of ");
-            serial_write_uint32(TMPFS_MAX_FILES);
-            serial_write_string("\n");
+            if (peak_out != NULL) {
+                *peak_out = g_tmpfs_slots_peak;
+            }
+            return true;
         }
     }
+    return false;
 }
 
 static void tmpfs_note_release_locked(void)
@@ -126,12 +129,26 @@ static void tmpfs_note_release_locked(void)
     }
 }
 
-static void tmpfs_note_full_locked(const char *path)
+static bool tmpfs_note_full_locked(void)
 {
     if (g_tmpfs_full_reported) {
-        return;
+        return false;
     }
     g_tmpfs_full_reported = true;
+    return true;
+}
+
+static void tmpfs_log_slots_reached(uint32_t peak)
+{
+    serial_write_string("[tmpfs] slots in use reached ");
+    serial_write_uint32(peak);
+    serial_write_string(" of ");
+    serial_write_uint32(TMPFS_MAX_FILES);
+    serial_write_string("\n");
+}
+
+static void tmpfs_log_full(const char *path)
+{
     serial_write_string("[tmpfs] table full (");
     serial_write_uint32(TMPFS_MAX_FILES);
     serial_write_string(" slots) creating ");
@@ -167,6 +184,9 @@ static bool tmpfs_vfs_find_file(const char *path, vfs_file_t *out_file)
     out_file->driver_data = slot;
     return true;
 }
+
+/* Forward declaration for tmpfs_vfs_get_mode() */
+static bool tmpfs_is_dir_locked(const char *path);
 
 static bool tmpfs_ensure_capacity_locked(tmpfs_slot_t *slot, uint32_t required)
 {
@@ -341,6 +361,9 @@ static bool tmpfs_vfs_creat(const char *path)
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return false;
     }
+    bool report_peak = false;
+    uint32_t peak = 0u;
+    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) != NULL) {
         spinlock_unlock(&g_tmpfs_lock);
@@ -350,15 +373,21 @@ static bool tmpfs_vfs_creat(const char *path)
         if (!g_tmpfs_slots[i].in_use) {
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
-            tmpfs_note_claim_locked();
+            report_peak = tmpfs_note_claim_locked(&peak);
             g_tmpfs_slots[i].mode = TMPFS_MODE_FILE;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
             spinlock_unlock(&g_tmpfs_lock);
+            if (report_peak) {
+                tmpfs_log_slots_reached(peak);
+            }
             return true;
         }
     }
-    tmpfs_note_full_locked(path);
+    report_full = tmpfs_note_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
+    if (report_full) {
+        tmpfs_log_full(path);
+    }
     return false;
 }
 
@@ -373,6 +402,9 @@ static bool tmpfs_vfs_mkdir(const char *path)
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return false;
     }
+    bool report_peak = false;
+    uint32_t peak = 0u;
+    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) == NULL) {
         bool recorded = false;
@@ -382,7 +414,7 @@ static bool tmpfs_vfs_mkdir(const char *path)
             }
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
-            tmpfs_note_claim_locked();
+            report_peak = tmpfs_note_claim_locked(&peak);
             g_tmpfs_slots[i].is_dir = 1;
             g_tmpfs_slots[i].mode = TMPFS_MODE_DIR;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
@@ -390,10 +422,16 @@ static bool tmpfs_vfs_mkdir(const char *path)
             break;
         }
         if (!recorded) {
-            tmpfs_note_full_locked(path);
+            report_full = tmpfs_note_full_locked();
         }
     }
     spinlock_unlock(&g_tmpfs_lock);
+    if (report_peak) {
+        tmpfs_log_slots_reached(peak);
+    }
+    if (report_full) {
+        tmpfs_log_full(path);
+    }
     return true;
 }
 
@@ -420,7 +458,16 @@ static int32_t tmpfs_vfs_get_mode(const char *path)
     }
     spinlock_lock(&g_tmpfs_lock);
     tmpfs_slot_t *slot = tmpfs_find_locked(path);
-    int32_t mode = slot != NULL ? (int32_t)slot->mode : -1;
+    int32_t mode;
+    if (slot != NULL) {
+        mode = (int32_t)slot->mode;
+    } else if (tmpfs_is_dir_locked(path)) {
+        /* Implicit directory (parent of an existing file/dir, or mount prefix).
+         * Return a sensible default mode (0755 for directories). */
+        mode = 0x1EDu; /* 0755 */
+    } else {
+        mode = -1;
+    }
     spinlock_unlock(&g_tmpfs_lock);
     return mode;
 }
@@ -486,12 +533,17 @@ static bool tmpfs_is_dir_locked(const char *path)
 
 static bool g_tmpfs_dir_handles_full_reported = false;
 
-static void tmpfs_note_dir_handles_full_locked(const char *path)
+static bool tmpfs_note_dir_handles_full_locked(void)
 {
     if (g_tmpfs_dir_handles_full_reported) {
-        return;
+        return false;
     }
     g_tmpfs_dir_handles_full_reported = true;
+    return true;
+}
+
+static void tmpfs_log_dir_handles_full(const char *path)
+{
     serial_write_string("[tmpfs] all ");
     serial_write_uint32(TMPFS_DIR_HANDLE_MAX);
     serial_write_string(" directory handles in use, opendir failed for ");
@@ -504,6 +556,7 @@ static int32_t tmpfs_vfs_opendir(const char *path)
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return -1;
     }
+    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (!tmpfs_is_dir_locked(path)) {
         spinlock_unlock(&g_tmpfs_lock);
@@ -527,8 +580,11 @@ static int32_t tmpfs_vfs_opendir(const char *path)
     /* Out of handles. Worth a line: the caller above sees only "-1", and the
      * syscall layer turns that into ENOENT, so without this the symptom is an
      * existing directory that stat() says is not there. */
-    tmpfs_note_dir_handles_full_locked(path);
+    report_full = tmpfs_note_dir_handles_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
+    if (report_full) {
+        tmpfs_log_dir_handles_full(path);
+    }
     return -1;
 }
 
@@ -715,6 +771,9 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
     if (target_len == 0u || target_len >= TMPFS_PATH_MAX) {
         return false;
     }
+    bool report_peak = false;
+    uint32_t peak = 0u;
+    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(linkpath) != NULL) {
         spinlock_unlock(&g_tmpfs_lock); /* EEXIST -- symlink(2) never replaces */
@@ -731,17 +790,23 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
             return false;
         }
         g_tmpfs_slots[i].in_use = 1;
-        tmpfs_note_claim_locked();
+        report_peak = tmpfs_note_claim_locked(&peak);
         g_tmpfs_slots[i].is_symlink = 1;
         g_tmpfs_slots[i].mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
         strncpy(g_tmpfs_slots[i].path, linkpath, TMPFS_PATH_MAX - 1u);
         memcpy(g_tmpfs_slots[i].data, target, target_len);
         g_tmpfs_slots[i].size = (uint32_t)target_len;
         spinlock_unlock(&g_tmpfs_lock);
+        if (report_peak) {
+            tmpfs_log_slots_reached(peak);
+        }
         return true;
     }
-    tmpfs_note_full_locked(linkpath);
+    report_full = tmpfs_note_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
+    if (report_full) {
+        tmpfs_log_full(linkpath);
+    }
     return false;
 }
 
@@ -808,20 +873,6 @@ static const vfs_driver_t g_tmpfs_vfs_driver = {
     .share_map = tmpfs_share_mapping,
 };
 
-/* Directories that have to be there before anyone creates anything in them.
- * The mount roots themselves are handled by tmpfs_is_dir_locked(); these are
- * the deeper ones a program probes rather than creates -- Xorg picks its
- * compiled-keymap output directory with access("/var/lib/xkb", W_OK|X_OK) and
- * cannot run xkbcomp without one, which is a fatal "Failed to activate virtual
- * core keyboard". */
-static const char *const TMPFS_SEED_DIRS[] = {
-    "/tmp/.X11-unix",
-    "/var/lib",
-    "/var/lib/xkb",
-    "/var/tmp",
-    "/run/user",
-};
-
 void tmpfs_init(void)
 {
     spinlock_init(&g_tmpfs_lock);
@@ -829,10 +880,11 @@ void tmpfs_init(void)
     memset(g_tmpfs_dir_in_use, 0, sizeof(g_tmpfs_dir_in_use));
     memset(g_tmpfs_dir_cursor, 0, sizeof(g_tmpfs_dir_cursor));
     memset(g_tmpfs_dir_path, 0, sizeof(g_tmpfs_dir_path));
-    for (uint32_t i = 0;
-         i < sizeof(TMPFS_SEED_DIRS) / sizeof(TMPFS_SEED_DIRS[0]); ++i) {
-        (void)tmpfs_vfs_mkdir(TMPFS_SEED_DIRS[i]);
-    }
+    /* Directories are implicit in tmpfs: mkdir() succeeds even when the
+     * directory already exists, and access() on a non-existent path correctly
+     * returns ENOENT. Applications that need a specific directory should
+     * create it with mkdir(2); pre-seeding Xorg-specific paths (/tmp/.X11-unix,
+     * /var/lib/xkb) was a workaround and is no longer done. */
 }
 
 const vfs_driver_t *tmpfs_vfs_get_driver(void)

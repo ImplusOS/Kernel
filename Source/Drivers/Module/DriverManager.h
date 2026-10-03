@@ -7,7 +7,6 @@
 #include "DriverBinary.h"
 #include "Core/vfs/VFS.h"
 #include "Drivers/Module/PCI_Main.h"
-#include "SerialManager.h"
 
 typedef device_type_t driver_manager_kind_t;
 
@@ -32,9 +31,6 @@ const device_t *device_manager_find(device_type_t type,
                                    const char *module_name);
 
 const pci_driver_t *driver_manager_get_pci_driver(void);
-/* First driver registered as DEVICE_TYPE_INPUT (historically the PS/2
- * controller module, hence the name) -- no module filename is hard-coded. */
-const driver_input_t *driver_manager_get_ps2_driver(void);
 const usb_master_vtable_t *driver_manager_get_usb_driver(void);
 const driver_display_t *driver_manager_get_display_driver(const char *module_name);
 const driver_nic_t *driver_manager_get_nic_driver(void);
@@ -82,24 +78,6 @@ bool driver_manager_display_get_monitor_mode_info(uint32_t monitor_index,
                                                   display_mode_info_t *out_info);
 bool driver_manager_display_set_monitor_mode(uint32_t monitor_index,
                                              uint32_t mode_index);
-
-bool driver_manager_input_ps2_init(void);
-void driver_manager_input_ps2_poll(void);
-int32_t driver_manager_input_ps2_read_keyboard(driver_keyboard_event_t *out_event);
-int32_t driver_manager_input_ps2_read_mouse(driver_mouse_event_t *out_event);
-
-void driver_manager_input_usb_init(void);
-bool driver_manager_input_usb_read_sectors(uint64_t lba, uint8_t *buffer, uint32_t sectors);
-bool driver_manager_input_usb_write_sectors(uint64_t lba, const uint8_t *buffer, uint32_t sectors);
-int32_t driver_manager_input_usb_read_keyboard(driver_keyboard_event_t *out_event);
-int32_t driver_manager_input_usb_read_mouse(driver_mouse_event_t *out_event);
-void driver_manager_input_usb_poll(void);
-void driver_manager_input_usb_drain_keyboard(driver_keyboard_event_t *tmp,
-                                             void (*forward)(driver_keyboard_event_t *));
-void driver_manager_input_usb_drain_mouse(driver_mouse_event_t *tmp,
-                                          void (*forward)(driver_mouse_event_t *));
-void driver_manager_input_usb_schedule_poll(void);
-bool driver_manager_input_usb_check_poll(void);
 
 bool driver_manager_nic_init(void);
 bool driver_manager_nic_is_ready(void);

@@ -605,6 +605,13 @@ int vfs_driver_count_get(void) {
     return g_vfs_driver_count;
 }
 
+const vfs_driver_t *vfs_driver_get_by_index(int index) {
+    if (index < 0 || index >= g_vfs_driver_count) {
+        return NULL;
+    }
+    return &g_vfs_drivers[index];
+}
+
 void vfs_list_root(void) {
     if (g_default_fs && g_default_fs->list_root) {
         g_default_fs->list_root();

@@ -14,6 +14,18 @@ int32_t syscall_file_creat_ex(const char *path, uint64_t flags);
 /* fcntl(F_ADD_SEALS) / fcntl(F_GET_SEALS) on a memfd. */
 int32_t syscall_memfd_add_seals(int32_t fd, uint32_t seals);
 int32_t syscall_memfd_get_seals(int32_t fd);
+
+/* Install a driver-supplied vfs_file_t as a descriptor: syscall_file_open()
+ * without the lookup. Used for objects that have no path -- a PRIME dma-buf
+ * fd is one, and routing it through open() would mean inventing a /dev node
+ * that anybody could open and steal another process's buffer out of.
+ * The descriptor is RDWR and takes ownership of `file` (the caller must not
+ * use it again), and the driver's close_file hook runs exactly once -- when
+ * the last descriptor naming it goes away. Returns the fd, or a negative
+ * os_status_t when no slot was free (in which case the caller still owns
+ * `file`). */
+int32_t syscall_file_install_dev(const vfs_file_t *file);
+
 int64_t syscall_file_read(int32_t fd, uint8_t *buffer, uint64_t len);
 int64_t syscall_file_write(int32_t fd, const uint8_t *buffer, uint64_t len);
 int64_t syscall_file_seek(int32_t fd, int64_t offset, int32_t whence);

@@ -1,9 +1,10 @@
 #include "Core/sound/ALSA.h"
-#include "DevFS.h"
+#include "Core/vfs/DevFS.h"
 
 #include <string.h>
 
 #include "Core/process/ProcessManager.h"
+#include "Core/syscall/Syscall_File.h"
 #include "Core/timer/Timer.h"
 #include "Crypto/Crypto.h"
 #include "Debug/serial/Serial.h"
@@ -43,6 +44,11 @@ typedef enum {
     DEVFS_KIND_APPLOG,        /* /dev/applog    -> launch-log ring only */
     DEVFS_KIND_SND_CTL,       /* /dev/snd/controlC0 -> ALSA control (Core/sound) */
     DEVFS_KIND_SND_PCM,       /* /dev/snd/pcmC0D0p  -> ALSA playback */
+    /* A PRIME dma-buf descriptor. Not a node: there is no path to open, so
+     * DevFS builds the vfs_file_t itself and hands it to the fd layer. Like
+     * the pty kinds it is a per-open object, and the prime slot travels in
+     * driver_data's index field -- the whole identity of the descriptor. */
+    DEVFS_KIND_DRM_PRIME,
     DEVFS_KIND_COUNT
 } devfs_kind_t;
 
@@ -402,6 +408,8 @@ static bool devfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
             devfs_set_pty_index(file, DEVFS_KIND_SND_PCM, index);
             return true;
         }
+        case DEVFS_KIND_DRM_CARD:
+        case DEVFS_KIND_DRM_RENDER:
         default:
             return true;
     }
@@ -505,7 +513,13 @@ static bool devfs_vfs_truncate(vfs_file_t *file, uint32_t new_size)
 
 static uint32_t devfs_vfs_get_file_size(vfs_file_t *file)
 {
-    return file != NULL ? file->size : 0u;
+    if (file == NULL) return 0u;
+    /* A dma-buf's size comes from the prime block, not from anything a lookup
+     * recorded -- it never changes, but asking is one line and cannot drift. */
+    if (devfs_kind_of(file) == DEVFS_KIND_DRM_PRIME) {
+        return drm_prime_size(devfs_pty_index_of(file));
+    }
+    return file->size;
 }
 
 static bool devfs_vfs_creat(const char *path)
@@ -522,21 +536,69 @@ static bool devfs_vfs_mkdir(const char *path)
 
 typedef struct {
     uint8_t in_use;
+    /* 0 => this handle is "/dev" itself and keeps the original flat listing
+     * ("dri/card0", "null", ...); 1 => `dir` is a real subdirectory and only
+     * the entries directly under it are listed, by basename. */
+    uint8_t nested;
+    char dir[32];
     uint32_t cursor;
 } devfs_dir_handle_t;
 
 #define DEVFS_DIR_HANDLE_MAX 8
 static devfs_dir_handle_t g_devfs_dir_handles[DEVFS_DIR_HANDLE_MAX];
 
+/* Is `path` a directory DevFS can enumerate? "/dev" always; "/dev/<x>" only
+ * when at least one static entry lives directly under it (so "/dev/dri",
+ * "/dev/input" and "/dev/snd" answer but "/dev/does-not-exist" does not).
+ *
+ * Accepting only "/dev" used to be a hard failure for libdrm: drmGetDevices2()
+ * and drmGetDeviceFromDevId() both opendir(DRM_DIR_NAME) == opendir("/dev/dri")
+ * and walk every name in it, so the call returned -ENOENT, Mesa's EGLDevice
+ * list stayed empty, and glamor gave up with "failed to get compatible render
+ * device". stat("/dev/dri") goes through the same opendir, so fixing it here
+ * also gives the directory a mode. */
+static bool devfs_dir_prefix(const char *path, char *out, uint32_t cap)
+{
+    uint32_t len = (uint32_t)strlen(path);
+    while (len > 1u && path[len - 1u] == '/') {
+        --len;
+    }
+    if (len == 4u && strncmp(path, "/dev", 4) == 0) {
+        if (cap > 0u) {
+            out[0] = '\0';
+        }
+        return true;
+    }
+    if (len < 5u || strncmp(path, "/dev/", 5) != 0 || len >= cap) {
+        return false;
+    }
+    for (uint32_t i = 0; i < DEVFS_ENTRY_COUNT; ++i) {
+        const char *name = g_devfs_entries[i].name;
+        uint32_t nlen = (uint32_t)strlen(name);
+        /* Boundary matters: "/dev/d" must not claim "/dev/dri/card0". */
+        if (nlen > len && strncmp(name, path, len) == 0 && name[len] == '/') {
+            memcpy(out, path, len);
+            out[len] = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
 static int32_t devfs_vfs_opendir(const char *path)
 {
-    if (path == NULL || (strcmp(path, "/dev") != 0 && strcmp(path, "/dev/") != 0)) {
+    char dir[32];
+    if (path == NULL || !devfs_dir_prefix(path, dir, sizeof(dir))) {
         return -1;
     }
     for (int32_t i = 0; i < DEVFS_DIR_HANDLE_MAX; ++i) {
         if (!g_devfs_dir_handles[i].in_use) {
-            g_devfs_dir_handles[i].in_use = 1;
-            g_devfs_dir_handles[i].cursor = 0;
+            devfs_dir_handle_t *h = &g_devfs_dir_handles[i];
+            h->in_use = 1;
+            h->cursor = 0;
+            h->nested = (dir[0] != '\0') ? 1u : 0u;
+            strncpy(h->dir, dir, sizeof(h->dir) - 1u);
+            h->dir[sizeof(h->dir) - 1u] = '\0';
             return i;
         }
     }
@@ -549,18 +611,33 @@ static int32_t devfs_vfs_readdir(int32_t handle, vfs_dirent_t *out_entry)
         !g_devfs_dir_handles[handle].in_use || out_entry == NULL) {
         return -1;
     }
-    uint32_t cursor = g_devfs_dir_handles[handle].cursor;
-    if (cursor >= DEVFS_ENTRY_COUNT) {
-        return 0;
+    devfs_dir_handle_t *h = &g_devfs_dir_handles[handle];
+    uint32_t dir_len = h->nested ? (uint32_t)strlen(h->dir) : 0u;
+    while (h->cursor < DEVFS_ENTRY_COUNT) {
+        const devfs_entry_t *entry = &g_devfs_entries[h->cursor];
+        ++h->cursor;
+        const char *base_name;
+        if (h->nested) {
+            const char *name = entry->name;
+            uint32_t nlen = (uint32_t)strlen(name);
+            if (nlen <= dir_len + 1u || strncmp(name, h->dir, dir_len) != 0 ||
+                name[dir_len] != '/') {
+                continue;
+            }
+            base_name = name + dir_len + 1u;
+            if (strchr(base_name, '/') != NULL) {
+                continue; /* one level deeper than this directory */
+            }
+        } else {
+            base_name = entry->name + 5; /* skip "/dev/" */
+        }
+        strncpy(out_entry->name, base_name, sizeof(out_entry->name) - 1);
+        out_entry->name[sizeof(out_entry->name) - 1] = '\0';
+        out_entry->size = entry->size;
+        out_entry->is_directory = false;
+        return 1;
     }
-    const devfs_entry_t *entry = &g_devfs_entries[cursor];
-    const char *base_name = entry->name + 5; /* skip "/dev/" */
-    strncpy(out_entry->name, base_name, sizeof(out_entry->name) - 1);
-    out_entry->name[sizeof(out_entry->name) - 1] = '\0';
-    out_entry->size = entry->size;
-    out_entry->is_directory = false;
-    g_devfs_dir_handles[handle].cursor = cursor + 1u;
-    return 1;
+    return 0;
 }
 
 static int32_t devfs_vfs_closedir(int32_t handle)
@@ -576,8 +653,10 @@ static bool devfs_vfs_close_file(vfs_file_t *file)
 {
     if (file != NULL) {
         devfs_kind_t kind = devfs_kind_of(file);
-        if (kind == DEVFS_KIND_DRM_CARD || kind == DEVFS_KIND_DRM_RENDER) {
+        if (kind == DEVFS_KIND_DRM_CARD) {
             drm_kms_close();
+        } else if (kind == DEVFS_KIND_DRM_RENDER) {
+            drm_render_close();
         } else if (kind == DEVFS_KIND_PTMX) {
             pty_master_release(devfs_pty_index_of(file));
         } else if (kind == DEVFS_KIND_PTS) {
@@ -588,6 +667,11 @@ static bool devfs_vfs_close_file(vfs_file_t *file)
             alsa_ctl_close();
         } else if (kind == DEVFS_KIND_SND_PCM) {
             alsa_pcm_close(devfs_pty_index_of(file));
+        } else if (kind == DEVFS_KIND_DRM_PRIME) {
+            /* The last descriptor naming this dma-buf: drops its reference,
+             * which frees the pages if no GEM handle and no other descriptor
+             * still holds one. */
+            drm_prime_close(devfs_pty_index_of(file));
         }
     }
     return true;
@@ -608,8 +692,9 @@ static int64_t devfs_vfs_dev_ioctl(vfs_file_t *file, uint64_t request, uint64_t 
     devfs_kind_t kind = devfs_kind_of(file);
     switch (kind) {
         case DEVFS_KIND_DRM_CARD:
-        case DEVFS_KIND_DRM_RENDER:
             return drm_kms_ioctl(request, arg);
+        case DEVFS_KIND_DRM_RENDER:
+            return drm_render_ioctl(request, arg);
         case DEVFS_KIND_INPUT_EVENT0:
         case DEVFS_KIND_INPUT_EVENT1:
             return evdev_ioctl(devfs_evdev_fd(kind), request, arg);
@@ -621,6 +706,9 @@ static int64_t devfs_vfs_dev_ioctl(vfs_file_t *file, uint64_t request, uint64_t 
             return alsa_ctl_ioctl(request, arg);
         case DEVFS_KIND_SND_PCM:
             return alsa_pcm_ioctl(devfs_pty_index_of(file), request, arg);
+        case DEVFS_KIND_DRM_PRIME:
+            /* DMA_BUF_IOCTL_SYNC / DMA_BUF_SET_NAME only. */
+            return drm_prime_ioctl(devfs_pty_index_of(file), request, arg);
         default:
             return -25; /* ENOTTY */
     }
@@ -633,8 +721,9 @@ static int64_t devfs_vfs_dev_read(vfs_file_t *file, uint8_t *buffer,
     devfs_kind_t kind = devfs_kind_of(file);
     switch (kind) {
         case DEVFS_KIND_DRM_CARD:
-        case DEVFS_KIND_DRM_RENDER:
             return drm_kms_read(buffer, length, nonblock);
+        case DEVFS_KIND_DRM_RENDER:
+            return drm_render_read(buffer, length, nonblock);
         case DEVFS_KIND_INPUT_EVENT0:
         case DEVFS_KIND_INPUT_EVENT1: {
             /* evdev_read() writes its dest directly; `buffer` here is a user
@@ -684,6 +773,10 @@ static int64_t devfs_vfs_dev_read(vfs_file_t *file, uint8_t *buffer,
             }
             return (int64_t)done;
         }
+        case DEVFS_KIND_DRM_PRIME:
+            /* A dma-buf has no read(2); Linux answers EINVAL for the same
+             * reason -- no f_op->read. */
+            return -22;
         default:
             return -14;
     }
@@ -695,8 +788,15 @@ static uint32_t devfs_vfs_dev_poll(vfs_file_t *file, uint32_t events)
     devfs_kind_t kind = devfs_kind_of(file);
     switch (kind) {
         case DEVFS_KIND_DRM_CARD:
-        case DEVFS_KIND_DRM_RENDER:
             return drm_kms_poll(events);
+        case DEVFS_KIND_DRM_RENDER:
+            return drm_render_poll(events);
+        case DEVFS_KIND_DRM_PRIME:
+            /* No fences behind these buffers, so there is nothing that could
+             * ever make one not ready to write into. Claiming POLLOUT keeps a
+             * blocking poll() from waiting for a signal that cannot come;
+             * POLLIN stays unsignalled because the object is not readable. */
+            return (events & 0x4u);
         case DEVFS_KIND_INPUT_EVENT0:
         case DEVFS_KIND_INPUT_EVENT1:
             /* Only readable when the ring actually holds an event. Claiming
@@ -725,8 +825,15 @@ static int64_t devfs_vfs_dev_mmap(vfs_file_t *file, uint64_t offset,
 {
     if (file == NULL) return -25;
     devfs_kind_t kind = devfs_kind_of(file);
-    if (kind == DEVFS_KIND_DRM_CARD || kind == DEVFS_KIND_DRM_RENDER) {
+    if (kind == DEVFS_KIND_DRM_CARD) {
         return drm_kms_mmap(offset, length, prot, flags);
+    }
+    if (kind == DEVFS_KIND_DRM_RENDER) {
+        return drm_render_mmap(offset, length, prot, flags);
+    }
+    if (kind == DEVFS_KIND_DRM_PRIME) {
+        return drm_prime_mmap(devfs_pty_index_of(file), offset, length, prot,
+                              flags);
     }
     return -25;
 }
@@ -806,7 +913,95 @@ const vfs_driver_t *devfs_vfs_get_driver(void)
     return &g_devfs_vfs_driver;
 }
 
+/* ---- PRIME dma-buf descriptors ------------------------------------------
+ *
+ * There is no node to open: drmPrimeHandleToFD() invents the descriptor, so
+ * the file layer's open path -- vfs_find_file(), vfs_open_file(), the driver's
+ * own open switch -- has nothing to run on. Build the vfs_file_t here and let
+ * syscall_file_install_dev() do the fd half. From then on the descriptor is
+ * an ordinary FILE_USED_FILE and inherits last-owner close, dup(), fork(),
+ * SCM_RIGHTS, fstat() and process-exit cleanup for free; only the identity,
+ * and the four operations that depend on it, come back through this driver.
+ *
+ * Deliberately NOT a resolvable path. Handing out "/dev/dri/prime<N>" would
+ * mean anybody who guessed a number could open() another process's buffer --
+ * there is nothing but the slot standing between them and it.
+ *
+ * fs_driver is DevFS's own struct rather than the copy vfs_mount() installed.
+ * That only matters to code that compares driver addresses, and none of it
+ * ever sees a descriptor built this way; what has to match is the dev_* hook
+ * set, which is the same functions either way. */
+int32_t devfs_prime_fd(int32_t slot, uint32_t size)
+{
+    if (slot < 0) return -22;
+
+    vfs_file_t file;
+    memset(&file, 0, sizeof(file));
+    /* Distinct inode per slot so fstat() tells two exported buffers apart;
+     * the same slot exported twice correctly reports the same object. */
+    file.internal_id = 0xE0000000ull | (uint64_t)(uint32_t)slot;
+    file.size = size;
+    file.driver_data = devfs_pack(DEVFS_KIND_DRM_PRIME, slot);
+    file.fs_driver = devfs_vfs_get_driver();
+    return syscall_file_install_dev(&file);
+}
+
+/* Which dma-buf `file` names, or -1 when it is not one. */
+int32_t devfs_prime_slot(const vfs_file_t *file)
+{
+    if (file == NULL || devfs_kind_of(file) != DEVFS_KIND_DRM_PRIME) {
+        return -1;
+    }
+    return devfs_pty_index_of(file);
+}
+
 bool devfs_path_is_device(const char *path)
 {
     return devfs_lookup(path) != NULL || pty_index_from_path(path) >= 0;
+}
+
+/* The DRM major/minor numbers stat() has to report live in DevFS.h next to the
+ * nodes they name: SysFS formats the same values back into
+ * /sys/dev/char/<maj>:<min> and libdrm refuses to answer unless both sides
+ * line up. */
+static uint64_t devfs_linux_makedev(uint32_t major_num, uint32_t minor_num)
+{
+    /* glibc's makedev(): minor bits 0-7 and 12-31, major bits 8-19 and
+     * 32-63. Written out because the freestanding libc has no
+     * <sys/sysmacros.h>. card0 -> 0x00000000_0000E200,
+     * renderD128 -> 0x00000000_0000E280. */
+    return (uint64_t)(minor_num & 0xFFu) |
+           ((uint64_t)(major_num & 0xFFFu) << 8) |
+           ((uint64_t)(minor_num & ~0xFFu) << 12) |
+           ((uint64_t)(major_num & ~0xFFFu) << 32);
+}
+
+static uint64_t devfs_kind_rdev(devfs_kind_t kind)
+{
+    if (kind == DEVFS_KIND_DRM_CARD) {
+        return devfs_linux_makedev(DEVFS_DRM_MAJOR, DEVFS_DRM_CARD_MINOR);
+    }
+    if (kind == DEVFS_KIND_DRM_RENDER) {
+        return devfs_linux_makedev(DEVFS_DRM_MAJOR, DEVFS_DRM_RENDER_MINOR);
+    }
+    if (kind == DEVFS_KIND_INPUT_EVENT0) {
+        return devfs_linux_makedev(DEVFS_INPUT_MAJOR, DEVFS_INPUT_EVENT0_MINOR);
+    }
+    if (kind == DEVFS_KIND_INPUT_EVENT1) {
+        return devfs_linux_makedev(DEVFS_INPUT_MAJOR, DEVFS_INPUT_EVENT1_MINOR);
+    }
+    return 0x0105u; /* 1:5, the placeholder every other /dev node keeps */
+}
+
+uint64_t devfs_path_rdev(const char *path)
+{
+    const devfs_entry_t *entry = devfs_lookup(path);
+    return devfs_kind_rdev(entry != NULL ? entry->kind : DEVFS_KIND_NULL);
+}
+
+uint64_t devfs_file_rdev(const vfs_file_t *file)
+{
+    /* devfs_kind_of() answers DEVFS_KIND_COUNT for a NULL file, which falls
+     * through to the placeholder below. */
+    return devfs_kind_rdev(devfs_kind_of(file));
 }

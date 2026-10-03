@@ -5,6 +5,7 @@
 #include "TmpFS.h"
 #include "ProcFS.h"
 #include "EtcFS.h"
+#include "SysFS.h"
 #include "Core/drm/DRM_Kms.h"
 
 #include <stddef.h>
@@ -34,6 +35,10 @@ typedef struct {
 static const vfs_pseudo_fs_t g_vfs_pseudo_table[] = {
     { devfs_init,   NULL,       NULL                 },
     { drm_kms_init, NULL,       NULL                 },
+    /* sysfs_publish_drm_nodes() runs inside drm_kms_init() above -- it fills
+     * the table this driver serves -- so /sys only has to be mounted here,
+     * after both the init and the node set exist. */
+    { sysfs_init,   "/sys",     sysfs_vfs_get_driver },
     { NULL,         "/dev",     devfs_vfs_get_driver },
     { tmpfs_init,   "/dev/shm", tmpfs_vfs_get_driver },
     { NULL,         "/tmp",     tmpfs_vfs_get_driver },

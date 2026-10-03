@@ -7,6 +7,7 @@
 #include "Core/timer/Timer.h"
 #include "Poll_Wait.h"
 #include "IPC/UnixSocket.h"
+#include "Syscall_Socket.h"
 #include "interfaces/hal_cpu.h"
 #include "Debug/serial/Serial.h"
 
@@ -119,8 +120,7 @@
  * as a separate small constant here (rather than a shared header) the
  * same way Syscall_Socket.c already cross-references config.h in a
  * comment; there is no runtime dependency, just a documented invariant. */
-#define EPOLL_SOCKET_FD_BASE  512
-#define EPOLL_SOCKET_FD_COUNT 256
+#define EPOLL_SOCKET_FD_COUNT SOCKET_TABLE_SIZE
 #define EPOLL_EVENTFD_FD_BASE 0x5000
 
 #define LINUX_EFD_SEMAPHORE 1u
@@ -313,8 +313,8 @@ static int epoll_fd_is_addressable(int32_t fd)
     if (fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
         return 1;
     }
-    if (fd >= EPOLL_SOCKET_FD_BASE &&
-        fd < EPOLL_SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
+    if (fd >= SOCKET_FD_BASE &&
+        fd < SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
         return 1;
     }
     if (fd >= EPOLL_EVENTFD_FD_BASE &&
@@ -411,7 +411,7 @@ static uint32_t eventfd_poll_locked(int32_t fd, uint32_t requested)
 /* Dispatches a readiness check to whichever fd-table `fd` actually lives
  * in (regular/pipe/timerfd/memfd/signalfd, socket, or eventfd - these are
  * disjoint numeric ranges, see kernel/config.h's OS_CONFIG_FILE_MAX_FD
- * comment and Syscall_Socket.c's SOCKET_FD_BASE comment). */
+ * comment. */
 /* The fd's arrival counter, or 0 for a kind of fd that does not keep one.
  * An fd with no counter keeps the pre-existing level-transition behaviour:
  * its seq never changes, so it never forces an edge on its own. */
@@ -430,8 +430,8 @@ static uint32_t epoll_poll_fd(int32_t fd, uint32_t requested)
     if (unix_socket_fd_in_range(fd)) {
         return unix_socket_poll(fd, requested);
     }
-    if (fd >= EPOLL_SOCKET_FD_BASE &&
-        fd < EPOLL_SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
+    if (fd >= SOCKET_FD_BASE &&
+        fd < SOCKET_FD_BASE + EPOLL_SOCKET_FD_COUNT) {
         return syscall_socket_poll(fd, requested);
     }
     if (fd >= 0 && fd < (int32_t)OS_CONFIG_FILE_MAX_FD) {
