@@ -1206,6 +1206,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_FALLOCATE     285u
 #define LINUX_SYS_GETCWD        79u
 #define LINUX_SYS_CHDIR         80u
+#define LINUX_SYS_FCHDIR        81u
 #define LINUX_SYS_RENAME        82u
 #define LINUX_SYS_MKDIR         83u
 #define LINUX_SYS_RMDIR         84u
@@ -1300,6 +1301,8 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_SCHED_GETSCHEDULER    145u
 #define LINUX_SYS_SCHED_GET_PRIORITY_MAX 146u
 #define LINUX_SYS_SCHED_GET_PRIORITY_MIN 147u
+#define LINUX_SYS_SCHED_SETATTR 314u
+#define LINUX_SYS_SCHED_GETATTR 315u
 #define LINUX_SYS_MLOCK        149u
 #define LINUX_SYS_MUNLOCK      150u
 #define LINUX_SYS_MLOCKALL     151u
@@ -1383,10 +1386,11 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_MAP_PRIVATE      0x02u
 #define LINUX_MAP_FIXED        0x10u
 #define LINUX_MAP_ANONYMOUS    0x20u
-/* File mappings at or above this size are demand-paged (Core/memory/FileMap.c)
- * instead of read in up front. Set to catch shared-object images -- the ones
- * that made resident sets explode -- while leaving small mappings on the
- * long-proven eager path. */
+#define LINUX_MAP_32BIT        0x40u
+#define LINUX_MAP_FIXED_NOREPLACE 0x100000u
+#define LINUX_USER_MAP_LIMIT   USER_MMAP_LIMIT
+/* Keep all file mappings eager while isolating Wine's low-address MAP_FIXED
+ * behavior from the separate demand-paging path. */
 #define LINUX_MMAP_LAZY_MIN_BYTES (1024u * 1024u)
 
 #define LINUX_PROT_READ        0x1u
@@ -1843,43 +1847,81 @@ static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
 }
 #endif
 
-#ifndef PAGING_LOST_MAPPING_TRACE
-#define PAGING_LOST_MAPPING_TRACE 0
-#endif
-#if PAGING_LOST_MAPPING_TRACE
-/* Anything that touches the window the main executable is mapped into is
- * suspect while chasing pages of that image reverting to demand-zero. */
-static void lostmap_note(const char *what, uint64_t addr, uint64_t len,
-                         uint64_t extra)
-{
-    if (addr + len <= 0x4000000000ULL || addr >= 0x4080000000ULL) {
-        return;
-    }
-    static volatile uint32_t seen;
-    if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) >= 32u) {
-        return;
-    }
-    serial_write_string("[lostmap] ");
-    serial_write_string(what);
-    serial_write_string(" addr=");
-    serial_write_uint64(addr);
-    serial_write_string(" len=");
-    serial_write_uint64(len);
-    serial_write_string(" x=");
-    serial_write_uint64(extra);
-    serial_write_string("\n");
-}
-#endif
-
 static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                           uint64_t flags, uint64_t fd, uint64_t offset)
 {
-#if PAGING_LOST_MAPPING_TRACE
-    lostmap_note("mmap", addr, length, flags);
-#endif
     (void)prot;
     if (length == 0u) {
         return LINUX_EINVAL;
+    }
+    /* Honour MAP_FIXED_NOREPLACE without replacing an existing page-table
+     * entry. The address-space implementation has no VMA tree, so page tables
+     * are the source of truth for resident and inherited identity mappings. */
+    if ((flags & LINUX_MAP_FIXED_NOREPLACE) != 0u) {
+        if (addr == 0u || addr < 0x1000u ||
+            (addr & (PAGE_SIZE - 1u)) != 0u) {
+            return LINUX_EINVAL;
+        }
+#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
+        if (addr <= 0x7FFE0000ULL &&
+            length > 0x7FFE0000ULL - addr) {
+            serial_write_string("[wine-map] shared-page request addr=");
+            serial_write_uint64(addr);
+            serial_write_string(" len=");
+            serial_write_uint64(length);
+            serial_write_string(" flags=");
+            serial_write_uint64(flags);
+            serial_write_char('\n');
+        }
+#endif
+        if (addr >= LINUX_USER_MAP_LIMIT ||
+            length > LINUX_USER_MAP_LIMIT - addr) {
+            return LINUX_ENOMEM;
+        }
+        uint64_t cr3 = process_get_current_cr3();
+        if (cr3 == 0u) {
+            return LINUX_ENOMEM;
+        }
+        uint64_t end = addr + length;
+        uint64_t aligned_end =
+            (end + PAGE_SIZE - 1u) & ~(PAGE_SIZE - 1u);
+        if (aligned_end < end) {
+            return LINUX_ENOMEM;
+        }
+        for (uint64_t page = addr; page < aligned_end;
+             page += PAGE_SIZE) {
+            uint64_t pte = paging_debug_leaf_pte(cr3, page);
+            if (pte == 0u) {
+                continue;
+            }
+            uint64_t mapped_phys = pte & PAGE_FRAME_MASK;
+            if ((pte & PAGE_PS) != 0u) {
+                mapped_phys =
+                    (mapped_phys & ~(0x200000ULL - 1u)) |
+                    (page & (0x200000ULL - 1u));
+            }
+            int identity_mapping_available =
+                (pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT &&
+                mapped_phys == page &&
+                pmm_page_is_allocated(page) == 0;
+#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
+            if (page == 0x7FFE0000ULL) {
+                serial_write_string("[wine-map] shared-page precheck pte=");
+                serial_write_uint64(pte);
+                serial_write_string(" phys=");
+                serial_write_uint64(mapped_phys);
+                serial_write_string(" allocated=");
+                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(page));
+                serial_write_string(" available=");
+                serial_write_uint64((uint64_t)identity_mapping_available);
+                serial_write_char('\n');
+            }
+#endif
+            if (identity_mapping_available == 0) {
+                return LINUX_EEXIST;
+            }
+        }
+        flags |= LINUX_MAP_FIXED;
     }
     if ((flags & LINUX_MAP_ANONYMOUS) != 0u) {
         if ((flags & LINUX_MAP_FIXED) != 0u) {
@@ -1915,13 +1957,21 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 }
                 return (int64_t)addr;
             }
-            if (length > 0x4000000000ULL - addr) {
-                return LINUX_EINVAL;
+            if (addr >= LINUX_USER_MAP_LIMIT ||
+                length > LINUX_USER_MAP_LIMIT - addr) {
+                return LINUX_ENOMEM;
             }
             uint64_t cr3 = process_get_current_cr3();
-            if (cr3 == 0u ||
+            int map_result = (cr3 == 0u) ? -1 :
                 paging_map_user_range_alloc(cr3, addr, length,
-                                            PAGE_RW | PAGE_USER) < 0) {
+                                            PAGE_RW | PAGE_USER);
+            if (map_result < 0) {
+#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
+                if (addr <= 0x7FFE0000ULL &&
+                    length > 0x7FFE0000ULL - addr) {
+                    serial_write_string("[wine-map] shared-page map failed\n");
+                }
+#endif
                 return LINUX_ENOMEM;
             }
             return (int64_t)addr;
@@ -2060,7 +2110,8 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             void *reserved;
             if ((flags & LINUX_MAP_FIXED) != 0u) {
                 if (addr == 0u || addr < 0x1000u ||
-                    length > 0x4000000000ULL - addr) {
+                    addr >= LINUX_USER_MAP_LIMIT ||
+                    length > LINUX_USER_MAP_LIMIT - addr) {
                     syscall_file_mmap_release(handle);
                     return LINUX_EINVAL;
                 }
@@ -2096,8 +2147,12 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     void *mapped;
     if ((flags & LINUX_MAP_FIXED) != 0u) {
-        if (addr == 0u || addr < 0x1000u || length > 0x4000000000ULL - addr) {
+        if (addr == 0u || addr < 0x1000u) {
             return LINUX_EINVAL;
+        }
+        if (addr >= LINUX_USER_MAP_LIMIT ||
+            length > LINUX_USER_MAP_LIMIT - addr) {
+            return LINUX_ENOMEM;
         }
         uint64_t cr3 = process_get_current_cr3();
         if (cr3 == 0u ||
@@ -6416,6 +6471,7 @@ static int lx_fd_pre(uint64_t num, uint64_t *a, int64_t *res, int32_t *cloexec)
         case LINUX_SYS_LSEEK: case LINUX_SYS_IOCTL: case LINUX_SYS_READV:
         case LINUX_SYS_WRITEV: case LINUX_SYS_FTRUNCATE:
         case LINUX_SYS_FALLOCATE: case LINUX_SYS_FSTATFS:
+        case LINUX_SYS_FCHDIR:
         case LINUX_SYS_GETDENTS64: case LINUX_SYS_EPOLL_WAIT:
         case LINUX_SYS_EPOLL_PWAIT: case LINUX_SYS_EPOLL_PWAIT2:
         case LINUX_SYS_TIMERFD_SETTIME: case LINUX_SYS_TIMERFD_GETTIME:
@@ -6830,16 +6886,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_MPROTECT:
-#if PAGING_LOST_MAPPING_TRACE
-            lostmap_note("mprotect", arg1, arg2, arg3);
-#endif
             result = syscall_vm_mprotect(arg1, arg2, arg3);
             break;
 
         case LINUX_SYS_MUNMAP: {
-#if PAGING_LOST_MAPPING_TRACE
-            lostmap_note("munmap", arg1, arg2, 0);
-#endif
             int32_t self = process_get_current_pid();
             if (self >= 0 && arg2 != 0u) {
                 /* Flush + drop any MAP_SHARED file mapping in this range. */
@@ -7158,6 +7208,17 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_CHDIR:
             result = linux_chdir(arg1);
             break;
+
+        case LINUX_SYS_FCHDIR: {
+            char dir[256];
+            int32_t fd = (int32_t)arg1;
+            if (syscall_file_get_dir_path(fd, dir, sizeof(dir)) != 0) {
+                result = LINUX_EBADF;
+            } else {
+                result = (int64_t)process_set_current_cwd(dir);
+            }
+            break;
+        }
 
         case LINUX_SYS_RENAME: {
             char old_path[256];
@@ -8205,6 +8266,84 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_SCHED_GET_PRIORITY_MIN:
             result = (arg1 == 1u || arg1 == 2u) ? 1 : 0;
             break;
+
+        case LINUX_SYS_SCHED_SETATTR: {
+            /* sched_attr is intentionally handled as a small compatibility
+             * surface. Wine uses this probe to select a normal or realtime
+             * worker policy; the rest of the Linux fields have no meaning in
+             * ImplusOS's round-robin scheduler. */
+            struct linux_sched_attr {
+                uint32_t size;
+                uint32_t policy;
+                uint64_t flags;
+                int32_t nice;
+                uint32_t priority;
+                uint64_t runtime;
+                uint64_t deadline;
+                uint64_t period;
+            } attr;
+            if (arg2 == 0u || arg3 != 0u ||
+                copy_from_user(&attr, (const void *)(uintptr_t)arg2,
+                               sizeof(attr)) != 0u ||
+                attr.size < sizeof(attr)) {
+                result = LINUX_EINVAL;
+                break;
+            }
+            int32_t tid = (int32_t)arg1 == 0 ? process_get_current_tid()
+                                             : process_pid_from_current_view((int32_t)arg1);
+            uint32_t policy = attr.policy & ~0x40000000u;
+            if (policy > 6u || policy == 4u ||
+                ((policy == 1u || policy == 2u) &&
+                 (attr.priority < 1u || attr.priority > 99u))) {
+                result = LINUX_EINVAL;
+                break;
+            }
+            uint8_t mapped = (policy == 1u || policy == 2u)
+                                 ? (uint8_t)policy : 0u;
+            result = process_set_rt_policy(tid, mapped,
+                                           mapped != 0u
+                                               ? (uint8_t)attr.priority : 0u) < 0
+                         ? LINUX_ESRCH : 0;
+            break;
+        }
+
+        case LINUX_SYS_SCHED_GETATTR: {
+            struct linux_sched_attr {
+                uint32_t size;
+                uint32_t policy;
+                uint64_t flags;
+                int32_t nice;
+                uint32_t priority;
+                uint64_t runtime;
+                uint64_t deadline;
+                uint64_t period;
+            } attr;
+            if (arg2 == 0u || arg3 != 0u ||
+                copy_from_user(&attr, (const void *)(uintptr_t)arg2,
+                               sizeof(uint32_t)) != 0u ||
+                attr.size < sizeof(uint32_t)) {
+                result = LINUX_EINVAL;
+                break;
+            }
+            uint32_t user_size = attr.size;
+            memset(&attr, 0, sizeof(attr));
+            attr.size = sizeof(attr);
+            int32_t tid = (int32_t)arg1 == 0 ? process_get_current_tid()
+                                             : process_pid_from_current_view((int32_t)arg1);
+            uint8_t policy = 0u;
+            uint8_t priority = 0u;
+            if (process_get_rt_policy(tid, &policy, &priority) < 0) {
+                result = LINUX_ESRCH;
+                break;
+            }
+            attr.policy = policy;
+            attr.priority = priority;
+            uint32_t copy_size = user_size < (uint32_t)sizeof(attr)
+                                     ? user_size : (uint32_t)sizeof(attr);
+            result = copy_to_user((void *)(uintptr_t)arg2, &attr, copy_size) != 0u
+                         ? LINUX_EFAULT : 0;
+            break;
+        }
 
         case LINUX_SYS_CAPGET:
             result = linux_capget(arg1, arg2);

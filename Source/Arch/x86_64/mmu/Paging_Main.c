@@ -1808,17 +1808,27 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
 
         uint64_t *pt = (uint64_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
         uint64_t old_pte = pt[pt_index];
+        if ((old_pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT) {
+            continue;
+        }
         if ((old_pte & PAGE_SWAP) != 0 && (old_pte & PAGE_PRESENT) == 0) {
             uint32_t slot = (uint32_t)((old_pte & PAGE_FRAME_MASK) >> 12);
             swap_free_slot(slot);
         } else if ((old_pte & PAGE_PRESENT) != 0 && (old_pte & PAGE_USER) != 0) {
+            uint64_t old_phys = old_pte & PAGE_FRAME_MASK;
             if ((old_pte & PAGE_EXTERNAL) == 0) {
                 deferred->frames[deferred->count++] =
-                    (void *)(uintptr_t)(old_pte & PAGE_FRAME_MASK);
+                    (void *)(uintptr_t)old_phys;
             }
         }
         swap_forget_track(cr3, addr);
-        pt[pt_index] = 0;
+        if (addr < 0x4000000000ULL &&
+            (old_pte & PAGE_PRESENT) != 0 &&
+            (old_pte & PAGE_FRAME_MASK) == (addr & PAGE_MASK)) {
+            pt[pt_index] = (addr & PAGE_FRAME_MASK) | PAGE_PRESENT | PAGE_RW;
+        } else {
+            pt[pt_index] = 0;
+        }
 
         int any_present = 0;
         for (uint64_t i = 0; i < 512; ++i) {
@@ -2087,6 +2097,39 @@ static int paging_map_user_page_locked(uint64_t cr3,
     }
 
     uint64_t old_pte = pt[i1];
+    /* A low identity page may only become user-accessible when that exact
+     * physical frame is the newly allocated backing page. This keeps the
+     * process's kernel identity pointers mapped to the same frame. */
+    if ((old_pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT) {
+        uint64_t old_phys = old_pte & PAGE_FRAME_MASK;
+        int can_map_identity_frame =
+            cr3 != kernel_cr3 && space != NULL &&
+            virt_addr < 0x4000000000ULL &&
+            old_phys == (virt_addr & PAGE_MASK) &&
+            (phys_addr & PAGE_FRAME_MASK) == old_phys &&
+            pmm_page_is_allocated(old_phys) == 1;
+        if (can_map_identity_frame == 0) {
+#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
+            static volatile uint32_t identity_failures;
+            if (__atomic_fetch_add(&identity_failures, 1u,
+                                   __ATOMIC_RELAXED) < 32u) {
+                serial_write_string("[wine-map] identity-map rejected va=");
+                serial_write_uint64(virt_addr);
+                serial_write_string(" old=");
+                serial_write_uint64(old_phys);
+                serial_write_string(" new=");
+                serial_write_uint64(phys_addr & PAGE_FRAME_MASK);
+                serial_write_string(" allocated=");
+                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(old_phys));
+                serial_write_char('\n');
+            }
+#endif
+            if (saved_cr3 != kernel_cr3) {
+                write_cr3(saved_cr3);
+            }
+            return -1;
+        }
+    }
     /* Replacing a live translation, not filling a hole: every other CPU may
      * still hold the old one, and the frame under it is freed just below and
      * handed straight back to the allocator. A thread on another CPU then
@@ -2248,7 +2291,27 @@ int paging_map_user_range_alloc(uint64_t cr3,
     if (aligned_end < end) return -1;
 
     for (uint64_t addr = aligned_start; addr < aligned_end; addr += PAGE_SIZE_BYTES) {
-        void *phys_page = alloc_page();
+        void *phys_page = NULL;
+        if (addr < 0x4000000000ULL) {
+            uint64_t pte = paging_debug_leaf_pte(cr3, addr);
+            if ((pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT) {
+                uint64_t identity_phys = pte & PAGE_FRAME_MASK;
+                if ((pte & PAGE_PS) != 0u) {
+                    identity_phys =
+                        (identity_phys & ~(MB2 - 1ULL)) |
+                        (addr & (MB2 - 1ULL));
+                }
+                if (identity_phys == (addr & PAGE_MASK)) {
+                    if (pmm_reserve_free_page(identity_phys) < 0) {
+                        return -1;
+                    }
+                    phys_page = (void *)(uintptr_t)identity_phys;
+                }
+            }
+        }
+        if (phys_page == NULL) {
+            phys_page = alloc_page();
+        }
         if (phys_page == NULL) {
             return -1;
         }

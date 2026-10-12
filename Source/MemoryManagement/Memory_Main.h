@@ -47,6 +47,9 @@ uint64_t memory_free_pages(void);
  * outside the managed range. Diagnostic: a live page table whose frame reads
  * back as free was freed while still linked into an address space. */
 int pmm_page_is_allocated(uint64_t phys);
+/* Atomically claim a free physical page, for example when using a low
+ * identity-mapped frame as the backing page of a fixed user mapping. */
+int pmm_reserve_free_page(uint64_t phys);
 /* RAM amount (E820 usable sum -- see get_physical_address_pages() for the
  * distinction: on QEMU the two differ by the size of the PCI hole). */
 uint64_t get_total_memory_pages(void);

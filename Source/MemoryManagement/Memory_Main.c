@@ -136,6 +136,29 @@ int pmm_page_is_allocated(uint64_t phys)
     return page_bitmap_get(page_index) ? 1 : 0;
 }
 
+int pmm_reserve_free_page(uint64_t phys)
+{
+    if (g_page_bitmap == NULL) {
+        return -1;
+    }
+    uint64_t page_index = phys / PAGE_SIZE;
+    if (page_index >= g_max_pages) {
+        return -1;
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&page_lock);
+    if (page_bitmap_get(page_index) != 0u) {
+        spinlock_unlock(&page_lock);
+        irq_restore(irq_flags);
+        return -1;
+    }
+    page_bitmap_set(page_index, 1u);
+    spinlock_unlock(&page_lock);
+    irq_restore(irq_flags);
+    return 0;
+}
+
 /* Physical pages currently free. */
 uint64_t memory_free_pages(void)
 {
