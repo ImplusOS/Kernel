@@ -111,8 +111,15 @@
  * un-notified readiness sources (timerfd, signalfd - see
  * TODO_Performance_LinuxApps.md §8) add at most 4 ms of latency. This is
  * well within one 60 Hz frame (16.6 ms) and brings the worst-case
- * key-to-pixel path for un-notified sources down from ~16 ms to ~4 ms. */
+ * key-to-pixel path for un-notified sources down from ~16 ms to ~4 ms.
+ *
+ * It is the *base* slice: poll_wait_idle_slice() stretches a thread that
+ * keeps waking up with nothing ready up to EPOLL_POLL_SLICE_MAX_MS (and the
+ * wait path caps that at the nearest armed timerfd deadline, so stretching
+ * cannot delay a timer). Everything that can notify still cuts the park
+ * short on the spot; only the pure-idle rescan rate changes. */
 #define EPOLL_POLL_SLICE_MS 4u
+#define EPOLL_POLL_SLICE_MAX_MS 32u
 
 
 
@@ -178,6 +185,10 @@ static int               g_epoll_initialized = 0;
 
 extern uint32_t syscall_file_poll(int32_t fd, uint32_t events);
 extern uint32_t syscall_socket_poll(int32_t fd, uint32_t events);
+/* Declared in Syscall_File.h; spelled out here the same way the two above
+ * are, since this file deliberately carries its own externs (see the note at
+ * the top of the file about the fd tables' numeric ranges). */
+extern bool syscall_timerfd_deadline_ms(int32_t fd, uint64_t *deadline_ms_out);
 
 static void epoll_ensure_init(void)
 {
@@ -459,10 +470,19 @@ uint32_t syscall_poll_one_fd(int32_t fd, uint32_t events)
 
 /* One non-blocking readiness pass over every fd registered on `epfd`.
  * Returns the number of ready entries written to `events` (capped at
- * maxevents), or <0 on error. */
+ * maxevents), or <0 on error.
+ *
+ * When `timerfd_deadline_out` is not NULL it receives the earliest armed
+ * timerfd deadline among the registered fds, or 0 when there is none. The
+ * caller needs it to cap its park: a timerfd goes ready on the clock, not on
+ * a poll_wait_notify(), so a long idle sleep must end at that deadline. */
 static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
-                                int32_t maxevents)
+                                int32_t maxevents,
+                                uint64_t *timerfd_deadline_out)
 {
+    if (timerfd_deadline_out != NULL) {
+        *timerfd_deadline_out = 0u;
+    }
     spinlock_lock(&g_epoll_lock);
     epoll_instance_t *inst = epoll_lookup(epfd);
     if (!inst) {
@@ -479,6 +499,7 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
     spinlock_unlock(&g_epoll_lock);
 
     int32_t n = 0;
+    uint64_t nearest_timerfd = 0u;
     /* Collected edge-trigger state updates, applied under the lock afterwards
      * (epoll_poll_fd() must not run while g_epoll_lock is held). */
     int      et_fd[EPOLL_MAX_ENTRIES];
@@ -487,6 +508,13 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
     uint32_t et_n = 0;
 
     for (uint32_t i = 0; i < count && n < maxevents; ++i) {
+        if (timerfd_deadline_out != NULL) {
+            uint64_t deadline = 0u;
+            if (syscall_timerfd_deadline_ms(snapshot[i].fd, &deadline) &&
+                (nearest_timerfd == 0u || deadline < nearest_timerfd)) {
+                nearest_timerfd = deadline;
+            }
+        }
         uint32_t requested = snapshot[i].events & (EPOLLIN | EPOLLOUT);
         if (requested == 0u) {
             requested = EPOLLIN | EPOLLOUT; /* Always watch for errors/hup. */
@@ -536,6 +564,9 @@ static int32_t epoll_check_once(int32_t epfd, epoll_event_t *events,
         }
         spinlock_unlock(&g_epoll_lock);
     }
+    if (timerfd_deadline_out != NULL) {
+        *timerfd_deadline_out = nearest_timerfd;
+    }
     return n;
 }
 
@@ -562,17 +593,41 @@ int32_t syscall_epoll_wait_ex(int32_t epfd, epoll_event_t *events,
      * is not lost -- see Poll_Wait.h. */
     uint64_t generation = poll_wait_generation();
 
-    int32_t n = epoll_check_once(epfd, events, maxevents);
+    uint64_t timerfd_deadline = 0u;
+    int32_t n = epoll_check_once(epfd, events, maxevents, &timerfd_deadline);
     if (n != 0) {
+        if (n > 0) {
+            /* Work to do: this thread is not idle, so its next park goes back
+             * to the base slice. */
+            poll_wait_idle_reset();
+        }
         return n; /* Ready (n>0) or an error (n<0): return immediately. */
     }
     if (timeout_ms == 0) {
         return 0; /* Pure poll: caller asked to never block. */
     }
 
-    uint32_t slice_ms = EPOLL_POLL_SLICE_MS;
+    /* Stretches (4 -> 32 ms) while consecutive waits expire with nothing
+     * ready; anything that becomes ready still ends the park immediately
+     * through poll_wait_notify(). */
+    uint32_t slice_ms = poll_wait_idle_slice(EPOLL_POLL_SLICE_MS,
+                                             EPOLL_POLL_SLICE_MAX_MS);
     if (timeout_ms > 0 && (uint32_t)timeout_ms < slice_ms) {
         slice_ms = (uint32_t)timeout_ms;
+    }
+    /* An armed timerfd in this set fires on the clock alone - nothing calls
+     * poll_wait_notify() for it - so the park must not run past its
+     * deadline. (One that is already due was reported ready by the scan
+     * above.) Clamp to 1 ms so a deadline that passes between the scan and
+     * here cannot turn into a zero-length park + rescan spin. */
+    if (timerfd_deadline != 0u) {
+        uint64_t now_ms = timer_monotonic_ns() / 1000000ULL;
+        if (timerfd_deadline > now_ms) {
+            uint64_t wait_ms = timerfd_deadline - now_ms;
+            if (wait_ms < (uint64_t)slice_ms) {
+                slice_ms = wait_ms < 1u ? 1u : (uint32_t)wait_ms;
+            }
+        }
     }
     if (poll_wait_park(generation, slice_ms) != 0) {
         *should_switch_out = 1;

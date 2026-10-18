@@ -138,14 +138,68 @@ static void block_provider_add(const driver_storage_t *storage,
     ++g_provider_count;
 }
 
+/* Which transport the boot medium came from, when the boot info says. Its
+ * provider is probed first, and the rest are deferred until something lists
+ * the disks: probing every transport up front makes each boot pay every
+ * absent controller's failed probe, and on a USB boot that is seconds of AHCI
+ * link-up timeouts before the stick the kernel actually booted from is even
+ * looked at. */
+static driver_block_transport_t g_preferred_transport;
+static bool g_have_preferred_transport;
+
+/* Providers deferred by block_manager_init() once a boot device was found;
+ * indices into g_providers[] (stable for the life of the boot). */
+static uint32_t g_deferred_providers[BLOCK_MANAGER_MAX_PROVIDERS];
+static uint32_t g_deferred_count;
+static bool g_deferred_done;
+
+static void block_preferred_transport_from_boot(void)
+{
+    g_have_preferred_transport = false;
+
+    if (!g_have_boot_identity) {
+        return;
+    }
+
+    /* BootDriveType is the media transport (the loader's hint); fall back to
+     * the controller transport when the loader did not say. Both use the same
+     * encoding. An unknown preference only costs ordering, never correctness:
+     * the probe loop still checks every device against the boot identity. */
+    driver_block_transport_t transport =
+        (driver_block_transport_t)g_boot_info.BootDriveType;
+    if (transport == DRIVER_BLOCK_TRANSPORT_UNKNOWN) {
+        transport = (driver_block_transport_t)g_boot_info.BootStorageTransport;
+    }
+    if (transport != DRIVER_BLOCK_TRANSPORT_UNKNOWN) {
+        g_preferred_transport = transport;
+        g_have_preferred_transport = true;
+    }
+}
+
+static uint32_t block_provider_rank(const block_provider_t *provider)
+{
+    if (!g_have_preferred_transport) {
+        return 0u;
+    }
+    return provider->storage->transport == g_preferred_transport ? 0u : 1u;
+}
+
 static void block_provider_sort(void)
 {
     for (uint32_t i = 1u; i < g_provider_count; ++i) {
         block_provider_t key = g_providers[i];
+        uint32_t key_rank = block_provider_rank(&key);
         uint32_t j = i;
-        while (j > 0u &&
-               g_providers[j - 1u].storage->priority >
-                   key.storage->priority) {
+        while (j > 0u) {
+            uint32_t prev_rank = block_provider_rank(&g_providers[j - 1u]);
+            if (prev_rank < key_rank) {
+                break;
+            }
+            if (prev_rank == key_rank &&
+                g_providers[j - 1u].storage->priority <=
+                    key.storage->priority) {
+                break;
+            }
             g_providers[j] = g_providers[j - 1u];
             --j;
         }
@@ -162,6 +216,8 @@ bool block_manager_init(void)
     g_provider_count = 0u;
     g_device_count = 0u;
     g_selected = 0u;
+    g_deferred_count = 0u;
+    g_deferred_done = false;
     spinlock_init(&g_block_lock);
 
     for (uint32_t i = 0u;; ++i) {
@@ -181,6 +237,7 @@ bool block_manager_init(void)
         block_provider_add(&vtable->storage, usb->name);
     }
 
+    block_preferred_transport_from_boot();
     block_provider_sort();
     for (uint32_t p = 0u; p < g_provider_count; ++p) {
         const driver_storage_t *storage = g_providers[p].storage;
@@ -191,6 +248,7 @@ bool block_manager_init(void)
             continue;
         }
         uint32_t count = storage->get_device_count();
+        uint32_t first_new = g_device_count;
         for (uint32_t d = 0u;
              d < count && g_device_count < BLOCK_MANAGER_MAX_DEVICES; ++d) {
             block_device_entry_t *entry = &g_devices[g_device_count];
@@ -206,6 +264,24 @@ bool block_manager_init(void)
             entry->local_index = d;
             ++g_device_count;
         }
+
+        /* Stop at the first provider that supplied the boot device. The rest
+         * are the machine's other transports, and nothing on the boot path
+         * needs them; block_manager_scan_deferred() probes them later, when
+         * something actually lists the disks. */
+        bool boot_found = false;
+        for (uint32_t i = first_new; i < g_device_count; ++i) {
+            if (block_device_matches_boot(&g_devices[i])) {
+                boot_found = true;
+                break;
+            }
+        }
+        if (boot_found) {
+            for (uint32_t rest = p + 1u; rest < g_provider_count; ++rest) {
+                g_deferred_providers[g_deferred_count++] = rest;
+            }
+            break;
+        }
     }
     for (uint32_t i = 0u; i < g_device_count; ++i) {
         if (block_device_matches_boot(&g_devices[i])) {
@@ -218,6 +294,58 @@ bool block_manager_init(void)
     }
     g_initialized = true;
     return g_device_count != 0u;
+}
+
+/*
+ * Probe the providers block_manager_init() deferred after it found the boot
+ * device, appending whatever they find. disk_scan_devices() calls this so the
+ * full disk list still shows every transport (a machine booted from USB can
+ * still see its internal NVMe/AHCI disks), while the boot path pays only for
+ * the transport it booted from. Idempotent; existing device indices never
+ * change.
+ */
+void block_manager_scan_deferred(void)
+{
+    if (!g_initialized || g_deferred_done || g_deferred_count == 0u) {
+        return;
+    }
+    /* Claim the scan before probing: a provider's init() may take seconds and
+     * must not run twice if two callers ask at once. */
+    g_deferred_done = true;
+
+    for (uint32_t d = 0u; d < g_deferred_count; ++d) {
+        const block_provider_t *provider =
+            &g_providers[g_deferred_providers[d]];
+        const driver_storage_t *storage = provider->storage;
+
+        if (storage->init != NULL && !storage->init()) {
+            continue;
+        }
+        if (storage->is_ready != NULL && !storage->is_ready()) {
+            continue;
+        }
+
+        uint32_t count = storage->get_device_count();
+        for (uint32_t i = 0u; i < count; ++i) {
+            driver_block_info_t info;
+            if (!storage->get_info(i, &info) ||
+                info.logical_block_size == 0u || info.block_count == 0u) {
+                continue;
+            }
+            spinlock_lock(&g_block_lock);
+            if (g_device_count < BLOCK_MANAGER_MAX_DEVICES) {
+                block_device_entry_t *entry = &g_devices[g_device_count];
+                memset(entry, 0, sizeof(*entry));
+                entry->info = info;
+                entry->info.flags &= ~DRIVER_BLOCK_FLAG_BOOT;
+                entry->storage = storage;
+                entry->module_name = provider->module_name;
+                entry->local_index = i;
+                ++g_device_count;
+            }
+            spinlock_unlock(&g_block_lock);
+        }
+    }
 }
 
 static bool block_manager_ensure_init(void)

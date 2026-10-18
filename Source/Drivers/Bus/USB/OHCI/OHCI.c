@@ -46,24 +46,9 @@ void ohci_init(void) {
     g_ready = false;
     g_regs = NULL;
 
-    uint8_t bus=0, dev=0, fn=0; bool found=false;
-    for (uint16_t b=0; b<256 && !found; b++) {
-        for (uint8_t d=0; d<32 && !found; d++) {
-            for (uint8_t f=0; f<8 && !found; f++) {
-                uint32_t id = g_api->pci_read_config((uint8_t)b,d,f,0x00);
-                if ((id & 0xFFFF)==0xFFFF) { if (f==0) break; continue; }
-                uint32_t cls = g_api->pci_read_config((uint8_t)b,d,f,0x08);
-                if (((cls>>24)&0xFF)==0x0C && ((cls>>16)&0xFF)==0x03 && ((cls>>8)&0xFF)==0x10) {
-                    bus=(uint8_t)b; dev=d; fn=f; found=true; break;
-                }
-                if (f==0) {
-                    uint32_t hdr=g_api->pci_read_config((uint8_t)b,d,f,0x0C);
-                    if (((hdr>>16)&0x80)==0) break;
-                }
-            }
-        }
-    }
-    if (!found) {
+    uint8_t bus = 0, dev = 0, fn = 0;
+    if (!driver_pci_find_class(g_api, 0x0Cu, 0x03u, 0x10u,
+                               &bus, &dev, &fn)) {
         return;
     }
 
@@ -191,7 +176,12 @@ static void ed_fill(ohci_ed_t *ed, uint8_t addr, uint8_t ep, uint16_t mps, uint3
     ed->next = 0;
 }
 
-static bool ohci_control_xfer(uint8_t addr, uint8_t ep, uint16_t mps, struct usb_device_request *req, void *data) {
+static bool ohci_control_xfer(uint8_t addr, uint8_t ep, uint16_t mps,
+                             struct usb_device_request *req, void *data,
+                             uint32_t timeout_ms) {
+    if (timeout_ms == 0u) {
+        timeout_ms = 5000u;
+    }
     bool dir_in = (req->bmRequestType & 0x80)!=0;
     uint16_t wlen = req->wLength;
 
@@ -235,7 +225,7 @@ static bool ohci_control_xfer(uint8_t addr, uint8_t ep, uint16_t mps, struct usb
     mmio_write(OHCI_REG_CTRL_HEAD, (uint32_t)g_ed_phys);
     mmio_write(OHCI_REG_CMD_STATUS, (1u<<1));
 
-    bool ok = wait_td_done(td_status, 5000);
+    bool ok = wait_td_done(td_status, timeout_ms);
     g_ed_ctrl->headp = 0;
     g_ed_ctrl->tailp = 0;
     return ok;
@@ -270,9 +260,17 @@ static bool ohci_bulk_xfer(uint8_t addr, uint8_t ep, uint16_t mps, uint8_t pid, 
 
 bool ohci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                          struct usb_device_request *req, void *data) {
+    return ohci_submit_control_timeout(addr, endpoint, max_packet_size, req, data,
+                                       0u);
+}
+
+bool ohci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms) {
     if (!g_ready) return false;
     uint16_t mps = (addr == 0) ? 8 : max_packet_size;
-    return ohci_control_xfer(addr, endpoint, mps, req, data);
+    return ohci_control_xfer(addr, endpoint, mps, req, data, timeout_ms);
 }
 
 bool ohci_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,

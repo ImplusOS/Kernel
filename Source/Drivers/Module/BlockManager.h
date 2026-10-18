@@ -8,6 +8,7 @@
 
 bool block_manager_init(void);
 void block_manager_set_boot_identity(const BOOT_INFO *boot_info);
+void block_manager_scan_deferred(void);
 uint32_t block_manager_get_device_count(void);
 bool block_manager_select_device(uint32_t index);
 uint32_t block_manager_selected_device(void);

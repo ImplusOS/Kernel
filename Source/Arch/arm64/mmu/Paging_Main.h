@@ -18,6 +18,7 @@
 
 void init_paging(void);
 void *map_mmio_virt(uint64_t phys_addr);
+void *map_mmio_wc_virt(uint64_t phys_addr);
 uint64_t paging_get_kernel_cr3(void);
 uint64_t paging_get_active_cr3(void);
 void paging_switch_cr3(uint64_t address_space);

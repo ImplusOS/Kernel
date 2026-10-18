@@ -88,6 +88,52 @@ typedef struct {
  * not harmless: it reinitialises whatever is plugged in. */
 #define USB_ROOT_PORT_ENUM_RETRIES 3u
 
+/* Ceilings for the bring-up sweep, all of them wall-clock. A port that is
+ * connected (a charger, a dock's idle downstream port, a device that answers
+ * nothing) used to be retried until its controller's own timeout expired --
+ * 30 s per control transfer on xHCI, 5 s on EHCI/UHCI/OHCI -- for up to eight
+ * descriptor attempts, five retries each for the configuration and the
+ * SET_CONFIGURATION, and three sweeps: minutes of boot time for hardware that
+ * was never going to answer. Every one of those waits is now bounded, and
+ * whatever the sweep does not reach is picked up after boot by the hotplug
+ * poll (and by usb_storage_init()'s own re-sweep, which runs before disk
+ * bring-up). A device that answers at all -- the normal case -- is unaffected:
+ * it completes its enumeration in well under these ceilings. */
+#define USB_ENUM_CTRL_TIMEOUT_MS   500u
+#define USB_ENUM_DESCRIPTOR_MS     400u
+#define USB_BOOT_ENUM_BUDGET_MS   2500u
+
+/* Milliseconds since boot, or 0 when the driver vtable has no clock (the
+ * sweep then falls back to its fixed retry counts). */
+static uint32_t usb_now_ms(void)
+{
+    if (g_api == NULL) {
+        return 0u;
+    }
+    if (g_api->timer.monotonic_ns != NULL) {
+        return (uint32_t)(g_api->timer.monotonic_ns() / 1000000u);
+    }
+    if (g_api->timer_hz != NULL && g_api->timer_ticks != NULL) {
+        uint32_t hz = g_api->timer_hz();
+        if (hz == 0u) {
+            return 0u;
+        }
+        return (uint32_t)((g_api->timer_ticks() * 1000u) / (uint64_t)hz);
+    }
+    return 0u;
+}
+
+/* True once `start_ms` (0 = clock unavailable, and then never) is this many
+ * milliseconds in the past. Wrapping subtraction, so a tick wrap is a
+ * non-event. */
+static bool usb_deadline_passed(uint32_t start_ms, uint32_t budget_ms)
+{
+    if (start_ms == 0u || budget_ms == 0u) {
+        return false;
+    }
+    return (uint32_t)(usb_now_ms() - start_ms) >= budget_ms;
+}
+
 static usb_root_port_state_t g_root_ports[USB_HC_TABLE_SIZE][USB_MAX_TRACKED_ROOT_PORTS];
 
 typedef struct {
@@ -113,6 +159,36 @@ static void usb_log_hex16(uint16_t value)
     }
     for (int shift = 12; shift >= 0; shift -= 4) {
         g_api->serial_write_char(digits[(value >> shift) & 0xFu]);
+    }
+}
+
+static void usb_log_string(const char *str)
+{
+    if (g_api == NULL || g_api->serial_write_string == NULL) {
+        return;
+    }
+    g_api->serial_write_string(str);
+}
+
+static void usb_log_u32(uint32_t value)
+{
+    char buf[10];
+    int pos = 0;
+
+    if (value == 0u) {
+        usb_log_string("0");
+        return;
+    }
+    while (value > 0u && pos < (int)sizeof(buf)) {
+        buf[pos++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+    while (pos > 0) {
+        if (g_api != NULL && g_api->serial_write_char != NULL) {
+            g_api->serial_write_char(buf[--pos]);
+        } else {
+            --pos;
+        }
     }
 }
 
@@ -154,10 +230,30 @@ static void usb_wait_ms(usb_hc_type_t hc, uint32_t ms)
     else                   xhci_delay_ms(ms);
 }
 
+/* xHCI tells us the port reset finished (and what state the device settled
+ * into) before it returns, so the "give the device time to answer" delays
+ * that the legacy controllers need can be much shorter here. The descriptor
+ * and configuration paths already retry with backoff when a device really is
+ * slow, so a too-short settle costs one retry, not a failed device. */
+static uint32_t usb_settle_ms(usb_hc_type_t hc, uint32_t xhci_ms, uint32_t legacy_ms)
+{
+    return hc == USB_HC_XHCI ? xhci_ms : legacy_ms;
+}
+
 bool usb_submit_control(uint8_t addr,
                         uint8_t bmRequestType, uint8_t bRequest,
                         uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                         void *data)
+{
+    return usb_submit_control_timeout(addr, bmRequestType, bRequest,
+                                      wValue, wIndex, wLength, data, 0u);
+}
+
+bool usb_submit_control_timeout(uint8_t addr,
+                                uint8_t bmRequestType, uint8_t bRequest,
+                                uint16_t wValue, uint16_t wIndex,
+                                uint16_t wLength, void *data,
+                                uint32_t timeout_ms)
 {
     usb_device_request_t req;
     req.bmRequestType = bmRequestType;
@@ -170,8 +266,8 @@ bool usb_submit_control(uint8_t addr,
     if (hc == USB_HC_NONE) hc = usb_get_hc_type();
     uint16_t mps = (addr == 0) ? ((hc == USB_HC_EHCI || hc == USB_HC_XHCI) ? 64 : 8) : g_dev_ep0_mps[addr];
     if (mps == 0) mps = 8;
-    
-    return usb_control_transfer(addr, 0, mps, &req, data);
+
+    return usb_control_transfer_timeout(addr, 0, mps, &req, data, timeout_ms);
 }
 
 #define USB_DESC_HUB 0x29
@@ -224,7 +320,8 @@ static bool usb_get_configuration_value(uint8_t addr,
     req.wIndex        = 0;
     req.wLength       = 1;
     uint8_t value = 0;
-    if (!usb_control_transfer(addr, 0, max_packet_size, &req, &value)) {
+    if (!usb_control_transfer_timeout(addr, 0, max_packet_size, &req, &value,
+                                      USB_ENUM_CTRL_TIMEOUT_MS)) {
         return false;
     }
     *out_config = value;
@@ -239,7 +336,8 @@ static bool usb_hub_get_descriptor(uint8_t addr, uint16_t max_packet_size, usb_h
     req.wValue        = (USB_DESC_HUB << 8) | 0;
     req.wIndex        = 0;
     req.wLength       = sizeof(usb_hub_descriptor_t);
-    return usb_control_transfer(addr, 0, max_packet_size, &req, hub_desc);
+    return usb_control_transfer_timeout(addr, 0, max_packet_size, &req, hub_desc,
+                                        USB_ENUM_CTRL_TIMEOUT_MS);
 }
 
 static bool usb_hub_get_port_status(uint8_t addr, uint8_t port, uint16_t max_packet_size,
@@ -252,7 +350,8 @@ static bool usb_hub_get_port_status(uint8_t addr, uint8_t port, uint16_t max_pac
     req.wValue        = 0;
     req.wIndex        = port;
     req.wLength       = sizeof(buffer);
-    if (!usb_control_transfer(addr, 0, max_packet_size, &req, buffer)) {
+    if (!usb_control_transfer_timeout(addr, 0, max_packet_size, &req, buffer,
+                                      USB_ENUM_CTRL_TIMEOUT_MS)) {
         return false;
     }
     
@@ -268,7 +367,8 @@ static bool usb_hub_set_port_feature(uint8_t addr, uint8_t port, uint16_t featur
     req.wValue        = feature;
     req.wIndex        = port;
     req.wLength       = 0;
-    return usb_control_transfer(addr, 0, max_packet_size, &req, NULL);
+    return usb_control_transfer_timeout(addr, 0, max_packet_size, &req, NULL,
+                                        USB_ENUM_CTRL_TIMEOUT_MS);
 }
 
 static bool usb_hub_clear_port_feature(uint8_t addr, uint8_t port, uint16_t feature, uint16_t max_packet_size)
@@ -279,7 +379,8 @@ static bool usb_hub_clear_port_feature(uint8_t addr, uint8_t port, uint16_t feat
     req.wValue        = feature;
     req.wIndex        = port;
     req.wLength       = 0;
-    return usb_control_transfer(addr, 0, max_packet_size, &req, NULL);
+    return usb_control_transfer_timeout(addr, 0, max_packet_size, &req, NULL,
+                                        USB_ENUM_CTRL_TIMEOUT_MS);
 }
 
 static bool usb_hub_power_on_port(uint8_t addr, uint8_t port, uint16_t max_packet_size)
@@ -334,10 +435,20 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
 {
     usb_device_descriptor_t desc = {0};
     bool desc_ok = false;
+    uint32_t desc_start_ms = usb_now_ms();
 
     for (int retry_count = 8; retry_count-- > 0;) {
         if (usb_get_device_descriptor(current_addr, &desc)) {
             desc_ok = true;
+            break;
+        }
+        /* The retries exist for a device that has just been addressed and is
+         * still settling. A device that answers nothing gets the same
+         * treatment as one that answers wrong -- quickly (the transfer
+         * itself is capped at USB_ENUM_CTRL_TIMEOUT_MS) and then the port is
+         * left to the post-boot sweeps, instead of eight full timeout waits
+         * per sweep. */
+        if (usb_deadline_passed(desc_start_ms, USB_ENUM_DESCRIPTOR_MS)) {
             break;
         }
         usb_wait_ms(port_hc, 50);
@@ -391,18 +502,19 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
 
     /* Every vendor-specific (class 0xFF) interface, reported generically to
      * BusRegistry via g_api->bus.report_device() below instead of being
-     * dispatched to a specific driver by name/VID here -- see AX900.c
-     * (Kernel/Drivers/Wi-Fi/AX900/) for the driver-side half of this
-     * contract.
+     * dispatched to a specific driver by name/VID here -- the driver-side
+     * half of this contract is a driver_module_descriptor_t carrying
+     * bus_matches[] + probe() (Kernel/Drivers/Wi-Fi/AIC8800/ and
+     * Kernel/Drivers/Module/DriverBinary.h document it).
      *
      * Every one of them, not just the last: this used to keep a single
      * interface, and -- worse -- did not clear the endpoints already
      * collected for the one it replaced, so a device with two
      * vendor-specific interfaces was reported with the second interface's
-     * number and whatever endpoints the first had left behind. The AX900's
-     * AIC8800D80 is exactly that shape (Wi-Fi and Bluetooth on separate
-     * vendor-specific interfaces), so the interface the driver wanted was
-     * either never offered or offered with the wrong pipes.
+     * number and whatever endpoints the first had left behind. The
+     * AIC8800D80 (Wi-Fi and Bluetooth on separate vendor-specific
+     * interfaces) is exactly that shape, so the interface the Wi-Fi driver
+     * wanted was either never offered or offered with the wrong pipes.
      *
      * Only bAlternateSetting 0 of each interface number is kept: a repeated
      * interface number is an alternate setting, and nothing here selects one
@@ -416,13 +528,16 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
         uint8_t  ep_out;
         uint16_t ep_in_mps;
         uint16_t ep_out_mps;
+        uint8_t  ep_out_data;
+        uint16_t ep_out_data_mps;
     } vendor_ifaces[4];
     uint32_t vendor_iface_count = 0u;
 
     uint16_t total_len = 0u;
     for (uint32_t retry = 0u; retry < 5u; ++retry) {
             req.wLength = 9;
-            if (usb_control_transfer(current_addr, 0, max_packet_size, &req, conf_buf)) {
+            if (usb_control_transfer_timeout(current_addr, 0, max_packet_size, &req,
+                                             conf_buf, USB_ENUM_CTRL_TIMEOUT_MS)) {
                 total_len = usb_le16(&conf_buf[2]);
                 if (total_len >= 9u) {
                     config_header_ok = true;
@@ -439,7 +554,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
 
         for (uint32_t retry = 0u; retry < 5u; ++retry) {
             req.wLength = total_len;
-            if (usb_control_transfer(current_addr, 0, max_packet_size, &req, conf_buf)) {
+            if (usb_control_transfer_timeout(current_addr, 0, max_packet_size, &req,
+                                             conf_buf, USB_ENUM_CTRL_TIMEOUT_MS)) {
                 config_full_ok = true;
                 break;
             }
@@ -501,6 +617,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                         slot->ep_out = 0u;
                         slot->ep_in_mps = 0u;
                         slot->ep_out_mps = 0u;
+                        slot->ep_out_data = 0u;
+                        slot->ep_out_data_mps = 0u;
                     }
                 }
             } else if (type == USB_DESC_ENDPOINT && len >= 7 && current_iface != 0xFF) {
@@ -531,6 +649,14 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                             vendor_ifaces[v].ep_in = ep_addr & 0x7Fu;
                             vendor_ifaces[v].ep_in_mps = mps;
                         } else {
+                            /* The first bulk OUT is the data pipe on
+                             * AIC8800D80; the last one is its command pipe.
+                             * Keep both.  Single-OUT devices naturally use
+                             * the same endpoint for both roles. */
+                            if (vendor_ifaces[v].ep_out_data == 0u) {
+                                vendor_ifaces[v].ep_out_data = ep_addr & 0x7Fu;
+                                vendor_ifaces[v].ep_out_data_mps = mps;
+                            }
                             vendor_ifaces[v].ep_out = ep_addr & 0x7Fu;
                             vendor_ifaces[v].ep_out_mps = mps;
                         }
@@ -554,7 +680,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     req.wLength       = 0;
     bool configured = false;
     for (uint32_t retry = 0u; retry < 5u; ++retry) {
-        if (usb_control_transfer(current_addr, 0, max_packet_size, &req, NULL)) {
+        if (usb_control_transfer_timeout(current_addr, 0, max_packet_size, &req, NULL,
+                                         USB_ENUM_CTRL_TIMEOUT_MS)) {
             configured = true;
             break;
         }
@@ -571,7 +698,9 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     if (mass_bot_scsi && mass_iface != 0xFF &&
         mass_ep_in != 0 && mass_ep_out != 0) {
         bot_add_device(current_addr, mass_iface, mass_ep_in, mass_ep_out, mass_ep_in_mps, mass_ep_out_mps);
-        usb_wait_ms(port_hc, configured ? 150u : 300u);
+        usb_wait_ms(port_hc, usb_settle_ms(port_hc,
+                                           configured ? 50u : 150u,
+                                           configured ? 150u : 300u));
     }
 
     /* One line per enumerated device. Without it a device no driver claims
@@ -605,8 +734,12 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
             usb_ctx.ep_out = vi->ep_out;
             usb_ctx.ep_in_mps = vi->ep_in_mps;
             usb_ctx.ep_out_mps = vi->ep_out_mps;
+            usb_ctx.ep_out_data = vi->ep_out_data;
+            usb_ctx.ep_out_data_mps = vi->ep_out_data_mps;
             usb_ctx.submit_bulk = usb_submit_bulk;
             usb_ctx.submit_bulk_timeout = usb_submit_bulk_timeout;
+            usb_ctx.submit_interrupt_in_async = usb_submit_interrupt_in_async;
+            usb_ctx.check_interrupt_event = usb_check_interrupt_event;
 
             bus_device_t bus_dev;
             bus_dev.bus_type = DEVICE_TYPE_USB;
@@ -632,7 +765,7 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     }
 
     if (configured) {
-        usb_wait_ms(port_hc, 100u);
+        usb_wait_ms(port_hc, usb_settle_ms(port_hc, 20u, 100u));
 
         if (kbd_iface != 0xFF && kbd_ep_in != 0) {
             g_hid_kbd_addr = current_addr;
@@ -1088,6 +1221,40 @@ static void usb_record_root_device(usb_root_port_state_t *state,
     }
 }
 
+/* Wait until at least one controller port reports a connected device, or
+ * `timeout_ms` elapses. Devices attached at power-on are visible as soon as
+ * the controller is initialised, so this normally returns in one poll
+ * interval, unlike the unconditional settle it replaces. Hardware that really
+ * is slow to connect still gets the whole timeout, polled. */
+static bool usb_wait_any_port_connected(uint32_t timeout_ms)
+{
+    static const usb_hc_type_t hcs[] = { USB_HC_XHCI, USB_HC_EHCI,
+                                         USB_HC_OHCI, USB_HC_UHCI };
+    uint32_t waited = 0u;
+
+    for (;;) {
+        for (uint32_t h = 0u; h < sizeof(hcs) / sizeof(hcs[0]); ++h) {
+            uint32_t ports = usb_hc_port_count(hcs[h]);
+            if (ports > USB_MAX_TRACKED_ROOT_PORTS) {
+                ports = USB_MAX_TRACKED_ROOT_PORTS;
+            }
+            for (uint32_t p = 0u; p < ports; ++p) {
+                if (usb_hc_port_valid(hcs[h], p) &&
+                    usb_hc_port_connected(hcs[h], p)) {
+                    return true;
+                }
+            }
+        }
+        if (waited >= timeout_ms) {
+            return false;
+        }
+        uint32_t step = (timeout_ms - waited) > 10u ? 10u
+                                                    : (timeout_ms - waited);
+        usb_wait_ms(USB_HC_XHCI, step);
+        waited += step;
+    }
+}
+
 static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
 {
     usb_root_port_state_t *state = usb_root_port_state(hc, port);
@@ -1103,7 +1270,7 @@ static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
         return false;
     }
 
-    usb_wait_ms(hc, 50);
+    usb_wait_ms(hc, usb_settle_ms(hc, 20u, 50u));
     if (!usb_hc_port_connected(hc, port)) {
         return false;
     }
@@ -1121,7 +1288,7 @@ static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
         return false;
     }
 
-    usb_wait_ms(hc, 50);
+    usb_wait_ms(hc, usb_settle_ms(hc, 10u, 50u));
     g_dev_hc[current_addr] = hc;
     g_dev_root_port[current_addr] = (uint8_t)(port + 1u);
     g_dev_route_string[current_addr] = 0u;
@@ -1141,8 +1308,24 @@ static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
 
 static bool usb_enumerate_root_port(usb_hc_type_t hc, uint32_t port)
 {
+    uint32_t start_ms = usb_now_ms();
     bool ok = usb_enumerate_root_port_once(hc, port);
     usb_root_port_state_t *state = usb_root_port_state(hc, port);
+
+    /* A port that answers normally is done in tens of milliseconds. Anything
+     * slower is either a settling device (fine) or a port that will never
+     * answer (the interesting case -- this line is what tells a "boot takes a
+     * minute" report which port and which controller the minute went to). */
+    if (usb_deadline_passed(start_ms, 150u)) {
+        usb_log_string(ok ? "[USB] slow port hc=" : "[USB] dead port hc=");
+        usb_log_u32((uint32_t)hc);
+        usb_log_string(" p=");
+        usb_log_u32(port);
+        usb_log_string(" ");
+        usb_log_u32((uint32_t)(usb_now_ms() - start_ms));
+        usb_log_string("ms\n");
+    }
+
     if (!ok && state != NULL && state->enum_failures < 0xFFu &&
         usb_hc_port_valid(hc, port) && usb_hc_port_connected(hc, port)) {
         ++state->enum_failures;
@@ -1154,7 +1337,12 @@ extern bool xhci_is_ready(void);
 
 void usb_core_init(void)
 {
-    usb_wait_ms(g_hc_type, 500);
+    /* Devices attached at power-on are already visible when the controller
+     * comes up; only wait longer when none is (a device that is slow to
+     * connect, or a hub chain). The old unconditional 500 ms was paid on
+     * every boot -- and, via usb_storage_init()'s retry, twice on a failed
+     * probe. */
+    (void)usb_wait_any_port_connected(500u);
 
     /* usb_storage_init() calls this again when it finds no storage, to give
      * slow devices another chance. Only the first call may start from a clean
@@ -1203,8 +1391,22 @@ void usb_core_init(void)
 rescan:;
     usb_hc_type_t hc_types[] = { USB_HC_XHCI, USB_HC_EHCI, USB_HC_OHCI, USB_HC_UHCI };
 
+    /* The whole sweep is on a wall-clock budget. Ports the budget does not
+     * reach are picked up by usb_poll_hotplug() (which retries a connected
+     * port USB_ROOT_PORT_ENUM_RETRIES times) and by usb_storage_init()'s own
+     * re-sweep, both of which run where a retry costs wall time nobody is
+     * waiting on. */
+    uint32_t sweep_start_ms = usb_now_ms();
+    uint32_t ports_tried = 0u;
+    uint32_t ports_failed = 0u;
+    bool budget_stopped = false;
+
     for (int pass = 0; pass < 3; pass++) {
         if (pass > 0) {
+            if (usb_deadline_passed(sweep_start_ms, USB_BOOT_ENUM_BUDGET_MS)) {
+                budget_stopped = true;
+                break;
+            }
             usb_wait_ms(g_hc_type, 150);
         }
 
@@ -1222,9 +1424,19 @@ rescan:;
             for (uint32_t i = 0; i < num_ports; i++) {
                 usb_root_port_state_t *state = usb_root_port_state(cur_hc, i);
                 if (state != NULL && state->connected) continue;
-                (void)usb_enumerate_root_port(cur_hc, i);
+                if (usb_deadline_passed(sweep_start_ms, USB_BOOT_ENUM_BUDGET_MS)) {
+                    budget_stopped = true;
+                    break;
+                }
+                ++ports_tried;
+                if (!usb_enumerate_root_port(cur_hc, i)) {
+                    ++ports_failed;
+                }
             }
+            if (budget_stopped) break;
         }
+
+        if (budget_stopped) break;
 
         if (g_usb_hub_count != 0u) {
             usb_rescan_known_hubs(&g_usb_next_addr);
@@ -1232,6 +1444,18 @@ rescan:;
 
         if (bot_get_device_count() != 0) break;
     }
+
+    /* One line per sweep. This is the number a boot-time complaint about
+     * input_init needs: whether the time is here, how many ports had to be
+     * tried, and whether the budget cut the sweep short (which is the only
+     * case where a device can be missing until the post-boot poll). */
+    usb_log_string("[USB] sweep tried=");
+    usb_log_u32(ports_tried);
+    usb_log_string(" failed=");
+    usb_log_u32(ports_failed);
+    usb_log_string(" ");
+    usb_log_u32((uint32_t)(usb_now_ms() - sweep_start_ms));
+    usb_log_string(budget_stopped ? "ms budget-stop\n" : "ms done\n");
 }
 
 static bool usb_poll_hc_hotplug(usb_hc_type_t hc)
@@ -1299,16 +1523,28 @@ static bool usb_poll_hotplug(void)
 
 bool usb_control_transfer(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                           usb_device_request_t *req, void *data_buffer) {
+    return usb_control_transfer_timeout(addr, endpoint, max_packet_size, req,
+                                        data_buffer, 0u);
+}
+
+bool usb_control_transfer_timeout(uint8_t addr, uint8_t endpoint,
+                                  uint16_t max_packet_size,
+                                  usb_device_request_t *req, void *data_buffer,
+                                  uint32_t timeout_ms) {
     usb_hc_type_t hc = (addr == 0) ? g_default_hc : g_dev_hc[addr];
     if (hc == USB_HC_NONE) hc = g_hc_type;
     if (hc == USB_HC_OHCI)
-        return ohci_submit_control(addr, endpoint, max_packet_size, req, data_buffer);
+        return ohci_submit_control_timeout(addr, endpoint, max_packet_size, req,
+                                           data_buffer, timeout_ms);
     else if (hc == USB_HC_UHCI)
-        return uhci_submit_control(addr, endpoint, max_packet_size, req, data_buffer);
+        return uhci_submit_control_timeout(addr, endpoint, max_packet_size, req,
+                                           data_buffer, timeout_ms);
     else if (hc == USB_HC_EHCI)
-        return ehci_submit_control(addr, endpoint, max_packet_size, req, data_buffer);
+        return ehci_submit_control_timeout(addr, endpoint, max_packet_size, req,
+                                           data_buffer, timeout_ms);
     else if (hc == USB_HC_XHCI)
-        return xhci_submit_control(addr, endpoint, max_packet_size, req, data_buffer);
+        return xhci_submit_control_timeout(addr, endpoint, max_packet_size, req,
+                                           data_buffer, timeout_ms);
     return false;
 }
 
@@ -1354,7 +1590,8 @@ bool usb_set_address(uint8_t old_addr, uint8_t new_addr) {
     uint16_t mps = (old_addr == 0) ? ((hc == USB_HC_EHCI || hc == USB_HC_XHCI) ? 64 : 8) : g_dev_ep0_mps[old_addr];
     if (mps == 0) mps = 8;
     
-    return usb_control_transfer(old_addr, 0, mps, &req, NULL);
+    return usb_control_transfer_timeout(old_addr, 0, mps, &req, NULL,
+                                        USB_ENUM_CTRL_TIMEOUT_MS);
 }
 
 bool usb_submit_interrupt_in_async(uint8_t addr, uint8_t ep_num,
@@ -1419,7 +1656,8 @@ bool usb_get_device_descriptor(uint8_t addr, usb_device_descriptor_t *desc) {
     uint16_t mps = (addr == 0) ? ((hc == USB_HC_EHCI || hc == USB_HC_XHCI) ? 64 : 8) : g_dev_ep0_mps[addr];
     if (mps == 0) mps = 8;
     
-    return usb_control_transfer(addr, 0, mps, &req, desc);
+    return usb_control_transfer_timeout(addr, 0, mps, &req, desc,
+                                        USB_ENUM_CTRL_TIMEOUT_MS);
 }
 
 void usb_set_hc_type(usb_hc_type_t type) {
@@ -1432,6 +1670,11 @@ static void usb_master_init(void)
         return;
     }
     g_usb_initialized = true;
+
+    /* This whole function runs inside the kernel's input_init phase, so its
+     * duration is the phase's duration minus PS/2. One line at the end is
+     * what a boot-time complaint about input_init is measured against. */
+    uint32_t start_ms = usb_now_ms();
 
     if (g_api) g_api->memset(g_dev_hc, 0, sizeof(g_dev_hc));
     g_default_hc = USB_HC_NONE;
@@ -1459,28 +1702,39 @@ static void usb_master_init(void)
         usb_set_hc_type(USB_HC_UHCI);
     }
 
+    uint32_t controllers_done_ms = usb_now_ms();
+
     usb_hid_init();
     usb_core_init();
+
+    usb_log_string("[USB] init ");
+    usb_log_u32((uint32_t)(usb_now_ms() - start_ms));
+    usb_log_string("ms (hc-wait ");
+    usb_log_u32((uint32_t)(controllers_done_ms - start_ms));
+    usb_log_string("ms)\n");
 }
 
 static bool usb_storage_init(void)
 {
     usb_master_init();
 
-    for (uint32_t attempt = 0u; attempt < 3u; ++attempt) {
-        if (attempt != 0u) {
+    for (uint32_t attempt = 0u; attempt < 2u; ++attempt) {
+        if (attempt != 0u && bot_get_device_count() == 0u) {
+            /* A full re-enumeration only when the bus never produced a mass
+             * storage device at all. When one is present but failed its
+             * bring-up, the device is already on the bus; what needs the
+             * retry is its Bulk-Only state, and bot_init() is where that
+             * lives. The old code re-enumerated every time, and a rescan that
+             * finds nothing new still pays its 3-pass × 150 ms settling. */
             usb_core_init();
-            usb_wait_ms(g_hc_type, 250u);
+            usb_wait_ms(g_hc_type, usb_settle_ms(g_hc_type, 50u, 250u));
         }
-        if (bot_get_device_count() != 0u) {
-            usb_wait_ms(g_hc_type, 250u);
-        }
-        bool ok = bot_init();
-        if (ok) {
+        if (bot_init()) {
             return true;
         }
-
-        usb_wait_ms(g_hc_type, 250u);
+        if (attempt == 0u) {
+            usb_wait_ms(g_hc_type, usb_settle_ms(g_hc_type, 50u, 250u));
+        }
     }
 
     return false;
@@ -1633,6 +1887,7 @@ static const usb_master_vtable_t g_usb_vtable = {
         .read_blocks      = usb_storage_read,
         .write_blocks     = usb_storage_write,
         .flush            = usb_storage_flush,
+        .transport        = DRIVER_BLOCK_TRANSPORT_USB,
     },
     .usb = {
         .submit_interrupt_in_async = usb_submit_interrupt_in_async,

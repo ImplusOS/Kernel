@@ -3298,7 +3298,7 @@ int32_t process_spawn_user_elf_with_env(const char *path,
     };
     elf_loaded_image_info_t image_info = {0};
 
-    if (!elf_loader_load_from_path(proc->cr3, path, &policy, &image_info)) {
+    if (!elf_loader_load_from_path(proc->cr3, pid, path, &policy, &image_info)) {
         const char *elf_err = elf_loader_last_error();
         extern void serial_write_string(const char *str);
         extern void serial_write_uint64(uint64_t value);
@@ -3311,6 +3311,7 @@ int32_t process_spawn_user_elf_with_env(const char *path,
         serial_write_string(" elf_err=");
         serial_write_string(elf_err ? elf_err : "(null)");
         serial_write_string("\n");
+        filemap_release_pid(pid);
         ipc_cleanup_process_queue(pid);
         uint64_t irq_flags = irq_save_disable();
         spinlock_lock(&g_process_table_lock);
@@ -3455,6 +3456,7 @@ int32_t process_spawn_user_elf_with_env(const char *path,
         if (initialize_elf_user_stack_ex(proc, &image_info, path,
                                          linux_argc, linux_argv,
                                          merged_envc, merged_env) < 0) {
+            filemap_release_pid(pid);
             ipc_cleanup_process_queue(pid);
             uint64_t irq_flags = irq_save_disable();
             spinlock_lock(&g_process_table_lock);
@@ -3465,6 +3467,7 @@ int32_t process_spawn_user_elf_with_env(const char *path,
             return -1;
         }
     } else if (initialize_elf_user_stack(proc, &image_info, path) < 0) {
+        filemap_release_pid(pid);
         ipc_cleanup_process_queue(pid);
         uint64_t irq_flags = irq_save_disable();
         spinlock_lock(&g_process_table_lock);
@@ -4347,7 +4350,7 @@ int32_t process_execve(const char *path, const char *const *argv,
         .max_vaddr = USER_CODE_LIMIT,
     };
     elf_loaded_image_info_t image_info = {0};
-    if (!elf_loader_load_from_path(proc->cr3, path_buf,
+    if (!elf_loader_load_from_path(proc->cr3, proc_pid, path_buf,
                                     &elf_policy, &image_info)) {
         const char *elf_err = elf_loader_last_error();
         extern void serial_write_string(const char *str);
@@ -4361,6 +4364,7 @@ int32_t process_execve(const char *path, const char *const *argv,
         serial_write_string(" elf_err=");
         serial_write_string(elf_err ? elf_err : "(null)");
         serial_write_string("\n");
+        filemap_release_pid(proc_pid);
         paging_destroy_process_space(new_cr3);
         proc->cr3 = 0;
         /* Past the point of no return: the old image is gone, so there is
@@ -5094,12 +5098,14 @@ int32_t process_get_current_pid(void)
 
 int32_t process_get_current_tid(void)
 {
-    uint64_t irq_flags = irq_save_disable();
-    spinlock_lock(&g_process_table_lock);
-    int32_t tid = is_valid_pid(current_pid_get()) ? current_pid_get() : -1;
-    spinlock_unlock(&g_process_table_lock);
-    irq_restore(irq_flags);
-    return tid;
+    /* Lock-free for the same reason as process_get_current_pid() above: it
+     * reads only the running task's own slot, via the per-CPU current-pid
+     * word, and that slot cannot be torn down while the task runs. This is on
+     * the front of every foreign-ABI syscall (linux_syscall_heartbeat), every
+     * futex operation and every poll park; taking g_process_table_lock here
+     * serialised all of those on one cacheline with interrupts off. */
+    int32_t tid = current_pid_get();
+    return is_valid_pid(tid) ? tid : -1;
 }
 
 int process_thread_join(int32_t tid)

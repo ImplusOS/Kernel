@@ -153,7 +153,7 @@
 #endif
 
 /* Kernel/Drivers/Module/DriverModule.c's g_modules[] table size. Decoupled
- * from BOOT_INFO's MAX_LOADED_FILES (kernel/boot_info.h, 16): that constant
+ * from BOOT_INFO's MAX_LOADED_FILES (kernel/boot_info.h, 32): that constant
  * bounds how many .ELF files the bootloader can preload before kernel_main
  * even runs, while this one also has to make room for driver modules
  * loaded post-boot (driver_module_manager_load_from_vfs()), so it must be

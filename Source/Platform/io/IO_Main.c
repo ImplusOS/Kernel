@@ -672,6 +672,11 @@ uint64_t disk_get_partition_lba(void) {
 static void disk_scan_devices(void) {
     if (g_disk_scan_done) return;
 
+    /* The boot path only probes the transport it booted from (see
+     * BlockManager.c). Listing the disks is the point where the other
+     * transports' devices have to appear, so probe them here -- once. */
+    block_manager_scan_deferred();
+
     g_detected_disk_count = 0;
 
     for (size_t i = 0; i < sizeof(g_block_devices) / sizeof(g_block_devices[0]); ++i) {

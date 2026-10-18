@@ -436,6 +436,7 @@ static const driver_storage_t g_storage = {
     .read_blocks = blk_read,
     .write_blocks = blk_write,
     .flush = blk_flush,
+    .transport = DRIVER_BLOCK_TRANSPORT_VIRTIO,
 };
 
 static void blk_shutdown(void)

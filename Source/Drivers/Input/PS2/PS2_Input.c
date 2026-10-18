@@ -58,11 +58,86 @@ static const driver_binary_t *g_driver_api = NULL;
 #define PS2_MOUSE_DEFAULT_X 12
 #define PS2_MOUSE_DEFAULT_Y 12
 
+/* Wall-clock ceilings for the controller handshakes. PS2_COMMAND_TIMEOUT is a
+ * spin count, and a spin count is only a timeout on the hardware it was
+ * written for: on a machine whose port I/O is slow, or whose i8042 never
+ * answers, the loop runs its full 100000 reads per command and the init ends
+ * up costing seconds (the boot phase it runs in is input_init). A live i8042
+ * answers in microseconds, so whichever ceiling runs out first -- spins or
+ * milliseconds -- means the same thing: the controller is not there. The
+ * total budget covers the whole init, because a machine with no PS/2 hardware
+ * at all should pay one bounded cost, not one bounded cost per command. */
+#define PS2_WAIT_TIMEOUT_MS 100u
+#define PS2_INIT_BUDGET_MS  750u
+/* A controller that answered nothing at boot is not going to answer later;
+ * without this the hotplug poll would re-run the whole (bounded, but still
+ * hundreds of milliseconds) init once a second forever. A retry is still
+ * allowed for an init that failed after the controller had answered. */
+#define PS2_INIT_RETRY_MS   5000u
+
+static uint32_t ps2_now_ms(void)
+{
+    if (g_driver_api == NULL) {
+        return 0u;
+    }
+    if (g_driver_api->timer.monotonic_ns != NULL) {
+        return (uint32_t)(g_driver_api->timer.monotonic_ns() / 1000000u);
+    }
+    if (g_driver_api->timer_hz != NULL && g_driver_api->timer_ticks != NULL) {
+        uint32_t hz = g_driver_api->timer_hz();
+        if (hz == 0u) {
+            return 0u;
+        }
+        return (uint32_t)((g_driver_api->timer_ticks() * 1000u) / (uint64_t)hz);
+    }
+    return 0u;
+}
+
+/* 0 = clock unavailable, and then the spin count alone decides. */
+static bool ps2_deadline_passed(uint32_t start_ms, uint32_t budget_ms)
+{
+    if (start_ms == 0u || budget_ms == 0u) {
+        return false;
+    }
+    return (uint32_t)(ps2_now_ms() - start_ms) >= budget_ms;
+}
+
+static void ps2_log_string(const char *str)
+{
+    if (g_driver_api != NULL && g_driver_api->serial_write_string != NULL) {
+        g_driver_api->serial_write_string(str);
+    }
+}
+
+static void ps2_log_u32(uint32_t value)
+{
+    char buf[10];
+    int pos = 0;
+
+    if (value == 0u) {
+        ps2_log_string("0");
+        return;
+    }
+    while (value > 0u && pos < (int)sizeof(buf)) {
+        buf[pos++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+    while (pos > 0) {
+        if (g_driver_api != NULL && g_driver_api->serial_write_char != NULL) {
+            g_driver_api->serial_write_char(buf[--pos]);
+        } else {
+            --pos;
+        }
+    }
+}
+
 #include "Drivers/Module/Display_Main.h"
 
 static uint8_t g_input_initialized = 0;
 static uint8_t g_keyboard_available = 0;
 static uint8_t g_mouse_available = 0;
+static uint8_t g_controller_absent = 0;
+static uint32_t g_last_init_ms = 0;
 
 static uint8_t g_keyboard_e0_pending = 0;
 static uint8_t g_keyboard_modifiers = 0;
@@ -91,22 +166,34 @@ static bool ps2_platform_supported(void)
 
 static int controller_wait_input_clear(uint32_t spins)
 {
+    uint32_t start_ms = ps2_now_ms();
+
     while (spins > 0u) {
         if ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0u) {
             return 0;
         }
         --spins;
+        if ((spins & 0x3FFu) == 0u &&
+            ps2_deadline_passed(start_ms, PS2_WAIT_TIMEOUT_MS)) {
+            break;
+        }
     }
     return -1;
 }
 
 static int controller_wait_output_full(uint32_t spins)
 {
+    uint32_t start_ms = ps2_now_ms();
+
     while (spins > 0u) {
         if ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0u) {
             return 0;
         }
         --spins;
+        if ((spins & 0x3FFu) == 0u &&
+            ps2_deadline_passed(start_ms, PS2_WAIT_TIMEOUT_MS)) {
+            break;
+        }
     }
     return -1;
 }
@@ -181,8 +268,15 @@ static int controller_test_port(uint8_t test_command)
 
 static int device_wait_ack(void)
 {
-    for (uint32_t spin = 0; spin < PS2_COMMAND_TIMEOUT; ++spin) {
+    uint32_t start_ms = ps2_now_ms();
+    uint32_t spin = 0;
+
+    for (; spin < PS2_COMMAND_TIMEOUT; ++spin) {
         if ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) == 0u) {
+            if ((spin & 0x3FFu) == 0u &&
+                ps2_deadline_passed(start_ms, PS2_WAIT_TIMEOUT_MS)) {
+                break;
+            }
             continue;
         }
         uint8_t value = inb(PS2_DATA_PORT);
@@ -416,6 +510,9 @@ bool ps2_input_init(void)
     uint8_t config = 0;
     int port1_ok = 0;
     int port2_ok = 0;
+    bool ok = false;
+    bool budget_hit = false;
+    uint32_t start_ms = 0;
 
     g_input_initialized = 0;
     g_keyboard_available = 0;
@@ -431,12 +528,26 @@ bool ps2_input_init(void)
         return false;
     }
 
+    start_ms = ps2_now_ms();
+    g_last_init_ms = start_ms;
+
     (void)controller_write_command(PS2_CMD_DISABLE_PORT1);
     (void)controller_write_command(PS2_CMD_DISABLE_PORT2);
     controller_flush_output();
 
     if (controller_read_config(&config) < 0) {
-        return false;
+        g_controller_absent = 1u;
+        goto done;
+    }
+    g_controller_absent = 0u;
+
+    /* Every step below is optional once the budget is gone: a machine with no
+     * PS/2 hardware (or one whose controller stopped answering) keeps
+     * whatever the earlier steps found, and USB HID carries the input. */
+    if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
+        budget_hit = true;
+        g_controller_absent = 1u;
+        goto done;
     }
 
     config &= (uint8_t)~(PS2_CONFIG_IRQ_PORT1 | PS2_CONFIG_IRQ_PORT2);
@@ -444,9 +555,14 @@ bool ps2_input_init(void)
     if (controller_write_command(PS2_CMD_SELF_TEST) == 0) {
         uint8_t self_test = 0;
         if (controller_read_data(&self_test) == 0 && self_test != PS2_SELF_OK) {
-            return false;
+            goto done;
         }
         controller_write_config(config);
+    }
+
+    if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
+        budget_hit = true;
+        goto done;
     }
 
     port1_ok = (controller_test_port(PS2_CMD_TEST_PORT1) == 0) ? 1 : 0;
@@ -461,8 +577,15 @@ bool ps2_input_init(void)
         g_mouse_available = 1;
     }
 
+    if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
+        budget_hit = true;
+        controller_flush_output();
+        ok = (port1_ok != 0) || (g_mouse_available != 0);
+        goto done;
+    }
+
     if (port1_ok && send_keyboard_command(PS2_KBD_CMD_ENABLE_SCANNING) < 0) {
-        return false;
+        goto done;
     }
 
     if (g_mouse_available) {
@@ -475,7 +598,7 @@ bool ps2_input_init(void)
     controller_flush_output();
 
     if (!port1_ok && !g_mouse_available) {
-        return false;
+        goto done;
     }
 
     g_input_initialized = 1;
@@ -489,7 +612,19 @@ bool ps2_input_init(void)
                                  "PS/2 mouse",
                                  2u);
     }
-    return true;
+    ok = true;
+
+done:
+    /* One line per init. input_init is the boot phase this runs in, and this
+     * is the part of it the kernel does not time itself. */
+    ps2_log_string("[PS2] init ");
+    ps2_log_u32((uint32_t)(ps2_now_ms() - start_ms));
+    ps2_log_string("ms kbd=");
+    ps2_log_string(g_keyboard_available != 0u ? "1" : "0");
+    ps2_log_string(" mouse=");
+    ps2_log_string(g_mouse_available != 0u ? "1" : "0");
+    ps2_log_string(budget_hit ? " budget\n" : "\n");
+    return ok;
 }
 
 static bool ps2_try_enable_keyboard_hotplug(void)
@@ -547,6 +682,15 @@ bool ps2_input_poll_hotplug(void)
     }
 
     if (!g_input_initialized) {
+        if (g_controller_absent != 0u) {
+            return false;
+        }
+        /* Rate limit the retry, but only when there is a clock to do it
+         * with: without one, behave as before and let every poll try. */
+        if (ps2_now_ms() != 0u && g_last_init_ms != 0u &&
+            !ps2_deadline_passed(g_last_init_ms, PS2_INIT_RETRY_MS)) {
+            return false;
+        }
         return ps2_input_init();
     }
 
@@ -678,7 +822,8 @@ int32_t ps2_input_read_keyboard(driver_keyboard_event_t *out_event)
     if (out_event == NULL) {
         return -1;
     }
-    ps2_input_poll();
+    /* Polled by InputManager on the timer tick (see USB_HID.c's read paths
+     * for why reads do not poll again). */
     return keyboard_queue_pop(out_event);
 }
 
@@ -690,7 +835,6 @@ int32_t ps2_input_read_mouse(driver_mouse_event_t *out_event)
     if (!g_mouse_available) {
         return 0;
     }
-    ps2_input_poll();
     return mouse_queue_pop(out_event);
 }
 

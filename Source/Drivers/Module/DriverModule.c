@@ -74,6 +74,39 @@ static void *driver_map_mmio_range(uint64_t phys_addr, size_t size)
     return first + (phys_addr - first_base);
 }
 
+static void *driver_map_mmio_wc_range(uint64_t phys_addr, size_t size)
+{
+    if (size == 0u) {
+        return NULL;
+    }
+#if defined(PLATFORM_ARM64)
+    const uint64_t chunk_size = 1024ULL * 1024ULL;
+#else
+    const uint64_t chunk_size = 2ULL * 1024ULL * 1024ULL;
+#endif
+    uint64_t first_base = phys_addr & ~(chunk_size - 1u);
+    uint64_t last_addr = phys_addr + (uint64_t)size - 1u;
+    if (last_addr < phys_addr) {
+        return NULL;
+    }
+    uint8_t *first = NULL;
+    for (uint64_t base = first_base;; base += chunk_size) {
+        uint8_t *mapped = (uint8_t *)map_mmio_wc_virt(base);
+        if (mapped == NULL) {
+            return NULL;
+        }
+        if (first == NULL) {
+            first = mapped;
+        } else if (mapped != first + (base - first_base)) {
+            return NULL;
+        }
+        if (base + chunk_size - 1u >= last_addr) {
+            break;
+        }
+    }
+    return first + (phys_addr - first_base);
+}
+
 static uint32_t driver_pci_get_device_count(void)
 {
     return pci_get_device_count();
@@ -369,6 +402,7 @@ static const driver_binary_t g_driver_api = {
         .pci_write_config = pci_write_config,
         .map_mmio_virt = map_mmio_virt,
         .map_mmio_range = driver_map_mmio_range,
+        .map_mmio_wc_range = driver_map_mmio_wc_range,
     },
     .dbg = {
         .write_char = serial_write_char,

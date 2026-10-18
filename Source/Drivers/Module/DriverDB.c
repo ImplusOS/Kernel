@@ -18,8 +18,8 @@
  *   <bus>:vid=<hex>[,pid=<hex>][,class=<hex>]=<module filename>
  * `#` starts a comment (rest of the line ignored); blank lines are
  * skipped. `<bus>` is "usb" or "pci". Example:
- *   usb:vid=A69C,pid=8D80=AX900_Driver.ELF
- *   usb:vid=368B,pid=8D80=AX900_Driver.ELF
+ *   usb:vid=A69C,pid=8D80=AIC8800_Driver.ELF
+ *   usb:vid=368B,pid=8D81=AIC8800_Driver.ELF
  */
 
 #define DRIVER_DB_MAX_FILE_BYTES 4096u

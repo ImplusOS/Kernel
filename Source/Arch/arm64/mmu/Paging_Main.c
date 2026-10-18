@@ -18,6 +18,7 @@
 #define ARM64_DESC_AP_EL0_RO        (3ULL << 6)
 #define ARM64_DESC_ATTRIDX_DEVICE   (0ULL << 2)
 #define ARM64_DESC_ATTRIDX_NORMAL   (1ULL << 2)
+#define ARM64_DESC_ATTRIDX_NORMAL_NC (2ULL << 2)
 #define ARM64_DESC_PXN              (1ULL << 53)
 #define ARM64_DESC_UXN              (1ULL << 54)
 #define ARM64_DESC_EXTERNAL         (1ULL << 55)
@@ -130,7 +131,9 @@ static inline uint64_t block_or_page_desc(uint64_t phys, uint64_t flags, int use
     }
 
     uint64_t attr = (flags & PAGE_PCD) ? ARM64_DESC_ATTRIDX_DEVICE
-                                       : ARM64_DESC_ATTRIDX_NORMAL;
+                                       : ((flags & PAGE_PWT) ?
+                                          ARM64_DESC_ATTRIDX_NORMAL_NC :
+                                          ARM64_DESC_ATTRIDX_NORMAL);
     uint64_t sh = (flags & PAGE_PCD) ? 0 : ARM64_DESC_SH_INNER;
 
     return (phys & ARM64_DESC_ADDR_MASK) |
@@ -422,7 +425,8 @@ void init_paging(void)
     g_kernel_l0[0] = table_desc((uint64_t)(uintptr_t)g_kernel_l1);
     g_kernel_ttbr = (uint64_t)(uintptr_t)g_kernel_l0;
 
-    write_mair(0xFF00ULL);
+    /* AttrIdx 0: Device-nGnRnE, 1: Normal WB, 2: Normal non-cacheable. */
+    write_mair(0x0044FF00ULL);
     write_tcr((16ULL << 0) | (16ULL << 16) |
               (0ULL << 14) | (2ULL << 30) |
               (3ULL << 12) | (3ULL << 28) |
@@ -440,6 +444,24 @@ void *map_mmio_virt(uint64_t phys_addr)
     const uint64_t high_mmio_base = 0x4000000000ULL;
     uint64_t base = phys_addr & ~(PAGE_SIZE - 1ULL);
     uint64_t flags = PAGE_RW | PAGE_NX;
+    if (phys_addr >= high_mmio_base) {
+        flags |= PAGE_PCD;
+    }
+    if (paging_map_kernel_range(base, mmio_window_size, flags) < 0) {
+        return NULL;
+    }
+    return (void *)(uintptr_t)phys_addr;
+}
+
+/* AArch64 uses the normal mapping attributes selected by map_mmio_virt() for
+ * the boot framebuffer.  Keep this separate from the generic MMIO entry point
+ * so the display driver can request the intended scanout policy on every arch. */
+void *map_mmio_wc_virt(uint64_t phys_addr)
+{
+    const uint64_t mmio_window_size = 1024ULL * 1024ULL;
+    const uint64_t high_mmio_base = 0x4000000000ULL;
+    uint64_t base = phys_addr & ~(PAGE_SIZE - 1ULL);
+    uint64_t flags = PAGE_RW | PAGE_NX | PAGE_PWT;
     if (phys_addr >= high_mmio_base) {
         flags |= PAGE_PCD;
     }

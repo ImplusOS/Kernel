@@ -37,6 +37,7 @@ typedef struct {
 const char *elf_loader_last_error(void);
 
 bool elf_loader_load_from_path(uint64_t target_cr3,
+                               int32_t target_pid,
                                const char *path,
                                const elf_load_policy_t *policy,
                                elf_loaded_image_info_t *image_out);

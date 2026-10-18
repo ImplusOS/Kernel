@@ -160,6 +160,15 @@ void xhci_init(void);
 
 bool xhci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                          struct usb_device_request *req, void *data);
+/* Same control transfer, with the caller's deadline instead of the 30 s
+ * default. timeout_ms == 0 means "use the default". The BOT bring-up path
+ * uses this: a 30 s wait per control transfer, multiplied by the reset and
+ * clear-halt retries, is what turned one unresponsive mass-storage device
+ * into minutes of boot. */
+bool xhci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms);
 bool xhci_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                       uint8_t pid, void *data, uint32_t length);
 /* Same transfer, with the caller's deadline instead of the 30 s default.

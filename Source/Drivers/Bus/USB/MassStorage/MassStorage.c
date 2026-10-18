@@ -58,6 +58,29 @@ static bool     bot_write_protected = false;
 #define BOT_BOUNCE_BUFFER_SIZE      (64u * 1024u)
 #define BOT_SCSI_RW10_MAX_BLOCKS    0xFFFFu
 
+/* Deadlines for the bring-up and recovery path.
+ *
+ * The controller's default bulk timeout is 30 s -- sized for large transfers
+ * to a healthy device. Every retry loop in this file multiplies that: one
+ * unresponsive stick (stale BOT state after a warm reboot, a device that
+ * browns out and stops answering) turned init into minutes of boot, per
+ * command, because each of the eight INQUIRY retries could block for the
+ * whole default. A device that is alive at all answers these commands in
+ * milliseconds; a device that misses them repeatedly is not coming up and
+ * boot has to move on. */
+#define BOT_PROBE_TIMEOUT_MS  1000u
+#define BOT_DATA_TIMEOUT_MS   2000u
+#define BOT_RESET_TIMEOUT_MS  1000u
+
+/* Total time one device gets to reach "ready" in bot_init(), across all of
+ * its retries and the one transport reset. The old code had no bound at all:
+ * the wait-ready loops alone were 20 attempts with delays doubling to 1 s,
+ * twice -- over 40 s of patience per device, for a device that had already
+ * enumerated. A boot device that cannot answer TEST UNIT READY in seconds
+ * either was never going to, or is better served by the next attempt from
+ * usb_storage_init(). */
+#define BOT_BRINGUP_BUDGET_MS 4000u
+
 static uint8_t  bot_bounce_buffer[BOT_BOUNCE_BUFFER_SIZE];
 
 void bot_reset_devices(void)
@@ -199,15 +222,38 @@ static void bot_wait_ms(uint32_t ms)
     else                                   ehci_delay_ms(ms);
 }
 
+/* Milliseconds since some fixed point, for the bring-up budget. Returns 0
+ * when the module API cannot provide a clock, which disables the budget
+ * (each loop still has its own attempt cap). */
+static uint64_t bot_now_ms(void)
+{
+    if (g_api == NULL || g_api->timer_ticks == NULL || g_api->timer_hz == NULL) {
+        return 0u;
+    }
+    uint32_t hz = g_api->timer_hz();
+    if (hz == 0u) {
+        return 0u;
+    }
+    return (g_api->timer_ticks() * 1000u) / hz;
+}
+
+#define BOT_BUDGET_EXCEEDED(start_ms) \
+    ((start_ms) != 0u && bot_now_ms() != 0u && \
+     bot_now_ms() - (start_ms) >= BOT_BRINGUP_BUDGET_MS)
+
 static bool bot_wait_ready(uint32_t max_attempts,
                            uint32_t initial_delay_ms,
-                           uint32_t max_delay_ms)
+                           uint32_t max_delay_ms,
+                           uint64_t start_ms)
 {
     uint32_t delay_ms = initial_delay_ms;
 
     for (uint32_t i = 0; i < max_attempts; i++) {
         if (bot_test_unit_ready()) {
             return true;
+        }
+        if (BOT_BUDGET_EXCEEDED(start_ms)) {
+            return false;
         }
 
         if (delay_ms != 0) {
@@ -224,11 +270,15 @@ static bool bot_wait_ready(uint32_t max_attempts,
 
 static bool bot_retry_simple_command(bool (*fn)(void),
                                      uint32_t max_attempts,
-                                     uint32_t retry_delay_ms)
+                                     uint32_t retry_delay_ms,
+                                     uint64_t start_ms)
 {
     for (uint32_t i = 0; i < max_attempts; i++) {
         if (fn()) {
             return true;
+        }
+        if (BOT_BUDGET_EXCEEDED(start_ms)) {
+            return false;
         }
 
         bot_clear_endpoint_halts();
@@ -242,8 +292,9 @@ static bool bot_retry_simple_command(bool (*fn)(void),
 
 static bool bot_mass_storage_reset(void)
 {
-    return usb_submit_control(g_mass_storage_addr, 0x21, 0xFF, 0,
-                              g_mass_storage_interface, 0, NULL);
+    return usb_submit_control_timeout(g_mass_storage_addr, 0x21, 0xFF, 0,
+                                      g_mass_storage_interface, 0, NULL,
+                                      BOT_RESET_TIMEOUT_MS);
 }
 
 static void bot_recover_transport(const char *reason)
@@ -257,11 +308,13 @@ static void bot_recover_transport(const char *reason)
 
 static void bot_clear_endpoint_halts(void)
 {
-    usb_submit_control(g_mass_storage_addr, 0x02, 0x01, 0x0000,
-                       g_mass_storage_ep_in | 0x80, 0, NULL);
+    usb_submit_control_timeout(g_mass_storage_addr, 0x02, 0x01, 0x0000,
+                               g_mass_storage_ep_in | 0x80, 0, NULL,
+                               BOT_RESET_TIMEOUT_MS);
 
-    usb_submit_control(g_mass_storage_addr, 0x02, 0x01, 0x0000,
-                       g_mass_storage_ep_out, 0, NULL);
+    usb_submit_control_timeout(g_mass_storage_addr, 0x02, 0x01, 0x0000,
+                               g_mass_storage_ep_out, 0, NULL,
+                               BOT_RESET_TIMEOUT_MS);
 }
 
 bool bot_test_unit_ready(void)
@@ -382,31 +435,42 @@ bool bot_init(void)
     for (uint32_t i = 0; i < g_bot_device_count; i++) {
         bot_select_device(i);
 
-        bot_wait_ms(100);
-        bot_clear_endpoint_halts();
-        bot_wait_ms(200);
+        uint64_t start_ms = bot_now_ms();
 
-        if (!bot_retry_simple_command(bot_inquiry, 8, 150)) {
+        /* No unconditional settle before the first attempt: the device was
+         * already enumerated, and handing it a descriptor over the control
+         * endpoint is proof it answers. The old 100 ms + 200 ms pair here was
+         * paid on every boot and every retry, for a device that was usually
+         * ready immediately. The retry loops below are what a slow device
+         * actually needs, and they only spend time when it is not answering. */
+        bot_clear_endpoint_halts();
+
+        if (!bot_retry_simple_command(bot_inquiry, 4, 50, start_ms)) {
             continue;
         }
 
-        if (!bot_wait_ready(20, 50, 1000)) {
-            bot_mass_storage_reset();
-            bot_wait_ms(100);
-            bot_clear_endpoint_halts();
-            if (!bot_wait_ready(20, 100, 1500)) {
+        if (!bot_wait_ready(10, 20, 100, start_ms)) {
+            if (BOT_BUDGET_EXCEEDED(start_ms)) {
+                continue;
+            }
+            /* One transport reset, then a second, more patient pass -- both
+             * bounded by the per-device budget, so an unresponsive device
+             * cannot turn into tens of seconds the way the old 20-attempt,
+             * 1 s-max-delay loops did (twice). */
+            bot_recover_transport("drive not ready");
+            if (!bot_wait_ready(10, 50, 200, start_ms)) {
                 continue;
             }
         }
 
-        if (!bot_retry_simple_command(bot_read_capacity, 8, 150)) {
+        if (!bot_retry_simple_command(bot_read_capacity, 4, 50, start_ms)) {
             continue;
         }
 
         bot_write_protected = false;
         g_bot_devices[i].write_protected = false;
 
-        (void)bot_wait_ready(4, 10, 40);
+        (void)bot_wait_ready(4, 10, 40, start_ms);
 
         if (ready_count != i) {
             g_bot_devices[ready_count] = g_bot_devices[i];
@@ -441,11 +505,12 @@ static bool bot_execute_command_ex(void *cbw_cb, uint8_t cb_len, uint8_t dir_in,
 
     if (g_api) g_api->memcpy(cbw.CBWCB, cbw_cb, cb_len);
 
-    if (!usb_submit_bulk(g_mass_storage_addr,
-                         g_mass_storage_ep_out,
-                         g_mass_storage_ep_out_mps,
-                         0,
-                         &cbw, sizeof(cbw))) {
+    if (!usb_submit_bulk_timeout(g_mass_storage_addr,
+                                 g_mass_storage_ep_out,
+                                 g_mass_storage_ep_out_mps,
+                                 0,
+                                 &cbw, sizeof(cbw),
+                                 BOT_PROBE_TIMEOUT_MS)) {
         bot_recover_transport("CBW failed");
         return false;
     }
@@ -455,7 +520,14 @@ static bool bot_execute_command_ex(void *cbw_cb, uint8_t cb_len, uint8_t dir_in,
         uint8_t  ep  = dir_in ? g_mass_storage_ep_in : g_mass_storage_ep_out;
         uint16_t mps = dir_in ? g_mass_storage_ep_in_mps : g_mass_storage_ep_out_mps;
 
-        if (!usb_submit_bulk(g_mass_storage_addr, ep, mps, pid, data_buf, data_len)) {
+        /* Scale with the payload: a healthy stick moves a 64 KiB bounce
+         * in single-digit milliseconds, but a slow one that is still
+         * flashing must not be cut off mid-transfer. */
+        uint32_t data_timeout_ms =
+            BOT_DATA_TIMEOUT_MS + (data_len / 65536u) * 1000u;
+
+        if (!usb_submit_bulk_timeout(g_mass_storage_addr, ep, mps, pid,
+                                     data_buf, data_len, data_timeout_ms)) {
             bot_recover_transport("DATA failed");
             return false;
         }
@@ -463,11 +535,12 @@ static bool bot_execute_command_ex(void *cbw_cb, uint8_t cb_len, uint8_t dir_in,
 
     usb_bot_csw_t csw = {0};
 
-    if (!usb_submit_bulk(g_mass_storage_addr,
-                         g_mass_storage_ep_in,
-                         g_mass_storage_ep_in_mps,
-                         1,
-                         &csw, sizeof(csw))) {
+    if (!usb_submit_bulk_timeout(g_mass_storage_addr,
+                                 g_mass_storage_ep_in,
+                                 g_mass_storage_ep_in_mps,
+                                 1,
+                                 &csw, sizeof(csw),
+                                 BOT_PROBE_TIMEOUT_MS)) {
         bot_recover_transport("CSW failed");
         return false;
     }

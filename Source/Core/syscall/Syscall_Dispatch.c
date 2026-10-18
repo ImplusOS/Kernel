@@ -473,12 +473,15 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
         driver_manager_hotplug_poll();
     }
 
-    if (num == SYSCALL_INPUT_READ_KEYBOARD ||
-        num == SYSCALL_INPUT_READ_MOUSE) {
-        uint64_t poll_flags = irq_save_disable();
-        input_manager_poll();
-        irq_restore(poll_flags);
-    }
+    /* INPUT_READ_* used to poll the input drivers again here, unconditionally:
+     * the timer tick already schedules a poll (input_manager_schedule_poll at
+     * 250 Hz) that the check above consumes, and every read path ends at the
+     * driver's queue, which that poll is what fills. The extra poll made each
+     * keyboard/mouse read touch every controller (MMIO round trips per read,
+     * several per loop iteration for the window manager) for no fresher data
+     * than the queue it then read from anyway. Readers that want a guaranteed
+     * fresh sample still get one, because a read cannot happen between ticks
+     * without that tick's poll having run first. */
 
     /* Kernel-side syscall-ABI compat layer dispatch (Docs/Others/
      * TODO_OS_Refactor.md phase P6) -- looked up by registry instead of a
@@ -2746,8 +2749,8 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                 syscall_fail(saved_rsp, num, OS_STATUS_FAULT, "invalid_wifi_ssid");
                 break;
             }
-            /* arg2 == 0 means "open network, no password" -- mirrors
-             * ax900_connect(ssid, NULL). */
+            /* arg2 == 0 means "open network, no password" -- the NIC
+             * layer's wifi_connect() takes a NULL psk for that case. */
             const char *psk_ptr = NULL;
             if (arg2 != 0u) {
                 if (copy_user_cstring(psk, sizeof(psk),

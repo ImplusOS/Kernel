@@ -74,24 +74,8 @@ static bool uhci_wait_td(uhci_td_t *td, uint32_t timeout_ms) {
 void uhci_init(void) {
     g_ready = false;
     uint8_t uhci_bus = 0, uhci_dev = 0, uhci_fn = 0;
-    bool found = false;
-    for (uint16_t b = 0; b < 256 && !found; b++) {
-        for (uint8_t d = 0; d < 32 && !found; d++) {
-            for (uint8_t f = 0; f < 8 && !found; f++) {
-                uint32_t id = g_api->pci_read_config((uint8_t)b, d, f, 0x00);
-                if ((id & 0xFFFF) == 0xFFFF) { if (f == 0) break; continue; }
-                uint32_t cls = g_api->pci_read_config((uint8_t)b, d, f, 0x08);
-                if (((cls >> 24) & 0xFF) == 0x0C && ((cls >> 16) & 0xFF) == 0x03 && ((cls >> 8) & 0xFF) == 0x00) {
-                    uhci_bus = (uint8_t)b; uhci_dev = d; uhci_fn = f; found = true;
-                }
-                if (f == 0) {
-                    uint32_t hdr = g_api->pci_read_config((uint8_t)b, d, f, 0x0C);
-                    if (((hdr >> 16) & 0x80) == 0) break;
-                }
-            }
-        }
-    }
-    if (!found) {
+    if (!driver_pci_find_class(g_api, 0x0Cu, 0x03u, 0x00u,
+                               &uhci_bus, &uhci_dev, &uhci_fn)) {
         return;
     }
 
@@ -197,7 +181,11 @@ static void td_fill(uhci_td_t *td, uint32_t link, uint32_t ctrl, uint32_t token,
 }
 
 static bool uhci_control_xfer(uint8_t addr, uint8_t endpoint, uint16_t mps,
-                              struct usb_device_request *req, void *data) {
+                              struct usb_device_request *req, void *data,
+                              uint32_t timeout_ms) {
+    if (timeout_ms == 0u) {
+        timeout_ms = 5000u;
+    }
     (void)mps;
     bool dir_in = (req->bmRequestType & 0x80) != 0;
     uint16_t wlen = req->wLength;
@@ -243,7 +231,7 @@ static bool uhci_control_xfer(uint8_t addr, uint8_t endpoint, uint16_t mps,
 
     g_qh_ctrl->elem_link = phys_setup;
 
-    bool ok = uhci_wait_td(td_status, 5000);
+    bool ok = uhci_wait_td(td_status, timeout_ms);
     if (ok && (td_status->ctrl_status & (UHCI_TD_CTRL_STALLED | UHCI_TD_CTRL_BABBLE | UHCI_TD_CTRL_CRCTIMEO))) ok = false;
     g_qh_ctrl->elem_link = 0x00000001;
     return ok;
@@ -272,9 +260,17 @@ static bool uhci_bulk_xfer(uint8_t addr, uint8_t endpoint, uint16_t max_packet_s
 
 bool uhci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                          struct usb_device_request *req, void *data) {
+    return uhci_submit_control_timeout(addr, endpoint, max_packet_size, req, data,
+                                       0u);
+}
+
+bool uhci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms) {
     (void)endpoint; (void)max_packet_size;
     if (!g_ready) return false;
-    return uhci_control_xfer(addr, 0, max_packet_size, req, data);
+    return uhci_control_xfer(addr, 0, max_packet_size, req, data, timeout_ms);
 }
 
 bool uhci_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,

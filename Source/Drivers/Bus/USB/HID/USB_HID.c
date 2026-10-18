@@ -30,6 +30,11 @@ static inline void irq_restore(uint64_t flags) { hal_cpu_restore_interrupts(flag
 #include "kernel/input_utils.h"
 
 #define USB_HID_QUEUE_SIZE 64
+/* SET_IDLE / SET_PROTOCOL, issued once per HID interface at enumeration
+ * time. 0 would mean "the controller's default", which on xHCI is 30 s: a
+ * device that stalls here would hold the boot sweep (input_init) for a
+ * minute on its own. */
+#define USB_HID_CTRL_TIMEOUT_MS 500u
 #define USB_HID_ENABLE_IDLE_PENDING_RECOVER 0u
 #define USB_HID_PENDING_RECOVER_NS (250ULL * 1000ULL * 1000ULL)
 #define USB_HID_PENDING_RECOVER_POLLS 64u
@@ -249,8 +254,10 @@ void usb_hid_add_keyboard(uint8_t dev_addr, uint8_t interface,
     g_usd_kbd.hc_type   = usb_get_device_hc_type(dev_addr);
     if (g_usd_kbd.hc_type == USB_HC_NONE) g_usd_kbd.hc_type = usb_get_hc_type();
 
-    usb_submit_control(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL);
-    usb_submit_control(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL);
+    usb_submit_control_timeout(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL,
+                               USB_HID_CTRL_TIMEOUT_MS);
+    usb_submit_control_timeout(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL,
+                               USB_HID_CTRL_TIMEOUT_MS);
 
     if (!hid_alloc_dma(&g_usd_kbd)) {
         return;
@@ -273,8 +280,10 @@ void usb_hid_add_mouse(uint8_t dev_addr, uint8_t interface,
     g_usd_mouse.hc_type   = usb_get_device_hc_type(dev_addr);
     if (g_usd_mouse.hc_type == USB_HC_NONE) g_usd_mouse.hc_type = usb_get_hc_type();
 
-    usb_submit_control(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL);
-    usb_submit_control(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL);
+    usb_submit_control_timeout(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL,
+                               USB_HID_CTRL_TIMEOUT_MS);
+    usb_submit_control_timeout(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL,
+                               USB_HID_CTRL_TIMEOUT_MS);
 
     if (!hid_alloc_dma(&g_usd_mouse)) {
         return;
@@ -568,8 +577,12 @@ void usb_hid_poll(void)
 
 int32_t usb_hid_read_keyboard(driver_keyboard_event_t *out_event)
 {
-    usb_hid_poll();
-    
+    /* No usb_hid_poll() here: InputManager polls every driver once per timer
+     * tick (input_manager_schedule_poll) and callers reach the queue only
+     * after that poll ran -- the dispatcher consumes the pending tick before
+     * dispatching any syscall. Polling per read meant several full controller
+     * sweeps per window-manager loop iteration for no fresher data. */
+
     uint64_t flags = irq_save_disable();
     spinlock_lock(&g_kbd_lock);
     
@@ -589,8 +602,8 @@ int32_t usb_hid_read_keyboard(driver_keyboard_event_t *out_event)
 
 int32_t usb_hid_read_mouse(driver_mouse_event_t *out_event)
 {
-    usb_hid_poll();
-    
+    /* Polled by InputManager on the timer tick; see read_keyboard above. */
+
     uint64_t flags = irq_save_disable();
     spinlock_lock(&g_mouse_lock);
     

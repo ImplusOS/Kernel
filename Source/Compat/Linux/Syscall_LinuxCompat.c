@@ -2285,8 +2285,14 @@ static void lx_wait_done(void)
  * costs nothing in a busy system and divides the rescan rate of an idle one
  * -- an idle Chromium spent 95% of its syscalls in wait calls, and they were
  * waking ten thousand times a second to discover nothing had happened.
- * See Syscall_Epoll.c's EPOLL_POLL_SLICE_MS for the same reasoning. */
+ * See Syscall_Epoll.c's EPOLL_POLL_SLICE_MS for the same reasoning.
+ *
+ * The base is still 4 ms (it is what a genuinely un-notified source waits
+ * for the first time), but a thread that keeps coming back with nothing
+ * ready backs off to LX_WAIT_SLICE_MAX_MS; the wait paths cap that at the
+ * nearest armed timerfd deadline, so no timer can be delayed by it. */
 #define LX_WAIT_SLICE_MS 4u
+#define LX_WAIT_SLICE_MAX_MS 32u
 
 static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
                                 uint64_t maxevents, uint64_t timeout_ms,
@@ -2303,8 +2309,9 @@ static int64_t linux_epoll_wait(uint64_t epfd, uint64_t events,
     int finite = tmo > 0;
     if (finite) {
         int64_t left = lx_wait_remaining_ms(0xE9u, epfd, events, tmo);
-        tmo = (int32_t)(left > (int64_t)LX_WAIT_SLICE_MS ? (int64_t)LX_WAIT_SLICE_MS
-                                                         : left);
+        tmo = (int32_t)(left > (int64_t)LX_WAIT_SLICE_MAX_MS
+                            ? (int64_t)LX_WAIT_SLICE_MAX_MS
+                            : left);
     }
     int64_t rc = (int64_t)syscall_epoll_wait_ex((int32_t)epfd,
                                                 (epoll_event_t *)(uintptr_t)events,
@@ -2433,8 +2440,6 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     int finite = timeout_ms > 0;
     if (finite) {
         timeout_ms = lx_wait_remaining_ms(0x507Eu, fds_ptr, nfds, timeout_ms);
-        slice_ms = timeout_ms > (int64_t)LX_WAIT_SLICE_MS ? LX_WAIT_SLICE_MS
-                                                          : (uint32_t)timeout_ms;
         if (timeout_ms == 0) {
             lx_wait_done(); /* due: one last scan, then report the timeout */
         }
@@ -2445,6 +2450,13 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
     uint64_t generation = poll_wait_generation();
 
     if (nfds == 0u) {
+        /* Pure sleep. Back off like any other idle wait, but never past the
+         * caller's own deadline. */
+        slice_ms = poll_wait_idle_slice(LINUX_POLL_SLICE_MS,
+                                        LX_WAIT_SLICE_MAX_MS);
+        if (timeout_ms > 0 && (uint32_t)timeout_ms < slice_ms) {
+            slice_ms = (uint32_t)timeout_ms;
+        }
         if (timeout_ms != 0 &&
             poll_wait_park(generation, slice_ms) != 0 &&
             should_switch_out != NULL) {
@@ -2501,6 +2513,9 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
         return LINUX_EFAULT;
     }
     if (ready_count > 0 || timeout_ms == 0) {
+        if (ready_count > 0) {
+            poll_wait_idle_reset(); /* work to do: back to the base slice */
+        }
         if (finite) {
             lx_wait_done();
         }
@@ -2509,6 +2524,28 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
 #if PROCESS_STALL_DUMP
     linux_poll_trace_note(pfds, nfds);
 #endif
+    /* Nothing ready. Back the sleep off (4 -> 32 ms) and cap it at both the
+     * caller's deadline and the nearest armed timerfd in the set: a timerfd
+     * fires on the clock alone, without a poll_wait_notify(), so it is the
+     * one thing a stretched sleep must not overshoot. */
+    slice_ms = poll_wait_idle_slice(LINUX_POLL_SLICE_MS, LX_WAIT_SLICE_MAX_MS);
+    if (timeout_ms > 0 && (uint32_t)timeout_ms < slice_ms) {
+        slice_ms = (uint32_t)timeout_ms;
+    }
+    for (uint64_t i = 0; i < nfds; ++i) {
+        if (pfds[i].fd < 0) {
+            continue;
+        }
+        uint64_t deadline = 0u;
+        int32_t global = lxfd_get(pfds[i].fd);
+        if (global >= 0 && syscall_timerfd_deadline_ms(global, &deadline)) {
+            uint64_t now_ms = timer_monotonic_ns() / 1000000ULL;
+            uint64_t wait_ms = deadline > now_ms ? deadline - now_ms : 1u;
+            if (wait_ms < (uint64_t)slice_ms) {
+                slice_ms = (uint32_t)wait_ms;
+            }
+        }
+    }
     if (poll_wait_park(generation, slice_ms) != 0 && should_switch_out != NULL) {
         *should_switch_out = 1;
     }
@@ -6085,6 +6122,7 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
     memset(wr_out, 0, sizeof(wr_out));
 
     int64_t ready = 0;
+    uint64_t nearest_timerfd_ms = 0u;
     for (uint64_t fd = 0; fd < nfds; ++fd) {
         uint32_t bit = 1u << (fd & 7u);
         uint64_t idx = fd >> 3;
@@ -6100,6 +6138,16 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
         if (global < 0) {
             return LINUX_EBADF; /* select() reports a bad descriptor */
         }
+        if (want_rd) {
+            /* A timerfd goes ready on the clock, with no
+             * poll_wait_notify() to announce it; remember the earliest
+             * armed deadline so the park below cannot run past it. */
+            uint64_t deadline = 0u;
+            if (syscall_timerfd_deadline_ms(global, &deadline) &&
+                (nearest_timerfd_ms == 0u || deadline < nearest_timerfd_ms)) {
+                nearest_timerfd_ms = deadline;
+            }
+        }
         uint32_t r = syscall_poll_one_fd(global, want);
         /* An error or hangup makes the fd readable as far as select() is
          * concerned - that is how a caller learns to go and collect it. */
@@ -6113,10 +6161,25 @@ static int64_t linux_select_common(uint64_t nfds, uint64_t rd_ptr,
         }
     }
 
+    if (ready > 0) {
+        poll_wait_idle_reset(); /* work to do: back to the base slice */
+    }
+
     if (ready == 0 && timeout_ms != 0) {
-        uint32_t slice_ms = LINUX_POLL_SLICE_MS;
+        /* Stretch an idle sleep (4 -> 32 ms), never past the caller's own
+         * deadline nor the nearest armed timerfd in the set. */
+        uint32_t slice_ms = poll_wait_idle_slice(LINUX_POLL_SLICE_MS,
+                                                 LX_WAIT_SLICE_MAX_MS);
         if (timeout_ms > 0 && (uint64_t)timeout_ms < slice_ms) {
             slice_ms = (uint32_t)timeout_ms;
+        }
+        if (nearest_timerfd_ms != 0u) {
+            uint64_t now_ms = timer_monotonic_ns() / 1000000ULL;
+            uint64_t wait_ms = nearest_timerfd_ms > now_ms ?
+                nearest_timerfd_ms - now_ms : 1u;
+            if (wait_ms < (uint64_t)slice_ms) {
+                slice_ms = (uint32_t)wait_ms;
+            }
         }
         if (poll_wait_park(generation, slice_ms) != 0 &&
             should_switch_out != NULL) {

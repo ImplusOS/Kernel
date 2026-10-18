@@ -428,6 +428,7 @@ static const driver_storage_t g_storage = {
     .read_blocks = nvme_read,
     .write_blocks = nvme_write,
     .flush = nvme_flush,
+    .transport = DRIVER_BLOCK_TRANSPORT_NVME,
 };
 
 static void nvme_shutdown(void)

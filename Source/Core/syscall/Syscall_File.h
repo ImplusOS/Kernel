@@ -95,6 +95,10 @@ int32_t syscall_file_get_dir_path(int32_t fd, char *out, uint32_t size);
 int32_t syscall_file_get_file_info(int32_t fd, vfs_file_t *file_out,
                                    uint32_t *writable_out);
 int32_t syscall_file_create_timerfd(void);
+/* True when `fd` is a timerfd with an armed deadline; *deadline_ms_out gets
+ * the absolute ms time of the next expiration. Used by the park paths to cap
+ * a wait at the nearest timerfd deadline -- see the definition. */
+bool syscall_timerfd_deadline_ms(int32_t fd, uint64_t *deadline_ms_out);
 int32_t syscall_file_timerfd_settime(int32_t fd,
                                      uint64_t it_value_sec,
                                      uint64_t it_value_nsec,

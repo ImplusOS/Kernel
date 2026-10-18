@@ -65,26 +65,13 @@ static void ehci_bios_handoff(uint8_t bus, uint8_t dev, uint8_t func) {
 
 void ehci_init(void) {
     pci_device_t ehci_dev;
-    bool found = false;
-    for (uint16_t b = 0; b < 256; b++) {
-        for (uint8_t d = 0; d < 32; d++) {
-            for (uint8_t f = 0; f < 8; f++) {
-                uint32_t class_reg = g_api->pci_read_config((uint8_t)b, d, f, 0x08);
-                uint8_t class_code = (uint8_t)((class_reg >> 24) & 0xFFu);
-                uint8_t subclass   = (uint8_t)((class_reg >> 16) & 0xFFu);
-                uint8_t prog_if    = (uint8_t)((class_reg >>  8) & 0xFFu);
-                if (class_code == 0x0C && subclass == 0x03 && prog_if == 0x20) {
-                    ehci_dev.bus    = (uint8_t)b;
-                    ehci_dev.device = d;
-                    ehci_dev.func   = f;
-                    found = true;
-                    goto pci_done;
-                }
-            }
-        }
-    }
-pci_done:
-    if (!found) {
+
+    /* Kernel PCI list, not a configuration-space sweep -- the sweep cost
+     * 1.75 s per boot on a machine with no EHCI (see driver_pci_find_class
+     * in DriverBinary.h). */
+    if (!driver_pci_find_class(g_api, 0x0Cu, 0x03u, 0x20u,
+                               &ehci_dev.bus, &ehci_dev.device,
+                               &ehci_dev.func)) {
         return;
     }
 
@@ -293,6 +280,17 @@ bool ehci_port_valid(uint32_t port) {
 
 bool ehci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                          struct usb_device_request *req, void *data) {
+    return ehci_submit_control_timeout(addr, endpoint, max_packet_size, req, data,
+                                       0u);
+}
+
+bool ehci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms) {
+    if (timeout_ms == 0u) {
+        timeout_ms = 5000u;
+    }
     if (!g_qh_control) return false;
 
     ehci_qtd_t *setup_qtd  = (ehci_qtd_t *)(g_qh_bulk_out + 1);
@@ -352,10 +350,10 @@ bool ehci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_siz
 
     ehci_ring_async_doorbell();
 
-    uint32_t timeout_ms = 5000;
+    uint32_t remaining_ms = timeout_ms;
     while (status_qtd->token & 0x80u) {
         ehci_delay_ms(1);
-        if (timeout_ms-- == 0) {
+        if (remaining_ms-- == 0) {
             return false;
         }
     }

@@ -8,13 +8,18 @@
 #ifndef IMPLUS_DRIVER_MODULE
 #include "mmu/Paging_Main.h"
 #include "Drivers/Module/DriverSelect.h"
+#include "interfaces/hal_cpu.h"
 #endif
 
 #include "Drivers/Module/DriverBinary.h"
 
 #define GENERIC_FB_DEVICE_NAME "Generic Framebuffer"
 #define GENERIC_FB_BYTES_PER_PIXEL 4U
+#if defined(PLATFORM_ARM64)
+#define GENERIC_FB_MAP_GRANULE (1ULL * 1024ULL * 1024ULL)
+#else
 #define GENERIC_FB_MAP_GRANULE (2ULL * 1024ULL * 1024ULL)
+#endif
 #define GENERIC_FB_MAX_MAPPINGS 1028
 
 #ifdef IMPLUS_DRIVER_MODULE
@@ -47,6 +52,8 @@ typedef struct {
     uint64_t map_offset_bytes;
     uint32_t mapped_chunks;
     uint8_t *mapped_bases[GENERIC_FB_MAX_MAPPINGS];
+    uint8_t *mapped_linear;
+    bool is_linear;
 } framebuffer_t;
 
 typedef struct {
@@ -61,6 +68,119 @@ static double_buffer_t g_double_buffer = {
 };
 static int g_ready = 0;
 static uint32_t g_generation = 1u;
+static bool g_copy_available = false;
+static bool g_sse2_available = false;
+
+static void *generic_map_framebuffer_chunk(uint64_t phys_addr)
+{
+#ifdef IMPLUS_DRIVER_MODULE
+    return g_driver_api->hw.map_mmio_wc_range(phys_addr,
+                                                GENERIC_FB_MAP_GRANULE);
+#else
+    return map_mmio_wc_virt(phys_addr);
+#endif
+}
+
+static bool generic_cpu_has_sse2(void)
+{
+#if defined(PLATFORM_X86_64)
+    uint32_t eax = 0u;
+    uint32_t edx = 0u;
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api == NULL || g_driver_api->hal.cpu_get_id == NULL ||
+        g_driver_api->hal.cpu_save_interrupts == NULL ||
+        g_driver_api->hal.cpu_restore_interrupts == NULL ||
+        g_driver_api->hal.cpu_disable_interrupts == NULL) {
+        return false;
+    }
+    g_driver_api->hal.cpu_get_id(1u, 0u, &eax, NULL, NULL, &edx);
+#else
+    hal_cpu_get_id(1u, 0u, &eax, NULL, NULL, &edx);
+#endif
+    return (edx & (1u << 26)) != 0u;
+#else
+    return false;
+#endif
+}
+
+#if defined(PLATFORM_X86_64)
+static void generic_copy_sse2(void *destination, const void *source,
+                              size_t bytes)
+{
+    uint8_t fpu_state[512] __attribute__((aligned(16)));
+    uint8_t *dst = (uint8_t *)destination;
+    const uint8_t *src = (const uint8_t *)source;
+    size_t blocks = bytes / 16u;
+
+#ifdef IMPLUS_DRIVER_MODULE
+    uint64_t interrupt_state = g_driver_api->hal.cpu_save_interrupts();
+    g_driver_api->hal.cpu_disable_interrupts();
+#else
+    uint64_t interrupt_state = hal_cpu_save_interrupts();
+    hal_cpu_disable_interrupts();
+#endif
+
+    /* Kernel entry paths do not save XMM state; preserve it around the store. */
+    __asm__ volatile(
+        "fxsave %[state]\n\t"
+        "1:\n\t"
+        "test %[blocks], %[blocks]\n\t"
+        "jz 2f\n\t"
+        "movdqu (%[src]), %%xmm0\n\t"
+        "movntdq %%xmm0, (%[dst])\n\t"
+        "add $16, %[src]\n\t"
+        "add $16, %[dst]\n\t"
+        "dec %[blocks]\n\t"
+        "jmp 1b\n\t"
+        "2:\n\t"
+        "sfence\n\t"
+        "fxrstor %[state]"
+        : [dst] "+r"(dst), [src] "+r"(src), [blocks] "+r"(blocks),
+          [state] "+m"(fpu_state)
+        :
+        /* XMM0 is deliberately omitted from the clobber list: this file is
+         * compiled with -mgeneral-regs-only, and the FXSAVE/FXRSTOR pair
+         * restores the complete vector state before returning. */
+        : "cc", "memory");
+
+#ifdef IMPLUS_DRIVER_MODULE
+    g_driver_api->hal.cpu_restore_interrupts(interrupt_state);
+#else
+    hal_cpu_restore_interrupts(interrupt_state);
+#endif
+}
+#endif
+
+static void generic_copy_bytes(void *destination, const void *source,
+                               uint64_t bytes)
+{
+    uint8_t *dst = (uint8_t *)destination;
+    const uint8_t *src = (const uint8_t *)source;
+    size_t length = (size_t)bytes;
+
+#if defined(PLATFORM_X86_64)
+    if (g_copy_available && g_sse2_available && length >= 64u) {
+        size_t lead = (size_t)(-(uintptr_t)dst) & 15u;
+        if (lead > length) lead = length;
+        if (lead != 0u) {
+            memcpy(dst, src, lead);
+            dst += lead;
+            src += lead;
+            length -= lead;
+        }
+        size_t simd_bytes = length & ~(size_t)15u;
+        if (simd_bytes != 0u) {
+            generic_copy_sse2(dst, src, simd_bytes);
+            dst += simd_bytes;
+            src += simd_bytes;
+            length -= simd_bytes;
+        }
+        if (length != 0u) memcpy(dst, src, length);
+        return;
+    }
+#endif
+    memcpy(dst, src, length);
+}
 
 static void generic_copy_string(char *dst, uint32_t dst_size, const char *src) {
     if (dst == NULL || dst_size == 0u) {
@@ -120,7 +240,7 @@ static bool map_framebuffer_chunks(uint64_t phys_addr, uint64_t size_bytes) {
 
     for (uint32_t i = 0; i < (uint32_t)chunks_u64; ++i) {
         uint64_t chunk_phys = base_phys + ((uint64_t)i * GENERIC_FB_MAP_GRANULE);
-        void *chunk_virt = map_mmio_virt(chunk_phys);
+        void *chunk_virt = generic_map_framebuffer_chunk(chunk_phys);
         if (chunk_virt == NULL) {
             return false;
         }
@@ -129,6 +249,15 @@ static bool map_framebuffer_chunks(uint64_t phys_addr, uint64_t size_bytes) {
 
     g_fb.map_offset_bytes = base_offset;
     g_fb.mapped_chunks = (uint32_t)chunks_u64;
+    g_fb.mapped_linear = g_fb.mapped_bases[0] + base_offset;
+    g_fb.is_linear = true;
+    for (uint32_t i = 1u; i < g_fb.mapped_chunks; ++i) {
+        if (g_fb.mapped_bases[i] !=
+            g_fb.mapped_bases[0] + ((uint64_t)i * GENERIC_FB_MAP_GRANULE)) {
+            g_fb.is_linear = false;
+            break;
+        }
+    }
     return true;
 }
 
@@ -153,6 +282,8 @@ bool generic_fb_set(const driver_boot_framebuffer_t *framebuffer) {
     }
 
     g_ready = 0;
+    g_copy_available = false;
+    g_sse2_available = false;
     g_fb.mapped_chunks = 0;
     ++g_generation;
 
@@ -196,6 +327,15 @@ bool generic_fb_set(const driver_boot_framebuffer_t *framebuffer) {
     if (!map_framebuffer_chunks((uint64_t)(uintptr_t)framebuffer->addr, required_bytes)) {
         return false;
     }
+
+#ifdef IMPLUS_DRIVER_MODULE
+    /* driver_module_init() validates the memcpy callback before publishing
+     * the descriptor; avoid the local memcpy macro expanding this access. */
+    g_copy_available = g_driver_api != NULL;
+#else
+    g_copy_available = true;
+#endif
+    g_sse2_available = generic_cpu_has_sse2();
 
     g_fb.width = framebuffer->width;
     g_fb.height = framebuffer->height;
@@ -371,8 +511,20 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color
             paint_end = buffer_pixels;
         }
 
-        for (uint64_t idx = paint_begin; idx < paint_end; ++idx) {
-            g_double_buffer.buffer[idx] = color;
+        uint64_t count = paint_end - paint_begin;
+        uint32_t *row = &g_double_buffer.buffer[paint_begin];
+        while (count != 0u && (((uintptr_t)row & 7u) != 0u)) {
+            *row++ = color;
+            --count;
+        }
+        uint64_t pair = ((uint64_t)color << 32) | color;
+        uint64_t *row64 = (uint64_t *)row;
+        while (count >= 2u) {
+            *row64++ = pair;
+            count -= 2u;
+        }
+        if (count != 0u) {
+            *(uint32_t *)row64 = color;
         }
     }
 }
@@ -392,18 +544,18 @@ static void copy_row_to_framebuffer(uint64_t pixel_index,
     uint8_t *dst = g_fb.mapped_bases[chunk_index] + chunk_offset;
     uint64_t remaining_in_chunk = GENERIC_FB_MAP_GRANULE - chunk_offset;
 
-    if (row_bytes <= remaining_in_chunk) {
-        memcpy((void *)dst, (const void *)src, row_bytes);
-        return;
-    }
-
-    uint64_t part1 = remaining_in_chunk;
-    uint64_t part2 = row_bytes - part1;
-    memcpy((void *)dst, (const void *)src, part1);
-    if (chunk_index + 1 < g_fb.mapped_chunks) {
-        memcpy((void *)g_fb.mapped_bases[chunk_index + 1],
-               (const void *)(src + part1),
-               part2);
+    uint64_t remaining = row_bytes;
+    uint64_t copied = 0u;
+    while (remaining != 0u && chunk_index < g_fb.mapped_chunks) {
+        uint64_t part = remaining < remaining_in_chunk ? remaining : remaining_in_chunk;
+        generic_copy_bytes((void *)dst, (const void *)(src + copied), part);
+        copied += part;
+        remaining -= part;
+        ++chunk_index;
+        if (remaining != 0u) {
+            dst = g_fb.mapped_bases[chunk_index];
+            remaining_in_chunk = GENERIC_FB_MAP_GRANULE;
+        }
     }
 }
 
@@ -451,6 +603,12 @@ void fb_present(void) {
     uint8_t *src_bytes = (uint8_t *)g_double_buffer.buffer;
     uint64_t row_bytes = (uint64_t)g_fb.width * sizeof(uint32_t);
     uint64_t scan_line_bytes = (uint64_t)g_fb.pixels_per_scan_line * sizeof(uint32_t);
+
+    if (g_fb.is_linear) {
+        generic_copy_bytes(g_fb.mapped_linear, src_bytes,
+                           scan_line_bytes * g_fb.height);
+        return;
+    }
 
     for (uint32_t y = 0; y < g_fb.height; ++y) {
         uint64_t pixel_index = (uint64_t)y * g_fb.pixels_per_scan_line;
@@ -545,7 +703,8 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
     if (!api) return NULL;
 
     if (!api->malloc || !api->free ||
-        !api->map_mmio_virt || !api->memcpy || !api->memset) {
+        !api->map_mmio_virt || !api->hw.map_mmio_wc_range ||
+        !api->memcpy || !api->memset) {
         return NULL;
     }
 

@@ -141,6 +141,7 @@ static const driver_storage_t g_storage = {
     .read_blocks = module_read,
     .write_blocks = module_write,
     .flush = module_flush,
+    .transport = DRIVER_BLOCK_TRANSPORT_AHCI,
 };
 
 static void module_shutdown(void)

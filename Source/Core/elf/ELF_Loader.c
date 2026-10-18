@@ -7,6 +7,8 @@
 #include "ELF_Loader.h"
 #include "mmu/Paging_Main.h"
 #include "Core/process/ProcessManager.h" /* USER_CODE_BASE / USER_CODE_LIMIT */
+#include "Core/memory/FileMap.h"
+#include "Core/syscall/Syscall_File.h"
 
 #include "Drivers/Module/DriverManager.h"
 #include "MemoryManagement/Memory_Main.h"
@@ -418,6 +420,17 @@ static bool zero_address_space(uint64_t target_cr3,
         cleared += chunk;
     }
     return true;
+}
+
+static bool ensure_user_page_alloc(uint64_t target_cr3,
+                                   uint64_t page_vaddr,
+                                   uint64_t flags)
+{
+    if (paging_virt_to_phys(target_cr3, page_vaddr) != 0u) {
+        return true;
+    }
+    return paging_map_user_range_alloc(target_cr3, page_vaddr,
+                                       ELF_PAGE_SIZE, flags) == 0;
 }
 
 static bool sym_value_for_reloc(const Elf64_Sym *symbols,
@@ -1066,16 +1079,20 @@ static bool apply_relocations(const uint8_t     *image,
  * loaded at USER_CODE_BASE and must stay below this. */
 #define ELF_INTERP_BIAS_RESERVE 0x08000000ULL /* 128 MiB */
 
+/* Chromium's main image is large enough that reading every PT_LOAD before
+ * its first instruction dominates startup.  Keep demand paging limited to
+ * large Linux images: native ImplusOS ELFs and small foreign helpers retain
+ * the old eager path, while the fallback below keeps this an optimization,
+ * not a new loader requirement. */
+#define ELF_DEMAND_PAGE_MIN_BYTES (16ULL * 1024ULL * 1024ULL)
+
 /* ---- [elfload] timing ---------------------------------------------------
  *
- * This loader reads an image's PT_LOAD segments in, whole, before the child
- * runs a single instruction -- and a Linux Chromium is ~500 MB of PT_LOAD,
- * re-read on the spawn *and* on every child's exec. Measured on QEMU that
- * one load was ~7 s of the 9 s it took to get the browser process started,
- * so where the time goes (reading the file, copying it into the new address
- * space, or allocating the pages) is the first thing to know about startup,
- * and it is not knowable from the outside: the process is in one syscall
- * with no output until it finishes.
+ * The eager fallback reads an image's PT_LOAD segments in, whole, before the
+ * child runs a single instruction -- and a Linux Chromium is ~500 MB of
+ * PT_LOAD, re-read on the spawn and on every child's exec. Large Linux images
+ * now use FileMap for their full file-backed pages, but the same counters are
+ * retained so a QEMU boot still shows what was eager and what was deferred.
  *
  * The counters hang off the load call rather than being file-scope: a
  * Chromium spawn runs the parent's load and the children's execs at the same
@@ -1088,10 +1105,12 @@ typedef struct {
     uint64_t copy_ns;
     uint64_t map_ns;
     uint64_t bytes;
+    uint64_t demand_bytes;
     uint64_t chunks;
 } elf_load_stats_t;
 
 static bool elf_load_image_biased(uint64_t target_cr3,
+                                  int32_t target_pid,
                                   const char *path,
                                   const elf_load_policy_t *policy,
                                   uint64_t bias_override,
@@ -1121,7 +1140,7 @@ static void elf_stats_dec(uint64_t v)
 static void elf_stats_dump(uint64_t total_ns, const char *path,
                            const elf_load_stats_t *s)
 {
-    if (s->bytes < (8u * 1024u * 1024u)) {
+    if (s->bytes < (8u * 1024u * 1024u) && s->demand_bytes == 0u) {
         return; /* Small image: nothing here costs anything worth printing. */
     }
     serial_write_string("[elfload] path=");
@@ -1130,25 +1149,29 @@ static void elf_stats_dump(uint64_t total_ns, const char *path,
     serial_write_string(" read_ms=");  elf_stats_dec(s->read_ns / 1000000u);
     serial_write_string(" copy_ms=");  elf_stats_dec(s->copy_ns / 1000000u);
     serial_write_string(" map_ms=");   elf_stats_dec(s->map_ns / 1000000u);
-    serial_write_string(" mb=");       elf_stats_dec(s->bytes / (1024u * 1024u));
+    serial_write_string(" eager_mb=");  elf_stats_dec(s->bytes / (1024u * 1024u));
+    serial_write_string(" demand_mb="); elf_stats_dec(s->demand_bytes /
+                                                       (1024u * 1024u));
     serial_write_string(" chunks=");   elf_stats_dec(s->chunks);
     serial_write_string("\n");
 }
 
 bool elf_loader_load_from_path(uint64_t target_cr3,
+                               int32_t target_pid,
                                const char *path,
                                const elf_load_policy_t *policy,
                                elf_loaded_image_info_t *image_out)
 {
     uint64_t started = timer_monotonic_ns();
-    elf_load_stats_t stats = {0u, 0u, 0u, 0u, 0u};
-    bool ok = elf_load_image_biased(target_cr3, path, policy, 0u, 0,
+    elf_load_stats_t stats = {0u, 0u, 0u, 0u, 0u, 0u};
+    bool ok = elf_load_image_biased(target_cr3, target_pid, path, policy, 0u, 0,
                                     image_out, &stats);
     elf_stats_dump(timer_monotonic_ns() - started, path, &stats);
     return ok;
 }
 
 static bool elf_load_image_biased(uint64_t target_cr3,
+                                  int32_t target_pid,
                                   const char *path,
                                   const elf_load_policy_t *policy,
                                   uint64_t bias_override,
@@ -1171,6 +1194,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
     }
     
     Elf64_Phdr *phdrs = NULL;
+    int32_t demand_fd = -1;
 
     if (file.size == 0 || (uint64_t)file.size > policy->max_file_size) {
         ELF_SET_ERROR("invalid file size");
@@ -1216,6 +1240,28 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             goto fail;
         }
     }
+
+    bool linux_image =
+        (ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX) ||
+        (ehdr.e_ident[EI_OSABI] == 0 &&
+         ehdr.e_entry >= 0x1000 &&
+         ehdr.e_entry < ELFOSABI_LINUX_ENTRY_HINT);
+#if defined(PLATFORM_X86_64)
+    bool demand_page_image = !is_interp && target_pid >= 0 && linux_image &&
+                             (uint64_t)file.size >= ELF_DEMAND_PAGE_MIN_BYTES;
+    if (demand_page_image) {
+        /* The loader is running in the parent during spawn, so acquire the
+         * reference from a short-lived descriptor in the current process.
+         * filemap_register() keeps the mmap reference after this descriptor
+         * is closed and associates the mapping with target_pid. */
+        demand_fd = syscall_file_open(path, 0u);
+        if (demand_fd < 0) {
+            demand_page_image = false;
+        }
+    }
+#else
+    (void)target_pid;
+#endif
 
     int    load_segments = 0;
     uint64_t phdr_vaddr  = 0;
@@ -1307,7 +1353,140 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             seg_flags |= PAGE_NX;
         }
 
-        {
+        bool segment_demand_paged = false;
+#if defined(PLATFORM_X86_64)
+        if (demand_page_image && demand_fd >= 0 &&
+            (ph->p_offset & (ELF_PAGE_SIZE - 1ULL)) ==
+                (seg_vaddr & (ELF_PAGE_SIZE - 1ULL))) {
+            uint64_t demand_start = align_up_u64(seg_vaddr, ELF_PAGE_SIZE);
+            uint64_t file_end = seg_vaddr + ph->p_filesz;
+            uint64_t demand_end = align_down_u64(file_end, ELF_PAGE_SIZE);
+            uint64_t demand_bytes =
+                demand_end > demand_start ? demand_end - demand_start : 0u;
+            if (demand_bytes >= ELF_PAGE_SIZE) {
+                int32_t handle = syscall_file_mmap_acquire(demand_fd);
+                if (handle >= 0 &&
+                    filemap_register(target_pid, demand_start, demand_bytes,
+                                     handle,
+                                     ph->p_offset + (demand_start - seg_vaddr),
+                                     seg_flags) == 0) {
+                    segment_demand_paged = true;
+                    stats->demand_bytes += demand_bytes;
+                } else if (handle >= 0) {
+                    syscall_file_mmap_release(handle);
+                }
+            }
+        }
+#endif
+
+        bool executable = ((ph->p_flags & PF_X) != 0);
+
+        if (segment_demand_paged) {
+            /* Full file-backed pages are now supplied by FileMap on first
+             * fault. The first partial file page, final partial file page and
+             * the BSS tail stay eager so the ELF rule that bytes after
+             * p_filesz are zero is preserved exactly. The first page may
+             * overlap the preceding PT_LOAD, so never replace it wholesale. */
+            uint64_t seg_page = align_down_u64(seg_vaddr, ELF_PAGE_SIZE);
+            uint64_t eager_start = align_up_u64(seg_vaddr, ELF_PAGE_SIZE);
+            if (eager_start > seg_page &&
+                !ensure_user_page_alloc(target_cr3, seg_page, seg_flags)) {
+                ELF_SET_ERROR("paging map failed");
+                goto fail;
+            }
+            uint64_t initial_size = eager_start - seg_vaddr;
+            if (initial_size > ph->p_filesz) initial_size = ph->p_filesz;
+            if (initial_size > 0u) {
+                enum { ELF_SEG_CHUNK = 256u * 1024u };
+                uint8_t *staging = (uint8_t *)malloc(ELF_SEG_CHUNK);
+                if (staging == NULL) {
+                    ELF_SET_ERROR("segment staging alloc failed (out of memory)");
+                    goto fail;
+                }
+                uint64_t done = 0;
+                while (done < initial_size) {
+                    uint64_t n = initial_size - done;
+                    if (n > ELF_SEG_CHUNK) n = ELF_SEG_CHUNK;
+                    if (!vfs_read_at(&file,
+                                     (uint32_t)(ph->p_offset + done),
+                                     staging, (uint32_t)n) ||
+                        !copy_to_address_space(target_cr3,
+                                               seg_vaddr + done,
+                                               staging, n, executable)) {
+                        free(staging);
+                        ELF_SET_ERROR("failed to load segment head");
+                        goto fail;
+                    }
+                    stats->bytes += n;
+                    ++stats->chunks;
+                    done += n;
+                }
+                free(staging);
+            }
+            if (ph->p_memsz > ph->p_filesz &&
+                ph->p_filesz < initial_size &&
+                !zero_address_space(target_cr3,
+                                    seg_vaddr + ph->p_filesz,
+                                    initial_size - ph->p_filesz,
+                                    executable)) {
+                ELF_SET_ERROR("failed to zero segment head");
+                goto fail;
+            }
+
+            uint64_t eager_end = align_up_u64(seg_vaddr + ph->p_memsz,
+                                              ELF_PAGE_SIZE);
+            uint64_t demand_end =
+                align_down_u64(seg_vaddr + ph->p_filesz, ELF_PAGE_SIZE);
+            uint64_t eager_tail = demand_end;
+            if (eager_end > eager_tail) {
+                uint64_t map_started = timer_monotonic_ns();
+                if (paging_map_user_range_alloc(target_cr3, eager_tail,
+                                                eager_end - eager_tail,
+                                                seg_flags) < 0) {
+                    ELF_SET_ERROR("paging map failed");
+                    goto fail;
+                }
+                stats->map_ns += timer_monotonic_ns() - map_started;
+
+                uint64_t tail_offset = eager_tail - seg_vaddr;
+                if (tail_offset < ph->p_filesz) {
+                    uint64_t tail_size = ph->p_filesz - tail_offset;
+                    enum { ELF_SEG_CHUNK = 256u * 1024u };
+                    uint8_t *staging = (uint8_t *)malloc(ELF_SEG_CHUNK);
+                    if (staging == NULL) {
+                        ELF_SET_ERROR("segment staging alloc failed (out of memory)");
+                        goto fail;
+                    }
+                    uint64_t done = 0;
+                    while (done < tail_size) {
+                        uint64_t n = tail_size - done;
+                        if (n > ELF_SEG_CHUNK) n = ELF_SEG_CHUNK;
+                        if (!vfs_read_at(&file,
+                                         (uint32_t)(ph->p_offset + tail_offset + done),
+                                         staging, (uint32_t)n) ||
+                            !copy_to_address_space(target_cr3,
+                                                   seg_vaddr + tail_offset + done,
+                                                   staging, n, executable)) {
+                            free(staging);
+                            ELF_SET_ERROR("failed to load segment tail");
+                            goto fail;
+                        }
+                        stats->bytes += n;
+                        ++stats->chunks;
+                        done += n;
+                    }
+                    free(staging);
+                }
+                if (ph->p_memsz > ph->p_filesz &&
+                    !zero_address_space(target_cr3,
+                                        seg_vaddr + ph->p_filesz,
+                                        ph->p_memsz - ph->p_filesz,
+                                        executable)) {
+                    ELF_SET_ERROR("failed to zero segment tail");
+                    goto fail;
+                }
+            }
+        } else {
             uint64_t t = timer_monotonic_ns();
             if (paging_map_user_range_alloc(target_cr3,
                                             seg_vaddr,
@@ -1317,17 +1496,13 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                 goto fail;
             }
             stats->map_ns += timer_monotonic_ns() - t;
-        }
 
-        bool executable = ((ph->p_flags & PF_X) != 0);
-
-        /*
-         * Stream the segment's file data through a small fixed staging buffer
-         * instead of malloc()'ing the whole p_filesz. Large binaries (a
-         * dynamically-linked Chromium has ~150-250 MB PT_LOAD segments) would
-         * otherwise instantly OOM the kernel heap.
-         */
-        if (ph->p_filesz > 0) {
+            /*
+             * Stream the segment's file data through a small fixed staging
+             * buffer instead of malloc()'ing the whole p_filesz. Large
+             * binaries would otherwise instantly OOM the kernel heap.
+             */
+            if (ph->p_filesz > 0) {
             enum { ELF_SEG_CHUNK = 256u * 1024u };
             uint8_t *staging = (uint8_t *)malloc(ELF_SEG_CHUNK);
             if (staging == NULL) {
@@ -1340,7 +1515,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                 if (n > ELF_SEG_CHUNK) {
                     n = ELF_SEG_CHUNK;
                 }
-                uint64_t t = timer_monotonic_ns();
+                uint64_t read_started = timer_monotonic_ns();
                 if (!vfs_read_at(&file,
                                  (uint32_t)(ph->p_offset + done),
                                  staging,
@@ -1349,9 +1524,9 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                     ELF_SET_ERROR("failed to read segment data");
                     goto fail;
                 }
-                stats->read_ns += timer_monotonic_ns() - t;
+                stats->read_ns += timer_monotonic_ns() - read_started;
 
-                t = timer_monotonic_ns();
+                uint64_t copy_started = timer_monotonic_ns();
                 if (!copy_to_address_space(target_cr3,
                                            seg_vaddr + done,
                                            staging,
@@ -1361,20 +1536,21 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                     ELF_SET_ERROR("copy to address space failed");
                     goto fail;
                 }
-                stats->copy_ns += timer_monotonic_ns() - t;
+                stats->copy_ns += timer_monotonic_ns() - copy_started;
                 stats->bytes += n;
                 ++stats->chunks;
                 done += n;
             }
             free(staging);
-        }
-        if (ph->p_memsz > ph->p_filesz) {
-            if (!zero_address_space(target_cr3,
-                                    seg_vaddr + ph->p_filesz,
-                                    ph->p_memsz - ph->p_filesz,
-                                    executable)) {
-                ELF_SET_ERROR("zero address space failed");
-                goto fail;
+            }
+            if (ph->p_memsz > ph->p_filesz) {
+                if (!zero_address_space(target_cr3,
+                                        seg_vaddr + ph->p_filesz,
+                                        ph->p_memsz - ph->p_filesz,
+                                        executable)) {
+                    ELF_SET_ERROR("zero address space failed");
+                    goto fail;
+                }
             }
         }
 
@@ -1436,10 +1612,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
     image_out->load_bias   = bias;
     image_out->interp_base = 0u;
     image_out->interp_path[0] = '\0';
-    image_out->linux_abi   =
-        (ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX) ||
-        (ehdr.e_ident[EI_OSABI] == 0 &&
-         ehdr.e_entry >= 0x1000 && ehdr.e_entry < ELFOSABI_LINUX_ENTRY_HINT) ? 1u : 0u;
+    image_out->linux_abi   = linux_image ? 1u : 0u;
 
     if (interp_path[0] != '\0' && !is_interp) {
         /* Load the dynamic linker high in the code region, clear of the main
@@ -1452,7 +1625,7 @@ static bool elf_load_image_biased(uint64_t target_cr3,
         }
         elf_loaded_image_info_t interp_info;
         memset(&interp_info, 0, sizeof(interp_info));
-        if (!elf_load_image_biased(target_cr3, interp_path, policy,
+        if (!elf_load_image_biased(target_cr3, target_pid, interp_path, policy,
                                    interp_bias, 1, &interp_info, stats)) {
             ELF_SET_ERROR("interpreter load failed");
             goto fail;
@@ -1467,12 +1640,18 @@ static bool elf_load_image_biased(uint64_t target_cr3,
     }
 
     free(phdrs);
+    if (demand_fd >= 0) {
+        (void)syscall_file_close(demand_fd);
+    }
     (void)vfs_close_file(&file);
     return true;
 
 fail:
     if (phdrs != NULL) {
         free(phdrs);
+    }
+    if (demand_fd >= 0) {
+        (void)syscall_file_close(demand_fd);
     }
     (void)vfs_close_file(&file);
     return false;

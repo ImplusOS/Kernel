@@ -9,7 +9,13 @@ typedef uint32_t UINT32;
 
 typedef uint64_t EFI_PHYSICAL_ADDRESS;
 
-#define MAX_LOADED_FILES 16
+/* How many preloaded files (driver modules, apps, services) the boot manager
+ * can describe in BootInfo. Keep this in sync with
+ * BootManager/Source/BootInfo.h -- the struct crosses the boot handoff
+ * verbatim. 32 covers every module the image stages today: at 16 the tail of
+ * the alphabetical preload list (VirtIO_Driver.ELF, WiFi_Driver.ELF) was
+ * silently dropped. */
+#define MAX_LOADED_FILES 32
 #define LOADED_FILE_NAME_MAX 64
 
 #define BOOT_DRIVE_TYPE_UNKNOWN 0

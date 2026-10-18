@@ -9,7 +9,7 @@
 #include "kernel/interfaces/vfs_file.h"
 
 #define DRIVER_API_VERSION_MAJOR 2u
-#define DRIVER_API_VERSION_MINOR 2u
+#define DRIVER_API_VERSION_MINOR 3u
 
 #define DRIVER_DESCRIPTOR_MAGIC 0x44525641u
 #define DRIVER_DESCRIPTOR_VERSION 2u
@@ -67,6 +67,8 @@ typedef struct {
     void (*pci_write_config)(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset, uint32_t value);
     void *(*map_mmio_virt)(uint64_t phys_addr);
     void *(*map_mmio_range)(uint64_t phys_addr, size_t size);
+    /* Write-combining mapping for linear scanout framebuffers. */
+    void *(*map_mmio_wc_range)(uint64_t phys_addr, size_t size);
 } driver_api_hw_t;
 
 /*
@@ -77,8 +79,8 @@ typedef struct {
  * drivers before it initializes filesystems), so find_file() will simply
  * return false there. From any later callback (poll(), is_ready(), a
  * probe(), ...) it works normally. Intended use: loading firmware blobs by
- * path (see Kernel/Drivers/Wi-Fi/AX900/AX900.c for a worked example),
- * not general-purpose file access -- there is deliberately no write/creat/
+ * path (see Kernel/Drivers/Wi-Fi/AIC8800/AIC8800_Fw.c for a worked
+ * example), not general-purpose file access -- there is deliberately no write/creat/
  * mkdir surface here.
  */
 typedef struct {
@@ -294,6 +296,49 @@ typedef struct {
     void (*pnp_notify)(const pnp_event_t *event);
 } driver_binary_t;
 
+/*
+ * Find the first PCI function of the given class through the kernel's
+ * enumerated device list instead of sweeping configuration space. A sweep is
+ * 65536 (bus, device, function) probes and, under a hypervisor, every probe
+ * is two port-I/O exits: ruling out a controller that is not present costs
+ * ~1.8 s that way (measured for the EHCI probe on a machine with only xHCI),
+ * and every driver module that scans this way pays it again. The kernel's
+ * list is built once, on first use, by pci_scan_bus().
+ *
+ * Returns true and fills out_bus/out_dev/out_func on the first match, false
+ * when no function of that class exists.
+ */
+static inline bool driver_pci_find_class(const driver_binary_t *api,
+                                         uint8_t class_code,
+                                         uint8_t subclass,
+                                         uint8_t prog_if,
+                                         uint8_t *out_bus,
+                                         uint8_t *out_dev,
+                                         uint8_t *out_func)
+{
+    if (api == NULL || api->pci.get_device_count == NULL ||
+        api->pci.get_device == NULL || out_bus == NULL || out_dev == NULL ||
+        out_func == NULL) {
+        return false;
+    }
+
+    uint32_t count = api->pci.get_device_count();
+    for (uint32_t i = 0u; i < count; ++i) {
+        driver_pci_device_t dev;
+        if (!api->pci.get_device(i, &dev)) {
+            continue;
+        }
+        if (dev.class_code == class_code && dev.subclass == subclass &&
+            dev.prog_if == prog_if) {
+            *out_bus = dev.bus;
+            *out_dev = dev.device;
+            *out_func = dev.function;
+            return true;
+        }
+    }
+    return false;
+}
+
 typedef struct {
     void (*init)(void);
     void (*poll)(void);
@@ -354,6 +399,12 @@ typedef struct {
                          const void *buffer,
                          uint32_t block_count);
     bool (*flush)(uint32_t device_index);
+
+    /* Optional; DRIVER_BLOCK_TRANSPORT_UNKNOWN when the provider does not say.
+     * BlockManager probes the boot medium's transport first (and can defer the
+     * others to a lazy scan) instead of paying every failing probe's timeouts
+     * on every boot. */
+    driver_block_transport_t transport;
 } driver_storage_t;
 
 #define DRIVER_AUDIO_FORMAT_S16_LE 1u
@@ -427,6 +478,13 @@ typedef struct {
     uint8_t  ep_out;
     uint16_t ep_in_mps;
     uint16_t ep_out_mps;
+    /* Some vendor-specific USB NICs expose separate bulk OUT pipes for
+     * control messages and data frames (AIC8800D80 is one example).  The
+     * historical ep_out fields remain the control pipe; ep_out_data is
+     * optional and falls back to ep_out when the interface has only one OUT
+     * endpoint. */
+    uint8_t  ep_out_data;
+    uint16_t ep_out_data_mps;
     bool (*submit_bulk)(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                         uint8_t pid, void *data, uint32_t length);
     /* submit_bulk with the caller's own deadline (0 = the controller default).
@@ -439,6 +497,30 @@ typedef struct {
                                 uint16_t max_packet_size, uint8_t pid,
                                 void *data, uint32_t length,
                                 uint32_t timeout_ms);
+    /* Non-blocking IN, for a driver that has to look at an endpoint on
+     * every poll: post one transfer into a caller-allocated DMA buffer and
+     * later ask check_interrupt_event() whether it has completed, instead
+     * of blocking for a timeout on each visit. An idle (NAKing) endpoint
+     * then costs one flag test per poll rather than the timeout.
+     *
+     * The endpoint's transfer ring is created by the controller on the
+     * first *sync* transfer, so a driver must run one submit_bulk(_timeout)
+     * on the endpoint before this pair starts working; afterwards the two
+     * paths share the ring and may not be mixed on the same endpoint while
+     * one of these is posted.
+     *
+     *   submit: true when the transfer was posted. On completion the data
+     *           lands in dma_buf (there is no length report).
+     *   check : 1  completed, data in dma_buf
+     *           0  still in flight
+     *          <0  the endpoint failed and was reset internally; the
+     *              transfer is gone, so post a new one.
+     * May be NULL on an older bus driver. */
+    bool (*submit_interrupt_in_async)(uint8_t addr, uint8_t ep_num,
+                                      uint16_t max_packet_size,
+                                      void *dma_buf, uint64_t dma_phys,
+                                      uint16_t length);
+    int  (*check_interrupt_event)(uint8_t addr, uint8_t ep_num);
 } usb_device_context_t;
 
 typedef struct {
@@ -570,8 +652,8 @@ typedef struct {
 typedef void (*driver_nic_rx_callback_t)(const uint8_t *frame, uint16_t frame_len);
 
 /*
- * Wi-Fi management plane (added alongside AX900.c, the first driver
- * module that needs it). Deliberately kept optional/additive on
+ * Wi-Fi management plane (added alongside the first driver module that
+ * needed it). Deliberately kept optional/additive on
  * driver_nic_t rather than a separate descriptor kind: a NIC that only
  * does the generic send/recv/poll surface (VirtIONet, I219V, ...) simply
  * leaves these fields NULL, and NicManager/DriverManager below guard every
@@ -606,7 +688,7 @@ typedef enum {
     DRIVER_WIFI_STATE_NO_ADAPTER = 0,
     DRIVER_WIFI_STATE_ADAPTER_ATTACHED,   /* USB device present, firmware not loaded yet */
     DRIVER_WIFI_STATE_FIRMWARE_LOADING,
-    DRIVER_WIFI_STATE_FIRMWARE_FAILED,    /* fw files missing/rejected -- see AX900.c */
+    DRIVER_WIFI_STATE_FIRMWARE_FAILED,    /* fw files missing/rejected -- see AIC8800.c */
     DRIVER_WIFI_STATE_READY,              /* firmware up, idle */
     DRIVER_WIFI_STATE_SCANNING,
     DRIVER_WIFI_STATE_CONNECTING,

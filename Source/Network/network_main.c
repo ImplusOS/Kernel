@@ -14,7 +14,7 @@ static uint32_t g_timer_ticks_for_aging = 0u;
 
 /* DHCP is driven from here rather than from any specific NIC driver: no
  * caller anywhere kicked off dhcp_discover() before this (every NIC
- * driver -- wired or AX900 -- just left the stack on the static
+ * driver -- wired or wireless -- just left the stack on the static
  * OS_CONFIG_NET_IPV4_* address above, which happens to match QEMU's
  * user-mode NAT defaults but is meaningless on a real network/AP). Kick
  * a DHCP lease the moment the active NIC reports link-up, and keep
@@ -91,7 +91,7 @@ void network_stack_on_timer_tick(void)
 
     bool nic_ready = driver_manager_nic_is_ready();
     if (nic_ready && !g_dhcp_nic_was_ready) {
-        /* Fresh link (including a just-completed AX900 association):
+        /* Fresh link (including a just-completed Wi-Fi association):
          * reset DHCP's own state machine so a lease held over from a
          * previous NIC/AP isn't reused against a network it was never
          * issued on. */

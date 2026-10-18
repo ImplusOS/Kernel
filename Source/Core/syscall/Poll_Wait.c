@@ -57,10 +57,13 @@ uint64_t poll_wait_generation(void)
 #if !OS_CONFIG_POLL_WAIT_WAKEUPS
     return 0u;
 #else
-    uint64_t flags = poll_lock_irq();
-    uint64_t generation = g_generation;
-    poll_unlock_irq(flags);
-    return generation;
+    /* Monotonic counter, compared after the caller's readiness scan ("did
+     * anything become ready while I was looking?"). It needs no lock: this
+     * runs at the front of every poll/epoll/ppoll/select syscall and used to
+     * take the global wakeups lock with interrupts masked on each one, for a
+     * counter that only the eventual comparison reads. An aligned uint64_t
+     * load cannot tear; the atomic load makes that explicit. */
+    return __atomic_load_n(&g_generation, __ATOMIC_ACQUIRE);
 #endif
 }
 
@@ -107,7 +110,8 @@ int poll_wait_park(uint64_t generation, uint32_t ms)
      * POLL_WAIT_MAX_DECLINES sleeps in a row, the next one is taken no matter
      * what either says. */
     int forced = (g_declines[pid] >= POLL_WAIT_MAX_DECLINES);
-    if (!forced && g_generation != generation) {
+    if (!forced &&
+        __atomic_load_n(&g_generation, __ATOMIC_ACQUIRE) != generation) {
         ++g_declines[pid];
         poll_unlock_irq(flags);
         return 1;   /* switch away and rescan, rather than spin */
@@ -155,6 +159,43 @@ int poll_wait_park(uint64_t generation, uint32_t ms)
  * an unbounded run of process_wake_pid() calls. */
 #define POLL_WAIT_WAKE_BATCH 32u
 
+/* ---- idle backoff ---------------------------------------------------- */
+
+/* Consecutive empty waits per thread, as a power-of-two shift applied to the
+ * caller's base slice. See poll_wait_idle_slice() in the header. Only the
+ * owning thread writes its own slot, so no lock is needed; a stale value left
+ * behind by a recycled tid costs at most one stretched sleep before the new
+ * owner's first real wait resets it. */
+#define POLL_WAIT_IDLE_SHIFT_MAX 3u
+static uint8_t g_idle_shift[OS_CONFIG_PROCESS_MAX_COUNT];
+
+uint32_t poll_wait_idle_slice(uint32_t base_ms, uint32_t max_ms)
+{
+    int32_t tid = process_get_current_tid();
+    uint32_t shift = 0u;
+
+    if (tid >= 0 && (uint32_t)tid < (uint32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        shift = g_idle_shift[tid];
+        if (g_idle_shift[tid] < POLL_WAIT_IDLE_SHIFT_MAX) {
+            ++g_idle_shift[tid];
+        }
+    }
+
+    uint32_t slice = base_ms << shift;
+    if (slice > max_ms) {
+        slice = max_ms;
+    }
+    return slice;
+}
+
+void poll_wait_idle_reset(void)
+{
+    int32_t tid = process_get_current_tid();
+    if (tid >= 0 && (uint32_t)tid < (uint32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_idle_shift[tid] = 0u;
+    }
+}
+
 void poll_wait_notify(void)
 {
 #if !OS_CONFIG_POLL_WAIT_WAKEUPS
@@ -163,13 +204,15 @@ void poll_wait_notify(void)
     int32_t  batch[POLL_WAIT_WAKE_BATCH];
     uint32_t count;
 
-    uint64_t flags = poll_lock_irq();
-    ++g_generation;
-    poll_unlock_irq(flags);
+    /* Bump before harvesting the parked bits, so a parker that had already
+     * read the old value cannot sleep through an event whose readiness scan
+     * predates this notify. The counter is read lock-free (see
+     * poll_wait_generation()); only the parked bits live under the lock. */
+    __atomic_add_fetch(&g_generation, 1u, __ATOMIC_RELEASE);
 
     do {
         count = 0u;
-        flags = poll_lock_irq();
+        uint64_t flags = poll_lock_irq();
         for (uint32_t word = 0;
              word < POLL_WAIT_MASK_WORDS && count < POLL_WAIT_WAKE_BATCH;
              ++word) {

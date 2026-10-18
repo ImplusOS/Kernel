@@ -11,6 +11,7 @@
 #define PAGE_PWT     (1ULL << 3)
 #define PAGE_PCD     (1ULL << 4)
 #define PAGE_PS      (1ULL << 7)
+#define PAGE_PAT     (1ULL << 12)
 #define PAGE_EXTERNAL (1ULL << 10)
 /* OS-available PTE bit: marks a copy-on-write page shared with another
  * address space after fork (TODO_Chromium_LinuxABI.md bucket B). Such a
@@ -29,6 +30,7 @@
 
 void init_paging(void);
 void *map_mmio_virt(uint64_t phys_addr);
+void *map_mmio_wc_virt(uint64_t phys_addr);
 uint64_t paging_get_kernel_cr3(void);
 uint64_t paging_get_active_cr3(void);
 void paging_switch_cr3(uint64_t cr3);

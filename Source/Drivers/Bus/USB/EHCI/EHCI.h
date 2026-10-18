@@ -50,6 +50,12 @@ void ehci_init(void);
 
 bool ehci_submit_control(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                          struct usb_device_request *req, void *data);
+
+/* Same transfer with an explicit deadline in milliseconds (0 = 5 s default). */
+bool ehci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms);
 bool ehci_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                       uint8_t pid, void *data, uint32_t length);
 

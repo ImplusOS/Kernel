@@ -24,6 +24,7 @@
 #define PAGE_SWAP (1ULL << 9)
 
 #define PAGE_SIZE_BYTES 4096ULL
+#define IA32_PAT_MSR 0x277u
 
 typedef struct {
     uint8_t used;
@@ -39,6 +40,7 @@ static uint64_t g_kernel_pd[MAX_PDPT_ENTRIES][512] __attribute__((aligned(4096))
 static uint64_t g_mmio_pdpt[512] __attribute__((aligned(4096)));
 static uint64_t g_mmio_pd[512] __attribute__((aligned(4096)));
 static uint64_t g_mmio_phys_base[MMIO_WINDOW_SLOTS];
+static uint8_t g_mmio_is_wc[MMIO_WINDOW_SLOTS];
 static uint32_t g_mmio_slots_used = 0;
 static uint64_t g_kernel_identity_entries = PAGING_BOOT_IDENTITY_GB;
 static paging_space_t g_process_spaces_static[OS_CONFIG_PROCESS_MAX_COUNT];
@@ -888,22 +890,37 @@ static void paging_identity_mark_2mb_uncached(uint64_t phys_addr)
     invlpg_addr(base);
 }
 
-void *map_mmio_virt(uint64_t phys_addr)
+static void paging_enable_wc_pat(void)
+{
+    /* PAT entry 1 is selected by PWT=1, PCD=0, PAT=0. */
+    uint64_t pat = hal_cpu_read_msr(IA32_PAT_MSR);
+    if (((pat >> 8) & 0xFFULL) != 0x01ULL) {
+        pat = (pat & ~0xFF00ULL) | 0x0100ULL; /* WC */
+        hal_cpu_write_msr(IA32_PAT_MSR, pat);
+    }
+}
+
+static void *map_mmio_virt_internal(uint64_t phys_addr, bool write_combining)
 {
     if ((phys_addr & ~(PAGE_FRAME_MASK | (PAGE_SIZE_BYTES - 1ULL))) != 0u) {
         return NULL;
     }
 
-    if (phys_addr < (PAGING_BOOT_IDENTITY_GB * GB)) {
+    if (!write_combining && phys_addr < (PAGING_BOOT_IDENTITY_GB * GB)) {
         paging_identity_mark_2mb_uncached(phys_addr);
         return (void *)(uintptr_t)phys_addr;
+    }
+
+    if (write_combining) {
+        paging_enable_wc_pat();
     }
 
     uint64_t phys_base = phys_addr & ~(MB2 - 1ULL);
     uint64_t offset = phys_addr - phys_base;
 
     for (uint32_t i = 0; i < g_mmio_slots_used; ++i) {
-        if (g_mmio_phys_base[i] == phys_base) {
+        if (g_mmio_phys_base[i] == phys_base &&
+            g_mmio_is_wc[i] == (write_combining ? 1u : 0u)) {
             uint64_t virt_base = MMIO_WINDOW_BASE + ((uint64_t)i * MB2);
             return (void *)(uintptr_t)(virt_base + offset);
         }
@@ -930,14 +947,27 @@ void *map_mmio_virt(uint64_t phys_addr)
         g_mmio_pdpt[pdpt_index] = ((uint64_t)g_mmio_pd) | PAGE_PRESENT | PAGE_RW;
     }
 
-    g_mmio_pd[pd_index] = phys_base | PAGE_PRESENT | PAGE_RW | PAGE_PS | PAGE_PCD | PAGE_PWT;
+    uint64_t cache_flags = write_combining ? (PAGE_PWT | PAGE_PAT)
+                                           : (PAGE_PCD | PAGE_PWT);
+    g_mmio_pd[pd_index] = phys_base | PAGE_PRESENT | PAGE_RW | PAGE_PS | cache_flags;
     
     invlpg_addr(virt_base);
 
     g_mmio_phys_base[g_mmio_slots_used] = phys_base;
+    g_mmio_is_wc[g_mmio_slots_used] = write_combining ? 1u : 0u;
     g_mmio_slots_used++;
 
     return (void *)(uintptr_t)(virt_base + offset);
+}
+
+void *map_mmio_virt(uint64_t phys_addr)
+{
+    return map_mmio_virt_internal(phys_addr, false);
+}
+
+void *map_mmio_wc_virt(uint64_t phys_addr)
+{
+    return map_mmio_virt_internal(phys_addr, true);
 }
 
 void init_paging(void)
@@ -953,6 +983,7 @@ void init_paging(void)
     memset(g_mmio_pdpt, 0, sizeof(g_mmio_pdpt));
     memset(g_mmio_pd, 0, sizeof(g_mmio_pd));
     memset(g_mmio_phys_base, 0, sizeof(g_mmio_phys_base));
+    memset(g_mmio_is_wc, 0, sizeof(g_mmio_is_wc));
     memset(g_swap_slots, 0, sizeof(g_swap_slots));
     memset(g_swap_tracks, 0, sizeof(g_swap_tracks));
     spinlock_init(&g_paging_space_lock);

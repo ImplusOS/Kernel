@@ -154,6 +154,13 @@ typedef struct {
     int32_t owner_pid;
     uint64_t next_deadline_ms;
     uint64_t interval_ms;
+    /* Armed separately from interval_ms: a one-shot timer (it_interval == 0)
+     * is armed but never repeats. Using `interval_ms != 0` as the armed flag
+     * -- as this file originally did -- meant a one-shot timer was never
+     * readable and its read() always reported EAGAIN, which is not a corner
+     * case: it is how Chromium (and anything else driving delayed work off a
+     * timerfd) arms every single timer. Cleared when a one-shot expires. */
+    uint8_t armed;
 } kernel_timerfd_t;
 
 typedef struct {
@@ -2164,7 +2171,7 @@ uint32_t syscall_file_poll(int32_t fd, uint32_t events)
         kernel_timerfd_t *timerfd = &g_timerfds[fd];
         uint64_t now_ms = timer_ms_now();
         uint32_t ready = 0u;
-        if ((events & POLL_IN) != 0u && timerfd->interval_ms != 0u &&
+        if ((events & POLL_IN) != 0u && timerfd->armed != 0u &&
             timerfd->next_deadline_ms <= now_ms) {
             ready |= POLL_IN;
         }
@@ -2637,7 +2644,10 @@ int64_t syscall_file_available(int32_t fd)
     if (g_files[fd].used == 5) {
         kernel_timerfd_t *timerfd = &g_timerfds[fd];
         uint64_t now_ms = timer_ms_now();
-        if (timerfd->interval_ms != 0u && timerfd->next_deadline_ms <= now_ms) {
+        if (timerfd->armed != 0u && timerfd->next_deadline_ms <= now_ms) {
+            if (timerfd->interval_ms == 0u) {
+                return 1; /* one-shot: exactly one expiration pending */
+            }
             uint64_t extra = (now_ms - timerfd->next_deadline_ms) / timerfd->interval_ms + 1u;
             return (int64_t)extra;
         }
@@ -2675,12 +2685,21 @@ int64_t syscall_timerfd_read(int32_t fd, uint8_t *buffer, uint64_t len)
     uint64_t now_ms = timer_ms_now();
     uint64_t expirations = 0;
 
-    if (timerfd->interval_ms != 0u && timerfd->next_deadline_ms <= now_ms) {
-        expirations = (now_ms - timerfd->next_deadline_ms) / timerfd->interval_ms + 1u;
-        timerfd->next_deadline_ms =
-            timerfd->next_deadline_ms + expirations * timerfd->interval_ms;
-        if (timerfd->next_deadline_ms <= now_ms) {
-            timerfd->next_deadline_ms = now_ms + timerfd->interval_ms;
+    if (timerfd->armed != 0u && timerfd->next_deadline_ms <= now_ms) {
+        if (timerfd->interval_ms == 0u) {
+            /* One-shot: fires once, then disarms. Re-arming is
+             * timerfd_settime()'s job, and the caller will do exactly that
+             * after reading the expiration - that is the whole pattern. */
+            expirations = 1u;
+            timerfd->armed = 0u;
+            timerfd->next_deadline_ms = 0u;
+        } else {
+            expirations = (now_ms - timerfd->next_deadline_ms) / timerfd->interval_ms + 1u;
+            timerfd->next_deadline_ms =
+                timerfd->next_deadline_ms + expirations * timerfd->interval_ms;
+            if (timerfd->next_deadline_ms <= now_ms) {
+                timerfd->next_deadline_ms = now_ms + timerfd->interval_ms;
+            }
         }
     }
 
@@ -3007,12 +3026,38 @@ int32_t syscall_file_timerfd_settime(int32_t fd,
     if (it_value_sec == 0u && it_value_nsec == 0u) {
         timerfd->next_deadline_ms = 0;
         timerfd->interval_ms = 0;
+        timerfd->armed = 0;
         return 0;
     }
     timerfd->next_deadline_ms = timer_ms_now() +
         (it_value_sec * 1000u + it_value_nsec / 1000000u);
     timerfd->interval_ms = interval_ms;
+    timerfd->armed = 1;
     return 0;
+}
+
+/* True when `fd` is a timerfd with an armed deadline; *deadline_ms_out (when
+ * not NULL) receives the absolute ms time of its next expiration.
+ *
+ * The wait paths (epoll_wait/ppoll/select) use this to cap their park: a
+ * timerfd is the one readiness source that cannot call poll_wait_notify() --
+ * it becomes readable when its deadline passes, and nothing runs at that
+ * instant to say so. Every other source either notifies or is readable by
+ * inspection, so capping at the nearest armed deadline costs nothing and
+ * lets the idle backoff sleep through everything else. */
+bool syscall_timerfd_deadline_ms(int32_t fd, uint64_t *deadline_ms_out)
+{
+    if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_TIMERFD) {
+        return false;
+    }
+    kernel_timerfd_t *timerfd = &g_timerfds[fd];
+    if (timerfd->armed == 0u) {
+        return false;
+    }
+    if (deadline_ms_out != NULL) {
+        *deadline_ms_out = timerfd->next_deadline_ms;
+    }
+    return true;
 }
 
 int32_t syscall_file_timerfd_gettime(int32_t fd,
@@ -3028,7 +3073,7 @@ int32_t syscall_file_timerfd_gettime(int32_t fd,
     kernel_timerfd_t *timerfd = &g_timerfds[fd];
     uint64_t now_ms = timer_ms_now();
     uint64_t remain_ms = 0;
-    if (timerfd->interval_ms != 0u && timerfd->next_deadline_ms > now_ms) {
+    if (timerfd->armed != 0u && timerfd->next_deadline_ms > now_ms) {
         remain_ms = timerfd->next_deadline_ms - now_ms;
     }
     if (it_value_sec_out != NULL) *it_value_sec_out = remain_ms / 1000u;

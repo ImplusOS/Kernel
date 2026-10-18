@@ -63,3 +63,30 @@ int poll_wait_park(uint64_t generation, uint32_t ms);
 /* Something became readable/writable. Wakes every parked poller. Cheap and
  * safe to call from any context, including a timer or device interrupt. */
 void poll_wait_notify(void);
+
+/* ---- idle backoff ---------------------------------------------------- */
+
+/* The slice the calling thread should park for on its *next* wait, given the
+ * family's base slice. Consecutive waits that expire with nothing ready
+ * double it (base, 2x, 4x, 8x), capped at max_ms; poll_wait_idle_reset()
+ * drops it back to base_ms.
+ *
+ * Why: the cost of an idle wait is not the sleep, it is the *rescan* every
+ * wake-up forces -- an idle Chromium was measured at roughly ten thousand
+ * wake-ups a second, each one polling its whole fd set (95% of every
+ * syscall it made). The base slice stays short so a readiness source that
+ * has not been taught about poll_wait_notify() is still noticed quickly,
+ * while a thread that keeps finding nothing stretches its sleeps and pays
+ * that rescan a few times a second instead of a hundred. Anything that
+ * actually becomes ready still cuts the park short through
+ * poll_wait_notify(), and callers that know a closer deadline (a finite
+ * timeout, the next armed timerfd) cap the result themselves.
+ *
+ * Per-thread: one thread's busyness must not shorten another's sleep, and
+ * Chromium's sixty threads sharing one process-wide value would keep it
+ * pinned at the base slice forever. */
+uint32_t poll_wait_idle_slice(uint32_t base_ms, uint32_t max_ms);
+
+/* Readiness was found: this thread is not idle, so its next park goes back
+ * to the base slice. */
+void poll_wait_idle_reset(void);

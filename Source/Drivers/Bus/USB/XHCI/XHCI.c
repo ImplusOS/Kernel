@@ -1017,46 +1017,17 @@ void xhci_init(void)
     g_dma_max_address = 0u;
 
     uint8_t xhci_bus = 0, xhci_dev = 0, xhci_func = 0;
-    bool    found = false;
 
-#if defined(__aarch64__)
-    const uint16_t pci_bus_limit = 1;
-#else
-    const uint16_t pci_bus_limit = 256;
-#endif
-
-    for (uint16_t b = 0; b < pci_bus_limit && !found; b++) {
-        for (uint8_t d = 0; d < 32 && !found; d++) {
-            for (uint8_t f = 0; f < 8 && !found; f++) {
-                uint32_t id = g_api->pci_read_config((uint8_t)b, d, f, 0x00);
-                if ((id & 0xFFFFu) == 0xFFFFu) { if (f == 0) break; continue; }
-
-                uint32_t cls = g_api->pci_read_config((uint8_t)b, d, f, 0x08);
-
-                if (((cls >> 24) & 0xFFu) == 0x0Cu &&
-                    ((cls >> 16) & 0xFFu) == 0x03u &&
-                    ((cls >>  8) & 0xFFu) == 0x30u)
-                {
-                    xhci_bus  = (uint8_t)b;
-                    xhci_dev  = d;
-                    xhci_func = f;
-                    g_xhci_pci_bus = xhci_bus;
-                    g_xhci_pci_dev = xhci_dev;
-                    g_xhci_pci_func = xhci_func;
-                    found = true;
-                }
-
-                if (f == 0) {
-                    uint32_t hdr = g_api->pci_read_config((uint8_t)b, d, f, 0x0C);
-                    if (((hdr >> 16) & 0x80u) == 0) break;
-                }
-            }
-        }
-    }
-
-    if (!found) {
+    /* The kernel's PCI list, not a configuration-space sweep: see
+     * driver_pci_find_class() for why the sweep is so slow under a
+     * hypervisor and how much this saves on machines with no xHCI at all. */
+    if (!driver_pci_find_class(g_api, 0x0Cu, 0x03u, 0x30u,
+                               &xhci_bus, &xhci_dev, &xhci_func)) {
         return;
     }
+    g_xhci_pci_bus = xhci_bus;
+    g_xhci_pci_dev = xhci_dev;
+    g_xhci_pci_func = xhci_func;
 
     uint32_t cmd = g_api->pci_read_config(xhci_bus, xhci_dev, xhci_func, 0x04);
     cmd |= (1u << 1) | (1u << 2);
@@ -1609,9 +1580,21 @@ bool xhci_submit_control(uint8_t addr, uint8_t endpoint,
                           uint16_t max_packet_size,
                           struct usb_device_request *req, void *data)
 {
+    return xhci_submit_control_timeout(addr, endpoint, max_packet_size, req,
+                                       data, 0u);
+}
+
+bool xhci_submit_control_timeout(uint8_t addr, uint8_t endpoint,
+                                 uint16_t max_packet_size,
+                                 struct usb_device_request *req, void *data,
+                                 uint32_t timeout_ms)
+{
     (void)endpoint;
     if (!g_ready) {
         return false;
+    }
+    if (timeout_ms == 0u) {
+        timeout_ms = XHCI_CONTROL_TIMEOUT_MS;
     }
 
     usb_device_request_t *setup = (usb_device_request_t *)req;
@@ -1705,7 +1688,7 @@ bool xhci_submit_control(uint8_t addr, uint8_t endpoint,
     hal_cpu_restore_interrupts(rflags);
 
     uint32_t cc = 0;
-    bool ok = xhci_wait_event(32u, slot_id, 1u, &cc, XHCI_CONTROL_TIMEOUT_MS);
+    bool ok = xhci_wait_event(32u, slot_id, 1u, &cc, timeout_ms);
 
     if (ok && dir_in && wlen > 0 && data != NULL && data_buf != NULL) {
         if (g_api && g_api->memcpy)

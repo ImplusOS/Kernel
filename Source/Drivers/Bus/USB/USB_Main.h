@@ -76,16 +76,33 @@ bool usb_submit_control(uint8_t addr,
                         uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                         void *data);
 
+/* Same control transfer, bounded by the caller's own deadline (0 = the
+ * controller's default). See usb_submit_bulk_timeout() for why the bring-up
+ * path needs this. */
+bool usb_submit_control_timeout(uint8_t addr,
+                                uint8_t bmRequestType, uint8_t bRequest,
+                                uint16_t wValue, uint16_t wIndex,
+                                uint16_t wLength, void *data,
+                                uint32_t timeout_ms);
+
 bool usb_submit_bulk(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                      uint8_t pid, void *data, uint32_t length);
 
 /* Same transfer, bounded by the caller's own deadline (0 = the controller's
- * default). Only xHCI honours it -- the older controllers already give up in a
- * couple of seconds -- but that is the one whose default is 30 s, long enough
- * that a driver polling a silent endpoint looks like a hung kernel. */
+ * default). All four controllers honour it; the defaults are what matters
+ * here -- 30 s on xHCI and 5 s on EHCI/UHCI/OHCI, long enough that a driver
+ * polling a silent endpoint looks like a hung kernel. */
 bool usb_submit_bulk_timeout(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
                              uint8_t pid, void *data, uint32_t length,
                              uint32_t timeout_ms);
+
+/* The raw control-transfer form of usb_submit_control_timeout(): same
+ * deadline rule (0 = the controller's default), for callers that build the
+ * setup packet themselves. */
+bool usb_control_transfer_timeout(uint8_t addr, uint8_t endpoint,
+                                  uint16_t max_packet_size,
+                                  usb_device_request_t *req, void *data_buffer,
+                                  uint32_t timeout_ms);
 
 bool usb_set_address(uint8_t old_addr, uint8_t new_addr);
 bool usb_get_device_descriptor(uint8_t addr, usb_device_descriptor_t *desc);
