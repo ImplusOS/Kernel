@@ -1292,7 +1292,9 @@ static bool ig9_fb_validate_ggtt_span(uint32_t ggtt_base)
         (span_bytes + IG9_PAGE_BYTES - 1u) / IG9_PAGE_BYTES;
     uint32_t first_entry = ggtt_base / IG9_PAGE_BYTES;
     if (pages64 == 0u || pages64 > g_ggtt_entries ||
-        first_entry > g_ggtt_entries - (uint32_t)pages64) {
+        first_entry > g_ggtt_entries - (uint32_t)pages64 ||
+        (pages64 > 1u &&
+         first_page > UINT64_MAX - ((pages64 - 1u) * IG9_PAGE_BYTES))) {
         return false;
     }
 
@@ -1814,6 +1816,17 @@ static void ig9_hw_bringup(void)
 
     if (g_fb.ggtt_found == 0) {
         ig9_log("[IntelGen9] bringup: no framebuffer address, CPU path only\n");
+        return;
+    }
+
+    /* Gen9 XY_SRC_COPY_BLT encodes a positive pitch in 15 bits and rectangle
+     * coordinates in 16 bits. Outside those limits keep the display on the
+     * CPU path rather than truncating a surface descriptor. */
+    uint64_t blt_pitch =
+        (uint64_t)g_fb.pixels_per_scan_line * IG9_BYTES_PER_PIXEL;
+    if (blt_pitch > 0x7FFFu || g_fb.width > 0xFFFFu ||
+        g_fb.height > 0xFFFFu) {
+        ig9_log("[IntelGen9] bringup: framebuffer exceeds BLT limits; CPU path only\n");
         return;
     }
 
