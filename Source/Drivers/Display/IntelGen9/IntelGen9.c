@@ -408,10 +408,6 @@ static bool ig9_ggtt_find_mapping(uint64_t phys, uint32_t *entry_out)
             if (entry_out != NULL) {
                 *entry_out = i;
             }
-            if (g_ggtt_template_ready == 0) {
-                g_ggtt_template = pte;
-                g_ggtt_template_ready = 1;
-            }
             return true;
         }
     }
@@ -1270,6 +1266,61 @@ static void ig9_pci_find_device(void);
  * The first accepted entry also teaches ig9_ggtt_map_pages() the PTE flags
  * the firmware itself uses.
  */
+/*
+ * A single matching first page is not sufficient: XY_SRC_COPY_BLT treats
+ * the framebuffer as one linear surface. Verify that every GPU virtual page
+ * in that surface maps to the corresponding consecutive physical page.
+ */
+static bool ig9_fb_validate_ggtt_span(uint32_t ggtt_base)
+{
+    if ((ggtt_base & (IG9_PAGE_BYTES - 1u)) != 0u ||
+        g_fb.phys_base == 0u || g_fb.size_bytes == 0u) {
+        return false;
+    }
+
+    uint64_t first_page =
+        g_fb.phys_base & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
+    uint64_t page_offset = g_fb.phys_base - first_page;
+    if (g_fb.size_bytes > UINT64_MAX - page_offset) {
+        return false;
+    }
+    uint64_t span_bytes = page_offset + g_fb.size_bytes;
+    if (span_bytes > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
+        return false;
+    }
+    uint64_t pages64 =
+        (span_bytes + IG9_PAGE_BYTES - 1u) / IG9_PAGE_BYTES;
+    uint32_t first_entry = ggtt_base / IG9_PAGE_BYTES;
+    if (pages64 == 0u || pages64 > g_ggtt_entries ||
+        first_entry > g_ggtt_entries - (uint32_t)pages64) {
+        return false;
+    }
+
+    uint64_t template_pte = 0u;
+    for (uint32_t i = 0u; i < (uint32_t)pages64; ++i) {
+        uint64_t expected_phys =
+            first_page + (uint64_t)i * IG9_PAGE_BYTES;
+        if ((expected_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
+            return false;
+        }
+
+        uint64_t pte = ig9_ggtt_read_pte(first_entry + i);
+        if ((pte & 0x1u) == 0u ||
+            (pte & IG9_GGTT_PTE_ADDR_MASK) != expected_phys) {
+            return false;
+        }
+        if (i == 0u) {
+            template_pte = pte;
+        }
+    }
+
+    if (g_ggtt_template_ready == 0) {
+        g_ggtt_template = template_pte;
+        g_ggtt_template_ready = 1;
+    }
+    return true;
+}
+
 static bool ig9_fb_find_via_plane(void)
 {
     static const uint32_t surf_regs[] = {
@@ -1282,7 +1333,7 @@ static bool ig9_fb_find_via_plane(void)
     }
 
     uint64_t first_page = g_fb.phys_base & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-    uint64_t last_page = g_fb.phys_base + g_fb.size_bytes;
+    uint64_t page_offset = g_fb.phys_base - first_page;
 
     for (uint32_t i = 0u; i < sizeof(surf_regs) / sizeof(surf_regs[0]); ++i) {
         uint32_t value = ig9_mmio_read32(surf_regs[i]);
@@ -1292,19 +1343,13 @@ static bool ig9_fb_find_via_plane(void)
         }
 
         uint64_t pte = ig9_ggtt_read_pte(ggtt / IG9_PAGE_BYTES);
-        if ((pte & 0x1u) == 0u) {
-            continue;
-        }
-        uint64_t page = pte & IG9_GGTT_PTE_ADDR_MASK;
-        if (page < first_page || page >= last_page) {
+        if ((pte & 0x1u) == 0u ||
+            (pte & IG9_GGTT_PTE_ADDR_MASK) != first_page ||
+            !ig9_fb_validate_ggtt_span(ggtt)) {
             continue;
         }
 
-        if (g_ggtt_template_ready == 0) {
-            g_ggtt_template = pte;
-            g_ggtt_template_ready = 1;
-        }
-        g_fb.ggtt_offset = ggtt;
+        g_fb.ggtt_offset = ggtt + (uint32_t)page_offset;
         g_fb.ggtt_found = 1;
         ig9_log("[IntelGen9] fb: plane 0x");
         ig9_log_hex(surf_regs[i]);
@@ -1752,8 +1797,12 @@ static void ig9_hw_bringup(void)
     if (!ig9_fb_find_via_plane()) {
         uint32_t fb_entry = 0u;
         if (g_fb.phys_base != 0u &&
-            ig9_ggtt_find_mapping(g_fb.phys_base, &fb_entry)) {
-            g_fb.ggtt_offset = fb_entry * IG9_PAGE_BYTES;
+            ig9_ggtt_find_mapping(g_fb.phys_base, &fb_entry) &&
+            ig9_fb_validate_ggtt_span(fb_entry * IG9_PAGE_BYTES)) {
+            uint64_t page_offset =
+                g_fb.phys_base & (uint64_t)(IG9_PAGE_BYTES - 1u);
+            g_fb.ggtt_offset = fb_entry * IG9_PAGE_BYTES +
+                               (uint32_t)page_offset;
             g_fb.ggtt_found = 1;
             ig9_log("[IntelGen9] fb: ggtt entry 0x");
             ig9_log_hex(fb_entry);
