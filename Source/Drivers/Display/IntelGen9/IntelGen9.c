@@ -295,6 +295,17 @@ static uint32_t g_ggtt_entries = 0u;
 static uint32_t g_ggtt_private_first = 0u;
 static uint32_t g_ggtt_private_bitmap[
     (IG9_GGTT_PRIVATE_ENTRIES + 31u) / 32u];
+#define IG9_GGTT_MAX_MAPPINGS 128u
+typedef struct {
+    uint8_t used;
+    uint32_t slot_first;
+    uint32_t slot_count;
+    uint32_t first_entry;
+    uint32_t pages;
+    const void *virt;
+} ig9_ggtt_mapping_t;
+
+static ig9_ggtt_mapping_t g_ggtt_mappings[IG9_GGTT_MAX_MAPPINGS];
 static volatile uint32_t g_ggtt_allocator_lock = 0u;
 static int g_ggtt_size_ready = 0;
 
@@ -322,6 +333,15 @@ static void ig9_ggtt_mark_slots(uint32_t first, uint32_t count)
     for (uint32_t i = 0u; i < count; ++i) {
         uint32_t slot = first + i;
         g_ggtt_private_bitmap[slot / 32u] |= 1u << (slot % 32u);
+    }
+}
+
+static void ig9_ggtt_clear_slots(uint32_t first, uint32_t count)
+{
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t slot = first + i;
+        g_ggtt_private_bitmap[slot / 32u] &=
+            ~(1u << (slot % 32u));
     }
 }
 
@@ -457,6 +477,19 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
         return false;
     }
 
+    uint32_t mapping_slot = UINT32_MAX;
+    for (uint32_t i = 0u; i < IG9_GGTT_MAX_MAPPINGS; ++i) {
+        if (g_ggtt_mappings[i].used == 0u) {
+            mapping_slot = i;
+            break;
+        }
+    }
+    if (mapping_slot == UINT32_MAX) {
+        ig9_ggtt_unlock();
+        ig9_log("[IntelGen9] ggtt: mapping table exhausted\n");
+        return false;
+    }
+
     /* Validate every DMA address before the first hardware page-table write.
      * A translation failure therefore cannot leave a partially mapped range. */
     for (uint32_t i = 0u; i < pages; ++i) {
@@ -507,7 +540,71 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
     }
 
     ig9_ggtt_mark_slots(slot_first, slots_needed);
+    g_ggtt_mappings[mapping_slot].used = 1u;
+    g_ggtt_mappings[mapping_slot].slot_first = slot_first;
+    g_ggtt_mappings[mapping_slot].slot_count = slots_needed;
+    g_ggtt_mappings[mapping_slot].first_entry = first_entry;
+    g_ggtt_mappings[mapping_slot].pages = pages;
+    g_ggtt_mappings[mapping_slot].virt = virt;
     *ggtt_offset_out = first_entry * IG9_PAGE_BYTES;
+    ig9_ggtt_unlock();
+    return true;
+}
+
+/*
+ * Remove a mapping only after the caller has proved that no engine can still
+ * reference it. The GPU-VA range remains reserved unless every cleared PTE
+ * reads back as zero; a failed clear therefore cannot be recycled to another
+ * allocation.
+ */
+static bool ig9_ggtt_unmap_pages(const void *virt, uint32_t ggtt_offset)
+{
+    if (g_ggtt_size_ready == 0 ||
+        (ggtt_offset & (IG9_PAGE_BYTES - 1u)) != 0u) {
+        return false;
+    }
+
+    ig9_ggtt_lock();
+    uint32_t mapping_slot = UINT32_MAX;
+    for (uint32_t i = 0u; i < IG9_GGTT_MAX_MAPPINGS; ++i) {
+        const ig9_ggtt_mapping_t *mapping = &g_ggtt_mappings[i];
+        if (mapping->used != 0u && mapping->virt == virt &&
+            mapping->first_entry * IG9_PAGE_BYTES == ggtt_offset) {
+            mapping_slot = i;
+            break;
+        }
+    }
+    if (mapping_slot == UINT32_MAX) {
+        ig9_ggtt_unlock();
+        return false;
+    }
+
+    ig9_ggtt_mapping_t *mapping = &g_ggtt_mappings[mapping_slot];
+    for (uint32_t i = 0u; i < mapping->pages; ++i) {
+        ig9_ggtt_write_pte(mapping->first_entry + i, 0u);
+    }
+    ig9_ggtt_invalidate();
+
+    bool cleared = true;
+    for (uint32_t i = 0u; i < mapping->pages; ++i) {
+        if (ig9_ggtt_read_pte(mapping->first_entry + i) != 0u) {
+            cleared = false;
+            break;
+        }
+    }
+    if (!cleared) {
+        ig9_ggtt_unlock();
+        ig9_log("[IntelGen9] ggtt: PTE clear failed; range retained\n");
+        return false;
+    }
+
+    ig9_ggtt_clear_slots(mapping->slot_first, mapping->slot_count);
+    mapping->used = 0u;
+    mapping->slot_first = 0u;
+    mapping->slot_count = 0u;
+    mapping->first_entry = 0u;
+    mapping->pages = 0u;
+    mapping->virt = NULL;
     ig9_ggtt_unlock();
     return true;
 }
@@ -972,10 +1069,32 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
     ++g_generation;
 
     if (g_back_buffer != NULL) {
-        api_free(g_back_buffer_raw);
+        bool release_back_buffer = true;
+        if (g_back_ggtt_ready != 0) {
+            /* A CPU free is legal only after the BCS has stopped reading the
+             * old pages and the corresponding GGTT PTEs are visibly cleared. */
+            if (g_ring.ready != 0 &&
+                !ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS)) {
+                release_back_buffer = false;
+                g_accel_ok = 0;
+                ig9_log("[IntelGen9] fb: old back buffer retained (engine busy)\n");
+            } else if (!ig9_ggtt_unmap_pages(g_back_buffer, g_back_ggtt)) {
+                release_back_buffer = false;
+                g_accel_ok = 0;
+                ig9_log("[IntelGen9] fb: old back buffer retained (GGTT unmap failed)\n");
+            }
+        }
+
+        if (release_back_buffer) {
+            api_free(g_back_buffer_raw);
+        }
+        /* On any uncertain hardware state we intentionally leak the pages
+         * rather than allow the GPU to DMA into memory that PMM has reused. */
         g_back_buffer = NULL;
         g_back_buffer_raw = NULL;
         g_back_buffer_bytes = 0u;
+        g_back_ggtt = 0u;
+        g_back_ggtt_ready = 0;
     }
     api_memset(&g_fb, 0, sizeof(g_fb));
 
