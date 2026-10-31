@@ -291,42 +291,80 @@ static void ig9_ggtt_invalidate(void)
  * present/cache bit layout. */
 static uint64_t g_ggtt_template = 0;
 static int g_ggtt_template_ready = 0;
-static uint32_t g_ggtt_entries = IG9_GGTT_MAX_ENTRIES;
-static uint32_t g_ggtt_private_first =
-    IG9_GGTT_MAX_ENTRIES - IG9_GGTT_PRIVATE_ENTRIES;
-static uint32_t g_ggtt_private_next =
-    IG9_GGTT_MAX_ENTRIES - IG9_GGTT_PRIVATE_ENTRIES;
+static uint32_t g_ggtt_entries = 0u;
+static uint32_t g_ggtt_private_first = 0u;
+static uint32_t g_ggtt_private_bitmap[
+    (IG9_GGTT_PRIVATE_ENTRIES + 31u) / 32u];
+static volatile uint32_t g_ggtt_allocator_lock = 0u;
+static int g_ggtt_size_ready = 0;
+
+static void ig9_ggtt_lock(void)
+{
+    while (__atomic_exchange_n(&g_ggtt_allocator_lock, 1u,
+                               __ATOMIC_ACQUIRE) != 0u) {
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    }
+}
+
+static void ig9_ggtt_unlock(void)
+{
+    __atomic_store_n(&g_ggtt_allocator_lock, 0u, __ATOMIC_RELEASE);
+}
+
+static bool ig9_ggtt_slot_used(uint32_t slot)
+{
+    return (g_ggtt_private_bitmap[slot / 32u] &
+            (1u << (slot % 32u))) != 0u;
+}
+
+static void ig9_ggtt_mark_slots(uint32_t first, uint32_t count)
+{
+    for (uint32_t i = 0u; i < count; ++i) {
+        uint32_t slot = first + i;
+        g_ggtt_private_bitmap[slot / 32u] |= 1u << (slot % 32u);
+    }
+}
 
 /*
- * Size the table the way the firmware programmed it, so the private window
- * at its top is always inside the real thing. A GMCH_CTRL value that makes
- * no sense (0 or garbage) leaves the full-size assumption in place.
+ * GMCH_CTRL.GGMS reports the size of the GTT page-table allocation. Never
+ * assume the maximum BAR layout when the field cannot be read: a guessed
+ * table size can make a PTE access walk beyond the implemented GGTT aperture.
  */
-static void ig9_ggtt_detect_size(void)
+static bool ig9_ggtt_detect_size(void)
 {
-    uint32_t entries = IG9_GGTT_MAX_ENTRIES;
-
-    if (g_api->pci.read_config != NULL) {
-        uint32_t gmch = g_api->pci.read_config(g_match.bus, g_match.device,
-                                               g_match.function,
-                                               IG9_PCI_GMCH_CTRL);
-        uint32_t ggms = (gmch >> IG9_GMCH_GGMS_SHIFT) & IG9_GMCH_GGMS_MASK;
-        if (ggms >= 1u && ggms <= 3u) {
-            entries = ((1u << ggms) * 1024u * 1024u) / IG9_GGTT_PTE_BYTES;
-        }
+    if (g_api->pci.read_config == NULL) {
+        return false;
     }
 
-    if (entries < IG9_GGTT_PRIVATE_ENTRIES * 2u) {
-        entries = IG9_GGTT_MAX_ENTRIES;
+    uint32_t gmch = g_api->pci.read_config(g_match.bus, g_match.device,
+                                           g_match.function,
+                                           IG9_PCI_GMCH_CTRL);
+    uint32_t ggms = (gmch >> IG9_GMCH_GGMS_SHIFT) & IG9_GMCH_GGMS_MASK;
+    if (ggms < 1u || ggms > 3u) {
+        ig9_log("[IntelGen9] ggtt: invalid GMCH_CTRL.GGMS\\n");
+        return false;
+    }
+
+    uint32_t entries = ((1u << ggms) * 1024u * 1024u) /
+                       IG9_GGTT_PTE_BYTES;
+    if (entries > IG9_GGTT_MAX_ENTRIES ||
+        entries < IG9_GGTT_PRIVATE_ENTRIES * 2u) {
+        ig9_log("[IntelGen9] ggtt: reported table is too small\\n");
+        return false;
     }
 
     g_ggtt_entries = entries;
     g_ggtt_private_first = entries - IG9_GGTT_PRIVATE_ENTRIES;
-    g_ggtt_private_next = g_ggtt_private_first;
+    for (uint32_t i = 0u;
+         i < (IG9_GGTT_PRIVATE_ENTRIES + 31u) / 32u; ++i) {
+        g_ggtt_private_bitmap[i] = 0u;
+    }
+    g_ggtt_size_ready = 1;
 
     ig9_log("[IntelGen9] ggtt entries 0x");
     ig9_log_hex(g_ggtt_entries);
-    ig9_log("\n");
+    ig9_log("\\n");
+    return true;
 }
 
 /*
@@ -372,8 +410,9 @@ static bool ig9_ggtt_find_mapping(uint64_t phys, uint32_t *entry_out)
 static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
                                uint32_t *ggtt_offset_out)
 {
-    if (g_ggtt_template_ready == 0 || virt == NULL || ggtt_offset_out == NULL ||
-        bytes == 0u) {
+    if (g_ggtt_size_ready == 0 || g_ggtt_template_ready == 0 ||
+        virt == NULL || ggtt_offset_out == NULL || bytes == 0u ||
+        bytes > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
         return false;
     }
     if (((uintptr_t)virt & (uintptr_t)(IG9_PAGE_BYTES - 1u)) != 0u) {
@@ -381,53 +420,97 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
     }
 
     uint64_t pages64 = (bytes + IG9_PAGE_BYTES - 1u) / IG9_PAGE_BYTES;
-    if (pages64 == 0u || pages64 > IG9_GGTT_PRIVATE_ENTRIES) {
+    /* A guard page on each side stops surface/command prefetches from reaching
+     * a neighbouring allocation in the private GGTT window. */
+    if (pages64 == 0u ||
+        pages64 > (uint64_t)IG9_GGTT_PRIVATE_ENTRIES - 2u) {
         return false;
     }
     uint32_t pages = (uint32_t)pages64;
-    if (g_ggtt_private_next + pages >
-        g_ggtt_private_first + IG9_GGTT_PRIVATE_ENTRIES) {
+    uint32_t slots_needed = pages + 2u;
+
+    ig9_ggtt_lock();
+
+    uint32_t slot_first = UINT32_MAX;
+    for (uint32_t candidate = 0u;
+         candidate + slots_needed <= IG9_GGTT_PRIVATE_ENTRIES;
+         ++candidate) {
+        bool available = true;
+        for (uint32_t j = 0u; j < slots_needed; ++j) {
+            uint32_t slot = candidate + j;
+            uint32_t entry = g_ggtt_private_first + slot;
+            if (ig9_ggtt_slot_used(slot) ||
+                ig9_ggtt_read_pte(entry) != 0u) {
+                available = false;
+                candidate += j;
+                break;
+            }
+        }
+        if (available) {
+            slot_first = candidate;
+            break;
+        }
+    }
+    if (slot_first == UINT32_MAX) {
+        ig9_ggtt_unlock();
+        ig9_log("[IntelGen9] ggtt: private window exhausted\\n");
         return false;
     }
 
-    uint32_t first = g_ggtt_private_next;
-
-    /* Validate the complete range before changing any live PTE. */
-    for (uint32_t i = 0; i < pages; ++i) {
+    /* Validate every DMA address before the first hardware page-table write.
+     * A translation failure therefore cannot leave a partially mapped range. */
+    for (uint32_t i = 0u; i < pages; ++i) {
         const uint8_t *page = (const uint8_t *)virt +
                               (uint64_t)i * IG9_PAGE_BYTES;
         uint64_t page_phys = api_virt_to_phys((void *)(uintptr_t)page);
         if (page_phys == 0u ||
             (page_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u ||
             (page_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
+            ig9_ggtt_unlock();
             ig9_log("[IntelGen9] ggtt: unmappable page\\n");
             return false;
         }
     }
 
-    for (uint32_t i = 0; i < pages; ++i) {
+    uint32_t first_entry = g_ggtt_private_first + slot_first + 1u;
+    for (uint32_t i = 0u; i < pages; ++i) {
         const uint8_t *page = (const uint8_t *)virt +
                               (uint64_t)i * IG9_PAGE_BYTES;
         uint64_t page_phys = api_virt_to_phys((void *)(uintptr_t)page);
         uint64_t pte = (g_ggtt_template & ~IG9_GGTT_PTE_ADDR_MASK) |
                        (page_phys & IG9_GGTT_PTE_ADDR_MASK);
-        ig9_ggtt_write_pte(first + i, pte);
+        ig9_ggtt_write_pte(first_entry + i, pte);
     }
-
     ig9_ggtt_invalidate();
 
-    for (uint32_t i = 0; i < pages; ++i) {
-        if (ig9_ggtt_read_pte(first + i) == 0u) {
-            ig9_log("[IntelGen9] ggtt: write did not stick\\n");
-            return false;
+    bool verified = true;
+    for (uint32_t i = 0u; i < pages; ++i) {
+        const uint8_t *page = (const uint8_t *)virt +
+                              (uint64_t)i * IG9_PAGE_BYTES;
+        uint64_t page_phys = api_virt_to_phys((void *)(uintptr_t)page);
+        uint64_t expected = (g_ggtt_template & ~IG9_GGTT_PTE_ADDR_MASK) |
+                            (page_phys & IG9_GGTT_PTE_ADDR_MASK);
+        if (ig9_ggtt_read_pte(first_entry + i) != expected) {
+            verified = false;
+            break;
         }
     }
 
-    g_ggtt_private_next += pages;
-    *ggtt_offset_out = first * IG9_PAGE_BYTES;
+    if (!verified) {
+        for (uint32_t i = 0u; i < pages; ++i) {
+            ig9_ggtt_write_pte(first_entry + i, 0u);
+        }
+        ig9_ggtt_invalidate();
+        ig9_ggtt_unlock();
+        ig9_log("[IntelGen9] ggtt: PTE readback mismatch\\n");
+        return false;
+    }
+
+    ig9_ggtt_mark_slots(slot_first, slots_needed);
+    *ggtt_offset_out = first_entry * IG9_PAGE_BYTES;
+    ig9_ggtt_unlock();
     return true;
 }
-
 /* ------------------------------------------------------------------ *
  * 3. Ring, commands, fences
  * ------------------------------------------------------------------ */
@@ -1483,7 +1566,10 @@ static void ig9_hw_bringup(void)
     g_mmio = mmio;
     ig9_log("[IntelGen9] bringup: MMIO mapped\n");
 
-    ig9_ggtt_detect_size();
+    if (!ig9_ggtt_detect_size()) {
+        ig9_log("[IntelGen9] bringup: GGTT size unavailable, CPU path only\\n");
+        return;
+    }
 
     /* The PTE template comes from the firmware's own mapping of the
      * framebuffer: whatever is found there is known to be a working entry.
