@@ -1118,10 +1118,19 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
         return false;
     }
 
-    uint64_t required = (uint64_t)framebuffer->pixels_per_scan_line *
-                        (uint64_t)framebuffer->height * (uint64_t)bpp;
-    if ((framebuffer->size_bytes != 0u) &&
-        (required > (uint64_t)framebuffer->size_bytes)) {
+    uint64_t stride = (uint64_t)framebuffer->pixels_per_scan_line;
+    uint64_t rows = (uint64_t)framebuffer->height;
+    if (rows != 0u && stride > UINT64_MAX / rows) {
+        return false;
+    }
+    uint64_t pixel_count = stride * rows;
+    if (pixel_count > UINT64_MAX / (uint64_t)bpp) {
+        return false;
+    }
+    uint64_t required = pixel_count * (uint64_t)bpp;
+    if (required == 0u || required > (uint64_t)SIZE_MAX ||
+        (framebuffer->size_bytes != 0u &&
+         required > (uint64_t)framebuffer->size_bytes)) {
         return false;
     }
 
@@ -1133,11 +1142,23 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
         return false;
     }
 
-    uint64_t buffer_size = (uint64_t)framebuffer->pixels_per_scan_line *
-                           (uint64_t)framebuffer->height * sizeof(uint32_t);
-    /* One extra page so the buffer the blitter sees can start on a page
-     * boundary whatever the allocator's alignment is. */
-    uint8_t *buffer_raw = (uint8_t *)api_malloc(buffer_size + IG9_PAGE_BYTES);
+    uint64_t buffer_size = required;
+    if (buffer_size > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
+        return false;
+    }
+    uint64_t buffer_map_size =
+        (buffer_size + IG9_PAGE_BYTES - 1u) &
+        ~(uint64_t)(IG9_PAGE_BYTES - 1u);
+    if (buffer_map_size > UINT64_MAX - IG9_PAGE_BYTES ||
+        buffer_map_size + IG9_PAGE_BYTES > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+
+    /* The allocation includes the page-rounded GPU mapping size plus the
+     * maximum alignment slop. Every page installed in the GGTT is therefore
+     * backed by memory owned by this allocation. */
+    uint8_t *buffer_raw =
+        (uint8_t *)api_malloc(buffer_map_size + IG9_PAGE_BYTES);
     if (buffer_raw == NULL) {
         return false;
     }
