@@ -1075,7 +1075,12 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
             /* A CPU free is legal only after the BCS has stopped reading the
              * old pages and the corresponding GGTT PTEs are visibly cleared. */
             if (g_ring.ready != 0 &&
-                !ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS)) {
+                (!ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS) ||
+                 g_scratch_ready == 0 ||
+                 !ig9_wait_fence(g_ring.seqno, IG9_FENCE_TIMEOUT_MS))) {
+                /* HEAD == TAIL only proves fetch progress. The fence is the
+                 * completion proof that every earlier BLT has stopped
+                 * reading the old buffer pages. */
                 release_back_buffer = false;
                 g_accel_ok = 0;
                 ig9_log("[IntelGen9] fb: old back buffer retained (engine busy)\n");
