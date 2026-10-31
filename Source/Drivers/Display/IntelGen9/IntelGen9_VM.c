@@ -444,7 +444,7 @@ static bool ig9_vm_unmap_locked(ig9_vm_space_t *vm,
         __atomic_store_n(slot, 0u, __ATOMIC_RELEASE);
     }
 
-    ++vm->generation;
+    (void)__atomic_add_fetch(&vm->generation, 1u, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -809,6 +809,8 @@ bool ig9_vm_software_selftest(const driver_binary_t *api)
     uint64_t physical0 = 0u;
     uint64_t physical1 = 0u;
     uint64_t generation;
+    uint64_t old_gpu_va = 0u;
+    uint64_t ignored = 0u;
     bool ok = false;
 
     if (!ig9_vm_system_init(api)) {
@@ -830,6 +832,7 @@ bool ig9_vm_software_selftest(const driver_binary_t *api)
         return false;
     }
 
+    old_gpu_va = ig9_gem_gpu_address(object);
     generation = ig9_vm_generation(vm);
     ok = generation > 1u &&
          ig9_vm_tlb_invalidate_pending(vm) &&
@@ -841,7 +844,6 @@ bool ig9_vm_software_selftest(const driver_binary_t *api)
          physical1 == ig9_gem_physical_address(object) + IG9_VM_PAGE_SIZE;
 
     if (ok) {
-        uint64_t ignored = 0u;
         ok = !ig9_vm_translate(vm,
                                ig9_gem_gpu_address(object) - IG9_VM_PAGE_SIZE,
                                &ignored) &&
@@ -855,6 +857,23 @@ bool ig9_vm_software_selftest(const driver_binary_t *api)
     if (!ig9_gem_put(object)) {
         ok = false;
     }
+    if (ig9_vm_translate(vm, old_gpu_va, &ignored)) {
+        ok = false;
+    }
+
+    /* Reuse the released VA range and check that the stale translation did
+     * not survive object destruction. */
+    ig9_gem_object_t *second = ig9_gem_create(
+        vm, IG9_VM_PAGE_SIZE, IG9_VM_MAP_READ | IG9_VM_MAP_WRITE);
+    if (second == NULL ||
+        !ig9_vm_translate(vm, ig9_gem_gpu_address(second), &ignored) ||
+        ignored != ig9_gem_physical_address(second)) {
+        ok = false;
+    }
+    if (second != NULL && !ig9_gem_put(second)) {
+        ok = false;
+    }
+
     if (!ig9_vm_destroy(vm)) {
         ok = false;
     }
