@@ -237,7 +237,8 @@ static int g_probe_attempted = 0;
  * not use; each candidate entry is required to read back as empty before it
  * is written, and the window is placed inside the table size the firmware
  * programmed (see ig9_ggtt_detect_size()). */
-#define IG9_GGTT_PRIVATE_ENTRIES 128u
+/* 16K entries reserve a 64 MiB GPU virtual window for scanout, ring and scratch. */
+#define IG9_GGTT_PRIVATE_ENTRIES 16384u
 
 static volatile uint8_t *g_mmio = NULL;
 static int g_forcewake_on = 0;
@@ -271,6 +272,18 @@ static void ig9_ggtt_write_pte(uint32_t index, uint64_t value)
                      (uint32_t)(value & 0xFFFFFFFFu));
     ig9_mmio_write32(IG9_GGTT_OFFSET + index * IG9_GGTT_PTE_BYTES + 4u,
                      (uint32_t)(value >> 32));
+}
+
+/* Gen8+ GGTT invalidation, matching the GFX_FLSH_CNTL_GEN6 path in i915. */
+#define IG9_GFX_FLSH_CNTL_GEN6 0x101008u
+#define IG9_GFX_FLSH_CNTL_EN   (1u << 0)
+
+static void ig9_ggtt_invalidate(void)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    ig9_mmio_write32(IG9_GFX_FLSH_CNTL_GEN6, IG9_GFX_FLSH_CNTL_EN);
+    (void)ig9_mmio_read32(IG9_GFX_FLSH_CNTL_GEN6);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
 /* PTE template: the flags of an entry the firmware installed and is
@@ -379,9 +392,15 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
 
     uint32_t first = g_ggtt_private_next;
 
+    /* Validate the complete range before changing any live PTE. */
     for (uint32_t i = 0; i < pages; ++i) {
-        if (ig9_ggtt_read_pte(first + i) != 0u) {
-            ig9_log("[IntelGen9] ggtt: private entry in use\n");
+        const uint8_t *page = (const uint8_t *)virt +
+                              (uint64_t)i * IG9_PAGE_BYTES;
+        uint64_t page_phys = api_virt_to_phys((void *)(uintptr_t)page);
+        if (page_phys == 0u ||
+            (page_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u ||
+            (page_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
+            ig9_log("[IntelGen9] ggtt: unmappable page\\n");
             return false;
         }
     }
@@ -390,20 +409,16 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
         const uint8_t *page = (const uint8_t *)virt +
                               (uint64_t)i * IG9_PAGE_BYTES;
         uint64_t page_phys = api_virt_to_phys((void *)(uintptr_t)page);
-        if (page_phys == 0u ||
-            (page_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u) {
-            ig9_log("[IntelGen9] ggtt: unmappable page\n");
-            return false;
-        }
-        /* Same flags as the firmware's own entries, new address. */
         uint64_t pte = (g_ggtt_template & ~IG9_GGTT_PTE_ADDR_MASK) |
                        (page_phys & IG9_GGTT_PTE_ADDR_MASK);
         ig9_ggtt_write_pte(first + i, pte);
     }
 
+    ig9_ggtt_invalidate();
+
     for (uint32_t i = 0; i < pages; ++i) {
         if (ig9_ggtt_read_pte(first + i) == 0u) {
-            ig9_log("[IntelGen9] ggtt: write did not stick\n");
+            ig9_log("[IntelGen9] ggtt: write did not stick\\n");
             return false;
         }
     }
@@ -1334,9 +1349,9 @@ static bool ig9_gpu_present_rects(const display_rect_t *rects, uint32_t count)
         }
 
         dw += ig9_emit_copy(batch,
-                            g_fb.ggtt_offset + y * dst_pitch + x * 4u,
+                            g_fb.ggtt_offset,
                             dst_pitch,
-                            g_back_ggtt + y * src_pitch + x * 4u,
+                            g_back_ggtt,
                             src_pitch, (int32_t)x, (int32_t)y, w, h);
         ++batched_rects;
     }
