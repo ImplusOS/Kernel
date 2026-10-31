@@ -754,10 +754,21 @@ static bool ig9_emit_fence(uint32_t *batch, uint32_t *dw_inout)
         return false;
     }
     uint32_t dw = *dw_inout;
+    uint32_t seqno = g_ring.seqno + 1u;
+    if (seqno == 0u) {
+        seqno = 1u;
+    }
+    g_ring.seqno = seqno;
+
+    /* Prevent an old value from satisfying a wait after 32-bit wraparound. */
+    volatile uint32_t *slot = ig9_fence_slot();
+    __atomic_store_n(slot, ~seqno, __ATOMIC_RELEASE);
+    ig9_cache_flush((const void *)slot, sizeof(uint32_t));
+
     batch[dw++] = IG9_MI_STORE_DWORD_IMM_GEN4 | IG9_MI_USE_GGTT;
     batch[dw++] = g_scratch_ggtt + IG9_FENCE_DWORD_OFFSET;
     batch[dw++] = 0u;   /* address high dword */
-    batch[dw++] = ++g_ring.seqno;
+    batch[dw++] = seqno;
     *dw_inout = dw;
     return true;
 }
@@ -771,7 +782,7 @@ static bool ig9_wait_fence(uint32_t seqno, uint32_t timeout_ms)
     for (uint32_t waited = 0; waited <= timeout_ms; ++waited) {
         /* Drop the CPU's cached copy so the engine's store is visible. */
         ig9_cache_flush((const void *)slot, sizeof(uint32_t));
-        if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) >= seqno) {
+        if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == seqno) {
             return true;
         }
         ig9_msleep(1u);
@@ -1077,7 +1088,8 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
             if (g_ring.ready != 0 &&
                 (!ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS) ||
                  g_scratch_ready == 0 ||
-                 !ig9_wait_fence(g_ring.seqno, IG9_FENCE_TIMEOUT_MS))) {
+                 (g_ring.seqno != 0u &&
+                  !ig9_wait_fence(g_ring.seqno, IG9_FENCE_TIMEOUT_MS)))) {
                 /* HEAD == TAIL only proves fetch progress. The fence is the
                  * completion proof that every earlier BLT has stopped
                  * reading the old buffer pages. */
