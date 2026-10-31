@@ -31,6 +31,15 @@ static const driver_binary_t *g_driver_api = NULL;
 #define memcpy g_driver_api->memcpy
 #define memset g_driver_api->memset
 
+/* Interrupt-control comes through the driver vtable when this file is built
+ * as a loadable module: the kernel build links the inline-able hal directly
+ * and the module accesses the same functions through g_driver_api. */
+#define FB_HAL_SAVE_INTERRUPTS()      g_driver_api->hal.cpu_save_interrupts()
+#define FB_HAL_DISABLE_INTERRUPTS()   g_driver_api->hal.cpu_disable_interrupts()
+#define FB_HAL_ENABLE_INTERRUPTS()    g_driver_api->hal.cpu_enable_interrupts()
+#define FB_HAL_RESTORE_INTERRUPTS(s)  g_driver_api->hal.cpu_restore_interrupts(s)
+#define FB_HAL_PAUSE()                g_driver_api->hal.cpu_pause()
+
 static int driver_module_strcmp(const char *a, const char *b) {
     while (*a && *a == *b) {
         ++a;
@@ -42,6 +51,14 @@ static int driver_module_strcmp(const char *a, const char *b) {
 
 #else
 #include <string.h>
+#endif
+
+#ifndef IMPLUS_DRIVER_MODULE
+#define FB_HAL_SAVE_INTERRUPTS()      hal_cpu_save_interrupts()
+#define FB_HAL_DISABLE_INTERRUPTS()   hal_cpu_disable_interrupts()
+#define FB_HAL_ENABLE_INTERRUPTS()    hal_cpu_enable_interrupts()
+#define FB_HAL_RESTORE_INTERRUPTS(s)  hal_cpu_restore_interrupts(s)
+#define FB_HAL_PAUSE()                hal_cpu_pause()
 #endif
 
 typedef struct {
@@ -104,6 +121,20 @@ static bool generic_cpu_has_sse2(void)
 }
 
 #if defined(PLATFORM_X86_64)
+/* Slicing bound for generic_copy_bytes(): the SSE blit to (potentially)
+ * write-through framebuffer memory runs one bounded cli window per slice,
+ * with the interrupts a pending timer tick needs enabled in between. The
+ * whole shadow buffer is ~8 MB at 1080p; copying all of it under a single
+ * cli once took long enough to drop timer ticks (tick loss,
+ * TODO_Performance_LinuxApps.md §10.8), which showed up as input stalls and
+ * a lagging clock on slow framebuffer memory. 64 KiB per window stays well
+ * under a millisecond even at sluggish (hundreds of MB/s) WC/WT rates while
+ * the per-window fxsave cost remains negligible. */
+#define GENERIC_FB_COPY_WINDOW_BYTES (64u * 1024u)
+
+/* Copies exactly `bytes` (a multiple of 16) with interrupts OFF on entry.
+ * Interrupt handling lives in generic_copy_bytes() so the slicing there can
+ * open bounded gaps between windows. */
 static void generic_copy_sse2(void *destination, const void *source,
                               size_t bytes)
 {
@@ -111,14 +142,6 @@ static void generic_copy_sse2(void *destination, const void *source,
     uint8_t *dst = (uint8_t *)destination;
     const uint8_t *src = (const uint8_t *)source;
     size_t blocks = bytes / 16u;
-
-#ifdef IMPLUS_DRIVER_MODULE
-    uint64_t interrupt_state = g_driver_api->hal.cpu_save_interrupts();
-    g_driver_api->hal.cpu_disable_interrupts();
-#else
-    uint64_t interrupt_state = hal_cpu_save_interrupts();
-    hal_cpu_disable_interrupts();
-#endif
 
     /* Kernel entry paths do not save XMM state; preserve it around the store. */
     __asm__ volatile(
@@ -142,12 +165,6 @@ static void generic_copy_sse2(void *destination, const void *source,
          * compiled with -mgeneral-regs-only, and the FXSAVE/FXRSTOR pair
          * restores the complete vector state before returning. */
         : "cc", "memory");
-
-#ifdef IMPLUS_DRIVER_MODULE
-    g_driver_api->hal.cpu_restore_interrupts(interrupt_state);
-#else
-    hal_cpu_restore_interrupts(interrupt_state);
-#endif
 }
 #endif
 
@@ -160,6 +177,14 @@ static void generic_copy_bytes(void *destination, const void *source,
 
 #if defined(PLATFORM_X86_64)
     if (g_copy_available && g_sse2_available && length >= 64u) {
+        /* FB_HAL_SAVE_INTERRUPTS() returns EFLAGS with interrupts cleared,
+         * so EFLAGS.IF (bit 9) records whether the caller was running with
+         * them enabled. Only then may this re-open them between windows --
+         * if the caller had interrupts off (present under some spinlock),
+         * the whole copy stays closed and the gaps honour that. */
+        uint64_t interrupt_state = FB_HAL_SAVE_INTERRUPTS();
+        bool gaps_allowed = (interrupt_state & (1ULL << 9)) != 0u;
+
         size_t lead = (size_t)(-(uintptr_t)dst) & 15u;
         if (lead > length) lead = length;
         if (lead != 0u) {
@@ -169,13 +194,28 @@ static void generic_copy_bytes(void *destination, const void *source,
             length -= lead;
         }
         size_t simd_bytes = length & ~(size_t)15u;
-        if (simd_bytes != 0u) {
-            generic_copy_sse2(dst, src, simd_bytes);
-            dst += simd_bytes;
-            src += simd_bytes;
-            length -= simd_bytes;
+        size_t tail = length - simd_bytes;
+        while (simd_bytes != 0u) {
+            size_t window = simd_bytes > GENERIC_FB_COPY_WINDOW_BYTES
+                                ? GENERIC_FB_COPY_WINDOW_BYTES
+                                : simd_bytes;
+            FB_HAL_DISABLE_INTERRUPTS();
+            generic_copy_sse2(dst, src, window);
+            dst += window;
+            src += window;
+            simd_bytes -= window;
+            /* A pending timer tick becomes deliverable in the gap; pause
+             * briefly so a just-asserted line gets latched before the next
+             * window closes again. All XMM state is back in the owning
+             * thread's fxsave region by now (fxrstor ran at window end), so
+             * a preemption here cannot lose anything but integer state. */
+            if (gaps_allowed && simd_bytes != 0u) {
+                FB_HAL_ENABLE_INTERRUPTS();
+                FB_HAL_PAUSE();
+            }
         }
-        if (length != 0u) memcpy(dst, src, length);
+        if (tail != 0u) memcpy(dst, src, tail);
+        FB_HAL_RESTORE_INTERRUPTS(interrupt_state);
         return;
     }
 #endif

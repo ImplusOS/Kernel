@@ -47,12 +47,10 @@
 /* usb_submit_bulk()'s pid argument (AIC_USB_PID_IN/OUT) lives in AIC8800.h,
  * shared with AIC8800_Data.c's TX path. */
 
-/* How long an opportunistic sync read of the IN endpoint may spin before it
- * gives up. Only the *fallback* path pays this -- see aic_rx_service(). */
+/* How long an opportunistic sync read of an IN endpoint may spin before it
+ * gives up. Only the *fallback* path pays this -- see
+ * aic_rx_service_pipe(). */
 #define AIC_RX_SYNC_TIMEOUT_MS      2u
-/* Inside aic_cmd()'s wait the reply is expected, so a longer window is
- * right: the transfer still returns the moment data arrives. */
-#define AIC_CMD_RX_TIMEOUT_MS       50u
 
 /* Latency between completion checks while aic_cmd() waits for its reply. */
 #define AIC_CMD_WAIT_SLEEP_MS       1u
@@ -61,9 +59,10 @@ aic_state_t g_aic;
 const driver_binary_t *g_aic_api = NULL;
 
 /* Static, not on the syscall dispatcher's stack (see the size note on
- * AIC_CMD_BUF_MAX): the sync fallback's landing buffer, and the scratch the
- * RX parse walks. */
+ * AIC_CMD_BUF_MAX): the sync fallback's landing buffers -- one per bulk IN
+ * pipe -- and the scratch the RX parse walks. */
 static uint8_t g_rx_buf[AIC_RX_BUF_MAX];
+static uint8_t g_rx_data_buf[AIC_RX_BUF_MAX];
 
 /* ---- logging ---- */
 
@@ -122,8 +121,25 @@ void aic_msleep(uint32_t ms)
 
 /* ---- transport ---- */
 
+static bool aic_usb_bulk_to(uint8_t endpoint, uint16_t mps, uint8_t pid,
+                            void *data, uint32_t length, uint32_t timeout_ms);
+
 bool aic_usb_bulk(uint8_t endpoint, uint16_t mps, uint8_t pid,
                   void *data, uint32_t length)
+{
+    return aic_usb_bulk_to(endpoint, mps, pid, data, length,
+                           (pid == AIC_USB_PID_IN) ? AIC_RX_SYNC_TIMEOUT_MS
+                                                   : AIC_CMD_TIMEOUT_MS);
+}
+
+/* Same, with an explicit timeout. aic_rx_service_pipe() uses this so a
+ * command wait can keep its IN transfer posted for the whole reply window
+ * instead of asking XHCI.c for a 2 ms transfer and making it recover the
+ * endpoint on every miss; the endpoint recovery is a Stop/Reset Endpoint
+ * sequence, and doing that every couple of milliseconds while a ROM is
+ * still preparing its reply is how confirmations get lost. */
+static bool aic_usb_bulk_to(uint8_t endpoint, uint16_t mps, uint8_t pid,
+                            void *data, uint32_t length, uint32_t timeout_ms)
 {
     if (!g_aic.attached ||
         (g_aic.submit_bulk == NULL && g_aic.submit_bulk_timeout == NULL)) {
@@ -131,10 +147,7 @@ bool aic_usb_bulk(uint8_t endpoint, uint16_t mps, uint8_t pid,
     }
     if (g_aic.submit_bulk_timeout != NULL) {
         return g_aic.submit_bulk_timeout(g_aic.addr, endpoint, mps, pid,
-                                         data, length,
-                                         (pid == AIC_USB_PID_IN)
-                                             ? AIC_RX_SYNC_TIMEOUT_MS
-                                             : AIC_CMD_TIMEOUT_MS);
+                                         data, length, timeout_ms);
     }
     if (g_aic.submit_bulk != NULL) {
         return g_aic.submit_bulk(g_aic.addr, endpoint, mps, pid, data, length);
@@ -182,17 +195,17 @@ bool aic_cmd_nowait(uint16_t msg_id, uint16_t dest_id,
 
 /* ---- RX ---- */
 
-/* Defined below, next to aic_rx_service(): aic_cmd() has to run it while it
- * waits for a reply, and the dispatch pushes data frames up into the
- * kernel's network stack through g_aic.rx_callback. */
-static bool aic_rx_service(void);
+/* Defined below, next to aic_rx_service_pipe(): aic_cmd() has to run it
+ * while it waits for a reply, and the dispatch pushes data frames up into
+ * the kernel's network stack through g_aic.rx_callback. */
+static bool aic_rx_service_pipe(aic_rx_pipe_t *pipe, uint32_t timeout_ms);
 
 /* Everything the IN endpoint can hand up, in the framing AIC8800_Protocol.h
  * documents: a run of sub-packets, each with its own [u16 len][u8 type]
  * header. Bounded in both directions -- at most AIC_RX_MAX_SUBPKTS per
  * transfer, and any sub-packet whose length does not fit in the buffer ends
  * the walk (there is no length-of-transfer report to fall back on; see the
- * note on aic_rx_service()). */
+ * note on aic_rx_service_pipe()). */
 #define AIC_RX_MAX_SUBPKTS          16u
 
 static void aic_handle_cfg_rsp(const uint8_t *payload, uint16_t payload_len)
@@ -308,19 +321,19 @@ static void aic_rx_parse(const uint8_t *buf, uint32_t buf_len)
     }
 }
 
-static bool aic_rx_submit_async(void)
+static bool aic_rx_submit_async(aic_rx_pipe_t *pipe)
 {
-    if (!g_aic.rx_async || g_aic.submit_in_async == NULL ||
-        g_aic.rx_dma == NULL || g_aic.rx_dma_phys == 0u) {
+    if (!pipe->present || !pipe->use_async || g_aic.submit_in_async == NULL ||
+        pipe->dma == NULL || pipe->dma_phys == 0u) {
         return false;
     }
-    return g_aic.submit_in_async(g_aic.addr, g_aic.ep_in, g_aic.ep_in_mps,
-                                 g_aic.rx_dma, g_aic.rx_dma_phys,
+    return g_aic.submit_in_async(g_aic.addr, pipe->ep, pipe->mps,
+                                 pipe->dma, pipe->dma_phys,
                                  (uint16_t)AIC_RX_BUF_MAX);
 }
 
-/* Service the IN endpoint once. Returns true when a transfer completed, i.e.
- * when the device had something to say.
+/* Service one IN pipe once. Returns true when a transfer completed, i.e.
+ * when the device had something to say on that pipe.
  *
  * Two modes, never mixed on one endpoint (the completion bookkeeping in
  * XHCI.c is per endpoint, so interleaving an async transfer with a sync one
@@ -330,15 +343,15 @@ static bool aic_rx_submit_async(void)
  *     for its completion. Posting costs one ring doorbell, checking costs a
  *     flag read, so polling an idle link is free: this is what keeps the
  *     syscall path from paying a bulk-transfer timeout on every poll.
- *   sync -- one bounded bulk read into g_rx_buf. Used until the endpoint's
- *     transfer ring exists (a probe's very first reads) and whenever the
- *     async API or a DMA buffer is unavailable.
+ *   sync -- one bounded bulk read into the pipe's fallback buffer. Used
+ *     until the endpoint's transfer ring exists (a probe's very first reads)
+ *     and whenever the async API or a DMA buffer is unavailable.
  */
-static bool aic_rx_service(void)
+static bool aic_rx_service_pipe(aic_rx_pipe_t *pipe, uint32_t timeout_ms)
 {
     bool got = false;
 
-    if (!g_aic.attached || g_aic.ep_in == 0u ||
+    if (!g_aic.attached || pipe == NULL || !pipe->present || pipe->ep == 0u ||
         (g_aic.submit_bulk == NULL && g_aic.submit_bulk_timeout == NULL)) {
         return false;
     }
@@ -347,51 +360,48 @@ static bool aic_rx_service(void)
     }
     g_aic.rx_busy = true;
 
-    if (g_aic.rx_async) {
-        if (g_aic.rx_pending) {
-            int ev = g_aic.check_in_event(g_aic.addr, g_aic.ep_in);
+    if (pipe->use_async) {
+        if (pipe->pending) {
+            int ev = g_aic.check_in_event(g_aic.addr, pipe->ep);
             if (ev > 0) {
-                g_aic.rx_pending = false;
-                aic_rx_parse(g_aic.rx_dma, AIC_RX_BUF_MAX);
+                pipe->pending = false;
+                aic_rx_parse(pipe->dma, AIC_RX_BUF_MAX);
                 /* There is no transfer-length report, so the walk relies on
                  * each packet's own length field and on the zero terminator
                  * a short transfer leaves behind. Clear the buffer before
                  * re-arming it, or the previous transfer's bytes would sit
                  * behind the last packet of a shorter one and be replayed
                  * as duplicates. */
-                aic_memset(g_aic.rx_dma, 0u, AIC_RX_BUF_MAX);
+                aic_memset(pipe->dma, 0u, AIC_RX_BUF_MAX);
                 got = true;
             } else if (ev < 0) {
                 /* The endpoint was reset (or the device unplugged);
                  * check_interrupt_event() already tried to recover it. */
-                g_aic.rx_pending = false;
+                pipe->pending = false;
             }
         }
-        if (!g_aic.rx_pending) {
-            g_aic.rx_pending = aic_rx_submit_async();
+        if (!pipe->pending) {
+            pipe->pending = aic_rx_submit_async(pipe);
         }
         if (got) {
             g_aic.rx_busy = false;
             return true;
         }
-        if (g_aic.rx_pending) {
+        if (pipe->pending) {
             g_aic.rx_busy = false;
             return false; /* armed and still in flight */
         }
         /* Falling through means the async submit keeps failing: fall back
          * to sync reads for good. */
-        g_aic.rx_async = false;
+        pipe->use_async = false;
     }
 
     /* Same truncation story as the async path: clear before the read so a
      * short transfer cannot expose the previous one's bytes to the walk. */
-    aic_memset(g_rx_buf, 0u, sizeof(g_rx_buf));
-    if (aic_usb_bulk(g_aic.ep_in, g_aic.ep_in_mps, AIC_USB_PID_IN,
-                     g_rx_buf, sizeof(g_rx_buf))) {
-        /* The ring now exists, so a later async transfer lands on the same
-         * (bulk) endpoint configuration instead of re-configuring it. */
-        g_aic.rx_ring_ready = true;
-        aic_rx_parse(g_rx_buf, sizeof(g_rx_buf));
+    aic_memset(pipe->sync_buf, 0u, AIC_RX_BUF_MAX);
+    if (aic_usb_bulk_to(pipe->ep, pipe->mps, AIC_USB_PID_IN,
+                        pipe->sync_buf, AIC_RX_BUF_MAX, timeout_ms)) {
+        aic_rx_parse(pipe->sync_buf, AIC_RX_BUF_MAX);
         got = true;
     }
 
@@ -399,35 +409,46 @@ static bool aic_rx_service(void)
     return got;
 }
 
-/* Enable the async pump once the endpoint is known-good (one sync transfer
- * has run) and a DMA buffer exists. Called from aic_tick(). */
-static void aic_rx_enable_async(void)
+/* Enable the async pump for one pipe once a DMA buffer exists. The first
+ * async submit also creates the endpoint's transfer ring when it does not
+ * exist yet (xhci_submit_interrupt_in configures it), so a sync transfer is
+ * not a prerequisite on this controller. Called from aic_tick(). */
+static void aic_rx_pipe_enable_async(aic_rx_pipe_t *pipe)
 {
-    if (g_aic.rx_async || !g_aic.attached || !g_aic.rx_ring_ready) {
+    if (!pipe->present || pipe->use_async || pipe->ep == 0u) {
         return;
     }
-    if (g_aic.submit_in_async == NULL || g_aic.check_in_event == NULL) {
+    if (g_aic.submit_in_async == NULL || g_aic.check_in_event == NULL ||
+        g_aic_api == NULL || g_aic_api->dma_alloc == NULL) {
         return;
     }
-    if (g_aic.rx_dma == NULL) {
-        if (g_aic_api->dma_alloc == NULL) {
-            return;
-        }
-        g_aic.rx_dma = (uint8_t *)g_aic_api->dma_alloc(AIC_RX_BUF_MAX,
-                                                       &g_aic.rx_dma_phys);
-        if (g_aic.rx_dma == NULL || g_aic.rx_dma_phys == 0u) {
-            if (g_aic.rx_dma != NULL && g_aic_api->dma_free != NULL) {
-                g_aic_api->dma_free(g_aic.rx_dma, AIC_RX_BUF_MAX);
+    if (pipe->dma == NULL) {
+        pipe->dma = (uint8_t *)g_aic_api->dma_alloc(AIC_RX_BUF_MAX,
+                                                    &pipe->dma_phys);
+        if (pipe->dma == NULL || pipe->dma_phys == 0u) {
+            if (pipe->dma != NULL && g_aic_api->dma_free != NULL) {
+                g_aic_api->dma_free(pipe->dma, AIC_RX_BUF_MAX);
             }
-            g_aic.rx_dma = NULL;
-            g_aic.rx_dma_phys = 0u;
+            pipe->dma = NULL;
+            pipe->dma_phys = 0u;
             return;
         }
+        /* The parser depends on a zero terminator after the last packet. */
+        aic_memset(pipe->dma, 0u, AIC_RX_BUF_MAX);
     }
-    g_aic.rx_async = true;
+    pipe->use_async = true;
 }
 
-static void aic_rx_free_dma(void)
+static void aic_rx_enable_async(void)
+{
+    if (!g_aic.attached) {
+        return;
+    }
+    aic_rx_pipe_enable_async(&g_aic.rx_cfg);
+    aic_rx_pipe_enable_async(&g_aic.rx_data);
+}
+
+static void aic_rx_pipe_free_dma(aic_rx_pipe_t *pipe)
 {
     /* An armed async transfer writes into the buffer when it completes, so
      * the buffer may only be released once nothing is posted against it.
@@ -439,22 +460,28 @@ static void aic_rx_free_dma(void)
      * re-enumerates under a live transfer, is a far smaller problem than a
      * controller writing into memory the DMA allocator has since handed to
      * something else. */
-    bool armed = g_aic.rx_pending;
-    if (armed && g_aic.check_in_event != NULL && g_aic.attached) {
-        int ev = g_aic.check_in_event(g_aic.addr, g_aic.ep_in);
+    bool armed = pipe->pending;
+    if (armed && g_aic.check_in_event != NULL && g_aic.attached &&
+        pipe->ep != 0u) {
+        int ev = g_aic.check_in_event(g_aic.addr, pipe->ep);
         armed = (ev == 0);
     }
-    if (g_aic.rx_dma != NULL && g_aic_api != NULL &&
+    if (pipe->dma != NULL && g_aic_api != NULL &&
         g_aic_api->dma_free != NULL && !armed) {
-        g_aic_api->dma_free(g_aic.rx_dma, AIC_RX_BUF_MAX);
-    } else if (g_aic.rx_dma != NULL && armed) {
+        g_aic_api->dma_free(pipe->dma, AIC_RX_BUF_MAX);
+    } else if (pipe->dma != NULL && armed) {
         aic_log("[AIC8800] rx DMA buffer kept: transfer still in flight\n");
     }
-    g_aic.rx_dma = NULL;
-    g_aic.rx_dma_phys = 0u;
-    g_aic.rx_async = false;
-    g_aic.rx_pending = false;
-    g_aic.rx_ring_ready = false;
+    pipe->dma = NULL;
+    pipe->dma_phys = 0u;
+    pipe->use_async = false;
+    pipe->pending = false;
+}
+
+static void aic_rx_free_dma(void)
+{
+    aic_rx_pipe_free_dma(&g_aic.rx_cfg);
+    aic_rx_pipe_free_dma(&g_aic.rx_data);
 }
 
 bool aic_cmd(uint16_t msg_id, uint16_t expect_cfm_id, uint16_t dest_id,
@@ -485,7 +512,22 @@ bool aic_cmd(uint16_t msg_id, uint16_t expect_cfm_id, uint16_t dest_id,
     if (sent) {
         started = aic_now_ticks();
         while (!g_aic.cfm_received) {
-            (void)aic_rx_service();
+            /* The reply is expected on the CFG pipe, so keep that transfer
+             * posted for the whole command window: the transfer completes
+             * the instant the reply arrives, and a miss costs one endpoint
+             * recovery instead of hundreds of them (XHCI.c recovers a bulk
+             * endpoint whose transfer timed out, which is a Stop/Reset
+             * Endpoint sequence). */
+            (void)aic_rx_service_pipe(&g_aic.rx_cfg, timeout_ms);
+            if (g_aic.cfm_received) {
+                break;
+            }
+            /* Data may share the wait once the link is up; before that the
+             * endpoint is idle and must not be reset on every iteration. */
+            if (g_aic.ready && g_aic.rx_data.present) {
+                (void)aic_rx_service_pipe(&g_aic.rx_data,
+                                          AIC_RX_SYNC_TIMEOUT_MS);
+            }
             if (g_aic.cfm_received) {
                 break;
             }
@@ -510,8 +552,12 @@ void aic_pump(uint32_t max_transfers)
         return;
     }
     for (uint32_t done = 0u; done < max_transfers; ++done) {
-        if (!aic_rx_service()) {
-            break; /* nothing left in the endpoint */
+        bool got_cfg = aic_rx_service_pipe(&g_aic.rx_cfg,
+                                           AIC_RX_SYNC_TIMEOUT_MS);
+        bool got_data = aic_rx_service_pipe(&g_aic.rx_data,
+                                            AIC_RX_SYNC_TIMEOUT_MS);
+        if (!got_cfg && !got_data) {
+            break; /* nothing left in either endpoint */
         }
     }
 }
@@ -531,7 +577,7 @@ static void aic_make_local_mac(uint8_t mac[6])
     uint64_t seed = aic_now_ticks();
     /* Mix in the attach instance so two dongles (and two boots) differ. */
     seed ^= ((uint64_t)g_aic.addr << 32) | (uint64_t)g_aic.interface;
-    seed ^= (uint64_t)(g_aic.ep_in | ((uint16_t)g_aic.ep_out << 8));
+    seed ^= (uint64_t)(g_aic.rx_cfg.ep | ((uint16_t)g_aic.ep_out << 8));
 
     for (uint32_t i = 0u; i < 6u; ++i) {
         seed ^= seed << 13;
@@ -561,7 +607,8 @@ static bool aic_probe(const bus_device_t *dev)
      * already running firmware -- either the vendor's factory image or the
      * one this driver downloaded on a previous attach (the chip keeps its
      * RAM until it loses power, so a warm reboot comes back as 8d81). The
-     * rest of the vendor's product-id range (8d82/8d83/8d8x, on either
+     * rest of the vendor's product-id range (AIC_USB_PID_FDRV, 0x8d83,
+     * and 8d81/8d82/8d84/8d85/8d8c, on either
      * vendor id) lands in the same bucket on purpose: the two ladders are
      * distinguishable by the messages the device answers, and the one that
      * risks harm is pushing firmware into a *live* chip -- which only ever
@@ -586,14 +633,76 @@ static bool aic_probe(const bus_device_t *dev)
         return false;
     }
 
+    /* Both vendor ladders bind only to the WLAN interface, which is
+     * class/subclass/protocol ff/ff/ff; the Bluetooth side is e0/01/01.
+     * USB_Main.c already filters on the class, so this rejects a second
+     * vendor-specific interface that is not the Wi-Fi one. */
+    if (dev->subclass != AIC_USB_IFACE_CLASS_VENDOR ||
+        dev->protocol != AIC_USB_IFACE_CLASS_VENDOR) {
+        return false;
+    }
+
+    /* The D80 exposes two bulk pairs once firmware is running: the first
+     * carries 802.11 data, the second answers command confirmations. The
+     * ROM loader is the opposite way round -- it speaks TASK_DBG on the
+     * first pair and never touches the second -- so the command pair is
+     * stage-dependent while the data pair is always the first one. A
+     * single-pair interface collapses both roles onto the same endpoints,
+     * and rx_data stays absent; the CFG pump's parser handles data frames
+     * too in that case. */
+    uint8_t  first_in = (ctx->ep_in_data != 0u) ? ctx->ep_in_data : ctx->ep_in;
+    uint16_t first_in_mps = (ctx->ep_in_data != 0u) ? ctx->ep_in_data_mps
+                                                    : ctx->ep_in_mps;
+    uint8_t  first_out = (ctx->ep_out_data != 0u) ? ctx->ep_out_data
+                                                  : ctx->ep_out;
+    uint16_t first_out_mps = (ctx->ep_out_data != 0u) ? ctx->ep_out_data_mps
+                                                      : ctx->ep_out_mps;
+    uint8_t  cfg_in;
+    uint16_t cfg_in_mps;
+    uint8_t  cfg_out;
+    uint16_t cfg_out_mps;
+    if (stage == AIC_STAGE_LOADER) {
+        cfg_in = first_in;
+        cfg_in_mps = first_in_mps;
+        cfg_out = first_out;
+        cfg_out_mps = first_out_mps;
+    } else {
+        cfg_in = ctx->ep_in;
+        cfg_in_mps = ctx->ep_in_mps;
+        cfg_out = ctx->ep_out;
+        cfg_out_mps = ctx->ep_out_mps;
+    }
+    if (cfg_in_mps == 0u) {
+        cfg_in_mps = 64u;
+    }
+    if (cfg_out_mps == 0u) {
+        cfg_out_mps = 64u;
+    }
+    if (first_in_mps == 0u) {
+        first_in_mps = 64u;
+    }
+    if (first_out_mps == 0u) {
+        first_out_mps = 64u;
+    }
+
     if (g_aic.attached && ctx->addr == g_aic.addr &&
         !(g_aic.stage == AIC_STAGE_LOADER && stage == AIC_STAGE_FDRV)) {
-        aic_log("[AIC8800] another vendor interface at addr ");
-        aic_log_hex32((uint32_t)ctx->addr);
-        aic_log(" (iface ");
-        aic_log_hex32((uint32_t)ctx->interface);
-        aic_log(") ignored -- already driving this device\n");
-        return false;
+        /* A second vendor interface at the same address is normally the
+         * Bluetooth side or an enumeration replay. One exception is worth
+         * taking: a firmware-stage probe that has the second bulk pair
+         * while the attached one did not is the real Wi-Fi interface, and
+         * re-initializing the transport before association costs nothing. */
+        bool probe_has_data_pair =
+            (stage == AIC_STAGE_FDRV) && (first_in != cfg_in);
+        if (!(probe_has_data_pair && !g_aic.rx_data.present)) {
+            aic_log("[AIC8800] another vendor interface at addr ");
+            aic_log_hex32((uint32_t)ctx->addr);
+            aic_log(" (iface ");
+            aic_log_hex32((uint32_t)ctx->interface);
+            aic_log(") ignored -- already driving this device\n");
+            return false;
+        }
+        aic_log("[AIC8800] switching to the interface with a data bulk pair\n");
     }
 
     /* Release anything the previous instance owned before overwriting the
@@ -606,15 +715,19 @@ static bool aic_probe(const bus_device_t *dev)
     g_aic.pid = dev->device_id;
     g_aic.addr = ctx->addr;
     g_aic.interface = ctx->interface;
-    g_aic.ep_in = ctx->ep_in;
-    g_aic.ep_out = ctx->ep_out;
-    g_aic.ep_in_mps = ctx->ep_in_mps;
-    g_aic.ep_out_mps = ctx->ep_out_mps;
-    g_aic.ep_out_data = (ctx->ep_out_data != 0u) ? ctx->ep_out_data
-                                                  : ctx->ep_out;
-    g_aic.ep_out_data_mps = (ctx->ep_out_data_mps != 0u)
-                                ? ctx->ep_out_data_mps
-                                : ctx->ep_out_mps;
+    g_aic.ep_out = cfg_out;
+    g_aic.ep_out_mps = cfg_out_mps;
+    g_aic.ep_out_data = first_out;
+    g_aic.ep_out_data_mps = first_out_mps;
+    g_aic.rx_cfg.ep = cfg_in;
+    g_aic.rx_cfg.mps = cfg_in_mps;
+    g_aic.rx_cfg.present = (cfg_in != 0u);
+    g_aic.rx_cfg.sync_buf = g_rx_buf;
+    g_aic.rx_data.ep = first_in;
+    g_aic.rx_data.mps = first_in_mps;
+    g_aic.rx_data.present = (stage == AIC_STAGE_FDRV) &&
+                            (first_in != 0u) && (first_in != cfg_in);
+    g_aic.rx_data.sync_buf = g_rx_data_buf;
     g_aic.submit_bulk = ctx->submit_bulk;
     g_aic.submit_bulk_timeout = ctx->submit_bulk_timeout;
     g_aic.submit_in_async = ctx->submit_interrupt_in_async;
@@ -634,6 +747,14 @@ static bool aic_probe(const bus_device_t *dev)
     aic_log_hex32((uint32_t)g_aic.interface);
     aic_log(" pid 0x");
     aic_log_hex32((uint32_t)g_aic.pid);
+    aic_log(" cfg-in 0x");
+    aic_log_hex32((uint32_t)cfg_in);
+    aic_log(" cfg-out 0x");
+    aic_log_hex32((uint32_t)cfg_out);
+    aic_log(" data-in 0x");
+    aic_log_hex32((uint32_t)(g_aic.rx_data.present ? first_in : 0u));
+    aic_log(" data-out 0x");
+    aic_log_hex32((uint32_t)first_out);
     aic_log("\n");
     return true;
 }
@@ -794,6 +915,22 @@ static void aic_wifi_get_status(driver_wifi_status_t *out_status)
 
     aic_memcpy(out_status->ssid, g_aic.ssid, sizeof(out_status->ssid));
     aic_memcpy(out_status->mac, g_aic.mac, 6u);
+
+    /* A firmware failure has two very different causes -- the loader ladder
+     * (blob download) and the firmware-stage bring-up -- and the panel's
+     * single "firmware failed" line cannot tell them apart. Carry the step
+     * that failed in fw_fail()/bring_fail() so the user sees it without a
+     * serial console. */
+    if (out_status->state == (uint32_t)DRIVER_WIFI_STATE_FIRMWARE_FAILED) {
+        const char *why = (g_aic.stage == AIC_STAGE_LOADER)
+                              ? g_aic.fw_last_error
+                              : g_aic.bring_last_error;
+        if (why != NULL) {
+            uint32_t n = aic_strnlen(why, DRIVER_WIFI_DETAIL_MAX);
+            aic_memcpy(out_status->detail, why, n);
+            out_status->detail[n] = '\0';
+        }
+    }
 }
 
 /* ---- module wiring ---- */

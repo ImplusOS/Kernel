@@ -43,9 +43,9 @@
 
 /* ---- limits ---- */
 
-/* Firmware blobs live on the OS filesystem, not in the repository (they
- * are proprietary): drop the vendor's own .bin files from the driver
- * tarball into this directory. See Firmware/AIC8800/README.md. */
+/* Firmware blobs are proprietary vendor files, read at runtime from the
+ * OS filesystem (they are staged there from Firmware/AIC8800/, see its
+ * README for the file list and the U02/H variants). */
 #define AIC_FW_DIR              "/Kernel/Driver/Firmware/AIC8800/"
 
 #define AIC_FW_FILE_ADID        "fw_adid_8800d80_u02.bin"
@@ -80,7 +80,7 @@
 #define AIC_CMD_BUF_MAX         2048u
 #define AIC_RX_BUF_MAX          2048u
 #define AIC_USB_XFER_TIMEOUT_MS 100u
-#define AIC_CMD_TIMEOUT_MS      300u
+#define AIC_CMD_TIMEOUT_MS      2000u /* vendor RWNX_80211_CMD_TIMEOUT_MS */
 
 /* How many completed bulk transfers aic_pump()/aic_tick() will process in
  * one visit. Each one re-arms immediately, so this only bounds how long a
@@ -151,16 +151,39 @@ typedef enum {
     AIC_CONN_FAILED,
 } aic_conn_state_t;
 
+/* One bulk IN pipe the driver drains.
+ *
+ * The D80 firmware stage exposes two bulk pairs: the *first* carries 802.11
+ * data frames and the *second* answers command confirmations (the vendor's
+ * fdrv builds a separate msg URB on the second IN). Its ROM loader is the
+ * mirror image -- it answers TASK_DBG on the first pair and never touches
+ * the second -- so the loader stage has one pipe (rx_cfg) and the firmware
+ * stage has two. A single-pair interface reports first == last, in which
+ * case rx_data stays absent and the CFG pipe's parser handles data frames
+ * too (it dispatches on the packet type). */
+typedef struct {
+    uint8_t  ep;         /* endpoint number, 0 when the pipe is absent */
+    uint16_t mps;
+    bool     present;
+    bool     pending;    /* an async transfer is posted right now */
+    bool     use_async;  /* DMA buffer + async API available */
+    uint8_t *dma;
+    uint64_t dma_phys;
+    uint8_t *sync_buf;   /* fallback landing buffer (owned by AIC8800.c) */
+} aic_rx_pipe_t;
+
 typedef struct {
     /* ---- USB transport (set by probe(), cleared by remove()) ---- */
     bool     attached;
     uint16_t pid;
     uint8_t  addr;
     uint8_t  interface;
-    uint8_t  ep_in;
+    /* Command pipe: the first pair in the loader stage, the last pair once
+     * firmware is running (see aic_rx_pipe_t above). */
     uint8_t  ep_out;
-    uint16_t ep_in_mps;
     uint16_t ep_out_mps;
+    /* First bulk OUT: data frames in the firmware stage; same as ep_out in
+     * the loader stage and on single-pair interfaces. */
     uint8_t  ep_out_data;
     uint16_t ep_out_data_mps;
     bool (*submit_bulk)(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
@@ -198,22 +221,20 @@ typedef struct {
      * the dispatch defer any command they need to a later poll(). */
     bool     rx_busy;
 
-    /* ---- RX pump ----
+    /* ---- RX pumps ----
      *
      * Preferred mode is an asynchronously posted transfer into a DMA
-     * buffer (driver_binary_t.usb.submit_interrupt_in_async on the bulk IN
+     * buffer (driver_binary_t.usb.submit_interrupt_in_async on each bulk IN
      * endpoint): an idle link then costs nothing per poll, because each
      * poll only tests a completion flag instead of busy-waiting through a
-     * bulk transfer timeout. The sync bulk read stays as the fallback, and
-     * is what creates the endpoint's transfer ring in the first place. */
-    bool     rx_pending;    /* an async transfer is posted right now */
-    bool     rx_async;      /* DMA buffer + async API available */
-    bool     rx_ring_ready; /* one sync transfer has already run (ring exists) */
-    uint8_t *rx_dma;
-    uint64_t rx_dma_phys;
+     * bulk transfer timeout. The sync bulk read stays as the fallback and
+     * is also what creates the endpoint's transfer ring first. */
+    aic_rx_pipe_t rx_cfg;
+    aic_rx_pipe_t rx_data;
 
     /* ---- loader stage: firmware download ---- */
     aic_fw_phase_t fw_phase;
+    const char *fw_last_error; /* literal passed to fw_fail(), for status detail */
     uint32_t fw_attempts;
     uint64_t fw_last_attempt; /* ticks at the last attempt (for retry pacing) */
     bool     fw_done;
@@ -251,6 +272,7 @@ typedef struct {
 
     /* ---- fdrv stage: station bring-up ---- */
     aic_bring_phase_t bring_phase;
+    const char *bring_last_error; /* literal passed to bring_fail() */
     uint32_t bring_attempts;
     uint64_t bring_last_attempt; /* ticks at the last attempt (for retry pacing) */
     uint8_t  vif_idx;

@@ -166,9 +166,26 @@ static bool bring_rf_init(void)
     aic_mm_set_rf_calib_req_t calib;
     uint8_t cfm[8];
 
+    /* The vendor's built-in userconfig defaults (rwnx_platform.c's
+     * userconfig_info.txpwr_lvl_v3). A zero table would be sent with
+     * enable=1, i.e. "all rates at 0 dBm", which leaves the station unable
+     * to reach an AP even though every bring-up command succeeds. 0x80 in
+     * the 5 GHz 11a entries is the vendor's "not applicable" marker. */
+    static const aic_txpwr_lvl_conf_v3_t txpwr_defaults = {
+        .enable = AIC_TXPWR_LVL_V3_ENABLE,
+        .pwrlvl_11b_11ag_2g4 = { 20, 20, 20, 20, 20, 20, 20, 20,
+                                 18, 18, 16, 16 },
+        .pwrlvl_11n_11ac_2g4 = { 20, 20, 20, 20, 18, 18, 16, 16, 16, 16 },
+        .pwrlvl_11ax_2g4 = { 20, 20, 20, 20, 18, 18, 16, 16, 16, 16, 15, 15 },
+        .pwrlvl_11a_5g = { -128, -128, -128, -128, 20, 20, 20, 20,
+                           18, 18, 16, 16 },
+        .pwrlvl_11n_11ac_5g = { 20, 20, 20, 20, 18, 18, 16, 16, 16, 15 },
+        .pwrlvl_11ax_5g = { 20, 20, 20, 20, 18, 18, 16, 16, 16, 15, 14, 14 },
+    };
+
     aic_memset(&txpwr, 0u, sizeof(txpwr));
+    aic_memcpy(txpwr.raw, &txpwr_defaults, sizeof(txpwr_defaults));
     aic_memset(&cfm, 0u, sizeof(cfm));
-    txpwr.raw[0] = AIC_TXPWR_LVL_V3_ENABLE;
     if (!aic_cmd(AIC_MM_SET_TXPWR_IDX_LVL_REQ, AIC_MM_SET_TXPWR_IDX_LVL_CFM,
                  (uint16_t)AIC_TASK_MM, &txpwr, (uint16_t)sizeof(txpwr),
                  cfm, (uint16_t)sizeof(cfm), AIC_CMD_TIMEOUT_MS)) {
@@ -286,6 +303,7 @@ static bool bring_mm_add_if(void)
 
 static void bring_fail(const char *what)
 {
+    g_aic.bring_last_error = what;
     aic_log("[AIC8800] bring-up: ");
     aic_log(what);
     aic_log(" failed (attempt ");

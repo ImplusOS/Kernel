@@ -243,7 +243,7 @@ void ap_entry_c(void)
     init_idt_per_cpu();
     syscall_init_per_cpu();
 
-    /* Per-CPU MSR setup: EFER (NX), LAPIC */
+    /* Per-CPU MSR setup: EFER (NX), PAT, LAPIC */
     {
         uint32_t msr = 0xC0000080U;
         uint32_t lo, hi;
@@ -251,6 +251,13 @@ void ap_entry_c(void)
         lo |= (1u << 11);
         __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr) : "memory");
     }
+
+    /* The PAT MSR is per-CPU while the kernel page tables are shared: an AP
+     * without this would resolve the WC framebuffer PTEs (PWT=1,PCD=0,
+     * PAT=1 -> PAT entry 5) through its own power-on WT entry and blit at
+     * write-through speed. The BSP ran paging_setup_pat() in init_paging();
+     * mirror it here before this CPU can touch the MMIO window. */
+    paging_setup_pat();
 
     __atomic_fetch_add(&g_cpu_online, 1u, __ATOMIC_SEQ_CST);
 

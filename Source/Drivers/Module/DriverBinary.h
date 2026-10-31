@@ -478,11 +478,19 @@ typedef struct {
     uint8_t  ep_out;
     uint16_t ep_in_mps;
     uint16_t ep_out_mps;
-    /* Some vendor-specific USB NICs expose separate bulk OUT pipes for
+    /* Some vendor-specific USB NICs expose separate bulk IN/OUT pipes for
      * control messages and data frames (AIC8800D80 is one example).  The
-     * historical ep_out fields remain the control pipe; ep_out_data is
-     * optional and falls back to ep_out when the interface has only one OUT
-     * endpoint. */
+     * historical ep_in/ep_out fields remain the control (message) pipe;
+     * ep_in_data/ep_out_data are the first bulk pair and fall back to
+     * ep_in/ep_out when the interface has only one pair.
+     *
+     * AIC8800D80 is asymmetric across its two lives: the ROM loader answers
+     * its TASK_DBG commands on the *first* pair only, while the firmware
+     * stage answers commands on the *second* pair and carries 802.11 frames
+     * on the first (see aicwf_usb.c in the vendor's aic_load_fw and
+     * aic8800_fdrv).  Both pairs therefore have to be reported. */
+    uint8_t  ep_in_data;
+    uint16_t ep_in_data_mps;
     uint8_t  ep_out_data;
     uint16_t ep_out_data_mps;
     bool (*submit_bulk)(uint8_t addr, uint8_t endpoint, uint16_t max_packet_size,
@@ -669,6 +677,10 @@ typedef enum {
 } driver_wifi_security_t;
 
 #define DRIVER_WIFI_SSID_MAX 32u
+/* Longest firmware/bring-up failure step copied into
+ * driver_wifi_status_t.detail ("patch table write", "rf calibration", ...).
+ * Kept short enough for one line of the Wi-Fi panel. */
+#define DRIVER_WIFI_DETAIL_MAX 63u
 
 /* __attribute__((packed)) + a plain uint32_t (rather than the enum type
  * above) for `security`/`state` below: these two structs cross the
@@ -700,6 +712,11 @@ typedef struct __attribute__((packed)) {
     uint32_t state; /* driver_wifi_state_t */
     char ssid[DRIVER_WIFI_SSID_MAX + 1u]; /* valid when state >= CONNECTING */
     uint8_t mac[6];
+    /* Human-readable failing step while state == FIRMWARE_FAILED (empty
+     * otherwise), e.g. "chip configuration" or "add interface". The panel
+     * shows it next to the generic failure line so a real-hardware report
+     * carries the step without a serial console. */
+    char detail[DRIVER_WIFI_DETAIL_MAX + 1u];
 } driver_wifi_status_t;
 
 typedef struct {

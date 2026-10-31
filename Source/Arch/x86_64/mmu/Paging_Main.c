@@ -890,14 +890,58 @@ static void paging_identity_mark_2mb_uncached(uint64_t phys_addr)
     invlpg_addr(base);
 }
 
-static void paging_enable_wc_pat(void)
+/* Program the PAT so the WC MMIO windows below are actually WC (see
+ * Paging_Main.h). Must run on every CPU: the PAT MSR is per-CPU, and the
+ * kernel page tables (including the MMIO window) are shared -- an AP that
+ * never reprogrammed it would resolve the same PTE bits through the
+ * power-on WT entry. */
+void paging_setup_pat(void)
 {
-    /* PAT entry 1 is selected by PWT=1, PCD=0, PAT=0. */
+    static volatile uint32_t pat_reported_cpus;
     uint64_t pat = hal_cpu_read_msr(IA32_PAT_MSR);
-    if (((pat >> 8) & 0xFFULL) != 0x01ULL) {
-        pat = (pat & ~0xFF00ULL) | 0x0100ULL; /* WC */
+    uint64_t power_on = pat;
+    bool changed = false;
+
+    /* PAT index = (PAT bit << 2) | (PCD bit << 1) | PWT bit.
+     * The WC mappings in this file set PWT=1, PCD=0, PAT=1
+     * (PAGE_PWT | PAGE_PAT), which selects entry 5 -- not entry 1, as the
+     * old helper assumed. With the power-on defaults (entry 1 = entry 5 =
+     * 0x04, WT) the framebuffer therefore came up WRITE-THROUGH: invisible
+     * under QEMU (it ignores PAT for its RAM-backed framebuffer), but on
+     * real hardware every 16-byte non-temporal store in the display blit
+     * became a partial-line write. */
+    uint64_t entry5 = (pat >> 40) & 0xFFULL;
+    if (entry5 != 0x01ULL) {
+        pat = (pat & ~(0xFFULL << 40)) | (0x01ULL << 40); /* entry 5 -> WC */
+        changed = true;
+    }
+    /* Entry 1 (PWT=1, PCD=0, PAT=0) is what this file previously declared
+     * WC; nothing selects it today, but a PWT-only mapping would otherwise
+     * silently fall back to the power-on WT. */
+    uint64_t entry1 = (pat >> 8) & 0xFFULL;
+    if (entry1 != 0x01ULL) {
+        pat = (pat & ~(0xFFULL << 8)) | (0x01ULL << 8); /* entry 1 -> WC */
+        changed = true;
+    }
+    if (changed) {
         hal_cpu_write_msr(IA32_PAT_MSR, pat);
     }
+
+    /* Print the value each CPU ends up with; the first CPU also prints the
+     * power-on value, so firmware interference is distinguishable from a
+     * bug here on the first look (AP bring-up is serialized by smp_init, so
+     * the counter needs no lock). */
+    uint32_t cpu_rank =
+        __atomic_fetch_add(&pat_reported_cpus, 1u, __ATOMIC_RELAXED);
+    if (cpu_rank == 0u) {
+        serial_write_string("[pat] power-on MSR 0x277 = ");
+        serial_write_uint64(power_on);
+        serial_write_string("\n[pat] entries 1,5 -> WC on bsp; this cpu now ");
+    } else {
+        serial_write_string("[pat] ap now MSR 0x277 = ");
+    }
+    serial_write_uint64(pat);
+    serial_write_string("\n");
 }
 
 static void *map_mmio_virt_internal(uint64_t phys_addr, bool write_combining)
@@ -911,9 +955,9 @@ static void *map_mmio_virt_internal(uint64_t phys_addr, bool write_combining)
         return (void *)(uintptr_t)phys_addr;
     }
 
-    if (write_combining) {
-        paging_enable_wc_pat();
-    }
+    /* PAT has already been programmed per-CPU (init_paging for the BSP,
+     * ap_entry_c for every AP), so the pages can simply carry the
+     * PAGE_PWT | PAGE_PAT bits. */
 
     uint64_t phys_base = phys_addr & ~(MB2 - 1ULL);
     uint64_t offset = phys_addr - phys_base;
@@ -972,6 +1016,10 @@ void *map_mmio_wc_virt(uint64_t phys_addr)
 
 void init_paging(void)
 {
+    /* PAT before the first WC/UC mapping exists: BSP programming, mirrored
+     * by ap_entry_c for every AP (the MSR is per-CPU). */
+    paging_setup_pat();
+
     uint32_t msr = 0xC0000080;
     uint64_t efer = hal_cpu_read_msr(msr);
     efer |= (1 << 11); 

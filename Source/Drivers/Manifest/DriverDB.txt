@@ -9,11 +9,11 @@
 # swept by the bootloader's preloader at boot and would defeat the point
 # of loading these only when actually needed.
 
-# AICSemi AIC8800D80 USB Wi-Fi -- Kernel/Drivers/Wi-Fi/AIC8800/
+# AICSemi AIC8800D80 USB Wi-Fi -- Kernel/Source/Drivers/Wi-Fi/AIC8800/
 # No pid= filter: units enumerate under several product ids depending on
 # what the on-board firmware is doing (the loader stage shows up as one
 # pid, the full-mac driver as the next), and AIC8800.c's own
-# bus_matches[] (Kernel/Drivers/Wi-Fi/AIC8800/AIC8800.c) matches on
+# bus_matches[] (Kernel/Source/Drivers/Wi-Fi/AIC8800/AIC8800.c) matches on
 # vendor id + vendor-specific interface class only, treating the pid in
 # probe() -- keep this on-demand manifest consistent with that rather
 # than hardcoding one pid that would miss half the states the dongle

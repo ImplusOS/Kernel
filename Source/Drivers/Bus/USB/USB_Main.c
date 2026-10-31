@@ -528,6 +528,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
         uint8_t  ep_out;
         uint16_t ep_in_mps;
         uint16_t ep_out_mps;
+        uint8_t  ep_in_data;
+        uint16_t ep_in_data_mps;
         uint8_t  ep_out_data;
         uint16_t ep_out_data_mps;
     } vendor_ifaces[4];
@@ -617,6 +619,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                         slot->ep_out = 0u;
                         slot->ep_in_mps = 0u;
                         slot->ep_out_mps = 0u;
+                        slot->ep_in_data = 0u;
+                        slot->ep_in_data_mps = 0u;
                         slot->ep_out_data = 0u;
                         slot->ep_out_data_mps = 0u;
                     }
@@ -646,6 +650,15 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                             continue;
                         }
                         if (ep_addr & 0x80u) {
+                            /* The first bulk IN is the data pipe on
+                             * AIC8800D80's firmware stage and the only
+                             * message pipe its ROM loader uses; the last
+                             * one is the firmware stage's command pipe.
+                             * Keep both. */
+                            if (vendor_ifaces[v].ep_in_data == 0u) {
+                                vendor_ifaces[v].ep_in_data = ep_addr & 0x7Fu;
+                                vendor_ifaces[v].ep_in_data_mps = mps;
+                            }
                             vendor_ifaces[v].ep_in = ep_addr & 0x7Fu;
                             vendor_ifaces[v].ep_in_mps = mps;
                         } else {
@@ -734,6 +747,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
             usb_ctx.ep_out = vi->ep_out;
             usb_ctx.ep_in_mps = vi->ep_in_mps;
             usb_ctx.ep_out_mps = vi->ep_out_mps;
+            usb_ctx.ep_in_data = vi->ep_in_data;
+            usb_ctx.ep_in_data_mps = vi->ep_in_data_mps;
             usb_ctx.ep_out_data = vi->ep_out_data;
             usb_ctx.ep_out_data_mps = vi->ep_out_data_mps;
             usb_ctx.submit_bulk = usb_submit_bulk;

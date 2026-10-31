@@ -180,6 +180,7 @@ void nic_wifi_get_status(driver_wifi_status_t *out_status)
         out_status->ssid[0] = '\0';
         out_status->mac[0] = out_status->mac[1] = out_status->mac[2] = 0u;
         out_status->mac[3] = out_status->mac[4] = out_status->mac[5] = 0u;
+        out_status->detail[0] = '\0';
         return;
     }
     driver->wifi_get_status(out_status);

@@ -31,7 +31,7 @@ DRIVER_BASE_CFLAGS := \
 	$(DRIVER_ARCH_CFLAGS) -nostdlib -nostartfiles -nodefaultlibs \
 	-Wall -Wextra -Wtype-limits -Wconversion -Wsign-conversion -Wshadow \
 	-MMD -MP \
-	-Os -g0 -ffunction-sections -fdata-sections \
+	-O2 -g0 -ffunction-sections -fdata-sections \
 	-DIMPLUS_DRIVER_MODULE -DKERNEL
 
 DRIVER_MODULE_CFLAGS += $(DRIVER_BASE_CFLAGS)

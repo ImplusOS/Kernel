@@ -36,11 +36,12 @@
  * time against the vendor's DBG_MEM_BLOCK_WRITE_REQ instead of being read
  * into memory first.
  *
- * The firmware blobs are proprietary and deliberately not in the
- * repository: the driver reads them from AIC_FW_DIR on the OS filesystem.
- * When they are missing, every step simply fails and the ladder retries a
- * few times before giving up, so a machine without them boots normally
- * with the adapter reporting DRIVER_WIFI_STATE_FIRMWARE_FAILED.
+ * The firmware blobs are proprietary vendor files: the driver reads them
+ * from AIC_FW_DIR on the OS filesystem (staged there from
+ * Kernel/Source/Drivers/Firmware/AIC8800/, see its README). When they are
+ * missing, every step simply fails and the ladder retries a few times
+ * before giving up, so a machine without them boots normally with the
+ * adapter reporting DRIVER_WIFI_STATE_FIRMWARE_FAILED.
  */
 
 /* ---- loader-stage constants (aic_compat_8800d80.c / aicbluetooth.c) ---- */
@@ -77,6 +78,14 @@
 #define AICBT_PT_AF                 5u
 #define AICBT_PT_VER                6u
 #define AICBT_PT_SKIP_TYPE          1000u
+
+/* The INF block's first four (address, value) pairs are also written to
+ * the chip -- two pointer slots in the patch image plus the syscfg register
+ * -- but anything after them is loader metadata: the vendor truncates the
+ * block's pair count to this before aicbt_patch_table_load() writes it.
+ * Writing the tail would push 0x1 to address 0x1 and the ext-image pair to
+ * address 0 (see fw_patch_table_8800d80_u02.bin). */
+#define AICBT_PT_INF_PAIRS          4u
 
 /* Bluetooth coexistence defaults the BTMODE block receives: the vendor
  * applies aicbsp_info (hwinfo = -1 default, cpmode = work) and the
@@ -202,12 +211,18 @@ static bool fw_upload_begin(const char *name, uint32_t addr)
         return false;
     }
     if (!g_aic_api->fs.find_file(path, &g_aic.file)) {
+        aic_log("[AIC8800] firmware file missing: ");
+        aic_log(path);
+        aic_log("\n");
         return false;
     }
 
     size = g_aic_api->fs.get_file_size(&g_aic.file);
     if (size == 0u || size > AIC_FW_FILE_MAX) {
         (void)g_aic_api->fs.close_file(&g_aic.file);
+        aic_log("[AIC8800] firmware file has an unusable size: ");
+        aic_log(path);
+        aic_log("\n");
         return false;
     }
 
@@ -350,7 +365,10 @@ static bool fw_ext_name(char *out, uint32_t cap, uint32_t id)
     char digits[8];
     uint32_t ndigits = 0u;
 
-    if (len == 0u || len + 1u + 4u + 1u > cap) {
+    /* Worst case is every digit plus ".bin" and the NUL, whether or not
+     * this id needs all of them -- the caller's buffer is sized against
+     * this check, so it must bound the largest write the function can do. */
+    if (len == 0u || len + sizeof(digits) + sizeof(suffix) > cap) {
         return false;
     }
     for (pos = 0u; pos < len; ++pos) {
@@ -538,6 +556,7 @@ static aic_upload_result_t fw_pt_write(void)
     while (budget != 0u) {
         uint32_t off = g_aic.pt_off;
         fw_pt_block_t blk;
+        uint32_t pairs;
 
         if (off >= g_aic.patch_table_len) {
             return AIC_UP_DONE;
@@ -549,10 +568,14 @@ static aic_upload_result_t fw_pt_write(void)
             g_aic.pt_off = off;
             continue;
         }
+        pairs = blk.pairs;
+        if (blk.type == AICBT_PT_INF && pairs > AICBT_PT_INF_PAIRS) {
+            pairs = AICBT_PT_INF_PAIRS;
+        }
         if (g_aic.pt_pair == 0u && blk.type == AICBT_PT_BTMODE) {
             fw_pt_apply_btmode(&blk);
         }
-        if (g_aic.pt_pair < blk.pairs && blk.type != AICBT_PT_VER) {
+        if (g_aic.pt_pair < pairs && blk.type != AICBT_PT_VER) {
             uint8_t *pair = blk.data + (g_aic.pt_pair * AIC_FW_PT_PAIR_LEN);
             if (!fw_mem_write(aic_rd32(pair), aic_rd32(pair + 4u))) {
                 return AIC_UP_FAIL;
@@ -561,7 +584,7 @@ static aic_upload_result_t fw_pt_write(void)
         }
         ++g_aic.pt_pair;
 
-        if (g_aic.pt_pair >= blk.pairs) {
+        if (g_aic.pt_pair >= pairs) {
             g_aic.pt_off = off;
             g_aic.pt_pair = 0u;
             if (blk.type == AICBT_PT_PWRON) {
@@ -701,6 +724,7 @@ static void fw_ladder_reset(void)
 
 static void fw_fail(const char *what)
 {
+    g_aic.fw_last_error = what;
     aic_log("[AIC8800] firmware download: ");
     aic_log(what);
     aic_log(" failed (attempt ");
@@ -850,7 +874,7 @@ void aic_fw_step(void)
             return;
         }
         aic_log("[AIC8800] firmware running; waiting for the device to "
-                "come back as 8d81\n");
+                "come back with its firmware product id (8d83)\n");
         g_aic.fw_done = true;
         g_aic.fw_phase = AIC_FW_DONE;
         break;

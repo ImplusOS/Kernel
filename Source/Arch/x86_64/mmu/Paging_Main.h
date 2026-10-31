@@ -31,6 +31,13 @@
 void init_paging(void);
 void *map_mmio_virt(uint64_t phys_addr);
 void *map_mmio_wc_virt(uint64_t phys_addr);
+/* Program this CPU's PAT for the WC/UC page-table flag convention used by
+ * map_mmio_virt()/map_mmio_wc_virt(): WC pages carry PWT=1,PCD=0,PAT=1
+ * (PAT entry 5) and UC carries PCD=1,PWT=1 (power-on entry 3). Runs on the
+ * BSP from init_paging() and must be repeated on every AP in ap_entry_c(),
+ * because IA32_PAT_MSR is per-CPU while the kernel page tables are shared.
+ * Idempotent; also prints the PAT value over serial. */
+void paging_setup_pat(void);
 uint64_t paging_get_kernel_cr3(void);
 uint64_t paging_get_active_cr3(void);
 void paging_switch_cr3(uint64_t cr3);
