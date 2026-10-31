@@ -534,8 +534,24 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
             ig9_ggtt_write_pte(first_entry + i, 0u);
         }
         ig9_ggtt_invalidate();
+
+        bool rollback_ok = true;
+        for (uint32_t i = 0u; i < pages; ++i) {
+            if (ig9_ggtt_read_pte(first_entry + i) != 0u) {
+                rollback_ok = false;
+                break;
+            }
+        }
+        if (!rollback_ok) {
+            /* Do not let another allocation reuse an entry whose hardware
+             * state could not be proven clear. This reservation is permanent
+             * for this boot; it is safer than aliasing a live DMA mapping. */
+            ig9_ggtt_mark_slots(slot_first, slots_needed);
+        }
         ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: PTE readback mismatch\n");
+        ig9_log(rollback_ok ?
+                "[IntelGen9] ggtt: PTE readback mismatch; rolled back\n" :
+                "[IntelGen9] ggtt: rollback unverified; range quarantined\n");
         return false;
     }
 
