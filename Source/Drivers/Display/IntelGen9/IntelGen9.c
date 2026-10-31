@@ -1065,7 +1065,8 @@ static void ig9_copy_string(char *dst, uint32_t dst_size, const char *src)
 static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
 {
     g_ready = 0;
-    g_back_ggtt_ready = 0;
+    /* Preserve g_back_ggtt_ready until the old mapping has been drained and
+     * unmapped below; clearing it here would orphan a live GPU mapping. */
     ++g_generation;
 
     if (g_back_buffer != NULL) {
