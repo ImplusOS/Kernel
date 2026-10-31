@@ -151,7 +151,7 @@ static ig9_vm_pt_page_t *ig9_vm_alloc_pt_locked(ig9_vm_space_t *vm,
     void *allocation;
     ig9_vm_pt_page_t *page;
 
-    if (level == 0u || level >= IG9_VM_LEVELS ||
+    if (level == 0u || level > IG9_VM_LEVELS ||
         g_ig9_vm_api == NULL ||
         g_ig9_vm_api->mem.dma_alloc_ex == NULL ||
         g_ig9_vm_api->mem.dma_free == NULL) {
@@ -223,7 +223,7 @@ static volatile uint64_t *ig9_vm_leaf_slot_locked(ig9_vm_space_t *vm,
             entry = child->dma_address | IG9_VM_PTE_PRESENT |
                     IG9_VM_PTE_WRITE | IG9_VM_PTE_UNCACHED;
             __atomic_store_n(&parent->entries[index], entry, __ATOMIC_RELEASE);
-            ++vm->generation;
+            (void)__atomic_add_fetch(&vm->generation, 1u, __ATOMIC_RELEASE);
         } else {
             uint64_t child_dma = entry & IG9_VM_PHYS_MASK;
             child = ig9_vm_find_pt_locked(vm, child_dma);
@@ -400,14 +400,14 @@ static bool ig9_vm_map_contiguous_locked(ig9_vm_space_t *vm,
     for (uint64_t i = 0u; i < pages; ++i) {
         volatile uint64_t *slot = ig9_vm_leaf_slot_locked(
             vm, gpu_va + i * IG9_VM_PAGE_SIZE, false);
-        uint64_t pte = physical_base + i * IG9_VM_PAGE_SIZE | pte_flags;
+        uint64_t pte = (physical_base + i * IG9_VM_PAGE_SIZE) | pte_flags;
         if (slot == NULL) {
             return false;
         }
         __atomic_store_n(slot, pte, __ATOMIC_RELEASE);
     }
 
-    ++vm->generation;
+    (void)__atomic_add_fetch(&vm->generation, 1u, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -472,8 +472,8 @@ ig9_vm_space_t *ig9_vm_create(void)
         return NULL;
     }
     ig9_vm_zero(vm, sizeof(*vm));
-    vm->generation = 1u;
-    vm->invalidated_generation = 1u;
+    __atomic_store_n(&vm->generation, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&vm->invalidated_generation, 1u, __ATOMIC_RELAXED);
 
     root = ig9_vm_alloc_pt_locked(vm, IG9_VM_LEVELS);
     if (root == NULL) {
@@ -638,8 +638,9 @@ void ig9_vm_note_tlb_invalidate(ig9_vm_space_t *vm, uint64_t generation)
         return;
     }
     ig9_vm_lock(vm);
-    if (vm->generation == generation) {
-        vm->invalidated_generation = generation;
+    if (__atomic_load_n(&vm->generation, __ATOMIC_ACQUIRE) == generation) {
+        __atomic_store_n(&vm->invalidated_generation, generation,
+                         __ATOMIC_RELEASE);
     }
     ig9_vm_unlock(vm);
 }
@@ -846,8 +847,8 @@ bool ig9_vm_software_selftest(const driver_binary_t *api)
                                &ignored) &&
              !ig9_vm_translate(vm,
                                ig9_gem_gpu_address(object) +
-                               ig9_gem_size(object) +
-                               IG9_VM_PAGE_SIZE,
+                               ((ig9_gem_size(object) + IG9_VM_PAGE_SIZE - 1u) &
+                                ~(uint64_t)(IG9_VM_PAGE_SIZE - 1u)),
                                &ignored);
     }
 
