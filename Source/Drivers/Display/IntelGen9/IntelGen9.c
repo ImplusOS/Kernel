@@ -1884,16 +1884,6 @@ static void ig9_hw_bringup(void)
     g_accel_ok = 1;
     ig9_log("[IntelGen9] blitter verified, accelerated present enabled\n");
 
-    /*
-     * Exercise the software-only Gen8/Gen9 PPGTT hierarchy and GEM lifetime
-     * rules before introducing engine contexts. This does not install the
-     * page tables into hardware or submit GPU work.
-     */
-    if (ig9_vm_software_selftest(g_api)) {
-        ig9_log("[IntelGen9] PPGTT/GEM software selftest passed\n");
-    } else {
-        ig9_log("[IntelGen9] PPGTT/GEM software selftest failed; not enabled\n");
-    }
 }
 
 static void ig9_pci_find_device(void)
@@ -1980,6 +1970,21 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
     }
 
     g_api = api;
+
+#if defined(__x86_64__)
+    /*
+     * This is a CPU-only PPGTT/GEM test. The memory manager is already up
+     * before driver_module_init(), so it can run on QEMU even when no Intel
+     * PCI display function is present. It does not touch MMIO, install a GPU
+     * context, or submit commands.
+     */
+    if (ig9_vm_software_selftest(api)) {
+        ig9_log("[IntelGen9] PPGTT/GEM software selftest passed\n");
+    } else {
+        ig9_log("[IntelGen9] PPGTT/GEM software selftest failed\n");
+    }
+#endif
+
     /* This runs during the prepare pass, before any module is activated and
      * therefore before the PCI client can answer; the search itself is
      * deferred to probe(). The log stays unconditional so a staged module
