@@ -67,6 +67,7 @@
 #ifdef IMPLUS_DRIVER_MODULE
 
 #include "Drivers/Module/DriverBinary.h"
+#include "IntelGen9_VM.h"
 
 /* ------------------------------------------------------------------ *
  * 0. Driver-module glue
@@ -1882,6 +1883,17 @@ static void ig9_hw_bringup(void)
 
     g_accel_ok = 1;
     ig9_log("[IntelGen9] blitter verified, accelerated present enabled\n");
+
+    /*
+     * Exercise the software-only Gen8/Gen9 PPGTT hierarchy and GEM lifetime
+     * rules before introducing engine contexts. This does not install the
+     * page tables into hardware or submit GPU work.
+     */
+    if (ig9_vm_software_selftest(g_api)) {
+        ig9_log("[IntelGen9] PPGTT/GEM software selftest passed\n");
+    } else {
+        ig9_log("[IntelGen9] PPGTT/GEM software selftest failed; not enabled\n");
+    }
 }
 
 static void ig9_pci_find_device(void)
