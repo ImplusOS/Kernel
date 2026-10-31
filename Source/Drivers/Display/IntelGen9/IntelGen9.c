@@ -341,7 +341,7 @@ static bool ig9_ggtt_detect_size(void)
                                            IG9_PCI_GMCH_CTRL);
     uint32_t ggms = (gmch >> IG9_GMCH_GGMS_SHIFT) & IG9_GMCH_GGMS_MASK;
     if (ggms < 1u || ggms > 3u) {
-        ig9_log("[IntelGen9] ggtt: invalid GMCH_CTRL.GGMS\\n");
+        ig9_log("[IntelGen9] ggtt: invalid GMCH_CTRL.GGMS\n");
         return false;
     }
 
@@ -349,7 +349,7 @@ static bool ig9_ggtt_detect_size(void)
                        IG9_GGTT_PTE_BYTES;
     if (entries > IG9_GGTT_MAX_ENTRIES ||
         entries < IG9_GGTT_PRIVATE_ENTRIES * 2u) {
-        ig9_log("[IntelGen9] ggtt: reported table is too small\\n");
+        ig9_log("[IntelGen9] ggtt: reported table is too small\n");
         return false;
     }
 
@@ -363,7 +363,7 @@ static bool ig9_ggtt_detect_size(void)
 
     ig9_log("[IntelGen9] ggtt entries 0x");
     ig9_log_hex(g_ggtt_entries);
-    ig9_log("\\n");
+    ig9_log("\n");
     return true;
 }
 
@@ -404,8 +404,8 @@ static bool ig9_ggtt_find_mapping(uint64_t phys, uint32_t *entry_out)
  * contiguous physical span means this works for any allocation the kernel
  * hands out - the back buffer, the ring, scratch - whether or not it is
  * physically contiguous; the only requirement is a page-aligned start.
- * Every entry is verified empty before the write and non-empty after it; a
- * failure leaves the caller on the CPU path.
+ * Each allocation is isolated by an unmapped guard page on both sides. PTEs
+ * are read back exactly; a mismatch rolls the range back before returning.
  */
 static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
                                uint32_t *ggtt_offset_out)
@@ -453,7 +453,7 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
     }
     if (slot_first == UINT32_MAX) {
         ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: private window exhausted\\n");
+        ig9_log("[IntelGen9] ggtt: private window exhausted\n");
         return false;
     }
 
@@ -467,7 +467,7 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
             (page_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u ||
             (page_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
             ig9_ggtt_unlock();
-            ig9_log("[IntelGen9] ggtt: unmappable page\\n");
+            ig9_log("[IntelGen9] ggtt: unmappable page\n");
             return false;
         }
     }
@@ -502,7 +502,7 @@ static bool ig9_ggtt_map_pages(const void *virt, uint64_t bytes,
         }
         ig9_ggtt_invalidate();
         ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: PTE readback mismatch\\n");
+        ig9_log("[IntelGen9] ggtt: PTE readback mismatch\n");
         return false;
     }
 
@@ -1567,7 +1567,7 @@ static void ig9_hw_bringup(void)
     ig9_log("[IntelGen9] bringup: MMIO mapped\n");
 
     if (!ig9_ggtt_detect_size()) {
-        ig9_log("[IntelGen9] bringup: GGTT size unavailable, CPU path only\\n");
+        ig9_log("[IntelGen9] bringup: GGTT size unavailable, CPU path only\n");
         return;
     }
 
