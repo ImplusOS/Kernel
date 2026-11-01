@@ -846,12 +846,18 @@ static drm_render_session_t *render_session_for_current(void)
     int32_t pid = process_get_current_pid();
     if (pid <= 0) return NULL;
 
-    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++)
+    spinlock_lock(&g_lock);
+    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++) {
         if (g_render_sessions[i].used &&
-            g_render_sessions[i].client_pid == pid)
-            return &g_render_sessions[i];
-
-    return render_session_alloc(pid);
+            g_render_sessions[i].client_pid == pid) {
+            drm_render_session_t *found = &g_render_sessions[i];
+            spinlock_unlock(&g_lock);
+            return found;
+        }
+    }
+    drm_render_session_t *created = render_session_alloc(pid);
+    spinlock_unlock(&g_lock);
+    return created;
 }
 
 static void render_session_free(drm_render_session_t *s)
@@ -888,11 +894,16 @@ static int render_ensure_context(drm_render_session_t *sess)
 {
     const driver_display_t *gpu = render_gpu_backend();
     if (sess == NULL || gpu == NULL) return E_NODEV;
-    if (sess->context_id != 0u) return 0;
 
-    sess->context_id =
-        gpu->gpu_context_create(sess->context_capset_id, "ImplusOS Mesa");
-    return sess->context_id != 0u ? 0 : E_NODEV;
+    spinlock_lock(&g_lock);
+    if (sess->context_id == 0u) {
+        sess->context_id =
+            gpu->gpu_context_create(sess->context_capset_id,
+                                    "ImplusOS Mesa");
+    }
+    int rc = sess->context_id != 0u ? 0 : E_NODEV;
+    spinlock_unlock(&g_lock);
+    return rc;
 }
 
 /* Called with g_lock held. The resource is detached from the owning virgl
@@ -977,12 +988,23 @@ static int render_attach_bo_to_context(drm_render_session_t *sess,
     if (bo == NULL || bo->gpu_resource_id == 0u || gpu == NULL) {
         return E_INVAL;
     }
-    if (bo->gpu_attached_context == sess->context_id) return 0;
-    if (!gpu->gpu_context_attach_resource(sess->context_id,
-                                          bo->gpu_resource_id)) {
+    spinlock_lock(&g_lock);
+    if (bo->gpu_attached_context == sess->context_id) {
+        spinlock_unlock(&g_lock);
+        return 0;
+    }
+    uint32_t context_id = sess->context_id;
+    uint32_t resource_id = bo->gpu_resource_id;
+    spinlock_unlock(&g_lock);
+
+    if (!gpu->gpu_context_attach_resource(context_id, resource_id)) {
         return E_INVAL;
     }
-    bo->gpu_attached_context = sess->context_id;
+    spinlock_lock(&g_lock);
+    if (bo->used && bo->gpu_resource_id == resource_id) {
+        bo->gpu_attached_context = context_id;
+    }
+    spinlock_unlock(&g_lock);
     return 0;
 }
 
