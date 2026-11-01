@@ -465,3 +465,39 @@ const char *display_main_get_active_driver_name(void)
 {
     return g_active_display_module_name;
 }
+
+const driver_display_t *display_get_3d_driver(void)
+{
+    for (uint32_t i = 0u; i < DEVICE_REGISTRY_MAX; ++i) {
+        const device_t *dev =
+            device_registry_find_by_index(DEVICE_TYPE_DISPLAY, i);
+        if (dev == NULL) break;
+
+        const driver_display_t *candidate =
+            (const driver_display_t *)dev->ops;
+        if (candidate == NULL || candidate->gpu_has_3d == NULL ||
+            !candidate->gpu_has_3d()) {
+            continue;
+        }
+        if (candidate->is_ready != NULL && !candidate->is_ready()) {
+            continue;
+        }
+        if (candidate->gpu_resource_id_alloc == NULL ||
+            candidate->gpu_context_create == NULL ||
+            candidate->gpu_context_destroy == NULL ||
+            candidate->gpu_submit_3d == NULL ||
+            candidate->gpu_resource_create_3d == NULL ||
+            candidate->gpu_resource_attach_backing == NULL ||
+            candidate->gpu_resource_detach_backing == NULL ||
+            candidate->gpu_resource_unref == NULL ||
+            candidate->gpu_context_attach_resource == NULL ||
+            candidate->gpu_context_detach_resource == NULL ||
+            candidate->gpu_transfer_3d == NULL ||
+            candidate->gpu_get_capset_info == NULL ||
+            candidate->gpu_get_capset == NULL) {
+            continue;
+        }
+        return candidate;
+    }
+    return NULL;
+}
