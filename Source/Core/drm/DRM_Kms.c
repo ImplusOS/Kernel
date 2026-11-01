@@ -1112,6 +1112,9 @@ static int render_create_resource(drm_render_session_t *sess,
     if (rc < 0) return rc;
     if (args->width == 0u || args->height == 0u || args->depth == 0u ||
         args->target == 0u || args->array_size == 0u) return E_INVAL;
+    /* The kernel currently allocates the backing BO together with the
+     * resource. Rebinding an existing GEM handle is not implemented. */
+    if (args->bo_handle != 0u) return E_NOTSUPP;
 
     uint32_t requested_size = args->size != 0u ? args->size : 4096u;
     if (requested_size > (64u * 1024u * 1024u)) return E_NOMEM;
