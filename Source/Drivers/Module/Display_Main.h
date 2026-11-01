@@ -26,6 +26,8 @@ bool display_get_monitor_mode_info(uint32_t monitor_index,
 bool display_set_monitor_mode(uint32_t monitor_index, uint32_t mode_index);
 void display_driver_detached(const char *module_name);
 const char *display_main_get_active_driver_name(void);
-/* Returns a ready display module that exposes a complete 3D render backend,
- * independently of which display module owns scanout. */
+/* Initialize an available 3D backend independently of the active scanout
+ * driver. Call during boot/device discovery, outside the DRM session lock. */
+bool display_init_3d_backend(void);
+/* Returns a ready display module that exposes a complete 3D render backend. */
 const driver_display_t *display_get_3d_driver(void);
