@@ -475,8 +475,7 @@ const driver_display_t *display_get_3d_driver(void)
 
         const driver_display_t *candidate =
             (const driver_display_t *)dev->ops;
-        if (candidate == NULL || candidate->gpu_has_3d == NULL ||
-            !candidate->gpu_has_3d()) {
+        if (candidate == NULL || candidate->gpu_has_3d == NULL) {
             continue;
         }
 
@@ -493,7 +492,8 @@ const driver_display_t *display_get_3d_driver(void)
                 continue;
             }
         }
-        if (candidate->is_ready != NULL && !candidate->is_ready()) {
+        if ((candidate->is_ready != NULL && !candidate->is_ready()) ||
+            !candidate->gpu_has_3d()) {
             continue;
         }
         if (candidate->gpu_resource_id_alloc == NULL ||
