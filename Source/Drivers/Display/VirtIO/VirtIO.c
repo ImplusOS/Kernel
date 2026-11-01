@@ -717,6 +717,9 @@ static int virtio_pci_device_init(const virtio_gpu_pci_t *gpu, virtio_pci_transp
     uint32_t device_features0 = common_read32(t->common_cfg, 4);
     common_write32(t->common_cfg, 0, 1);
     uint32_t device_features1 = common_read32(t->common_cfg, 4);
+    if ((device_features1 & VIRTIO_F_VERSION_1) == 0u) {
+        return 0;
+    }
 
     g_gpu_features0 = 0u;
     if ((device_features0 & VIRTIO_GPU_F_EDID) != 0u) {
