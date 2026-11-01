@@ -2551,6 +2551,21 @@ static const driver_display_t g_virtio_display_driver = {
     .get_monitor_info = virtio_gpu_get_monitor_info,
     .get_mode_info = virtio_gpu_get_mode_info,
     .set_mode = virtio_gpu_set_mode,
+    .gpu_has_3d = virtio_gpu_has_3d,
+    .gpu_has_context_init = virtio_gpu_has_context_init,
+    .gpu_resource_id_alloc = virtio_gpu_resource_id_alloc,
+    .gpu_get_capset_info = virtio_gpu_get_capset_info,
+    .gpu_get_capset = virtio_gpu_get_capset,
+    .gpu_context_create = virtio_gpu_ctx_create,
+    .gpu_context_destroy = virtio_gpu_ctx_destroy,
+    .gpu_submit_3d = virtio_gpu_submit_3d,
+    .gpu_resource_create_3d = virtio_gpu_resource_create_3d_ex,
+    .gpu_resource_attach_backing = virtio_gpu_resource_attach_backing,
+    .gpu_resource_detach_backing = virtio_gpu_resource_detach_backing,
+    .gpu_resource_unref = virtio_gpu_resource_unref,
+    .gpu_context_attach_resource = virtio_gpu_ctx_attach_resource,
+    .gpu_context_detach_resource = virtio_gpu_ctx_detach_resource,
+    .gpu_transfer_3d = virtio_gpu_transfer_3d_ex,
 };
 
 static void virtio_gpu_driver_shutdown(void)
