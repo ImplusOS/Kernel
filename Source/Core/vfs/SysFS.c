@@ -339,6 +339,7 @@ void sysfs_publish_drm_nodes(void)
      * VirtIO GPU even when Intel (or another module) owns physical scanout. */
     sysfs_pci_t render_pci = display_pci;
     const char *render_driver = display_driver;
+    (void)display_init_3d_backend();
     if (display_get_3d_driver() != NULL &&
         sysfs_locate_virtio_gpu(&render_pci)) {
         render_driver = "virtio_gpu";
