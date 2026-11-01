@@ -860,13 +860,22 @@ static drm_render_session_t *render_session_for_current(void)
     return created;
 }
 
+static void render_session_release_gpu_locked(drm_render_session_t *sess);
+
 static void render_session_free(drm_render_session_t *s)
 {
-    if (!s || !s->used) return;
+    if (s == NULL || !s->used) return;
+    spinlock_lock(&g_lock);
+    if (!s->used) {
+        spinlock_unlock(&g_lock);
+        return;
+    }
+    render_session_release_gpu_locked(s);
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
         dumb_release_locked(&s->dumbs[i]);
     }
     memset(s, 0, sizeof(*s));
+    spinlock_unlock(&g_lock);
 }
 
 static drm_dumb_t *render_dumb_by_handle(drm_render_session_t *s, uint32_t h)
@@ -1064,16 +1073,23 @@ static int render_create_resource(drm_render_session_t *sess,
     spinlock_unlock(&g_lock);
 
     uint32_t resource_id = gpu->gpu_resource_id_alloc();
-    if (resource_id == 0u ||
-        !gpu->gpu_resource_create_3d(resource_id, args->target, args->format,
-                                     args->bind, args->width, args->height,
-                                     args->depth, args->array_size,
-                                     args->last_level, args->nr_samples,
-                                     args->flags) ||
-        !gpu->gpu_resource_attach_backing(resource_id, phys,
-                                           (uint32_t)allocation_bytes)) {
-        if (resource_id != 0u) {
-            (void)gpu->gpu_resource_detach_backing(resource_id);
+    bool resource_created = false;
+    bool backing_attached = false;
+    if (resource_id != 0u &&
+        gpu->gpu_resource_create_3d(resource_id, args->target, args->format,
+                                    args->bind, args->width, args->height,
+                                    args->depth, args->array_size,
+                                    args->last_level, args->nr_samples,
+                                    args->flags)) {
+        resource_created = true;
+        backing_attached = gpu->gpu_resource_attach_backing(
+            resource_id, phys, (uint32_t)allocation_bytes);
+    }
+    if (!resource_created || !backing_attached) {
+        if (resource_created) {
+            if (backing_attached) {
+                (void)gpu->gpu_resource_detach_backing(resource_id);
+            }
             (void)gpu->gpu_resource_unref(resource_id);
         }
         spinlock_lock(&g_lock);
@@ -1097,7 +1113,14 @@ static int render_create_resource(drm_render_session_t *sess,
     args->size = size;
     spinlock_unlock(&g_lock);
 
-    return copy_to_user(user_args, args, sizeof(*args)) == 0u ? 0 : E_FAULT;
+    if (copy_to_user(user_args, args, sizeof(*args)) != 0u) {
+        spinlock_lock(&g_lock);
+        slot = render_dumb_by_handle(sess, handle);
+        if (slot != NULL) render_dumb_release_locked(sess, slot);
+        spinlock_unlock(&g_lock);
+        return E_FAULT;
+    }
+    return 0;
 }
 
 int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
@@ -1623,9 +1646,7 @@ void drm_render_close(void)
         serial_write_uint32(n);
         serial_write_string("\n");
     }
-    spinlock_lock(&g_lock);
     render_session_free(sess);
-    spinlock_unlock(&g_lock);
 }
 
 int drm_kms_set_mirror(uint64_t pixels, uint32_t width, uint32_t height)
