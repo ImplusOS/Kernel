@@ -1427,18 +1427,27 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
             request_size > sizeof(exec)) return E_INVAL;
         memset(&exec, 0, sizeof(exec));
         if (copy_from_user(&exec, uarg, request_size) != 0u) return E_FAULT;
-        if (exec.flags != 0u || exec.ring_idx != 0u ||
+
+        /* The synchronous backend exposes only ring zero.  A selected ring
+         * zero is equivalent to the implicit default ring.  Fence-fd and
+         * syncobj interoperability need a separate Linux sync_file layer. */
+        if ((exec.flags & ~VIRTGPU_EXECBUF_RING_IDX) != 0u ||
+            ((exec.flags & VIRTGPU_EXECBUF_RING_IDX) != 0u &&
+             exec.ring_idx != 0u) ||
             exec.num_in_syncobjs != 0u || exec.num_out_syncobjs != 0u ||
             exec.syncobj_stride != 0u ||
-            exec.in_syncobjs != 0u || exec.out_syncobjs != 0u) {
+            exec.in_syncobjs != 0u || exec.out_syncobjs != 0u ||
+            ((exec.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN |
+                            VIRTGPU_EXECBUF_FENCE_FD_OUT)) != 0u)) {
             return E_NOTSUPP;
         }
-        if (exec.size == 0u || exec.size > (1024u * 1024u) ||
+        if (exec.size == 0u || exec.size > (16u * 1024u * 1024u) ||
             (exec.size & 3u) != 0u || exec.command == 0u ||
             exec.num_bo_handles > DRM_MAX_DUMB ||
             (exec.num_bo_handles != 0u && exec.bo_handles == 0u)) {
             return E_INVAL;
         }
+
         rc = render_ensure_context(sess);
         if (rc < 0) return rc;
         commands = (uint8_t *)malloc(exec.size);
@@ -1463,18 +1472,28 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
                 return E_FAULT;
             }
         }
-        for (uint32_t i = 0u; i < exec.num_bo_handles; ++i) {
-            spinlock_lock(&g_lock);
+
+        /* Keep GEM resources alive across both resource attachment and
+         * submission.  The driver queue is synchronous, so the lock can be
+         * released as soon as the host has consumed this command stream. */
+        spinlock_lock(&g_lock);
+        if (!sess->used || sess->context_id == 0u) {
+            rc = E_NODEV;
+        }
+        for (uint32_t i = 0u; rc == 0 && i < exec.num_bo_handles; ++i) {
             drm_dumb_t *bo = render_dumb_by_handle(sess, handles[i]);
-            spinlock_unlock(&g_lock);
-            if (bo == NULL) { rc = E_INVAL; break; }
-            rc = render_attach_bo_to_context(sess, bo);
-            if (rc < 0) break;
+            if (bo == NULL) {
+                rc = E_INVAL;
+                break;
+            }
+            rc = render_attach_bo_to_context_locked(sess, bo, gpu);
         }
         if (rc == 0 &&
             !gpu->gpu_submit_3d(sess->context_id, commands, exec.size)) {
             rc = E_INVAL;
         }
+        spinlock_unlock(&g_lock);
+
         if (handles != NULL) free(handles);
         free(commands);
         return rc;
@@ -1490,24 +1509,28 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
             transfer.box.d == 0u) return E_INVAL;
         int rc = render_ensure_context(sess);
         if (rc < 0) return rc;
+
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = render_dumb_by_handle(sess, transfer.bo_handle);
-        bool valid = bo != NULL && bo->gpu_resource_id != 0u &&
-                     (uint64_t)transfer.offset < bo->size;
-        spinlock_unlock(&g_lock);
-        if (!valid) return E_INVAL;
-        rc = render_attach_bo_to_context(sess, bo);
-        if (rc < 0) return rc;
-        if (!gpu->gpu_transfer_3d(
+        if (!sess->used || sess->context_id == 0u || bo == NULL ||
+            bo->gpu_resource_id == 0u ||
+            (uint64_t)transfer.offset >= bo->size) {
+            spinlock_unlock(&g_lock);
+            return E_INVAL;
+        }
+        rc = render_attach_bo_to_context_locked(sess, bo, gpu);
+        if (rc == 0 &&
+            !gpu->gpu_transfer_3d(
                 sess->context_id, bo->gpu_resource_id,
                 nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST,
                 transfer.box.x, transfer.box.y, transfer.box.z,
                 transfer.box.w, transfer.box.h, transfer.box.d,
                 (uint64_t)transfer.offset, transfer.level,
                 transfer.stride, transfer.layer_stride)) {
-            return E_INVAL;
+            rc = E_INVAL;
         }
-        return 0;
+        spinlock_unlock(&g_lock);
+        return rc;
     }
     case DRM_NR_VIRTGPU_WAIT: {
         struct drm_virtgpu_3d_wait wait;
