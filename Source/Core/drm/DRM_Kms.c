@@ -1108,8 +1108,9 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
     uint32_t nr = IOC_NR(request);
     void *uarg = (void *)(uintptr_t)arg;
+    const driver_display_t *gpu = render_gpu_backend();
 
-    /* Modeset ioctls are rejected on the render node (Linux returns EACCES). */
+    /* Modesetting is intentionally unavailable on renderD128. */
     switch (nr) {
     case DRM_NR_MODE_SETCRTC:
     case DRM_NR_MODE_PAGE_FLIP:
@@ -1122,7 +1123,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_MODE_SETPROPERTY:
     case DRM_NR_MODE_OBJ_SETPROP:
     case DRM_NR_MODE_LIST_LESSEES:
-        return -13; /* -EACCES */
+        return -13; /* EACCES */
     default:
         break;
     }
@@ -1131,51 +1132,58 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_VERSION: {
         struct drm_version v;
         if (!uarg || copy_from_user(&v, uarg, sizeof(v)) != 0u) return E_FAULT;
-        static const char nm[] = "implusdrm";
-        static const char dt[] = "20261001";
-        static const char ds[] = "ImplusOS render node";
-        uint64_t nl = sizeof(nm) - 1, dl = sizeof(dt) - 1, sl = sizeof(ds) - 1;
-        if (v.name && v.name_len >= nl)
-            if (copy_to_user((void *)(uintptr_t)v.name, nm, nl) != 0u) return E_FAULT;
-        if (v.date && v.date_len >= dl)
-            if (copy_to_user((void *)(uintptr_t)v.date, dt, dl) != 0u) return E_FAULT;
-        if (v.desc && v.desc_len >= sl)
-            if (copy_to_user((void *)(uintptr_t)v.desc, ds, sl) != 0u) return E_FAULT;
-        v.version_major = 1; v.version_minor = 0; v.version_patchlevel = 0;
-        v.name_len = nl; v.date_len = dl; v.desc_len = sl;
-        if (copy_to_user(uarg, &v, sizeof(v)) != 0u) return E_FAULT;
-        return 0;
+        static const char virtio_name[] = "virtio_gpu";
+        static const char generic_name[] = "implusdrm";
+        static const char date[] = "20261101";
+        static const char desc[] = "ImplusOS VirtIO-GPU render node";
+        const char *name = gpu != NULL ? virtio_name : generic_name;
+        uint64_t nl = (uint64_t)strlen(name);
+        uint64_t dl = sizeof(date) - 1u;
+        uint64_t sl = sizeof(desc) - 1u;
+        if (v.name && v.name_len >= nl &&
+            copy_to_user((void *)(uintptr_t)v.name, name, nl) != 0u) return E_FAULT;
+        if (v.date && v.date_len >= dl &&
+            copy_to_user((void *)(uintptr_t)v.date, date, dl) != 0u) return E_FAULT;
+        if (v.desc && v.desc_len >= sl &&
+            copy_to_user((void *)(uintptr_t)v.desc, desc, sl) != 0u) return E_FAULT;
+        v.version_major = 1;
+        v.version_minor = 0;
+        v.version_patchlevel = 0;
+        v.name_len = nl;
+        v.date_len = dl;
+        v.desc_len = sl;
+        return copy_to_user(uarg, &v, sizeof(v)) == 0u ? 0 : E_FAULT;
     }
     case DRM_NR_GET_MAGIC: {
-        uint32_t magic = 1;
+        uint32_t magic = 1u;
         if (uarg && copy_to_user(uarg, &magic, sizeof(magic)) != 0u) return E_FAULT;
         return 0;
     }
     case DRM_NR_AUTH_MAGIC:
-        /* drmAuthMagic(): authentication is implicit on a render node (and
-         * Xorg's DRI3 open path needs this to *not* fail on card0 either),
-         * so accept whatever magic GET_MAGIC handed out. */
         return 0;
+
     case DRM_NR_GET_CAP: {
-        struct drm_get_cap c;
-        if (!uarg || copy_from_user(&c, uarg, sizeof(c)) != 0u) return E_FAULT;
-        switch (c.capability) {
-        case DRM_CAP_DUMB_BUFFER:            c.value = 1; break;
-        case DRM_CAP_DUMB_PREFERRED_DEPTH:   c.value = 24; break;
-        case DRM_CAP_DUMB_PREFER_SHADOW:     c.value = 1; break;
-        case DRM_CAP_TIMESTAMP_MONOTONIC:    c.value = 1; break;
-        case DRM_CAP_PRIME:                  c.value = 1; break;
-        case DRM_CAP_ADDFB2_MODIFIERS:       c.value = 1; break;
-        case DRM_CAP_SYNCOBJ:                c.value = 1; break;
-        default:                             c.value = 0; break;
+        struct drm_get_cap cap;
+        if (!uarg || copy_from_user(&cap, uarg, sizeof(cap)) != 0u) return E_FAULT;
+        switch (cap.capability) {
+        case DRM_CAP_DUMB_BUFFER:           cap.value = 1u; break;
+        case DRM_CAP_DUMB_PREFERRED_DEPTH:  cap.value = 24u; break;
+        case DRM_CAP_DUMB_PREFER_SHADOW:    cap.value = 1u; break;
+        case DRM_CAP_TIMESTAMP_MONOTONIC:   cap.value = 1u; break;
+        case DRM_CAP_PRIME:                 cap.value = 1u; break;
+        /* We do not implement modifier-aware GEM or syncobj semantics yet.
+         * Returning 1 here makes Mesa select unsupported paths. */
+        case DRM_CAP_ADDFB2_MODIFIERS:      cap.value = 0u; break;
+        case DRM_CAP_SYNCOBJ:               cap.value = 0u; break;
+        default:                            cap.value = 0u; break;
         }
-        return copy_to_user(uarg, &c, sizeof(c)) == 0u ? 0 : E_FAULT;
+        return copy_to_user(uarg, &cap, sizeof(cap)) == 0u ? 0 : E_FAULT;
     }
     case DRM_NR_SET_CLIENT_CAP: {
-        /* Render node accepts UNIVERSAL_PLANES and ATOMIC caps (they only
-         * matter for modesetting, which is rejected above anyway). */
         struct drm_set_client_cap cap;
         if (!uarg || copy_from_user(&cap, uarg, sizeof(cap)) != 0u) return E_FAULT;
+        /* Universal planes / atomic modeset do not grant modesetting on a
+         * render node. Keep the negotiation harmless as Linux does. */
         return 0;
     }
     case DRM_NR_SET_MASTER:
@@ -1185,32 +1193,38 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_MODE_CREATE_DUMB: {
         struct drm_mode_create_dumb d;
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
-        /* Linux accepts any non-zero bpp here and rounds the bytes-per-pixel
-         * up, so an 8-bit (R8) allocation is as valid as a 32-bit scanout one.
-         * Refusing bpp=8 made Mesa's gbm fail its 64x64 luminance buffer. */
-        if (!d.width || !d.height || !d.bpp || d.bpp > 64u) {
-            return E_INVAL;
-        }
-        uint32_t bpp = d.bpp;
+        if (!d.width || !d.height || !d.bpp || d.bpp > 64u) return E_INVAL;
         uint32_t pitch = d.width * ((d.bpp + 7u) / 8u);
         uint64_t size = (uint64_t)pitch * d.height;
+        if (size == 0u || size > (64u * 1024u * 1024u)) return E_NOMEM;
         uint32_t npages = (uint32_t)((size + 4095u) / 4096u);
         spinlock_lock(&g_lock);
         drm_dumb_t *slot = NULL;
-        for (int i = 0; i < DRM_MAX_DUMB; i++)
+        for (int i = 0; i < DRM_MAX_DUMB; ++i)
             if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
         void *kva = pmm_alloc_pages(npages);
         if (!kva) { spinlock_unlock(&g_lock); return E_NOMEM; }
         memset(kva, 0, (size_t)npages * 4096u);
-        slot->used = 1;
+        uint64_t phys = paging_virt_to_phys(paging_get_kernel_cr3(),
+                                            (uint64_t)(uintptr_t)kva);
+        if (phys == 0u) {
+            pmm_free_pages(kva, npages);
+            spinlock_unlock(&g_lock);
+            return E_NODEV;
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->used = 1u;
         slot->handle = sess->next_handle++;
-        slot->width = d.width; slot->height = d.height;
-        slot->bpp = bpp; slot->pitch = pitch;
-        slot->size = size; slot->npages = npages;
+        if (sess->next_handle == 0u) sess->next_handle = 1u;
+        slot->width = d.width;
+        slot->height = d.height;
+        slot->bpp = d.bpp;
+        slot->pitch = pitch;
+        slot->size = size;
+        slot->npages = npages;
         slot->kva = kva;
-        slot->phys = paging_virt_to_phys(paging_get_kernel_cr3(),
-                                         (uint64_t)(uintptr_t)kva);
+        slot->phys = phys;
         slot->map_offset = sess->next_map_off;
         slot->prime = -1;
         sess->next_map_off += (uint64_t)npages * 4096u;
@@ -1220,46 +1234,316 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         spinlock_unlock(&g_lock);
         return copy_to_user(uarg, &d, sizeof(d)) == 0u ? 0 : E_FAULT;
     }
-    case DRM_NR_MODE_MAP_DUMB: {
-        struct drm_mode_map_dumb m;
-        if (!uarg || copy_from_user(&m, uarg, sizeof(m)) != 0u) return E_FAULT;
-        spinlock_lock(&g_lock);
-        drm_dumb_t *bo = render_dumb_by_handle(sess, m.handle);
-        if (!bo) { spinlock_unlock(&g_lock); return E_INVAL; }
-        m.offset = bo->map_offset;
-        spinlock_unlock(&g_lock);
-        return copy_to_user(uarg, &m, sizeof(m)) == 0u ? 0 : E_FAULT;
-    }
-    case DRM_NR_MODE_DESTROY_DUMB: {
-        struct drm_mode_destroy_dumb d;
-        if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
-        spinlock_lock(&g_lock);
-        drm_dumb_t *bo = render_dumb_by_handle(sess, d.handle);
-        if (bo) dumb_release_locked(bo);
-        spinlock_unlock(&g_lock);
-        return 0;
-    }
-    case DRM_NR_GEM_CLOSE: {
-        struct drm_gem_close g;
-        if (uarg && copy_from_user(&g, uarg, sizeof(g)) == 0u) {
+    case DRM_NR_MODE_MAP_DUMB:
+    case DRM_NR_VIRTGPU_MAP: {
+        uint32_t handle;
+        uint64_t offset;
+        if (nr == DRM_NR_MODE_MAP_DUMB) {
+            struct drm_mode_map_dumb map;
+            if (!uarg || copy_from_user(&map, uarg, sizeof(map)) != 0u) return E_FAULT;
+            handle = map.handle;
             spinlock_lock(&g_lock);
-            drm_dumb_t *bo = render_dumb_by_handle(sess, g.handle);
-            if (bo) dumb_release_locked(bo);
+            drm_dumb_t *bo = render_dumb_by_handle(sess, handle);
+            if (!bo) { spinlock_unlock(&g_lock); return E_INVAL; }
+            offset = bo->map_offset;
             spinlock_unlock(&g_lock);
+            map.offset = offset;
+            return copy_to_user(uarg, &map, sizeof(map)) == 0u ? 0 : E_FAULT;
         }
+        struct drm_virtgpu_map map;
+        if (!uarg || copy_from_user(&map, uarg, sizeof(map)) != 0u) return E_FAULT;
+        handle = map.handle;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, handle);
+        if (!bo) { spinlock_unlock(&g_lock); return E_INVAL; }
+        offset = bo->map_offset;
+        spinlock_unlock(&g_lock);
+        map.offset = offset;
+        return copy_to_user(uarg, &map, sizeof(map)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_MODE_DESTROY_DUMB:
+    case DRM_NR_GEM_CLOSE: {
+        uint32_t handle = 0u;
+        if (!uarg) return E_FAULT;
+        if (nr == DRM_NR_MODE_DESTROY_DUMB) {
+            struct drm_mode_destroy_dumb destroy;
+            if (copy_from_user(&destroy, uarg, sizeof(destroy)) != 0u) return E_FAULT;
+            handle = destroy.handle;
+        } else {
+            struct drm_gem_close close;
+            if (copy_from_user(&close, uarg, sizeof(close)) != 0u) return E_FAULT;
+            handle = close.handle;
+        }
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, handle);
+        if (bo) render_dumb_release_locked(sess, bo);
+        spinlock_unlock(&g_lock);
         return 0;
     }
     case DRM_NR_GEM_FLINK:
     case DRM_NR_GEM_OPEN:
-        return E_INVAL; /* no flink name sharing yet */
+        return E_INVAL;
+
     case DRM_NR_PRIME_HANDLE_TO_FD:
-        /* The render node exports exactly as the KMS node does: the buffer's
-         * pages move into a refcounted dma-buf block and a descriptor naming
-         * them is installed in this process. */
         return prime_handle_to_fd(sess->dumbs, uarg);
     case DRM_NR_PRIME_FD_TO_HANDLE:
         return prime_fd_to_handle(sess->dumbs, uarg, &sess->next_handle,
                                   &sess->next_map_off);
+
+    case DRM_NR_VIRTGPU_GETPARAM: {
+        struct drm_virtgpu_getparam param;
+        if (!uarg || copy_from_user(&param, uarg, sizeof(param)) != 0u) return E_FAULT;
+        uint32_t value = 0u;
+        switch ((uint32_t)param.param) {
+        case VIRTGPU_PARAM_3D_FEATURES:
+            value = gpu != NULL ? 1u : 0u;
+            break;
+        case VIRTGPU_PARAM_CAPSET_QUERY_FIX:
+            value = gpu != NULL ? 1u : 0u;
+            break;
+        case VIRTGPU_PARAM_RESOURCE_BLOB:
+        case VIRTGPU_PARAM_HOST_VISIBLE:
+        case VIRTGPU_PARAM_CROSS_DEVICE:
+            value = 0u;
+            break;
+        case VIRTGPU_PARAM_CONTEXT_INIT:
+            value = (gpu != NULL && gpu->gpu_has_context_init != NULL &&
+                     gpu->gpu_has_context_init()) ? 1u : 0u;
+            break;
+        case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS:
+            value = 0u;
+            break;
+        case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME:
+            value = (gpu != NULL && gpu->gpu_has_context_init != NULL &&
+                     gpu->gpu_has_context_init()) ? 1u : 0u;
+            break;
+        default:
+            return E_INVAL;
+        }
+        if (param.param == VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS) {
+            uint64_t mask = render_supported_capset_mask(gpu);
+            return copy_to_user((void *)(uintptr_t)param.value,
+                                &mask, sizeof(mask)) == 0u ? 0 : E_FAULT;
+        }
+        return copy_to_user((void *)(uintptr_t)param.value,
+                            &value, sizeof(value)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_VIRTGPU_CONTEXT_INIT: {
+        struct drm_virtgpu_context_init init;
+        struct drm_virtgpu_context_set_param params[4];
+        uint32_t capset_id = 0u;
+        uint32_t seen = 0u;
+        char debug_name[64];
+        bool have_debug_name = false;
+        if (gpu == NULL || gpu->gpu_has_context_init == NULL ||
+            !gpu->gpu_has_context_init()) return E_NOSYS;
+        if (!uarg || copy_from_user(&init, uarg, sizeof(init)) != 0u) return E_FAULT;
+        if (init.num_params > 4u) return E_INVAL;
+        if (sess->context_id != 0u) return E_EXIST;
+        memset(params, 0, sizeof(params));
+        memset(debug_name, 0, sizeof(debug_name));
+        if (init.num_params != 0u) {
+            if (init.ctx_set_params == 0u ||
+                copy_from_user(params,
+                    (const void *)(uintptr_t)init.ctx_set_params,
+                    (uint64_t)init.num_params * sizeof(params[0])) != 0u) {
+                return E_FAULT;
+            }
+        }
+        for (uint32_t i = 0u; i < init.num_params; ++i) {
+            uint64_t value = params[i].value;
+            uint32_t bit;
+            switch (params[i].param) {
+            case VIRTGPU_CONTEXT_PARAM_CAPSET_ID:
+                bit = 1u << 0;
+                if ((seen & bit) != 0u || value > 63u ||
+                    !render_find_capset(gpu, (uint32_t)value, 1u)) return E_INVAL;
+                capset_id = (uint32_t)value;
+                break;
+            case VIRTGPU_CONTEXT_PARAM_NUM_RINGS:
+                bit = 1u << 1;
+                /* This backend exposes one synchronous control timeline. */
+                if ((seen & bit) != 0u || value > 1u) return E_INVAL;
+                break;
+            case VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK:
+                bit = 1u << 2;
+                /* Fence completion is synchronous; no poll ring is exposed. */
+                if ((seen & bit) != 0u || value != 0u) return E_INVAL;
+                break;
+            case VIRTGPU_CONTEXT_PARAM_DEBUG_NAME:
+                bit = 1u << 3;
+                if ((seen & bit) != 0u || value == 0u ||
+                    copy_user_cstring_s(debug_name, sizeof(debug_name),
+                        (const char *)(uintptr_t)value) < 0) return E_FAULT;
+                have_debug_name = true;
+                break;
+            default:
+                return E_INVAL;
+            }
+            seen |= bit;
+        }
+        spinlock_lock(&g_lock);
+        if (sess->context_id != 0u) {
+            spinlock_unlock(&g_lock);
+            return E_EXIST;
+        }
+        sess->context_capset_id = capset_id;
+        sess->context_id = gpu->gpu_context_create(
+            capset_id, have_debug_name ? debug_name : "ImplusOS Mesa");
+        uint32_t created = sess->context_id;
+        if (created == 0u) sess->context_capset_id = 0u;
+        spinlock_unlock(&g_lock);
+        return created != 0u ? 0 : E_NOMEM;
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_CREATE: {
+        struct drm_virtgpu_resource_create create;
+        if (!uarg || copy_from_user(&create, uarg, sizeof(create)) != 0u) return E_FAULT;
+        return render_create_resource(sess, &create, uarg);
+    }
+    case DRM_NR_VIRTGPU_RESOURCE_INFO: {
+        struct drm_virtgpu_resource_info info;
+        if (!uarg || copy_from_user(&info, uarg, sizeof(info)) != 0u) return E_FAULT;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, info.bo_handle);
+        if (bo == NULL || bo->gpu_resource_id == 0u) {
+            spinlock_unlock(&g_lock);
+            return E_INVAL;
+        }
+        info.res_handle = bo->gpu_resource_id;
+        info.size = (uint32_t)bo->size;
+        info.blob_mem = 0u;
+        spinlock_unlock(&g_lock);
+        return copy_to_user(uarg, &info, sizeof(info)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_VIRTGPU_EXECBUFFER: {
+        struct drm_virtgpu_execbuffer exec;
+        uint32_t request_size = IOC_SIZE(request);
+        uint8_t *commands = NULL;
+        uint32_t *handles = NULL;
+        int rc = 0;
+        if (gpu == NULL) return E_NOSYS;
+        if (!uarg || request_size < 40u ||
+            request_size > sizeof(exec)) return E_INVAL;
+        memset(&exec, 0, sizeof(exec));
+        if (copy_from_user(&exec, uarg, request_size) != 0u) return E_FAULT;
+        if (exec.flags != 0u || exec.ring_idx != 0u ||
+            exec.num_in_syncobjs != 0u || exec.num_out_syncobjs != 0u ||
+            exec.syncobj_stride != 0u ||
+            exec.in_syncobjs != 0u || exec.out_syncobjs != 0u) {
+            return E_NOTSUPP;
+        }
+        if (exec.size == 0u || exec.size > (1024u * 1024u) ||
+            (exec.size & 3u) != 0u || exec.command == 0u ||
+            exec.num_bo_handles > DRM_MAX_DUMB ||
+            (exec.num_bo_handles != 0u && exec.bo_handles == 0u)) {
+            return E_INVAL;
+        }
+        rc = render_ensure_context(sess);
+        if (rc < 0) return rc;
+        commands = (uint8_t *)malloc(exec.size);
+        if (commands == NULL) return E_NOMEM;
+        if (copy_from_user(commands, (const void *)(uintptr_t)exec.command,
+                           exec.size) != 0u) {
+            free(commands);
+            return E_FAULT;
+        }
+        if (exec.num_bo_handles != 0u) {
+            handles = (uint32_t *)malloc((uint64_t)exec.num_bo_handles *
+                                         sizeof(uint32_t));
+            if (handles == NULL) {
+                free(commands);
+                return E_NOMEM;
+            }
+            if (copy_from_user(handles,
+                    (const void *)(uintptr_t)exec.bo_handles,
+                    (uint64_t)exec.num_bo_handles * sizeof(uint32_t)) != 0u) {
+                free(handles);
+                free(commands);
+                return E_FAULT;
+            }
+        }
+        for (uint32_t i = 0u; i < exec.num_bo_handles; ++i) {
+            spinlock_lock(&g_lock);
+            drm_dumb_t *bo = render_dumb_by_handle(sess, handles[i]);
+            spinlock_unlock(&g_lock);
+            if (bo == NULL) { rc = E_INVAL; break; }
+            rc = render_attach_bo_to_context(sess, bo);
+            if (rc < 0) break;
+        }
+        if (rc == 0 &&
+            !gpu->gpu_submit_3d(sess->context_id, commands, exec.size)) {
+            rc = E_INVAL;
+        }
+        if (handles != NULL) free(handles);
+        free(commands);
+        return rc;
+    }
+    case DRM_NR_VIRTGPU_TRANSFER_TO_HOST:
+    case DRM_NR_VIRTGPU_TRANSFER_FROM_HOST: {
+        struct drm_virtgpu_3d_transfer transfer;
+        if (gpu == NULL) return E_NOSYS;
+        if (!uarg || copy_from_user(&transfer, uarg, sizeof(transfer)) != 0u) {
+            return E_FAULT;
+        }
+        if (transfer.box.w == 0u || transfer.box.h == 0u ||
+            transfer.box.d == 0u) return E_INVAL;
+        int rc = render_ensure_context(sess);
+        if (rc < 0) return rc;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, transfer.bo_handle);
+        bool valid = bo != NULL && bo->gpu_resource_id != 0u &&
+                     (uint64_t)transfer.offset < bo->size;
+        spinlock_unlock(&g_lock);
+        if (!valid) return E_INVAL;
+        rc = render_attach_bo_to_context(sess, bo);
+        if (rc < 0) return rc;
+        if (!gpu->gpu_transfer_3d(
+                sess->context_id, bo->gpu_resource_id,
+                nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST,
+                transfer.box.x, transfer.box.y, transfer.box.z,
+                transfer.box.w, transfer.box.h, transfer.box.d,
+                (uint64_t)transfer.offset, transfer.level,
+                transfer.stride, transfer.layer_stride)) {
+            return E_INVAL;
+        }
+        return 0;
+    }
+    case DRM_NR_VIRTGPU_WAIT: {
+        struct drm_virtgpu_3d_wait wait;
+        if (!uarg || copy_from_user(&wait, uarg, sizeof(wait)) != 0u) return E_FAULT;
+        if ((wait.flags & ~VIRTGPU_WAIT_NOWAIT) != 0u) return E_INVAL;
+        spinlock_lock(&g_lock);
+        drm_dumb_t *bo = render_dumb_by_handle(sess, wait.handle);
+        bool valid = bo != NULL;
+        spinlock_unlock(&g_lock);
+        /* GPU submissions and transfers complete synchronously on our
+         * control queue, so a live BO is already signaled. */
+        return valid ? 0 : E_INVAL;
+    }
+    case DRM_NR_VIRTGPU_GET_CAPS: {
+        struct drm_virtgpu_get_caps caps;
+        uint8_t *buffer;
+        if (gpu == NULL) return E_NOSYS;
+        if (!uarg || copy_from_user(&caps, uarg, sizeof(caps)) != 0u) return E_FAULT;
+        if (caps.size == 0u || caps.size > (64u * 1024u) || caps.addr == 0u) {
+            return E_INVAL;
+        }
+        buffer = (uint8_t *)malloc(caps.size);
+        if (buffer == NULL) return E_NOMEM;
+        memset(buffer, 0, caps.size);
+        if (!gpu->gpu_get_capset(caps.cap_set_id, caps.cap_set_ver,
+                                 buffer, caps.size)) {
+            free(buffer);
+            return E_INVAL;
+        }
+        int64_t result =
+            copy_to_user((void *)(uintptr_t)caps.addr, buffer, caps.size) == 0u
+                ? 0 : E_FAULT;
+        free(buffer);
+        return result;
+    }
+    case DRM_COMMAND_BASE + 0x0Au: /* RESOURCE_CREATE_BLOB */
+        return E_NOTSUPP;
     default:
         return E_NOTTY;
     }
