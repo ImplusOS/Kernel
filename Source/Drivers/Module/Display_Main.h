@@ -26,3 +26,6 @@ bool display_get_monitor_mode_info(uint32_t monitor_index,
 bool display_set_monitor_mode(uint32_t monitor_index, uint32_t mode_index);
 void display_driver_detached(const char *module_name);
 const char *display_main_get_active_driver_name(void);
+/* Returns a ready display module that exposes a complete 3D render backend,
+ * independently of which display module owns scanout. */
+const driver_display_t *display_get_3d_driver(void);
