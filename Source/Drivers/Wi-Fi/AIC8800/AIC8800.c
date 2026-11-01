@@ -149,9 +149,11 @@ static bool aic_usb_bulk_to(uint8_t endpoint, uint16_t mps, uint8_t pid,
         return g_aic.submit_bulk_timeout(g_aic.addr, endpoint, mps, pid,
                                          data, length, timeout_ms);
     }
-    if (g_aic.submit_bulk != NULL) {
-        return g_aic.submit_bulk(g_aic.addr, endpoint, mps, pid, data, length);
-    }
+    /* Do not fall back to submit_bulk() here.  Its controller default is
+     * deliberately long (30 s on xHCI), which is appropriate for storage
+     * but turns a missing optional USB timeout hook into a boot hang.  A
+     * driver that polls an AIC8800 endpoint must fail fast until the bus
+     * exposes the bounded variant. */
     return false;
 }
 
@@ -629,7 +631,11 @@ static bool aic_probe(const bus_device_t *dev)
      * real hand-over and is taken. */
     ctx = (const usb_device_context_t *)dev->bus_context;
     if (ctx->ep_in == 0u || ctx->ep_out == 0u ||
-        (ctx->submit_bulk == NULL && ctx->submit_bulk_timeout == NULL)) {
+        ctx->submit_bulk_timeout == NULL) {
+        /* AIC firmware probing is not allowed to use the controller's
+         * unbounded/default bulk wait.  USB_Main supplies this hook on all
+         * supported stacks; rejecting an older bus ABI is safer than
+         * turning a dongle attach into a multi-second boot stall. */
         return false;
     }
 
@@ -842,7 +848,12 @@ static bool aic_nic_send_frame(const uint8_t *frame, uint16_t frame_len)
 
 static void aic_nic_poll(void)
 {
-    aic_tick();
+    /* Firmware commands are synchronous: a single step may wait up to the
+     * command deadline while it drains the USB confirmation endpoint.  Do
+     * not run that state machine from the generic network poll, which is
+     * also reached by the first userspace syscall during boot.  The Wi-Fi
+     * control entry points below explicitly advance it when the adapter is
+     * actually being used. */
 }
 
 static void aic_nic_set_rx_callback(driver_nic_rx_callback_t cb)

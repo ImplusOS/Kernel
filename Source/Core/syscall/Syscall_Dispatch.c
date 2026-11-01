@@ -1347,6 +1347,27 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
             uint64_t aligned_end_virt = (start_virt + size + 4095ULL) & ~4095ULL;
             uint64_t num_pages = (aligned_end_virt - aligned_start_virt) / 4096ULL;
 
+            static uint32_t g_fbsys_log_budget = 40u;
+            bool fbsys_log = g_fbsys_log_budget != 0u;
+            if (fbsys_log) {
+                --g_fbsys_log_budget;
+                serial_write_string("[fbsys] ptr=");
+                serial_write_uint64((uint64_t)(uintptr_t)ptr);
+                serial_write_string(" w=");
+                serial_write_uint64(w);
+                serial_write_string(" h=");
+                serial_write_uint64(h);
+                serial_write_string(" stride=");
+                serial_write_uint64(stride);
+                serial_write_string(" size=");
+                serial_write_uint64(size);
+                serial_write_string(" pages=");
+                serial_write_uint64(num_pages);
+                serial_write_string(" user=");
+                serial_write_uint64(user_virt);
+                serial_write_string("\n");
+            }
+
             int res = 0;
             for (uint64_t i = 0; i < num_pages; ++i) {
                 uint64_t kvirt = aligned_start_virt + i * 4096ULL;
@@ -1365,8 +1386,16 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                 }
             }
             if (res < 0) {
+                if (fbsys_log) {
+                    serial_write_string("[fbsys] FAIL at page\n");
+                }
                 set_syscall_result(saved_rsp, 0);
             } else {
+                if (fbsys_log) {
+                    serial_write_string("[fbsys] ok ret=");
+                    serial_write_uint64(user_virt + (start_virt & 4095ULL));
+                    serial_write_string("\n");
+                }
                 set_syscall_result(saved_rsp, user_virt + (start_virt & 4095ULL));
             }
             break;

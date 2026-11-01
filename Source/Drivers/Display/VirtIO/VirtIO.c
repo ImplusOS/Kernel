@@ -75,7 +75,25 @@
 #define VIRTIO_GPU_MAX_MODES     8u
 #define VIRTIO_GPU_MAX_PIXELS    (64ull * 1024ull * 1024ull)
 
-#define VIRTIO_MMIO_TIMEOUT 10000000u
+/* How long a single control-queue command may take before the driver gives up.
+ * The first command after DRIVER_OK can take a while: QEMU spawns the GPU
+ * worker thread lazily, and a 10M-iteration spin (a few milliseconds) expired
+ * before the device answered, which made the driver install a bogus 1024x768
+ * fallback layout and re-layout -- moving the framebuffer -- once the real
+ * mode arrived. */
+#define VIRTIO_GPU_CMD_TIMEOUT_MS 1000u
+/* Fallback busy-wait budget when the module API exposes no clock. */
+#define VIRTIO_GPU_SPIN_BUDGET  400000000u
+/* Control-queue response scratch buffer: the largest response is
+ * virtio_gpu_resp_edid_t (24 + 8 + 1024 bytes). */
+#define VIRTIO_GPU_RESP_BUF_BYTES 2048u
+/* The desktop framebuffer is allocated with headroom so a later mode change
+ * usually reuses the same pages instead of moving them under user space. */
+#define VIRTIO_GPU_FB_MIN_CAPACITY (1920u * 1080u * 4u)
+/* Former framebuffers are retained, not freed: user space holds a direct
+ * mapping of those pages and a stale write must land in dead memory rather
+ * than in a reused kernel heap block. */
+#define VIRTIO_GPU_RETIRED_FB_MAX 4u
 
 #ifdef IMPLUS_DRIVER_MODULE
 static const driver_binary_t *g_driver_api = NULL;
@@ -177,6 +195,11 @@ typedef struct {
     uint16_t used_idx_seen;
     volatile uint16_t *notify_addr;
     void *raw_ring;
+    /* Device-writable response buffer owned by the queue. The device must
+     * never be pointed at a caller's stack: a request that completes after the
+     * driver stopped waiting would scribble over whatever reused that frame. */
+    uint8_t *resp_buf;
+    uint32_t resp_cap;
 } virtqueue_t;
 
 typedef struct __attribute__((packed)) {
@@ -346,11 +369,132 @@ typedef struct {
     uint32_t fb_bytes;
 } virtio_gpu_monitor_t;
 
+#ifdef IMPLUS_DRIVER_MODULE
+static uint32_t g_vlog_budget = 140u;
+
+static void vlog(const char *s) {
+    if (g_vlog_budget != 0u && g_driver_api != NULL &&
+        g_driver_api->serial_write_string != NULL) {
+        g_driver_api->serial_write_string(s);
+    }
+}
+
+static void vlog_num(uint64_t v) {
+    if (g_vlog_budget != 0u && g_driver_api != NULL &&
+        g_driver_api->serial_write_uint32 != NULL) {
+        g_driver_api->serial_write_uint32((uint32_t)v);
+    }
+}
+
+static void vlog_hex(uint64_t v) {
+    static const char digits[] = "0123456789abcdef";
+    char buf[19];
+    if (g_vlog_budget == 0u || g_driver_api == NULL ||
+        g_driver_api->serial_write_string == NULL) {
+        return;
+    }
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (uint32_t i = 0u; i < 16u; ++i) {
+        buf[2u + i] = digits[(v >> (60u - i * 4u)) & 0xFu];
+    }
+    buf[18] = '\0';
+    g_driver_api->serial_write_string(buf);
+}
+
+static void vlog_done(void) {
+    if (g_vlog_budget != 0u) {
+        --g_vlog_budget;
+    }
+}
+#else
+static void vlog(const char *s) { (void)s; }
+static void vlog_num(uint64_t v) { (void)v; }
+static void vlog_hex(uint64_t v) { (void)v; }
+static void vlog_done(void) {}
+#endif
+
+/*
+ * The virtio-gpu control queue is one shared ring for every command in this
+ * module, and callers arrive from any CPU: the kernel log path calls
+ * driver_manager_display_present() on every printf, userland syscalls poll the
+ * config on every frames, and the driver module probe runs concurrently. With
+ * no serialisation two CPUs rewrite desc[0]/desc[1] while the device is still
+ * reading them, and the used-ring entry is consumed by the wrong caller -- the
+ * device then DMAs at whatever address it read out of a half-updated chain.
+ * That corrupts arbitrary kernel memory and shows up as random #UD / faults
+ * under KVM (where the two CPUs genuinely interleave).
+ *
+ * Interrupts are masked while the lock is held: the display path is reachable
+ * from an interrupt context through printf(), and taking the lock again on the
+ * same CPU would deadlock.
+ */
+static volatile int g_gpu_lock = 0;
+
+static uint64_t gpu_lock(void)
+{
+    uint64_t irq_state = 0u;
+
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL &&
+        g_driver_api->hal.cpu_save_interrupts != NULL) {
+        irq_state = g_driver_api->hal.cpu_save_interrupts();
+    }
+#endif
+
+    while (__atomic_exchange_n(&g_gpu_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+        while (__atomic_load_n(&g_gpu_lock, __ATOMIC_RELAXED) != 0) {
+#ifdef PLATFORM_X86_64
+            __asm__ volatile ("pause" ::: "memory");
+#else
+            __asm__ volatile ("yield" ::: "memory");
+#endif
+        }
+    }
+    return irq_state;
+}
+
+static void gpu_unlock(uint64_t irq_state)
+{
+    __atomic_store_n(&g_gpu_lock, 0, __ATOMIC_RELEASE);
+
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL &&
+        g_driver_api->hal.cpu_restore_interrupts != NULL) {
+        g_driver_api->hal.cpu_restore_interrupts(irq_state);
+    }
+#else
+    (void)irq_state;
+#endif
+}
+
+/* Milliseconds since boot, or 0 when the driver API offers no clock (then the
+ * wait helpers fall back to a spin budget). */
+static uint64_t gpu_now_ms(void)
+{
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL) {
+        if (g_driver_api->timer.monotonic_ns != NULL) {
+            return g_driver_api->timer.monotonic_ns() / 1000000ull;
+        }
+        if (g_driver_api->timer.hz != NULL &&
+            g_driver_api->timer.ticks != NULL) {
+            uint32_t hz = g_driver_api->timer.hz();
+            if (hz != 0u) {
+                return (g_driver_api->timer.ticks() * 1000ull) / (uint64_t)hz;
+            }
+        }
+    }
+#endif
+    return 0ull;
+}
+
 static int g_gpu_ready = 0;
 static uint32_t g_gpu_width = 0;
 static uint32_t g_gpu_height = 0;
 static uint32_t *g_gpu_fb = NULL;
 static uint32_t g_gpu_fb_bytes = 0;
+static uint32_t g_gpu_fb_capacity = 0;
 static uint32_t g_gpu_generation = 1u;
 static uint32_t g_gpu_monitor_count = 0;
 static uint32_t g_gpu_next_resource_id = 1u;
@@ -632,6 +776,15 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     vq->used_idx_seen = 0;
     vq->raw_ring = raw_ring;
 
+    vq->resp_buf = (uint8_t *)malloc(VIRTIO_GPU_RESP_BUF_BYTES);
+    if (vq->resp_buf == NULL) {
+        free(raw_ring);
+        vq->raw_ring = NULL;
+        return 0;
+    }
+    memset(vq->resp_buf, 0, VIRTIO_GPU_RESP_BUF_BYTES);
+    vq->resp_cap = VIRTIO_GPU_RESP_BUF_BYTES;
+
     common_write16(t->common_cfg, 26, 0xFFFFu);
     common_write64(t->common_cfg, 32, (uint64_t)(uintptr_t)vq->desc);
     common_write64(t->common_cfg, 40, (uint64_t)(uintptr_t)vq->avail);
@@ -649,17 +802,74 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     return 1;
 }
 
-static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len) {
-    if (vq->queue_size < 2) {
+/*
+ * Wait for the used ring to advance past `prev_used`. Returns false when the
+ * device did not respond within VIRTIO_GPU_CMD_TIMEOUT_MS.
+ */
+static int virtqueue_wait_used(virtqueue_t *vq, uint16_t prev_used)
+{
+    uint64_t start_ms = gpu_now_ms();
+    uint32_t spins = 0u;
+
+    while ((uint16_t)(vq->used->idx - prev_used) == 0u) {
+        memory_barrier();
+        if (start_ms != 0ull) {
+            if (gpu_now_ms() - start_ms >= VIRTIO_GPU_CMD_TIMEOUT_MS) {
+                return 0;
+            }
+        } else if (++spins >= VIRTIO_GPU_SPIN_BUDGET) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Submit one command on the control queue and wait for its completion.
+ *
+ * The caller must hold g_gpu_lock. The device always writes its response into
+ * vq->resp_buf, never into the caller's buffer, so a request that completes
+ * late cannot corrupt a stack frame that has already been reused.
+ */
+static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
+                                 void *resp, uint32_t resp_len) {
+    if (vq->queue_size < 2 || cmd == NULL || resp == NULL ||
+        vq->resp_buf == NULL || resp_len > vq->resp_cap) {
         return 0;
     }
+
+    if (g_vlog_budget != 0u) {
+        vlog("[vgpu] submit t=");
+        vlog_num(cmd != NULL ? (uint64_t)(*(const uint32_t *)cmd) : 0u);
+        vlog(" avail=");
+        vlog_num(vq->avail_idx);
+        vlog(" used=");
+        vlog_num(vq->used->idx);
+        vlog(" resp=");
+        vlog_hex((uint64_t)(uintptr_t)resp);
+        vlog("\n");
+        vlog_done();
+    }
+
+    /* Retire a completion we never consumed (a previous request timed out).
+     * The descriptors must not be rewritten while the device may still be
+     * reading them. */
+    if ((uint16_t)(vq->used->idx - vq->used_idx_seen) != 0u) {
+        if (!virtqueue_wait_used(vq, vq->used_idx_seen)) {
+            return 0;
+        }
+    }
+    uint16_t prev_used = vq->used->idx;
+    vq->used_idx_seen = prev_used;
+
+    memset(vq->resp_buf, 0, resp_len);
 
     vq->desc[0].addr = (uint64_t)(uintptr_t)cmd;
     vq->desc[0].len = cmd_len;
     vq->desc[0].flags = VIRTQ_DESC_F_NEXT;
     vq->desc[0].next = 1;
 
-    vq->desc[1].addr = (uint64_t)(uintptr_t)resp;
+    vq->desc[1].addr = (uint64_t)(uintptr_t)vq->resp_buf;
     vq->desc[1].len = resp_len;
     vq->desc[1].flags = VIRTQ_DESC_F_WRITE;
     vq->desc[1].next = 0;
@@ -672,14 +882,30 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len, v
 
     *vq->notify_addr = vq->queue_index;
 
-    uint32_t timeout = VIRTIO_MMIO_TIMEOUT;
-    while ((uint16_t)(vq->used->idx - vq->used_idx_seen) == 0) {
-        if (--timeout == 0) {
-            return 0;
-        }
+    if (!virtqueue_wait_used(vq, prev_used)) {
+        vlog("[vgpu] submit TIMEOUT t=");
+        vlog_num(cmd != NULL ? (uint64_t)(*(const uint32_t *)cmd) : 0u);
+        vlog(" avail=");
+        vlog_num(vq->avail_idx);
+        vlog(" used=");
+        vlog_num(vq->used->idx);
+        vlog("\n");
+        vlog_done();
+        /* Leave used_idx_seen behind: the next submit drains it first. The
+         * response buffer stays owned by the queue, so a late completion is
+         * harmless. */
+        return 0;
+    }
+
+    /* Only consume the entry that belongs to this request (descriptor 0). */
+    uint16_t slot = (uint16_t)(prev_used % vq->queue_size);
+    if ((uint16_t)vq->used->ring[slot].id != 0u) {
+        vq->used_idx_seen = vq->used->idx;
+        return 0;
     }
 
     vq->used_idx_seen = vq->used->idx;
+    memcpy(resp, vq->resp_buf, resp_len);
     return 1;
 }
 
@@ -1218,16 +1444,39 @@ static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor) {
     return true;
 }
 
+/* ---- desktop framebuffer lifetime ----
+ *
+ * SYSCALL_GET_DISPLAY_FRAMEBUFFER maps these very pages into the calling
+ * process, so the buffer must not be freed or moved while a compositor is
+ * drawing into it. A layout change therefore reuses the existing allocation
+ * whenever it is large enough, and otherwise *retires* the old buffer instead
+ * of freeing it: a stale user mapping then writes into dead memory rather than
+ * into a kernel heap block that has since been handed to something else. */
+static uint32_t *g_gpu_retired_fb[VIRTIO_GPU_RETIRED_FB_MAX];
+static uint32_t g_gpu_retired_fb_next = 0u;
+
+static void virtio_gpu_retire_framebuffer(uint32_t *fb)
+{
+    if (fb == NULL) {
+        return;
+    }
+    uint32_t slot = g_gpu_retired_fb_next % VIRTIO_GPU_RETIRED_FB_MAX;
+    if (g_gpu_retired_fb[slot] != NULL) {
+        free(g_gpu_retired_fb[slot]);
+    }
+    g_gpu_retired_fb[slot] = fb;
+    ++g_gpu_retired_fb_next;
+}
+
 static void virtio_gpu_release_resources(void) {
     for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
         virtio_gpu_release_monitor_resource(&g_gpu_monitors[i]);
     }
     g_gpu_monitor_count = 0u;
-    if (g_gpu_fb != NULL) {
-        free(g_gpu_fb);
-        g_gpu_fb = NULL;
-    }
+    virtio_gpu_retire_framebuffer(g_gpu_fb);
+    g_gpu_fb = NULL;
     g_gpu_fb_bytes = 0u;
+    g_gpu_fb_capacity = 0u;
     g_gpu_width = 0u;
     g_gpu_height = 0u;
 }
@@ -1265,11 +1514,28 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
     }
 
     uint32_t virtual_bytes = (uint32_t)(desktop_pixels * sizeof(uint32_t));
-    uint32_t *virtual_fb = (uint32_t *)malloc(virtual_bytes);
-    if (virtual_fb == NULL) {
-        return false;
+
+    /* Reuse the live framebuffer whenever it is large enough: user space maps
+     * these pages directly, so a mode change must not move them. */
+    bool fb_reused = (g_gpu_fb != NULL && g_gpu_fb_capacity >= virtual_bytes);
+    uint32_t prev_capacity = g_gpu_fb_capacity;
+    uint32_t *virtual_fb = g_gpu_fb;
+    if (!fb_reused) {
+        uint32_t capacity = virtual_bytes;
+        if (capacity < VIRTIO_GPU_FB_MIN_CAPACITY) {
+            capacity = VIRTIO_GPU_FB_MIN_CAPACITY;
+        }
+        virtual_fb = (uint32_t *)malloc(capacity);
+        if (virtual_fb == NULL) {
+            capacity = virtual_bytes;
+            virtual_fb = (uint32_t *)malloc(capacity);
+            if (virtual_fb == NULL) {
+                return false;
+            }
+        }
+        memset(virtual_fb, 0, virtual_bytes);
+        g_gpu_fb_capacity = capacity;
     }
-    memset(virtual_fb, 0, virtual_bytes);
 
     uint16_t pnp_actions[VIRTIO_GPU_MAX_SCANOUTS];
     for (uint32_t i = 0u; i < monitor_count; ++i) {
@@ -1293,7 +1559,10 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
             for (uint32_t j = 0u; j <= i; ++j) {
                 virtio_gpu_release_monitor_resource(&monitors[j]);
             }
-            free(virtual_fb);
+            if (!fb_reused) {
+                free(virtual_fb);
+                g_gpu_fb_capacity = prev_capacity;
+            }
             return false;
         }
     }
@@ -1306,9 +1575,15 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
                                              i,
                                              PNP_EVENT_DEVICE_REMOVED);
         }
+        virtio_gpu_release_monitor_resource(&g_gpu_monitors[i]);
     }
+    g_gpu_monitor_count = 0u;
 
-    virtio_gpu_release_resources();
+    /* Only the outgoing desktop buffer, and only when we actually switched
+     * allocation, is retired (never freed -- user space may still map it). */
+    if (!fb_reused) {
+        virtio_gpu_retire_framebuffer(g_gpu_fb);
+    }
     g_gpu_fb = virtual_fb;
     g_gpu_fb_bytes = virtual_bytes;
     g_gpu_width = desktop_width;
@@ -1316,6 +1591,20 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
     g_gpu_origin_x = origin_x;
     g_gpu_origin_y = origin_y;
     g_gpu_monitor_count = monitor_count;
+    vlog("[vgpu] apply layout w=");
+    vlog_num(desktop_width);
+    vlog(" h=");
+    vlog_num(desktop_height);
+    vlog(" fb=");
+    vlog_hex((uint64_t)(uintptr_t)virtual_fb);
+    vlog(" bytes=");
+    vlog_num(virtual_bytes);
+    vlog(" nmon=");
+    vlog_num(monitor_count);
+    vlog(" mon0fb=");
+    vlog_hex((uint64_t)(uintptr_t)(monitor_count != 0u ? monitors[0].fb : NULL));
+    vlog("\n");
+    vlog_done();
     for (uint32_t i = 0u; i < monitor_count; ++i) {
         g_gpu_monitors[i] = monitors[i];
         virtio_gpu_publish_monitor_event(&g_gpu_monitors[i], i, pnp_actions[i]);
@@ -1471,32 +1760,77 @@ bool virtio_gpu_init(void) {
     virtio_pci_transport_t t;
     virtqueue_t controlq;
 
+    vlog("[vgpu] init enter\n");
+    vlog_done();
+
     g_gpu_ready = 0;
-    g_gpu_width = 0;
-    g_gpu_height = 0;
-    g_gpu_fb = NULL;
-    g_gpu_fb_bytes = 0u;
-    g_gpu_monitor_count = 0u;
+    if (g_gpu_controlq.raw_ring != NULL) {
+        free(g_gpu_controlq.raw_ring);
+        g_gpu_controlq.raw_ring = NULL;
+    }
+    if (g_gpu_controlq.resp_buf != NULL) {
+        free(g_gpu_controlq.resp_buf);
+        g_gpu_controlq.resp_buf = NULL;
+    }
+    virtio_gpu_release_resources();
     memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
     memset(&g_gpu_transport, 0, sizeof(g_gpu_transport));
     memset(g_gpu_monitors, 0, sizeof(g_gpu_monitors));
 
     if (!find_virtio_gpu(&gpu)) {
+        vlog("[vgpu] no device\n");
+        vlog_done();
         return false;
     }
+    vlog("[vgpu] find bus=");
+    vlog_num(gpu.bus);
+    vlog(" dev=");
+    vlog_num(gpu.device);
+    vlog(" func=");
+    vlog_num(gpu.func);
+    vlog(" bar4=");
+    vlog_hex(gpu.bar_addr[4]);
+    vlog(" mem4=");
+    vlog_num(gpu.bar_is_mem[4]);
+    vlog("\n");
+    vlog_done();
 
 
     if (!virtio_pci_find_caps(&gpu, &t)) {
+        vlog("[vgpu] no caps\n");
+        vlog_done();
         return false;
     }
+    vlog("[vgpu] caps common=");
+    vlog_hex((uint64_t)(uintptr_t)t.common_cfg);
+    vlog(" notify=");
+    vlog_hex((uint64_t)(uintptr_t)t.notify_base);
+    vlog(" devcfg=");
+    vlog_hex((uint64_t)(uintptr_t)t.device_cfg);
+    vlog("\n");
+    vlog_done();
 
     if (!virtio_pci_device_init(&gpu, &t)) {
+        vlog("[vgpu] device init failed\n");
+        vlog_done();
         return false;
     }
 
     if (!virtqueue_init_ctrl(&t, &controlq, 0)) {
+        vlog("[vgpu] queue init failed\n");
+        vlog_done();
         return false;
     }
+    vlog("[vgpu] queue qsize=");
+    vlog_num(controlq.queue_size);
+    vlog(" ring=");
+    vlog_hex((uint64_t)(uintptr_t)controlq.raw_ring);
+    vlog(" desc=");
+    vlog_hex((uint64_t)(uintptr_t)controlq.desc);
+    vlog(" notify=");
+    vlog_hex((uint64_t)(uintptr_t)controlq.notify_addr);
+    vlog("\n");
+    vlog_done();
 
     uint8_t status = common_read8(t.common_cfg, 20);
     common_write8(t.common_cfg, 20, (uint8_t)(status | VIRTIO_STATUS_DRIVER_OK));
@@ -1504,16 +1838,50 @@ bool virtio_gpu_init(void) {
     g_gpu_controlq = controlq;
     g_gpu_transport = t;
 
-    if (!virtio_gpu_refresh_layout_from_device() &&
-        !virtio_gpu_apply_fallback_layout(1024u, 768u)) {
+    /* The first command after DRIVER_OK can take longer than the steady-state
+     * timeout while QEMU brings the GPU worker up. Retry a few times so the
+     * real mode is installed on the first layout instead of a fallback that a
+     * later poll would have to replace (which used to move the framebuffer out
+     * from under a process that had already mapped it). */
+    bool layout_ok = false;
+    for (uint32_t attempt = 0u; attempt < 5u && !layout_ok; ++attempt) {
+        layout_ok = virtio_gpu_refresh_layout_from_device();
+#ifdef IMPLUS_DRIVER_MODULE
+        if (!layout_ok && g_driver_api != NULL &&
+            g_driver_api->timer.msleep != NULL) {
+            g_driver_api->timer.msleep(20u);
+        }
+#endif
+    }
+
+    if (!layout_ok && !virtio_gpu_apply_fallback_layout(1024u, 768u)) {
+        vlog("[vgpu] layout failed\n");
+        vlog_done();
         if (g_gpu_controlq.raw_ring != NULL) {
             free(g_gpu_controlq.raw_ring);
             g_gpu_controlq.raw_ring = NULL;
         }
+        if (g_gpu_controlq.resp_buf != NULL) {
+            free(g_gpu_controlq.resp_buf);
+            g_gpu_controlq.resp_buf = NULL;
+        }
+        g_gpu_fb_capacity = 0u;
         return false;
     }
 
     g_gpu_ready = 1;
+    vlog("[vgpu] ready w=");
+    vlog_num(g_gpu_width);
+    vlog(" h=");
+    vlog_num(g_gpu_height);
+    vlog(" fb=");
+    vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
+    vlog(" bytes=");
+    vlog_num(g_gpu_fb_bytes);
+    vlog(" nmon=");
+    vlog_num(g_gpu_monitor_count);
+    vlog("\n");
+    vlog_done();
     return true;
 }
 
@@ -1533,7 +1901,11 @@ void virtio_gpu_draw_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (!g_gpu_ready || !g_gpu_fb || x >= g_gpu_width || y >= g_gpu_height) {
         return;
     }
-    g_gpu_fb[(uint64_t)y * g_gpu_width + x] = color;
+    uint64_t irq = gpu_lock();
+    if (g_gpu_ready && g_gpu_fb && x < g_gpu_width && y < g_gpu_height) {
+        g_gpu_fb[(uint64_t)y * g_gpu_width + x] = color;
+    }
+    gpu_unlock(irq);
 }
 
 void virtio_gpu_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
@@ -1543,6 +1915,13 @@ void virtio_gpu_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     if (x >= g_gpu_width || y >= g_gpu_height) {
         return;
     }
+
+    uint64_t irq = gpu_lock();
+    if (!g_gpu_ready || !g_gpu_fb) {
+        gpu_unlock(irq);
+        return;
+    }
+
     uint32_t x_end = x + w;
     uint32_t y_end = y + h;
     if (x_end > g_gpu_width || x_end < x) {
@@ -1574,10 +1953,21 @@ void virtio_gpu_present(void) {
         return;
     }
 
+    uint64_t irq = gpu_lock();
+
+    if (g_vlog_budget != 0u) {
+        vlog("[vgpu] present fb=");
+        vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
+        vlog(" nmon=");
+        vlog_num(g_gpu_monitor_count);
+        vlog("\n");
+        vlog_done();
+    }
+
     for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
         virtio_gpu_monitor_t *monitor = &g_gpu_monitors[i];
         if (monitor->fb == NULL || monitor->resource_id == 0u ||
-            monitor->width == 0u || monitor->height == 0u) {
+            monitor->width == 0u || monitor->height == 0u || g_gpu_fb == NULL) {
             continue;
         }
         for (uint32_t row = 0u; row < monitor->height; ++row) {
@@ -1605,6 +1995,8 @@ void virtio_gpu_present(void) {
                                      monitor->width,
                                      monitor->height);
     }
+
+    gpu_unlock(irq);
 }
 
 /* ---- 3D (virgl) public API ---- */
@@ -1685,7 +2077,14 @@ static bool virtio_gpu_poll_config(void) {
         return false;
     }
     (void)virtio_gpu_config_event_pending();
-    return virtio_gpu_refresh_layout_from_device();
+    bool changed = virtio_gpu_refresh_layout_from_device();
+    if (changed && g_vlog_budget != 0u) {
+        vlog("[vgpu] poll relayout fb=");
+        vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
+        vlog("\n");
+        vlog_done();
+    }
+    return changed;
 }
 
 static uint32_t virtio_gpu_monitor_count(void) {

@@ -191,6 +191,7 @@ void serial_write_char(char c)
     if (g_backend && g_backend->write_char) {
         g_backend->write_char(c);
         serial_lock_release(held, irq_flags);
+        serial_log_file_char(c);
         return;
     }
     serial_write_char_to_uart(c);
@@ -224,6 +225,9 @@ void serial_write_buffer(const char *data, uint32_t length)
             g_backend->write_char(data[i]);
         }
         serial_lock_release(held, irq_flags);
+        for (uint32_t i = 0; i < length; ++i) {
+            serial_log_file_char(data[i]);
+        }
         return;
     }
 
@@ -254,6 +258,14 @@ void serial_write_string(const char *str)
     if (g_backend && g_backend->write_string) {
         g_backend->write_string(str);
         serial_lock_release(held, irq_flags);
+        if (g_log_file_open && g_log_file_writing == 0) {
+            g_log_file_writing = 1;
+            uint32_t len = (uint32_t)strlen(str);
+            vfs_write_at(&g_log_file, g_log_file_offset,
+                         (const uint8_t *)str, len);
+            g_log_file_offset += len;
+            g_log_file_writing = 0;
+        }
         return;
     }
 

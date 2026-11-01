@@ -165,6 +165,42 @@ static bool find_wifi_controller(wifi_pci_dev_t *out_dev)
         return false;
     }
 
+#ifdef IMPLUS_DRIVER_MODULE
+    /* PCI_Main has already enumerated the bus before network_stack_init().
+     * Do not walk all 256*32*8 functions here: on a physical machine each
+     * absent-function config access can be a relatively expensive legacy
+     * config-cycle, making boot appear to hang immediately after audio
+     * initialization.  Use the validated device snapshot instead. */
+    if (g_api->pci.get_device_count == NULL ||
+        g_api->pci.get_device == NULL) {
+        return false;
+    }
+
+    uint32_t count = g_api->pci.get_device_count();
+    for (uint32_t i = 0u; i < count; ++i) {
+        driver_pci_device_t device;
+        if (!g_api->pci.get_device(i, &device)) {
+            continue;
+        }
+
+        bool match = wifi_pci_id_is_known(device.vendor_id, device.device_id) ||
+                     (device.class_code == PCI_CLASS_NETWORK &&
+                      device.subclass == PCI_SUBCLASS_NETWORK_OTHER);
+        if (!match) {
+            continue;
+        }
+
+        out_dev->bus = device.bus;
+        out_dev->device = device.device;
+        out_dev->func = device.function;
+        g_api->pci.enable_bus_master(device.bus, device.device,
+                                     device.function);
+        wifi_read_bar_addrs(device.bus, device.device, device.function,
+                            out_dev->bar_addr, out_dev->bar_is_mem);
+        return true;
+    }
+    return false;
+#else
     for (uint16_t bus = 0; bus < 256u; ++bus) {
         for (uint8_t device = 0; device < 32u; ++device) {
             for (uint8_t func = 0; func < 8u; ++func) {
@@ -210,6 +246,7 @@ static bool find_wifi_controller(wifi_pci_dev_t *out_dev)
     }
 
     return false;
+#endif
 }
 
 /* ---- driver state ---- */
@@ -889,6 +926,8 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
         api->hw.map_mmio_range == NULL ||
         api->pci_read_config == NULL ||
         api->pci_write_config == NULL ||
+        api->pci.get_device_count == NULL ||
+        api->pci.get_device == NULL ||
         api->serial_write_string == NULL ||
         api->timer_ticks == NULL ||
         api->timer_hz == NULL ||

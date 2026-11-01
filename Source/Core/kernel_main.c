@@ -401,7 +401,10 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
         kernel_panic("Filesystem initialization failed and diskless boot not enabled", "kernel_main");
     }
 
-    serial_enable_file_logging("/tmp/Kernel.log");
+    /* /tmp is tmpfs and disappears on reboot. Keep the boot log on the
+     * writable root filesystem so it can be read from the FAT32 boot medium
+     * after a failed hardware bring-up. */
+    serial_enable_file_logging("/Kernel.log");
     phase_ns = boot_profile_begin();
     bool display_ready = driver_manager_display_init();
     bool debug_display_ready = debugger_display_init();
