@@ -30,11 +30,18 @@
 #define E_AGAIN   (-11)
 #define E_NOTTY   (-25)
 #define E_NODEV   (-19)
+#define E_EXIST   (-17)
+#define E_BUSY    (-16)
+#define E_NOSYS   (-38)
+#define E_RANGE   (-34)
+#define E_NOTSUPP (-95)
 
 /* ---- Linux _IOC decode ------------------------------------------------- */
 #define IOC_NR(cmd)   ((uint32_t)((cmd) >> 0) & 0xffu)
 #define IOC_TYPE(cmd) ((uint32_t)((cmd) >> 8) & 0xffu)
+#define IOC_SIZE(cmd) ((uint32_t)((cmd) >> 16) & 0x3fffu)
 #define DRM_IOCTL_BASE 'd'
+#define DRM_COMMAND_BASE 0x40u
 
 /* command numbers (nr) */
 #define DRM_NR_VERSION            0x00
@@ -86,6 +93,40 @@
 /* PRIME fd sharing (ioctl base 'd', so _IOWR('d', 0x2D, ...) etc.) */
 #define DRM_NR_PRIME_HANDLE_TO_FD  0x2D
 #define DRM_NR_PRIME_FD_TO_HANDLE  0x2E
+
+/* VirtIO-GPU DRM UAPI (include/uapi/drm/virtgpu_drm.h). */
+#define DRM_NR_VIRTGPU_MAP             (DRM_COMMAND_BASE + 0x01u)
+#define DRM_NR_VIRTGPU_EXECBUFFER      (DRM_COMMAND_BASE + 0x02u)
+#define DRM_NR_VIRTGPU_GETPARAM        (DRM_COMMAND_BASE + 0x03u)
+#define DRM_NR_VIRTGPU_RESOURCE_CREATE (DRM_COMMAND_BASE + 0x04u)
+#define DRM_NR_VIRTGPU_RESOURCE_INFO   (DRM_COMMAND_BASE + 0x05u)
+#define DRM_NR_VIRTGPU_TRANSFER_FROM_HOST (DRM_COMMAND_BASE + 0x06u)
+#define DRM_NR_VIRTGPU_TRANSFER_TO_HOST  (DRM_COMMAND_BASE + 0x07u)
+#define DRM_NR_VIRTGPU_WAIT            (DRM_COMMAND_BASE + 0x08u)
+#define DRM_NR_VIRTGPU_GET_CAPS        (DRM_COMMAND_BASE + 0x09u)
+#define DRM_NR_VIRTGPU_CONTEXT_INIT    (DRM_COMMAND_BASE + 0x0Bu)
+
+#define VIRTGPU_EXECBUF_FENCE_FD_IN  0x01u
+#define VIRTGPU_EXECBUF_FENCE_FD_OUT 0x02u
+#define VIRTGPU_EXECBUF_RING_IDX     0x04u
+#define VIRTGPU_EXECBUF_FLAGS (VIRTGPU_EXECBUF_FENCE_FD_IN | \\
+                               VIRTGPU_EXECBUF_FENCE_FD_OUT | \\
+                               VIRTGPU_EXECBUF_RING_IDX)
+
+#define VIRTGPU_PARAM_3D_FEATURES             1u
+#define VIRTGPU_PARAM_CAPSET_QUERY_FIX        2u
+#define VIRTGPU_PARAM_RESOURCE_BLOB           3u
+#define VIRTGPU_PARAM_HOST_VISIBLE            4u
+#define VIRTGPU_PARAM_CROSS_DEVICE            5u
+#define VIRTGPU_PARAM_CONTEXT_INIT            6u
+#define VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS    7u
+#define VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME     8u
+
+#define VIRTGPU_WAIT_NOWAIT 1u
+#define VIRTGPU_CONTEXT_PARAM_CAPSET_ID       0x0001u
+#define VIRTGPU_CONTEXT_PARAM_NUM_RINGS       0x0002u
+#define VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK 0x0003u
+#define VIRTGPU_CONTEXT_PARAM_DEBUG_NAME      0x0004u
 
 /* GEM names / open (legacy flink sharing) */
 
@@ -276,6 +317,58 @@ struct drm_prime_handle {
     uint32_t flags;
     int32_t  fd;
 };
+struct drm_virtgpu_map {
+    uint64_t offset;
+    uint32_t handle;
+    uint32_t pad;
+};
+struct drm_virtgpu_getparam {
+    uint64_t param;
+    uint64_t value;
+};
+struct drm_virtgpu_resource_create {
+    uint32_t target, format, bind, width, height, depth;
+    uint32_t array_size, last_level, nr_samples, flags;
+    uint32_t bo_handle, res_handle, size, stride;
+};
+struct drm_virtgpu_resource_info {
+    uint32_t bo_handle, res_handle, size, blob_mem;
+};
+struct drm_virtgpu_3d_box {
+    uint32_t x, y, z, w, h, d;
+};
+struct drm_virtgpu_3d_transfer {
+    uint32_t bo_handle;
+    struct drm_virtgpu_3d_box box;
+    uint32_t level, offset, stride, layer_stride;
+};
+struct drm_virtgpu_3d_wait {
+    uint32_t handle, flags;
+};
+struct drm_virtgpu_get_caps {
+    uint32_t cap_set_id, cap_set_ver;
+    uint64_t addr;
+    uint32_t size, pad;
+};
+struct drm_virtgpu_context_set_param {
+    uint64_t param, value;
+};
+struct drm_virtgpu_context_init {
+    uint32_t num_params, pad;
+    uint64_t ctx_set_params;
+};
+/* Modern Linux UAPI includes syncobj arrays at the tail. The ioctl's encoded
+ * _IOC_SIZE tells us whether the caller uses the legacy 40-byte layout or
+ * the current 64-byte layout; unsupported syncobj/fence fields stay zero. */
+struct drm_virtgpu_execbuffer {
+    uint32_t flags, size;
+    uint64_t command, bo_handles;
+    uint32_t num_bo_handles;
+    int32_t fence_fd;
+    uint32_t ring_idx, syncobj_stride;
+    uint32_t num_in_syncobjs, num_out_syncobjs;
+    uint64_t in_syncobjs, out_syncobjs;
+};
 #define DRM_PRIME_FLAG_IMPORT (1 << 0)
 #define DRM_PRIME_FLAG_EXPORT (1 << 1)
 
@@ -288,7 +381,7 @@ struct drm_event_vblank {
 };
 
 /* ---- state ---------------------------------------------------------------- */
-#define DRM_MAX_DUMB 16
+#define DRM_MAX_DUMB 128
 #define DRM_MAX_FB   16
 #define DRM_EVQ_MAX  16
 #define DRM_MMAP_OFFSET_BASE 0x100000000ull  /* fake mmap offset space */
@@ -316,6 +409,8 @@ typedef struct {
      * Must be initialised to -1 on creation -- memset(0) would otherwise make
      * every buffer look exported into slot 0. */
     int32_t  prime;
+    uint32_t gpu_resource_id;
+    uint32_t gpu_attached_context;
 } drm_dumb_t;
 
 /* ---- PRIME (dma-buf) ----------------------------------------------------
@@ -714,7 +809,7 @@ static drm_session_t *session_for_owner(int32_t owner_pid)
  * session). The session is keyed by client pid only (no launcher binding).
  */
 
-#define DRM_MAX_RENDER_SESSIONS 4
+#define DRM_MAX_RENDER_SESSIONS 16
 
 typedef struct {
     uint8_t  used;
@@ -723,6 +818,8 @@ typedef struct {
     drm_dumb_t dumbs[DRM_MAX_DUMB];
     uint32_t   next_handle;
     uint64_t   next_map_off;
+    uint32_t   context_id;
+    uint32_t   context_capset_id;
 } drm_render_session_t;
 
 static drm_render_session_t g_render_sessions[DRM_MAX_RENDER_SESSIONS];
