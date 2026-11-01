@@ -6,6 +6,7 @@
 #include "DevFS.h"
 #include "Drivers/Module/PCI_Main.h"
 #include "Drivers/Module/DisplayManager.h"
+#include "Drivers/Module/Display_Main.h"
 
 #define SYSFS_PATH_MAX 96u
 #define SYSFS_TEXT_MAX 320u
@@ -165,6 +166,35 @@ static bool sysfs_locate_display_pci(sysfs_pci_t *out)
 /* Used when the bus layer has not enumerated anything (a build without the
  * PCI module, or a machine with no display class device). The identity is
  * unknown -- zeros so consumers do not mistake it for a real device. */
+static bool sysfs_locate_virtio_gpu(sysfs_pci_t *out)
+{
+    uint32_t count = pci_get_device_count();
+    for (uint32_t i = 0; i < count; ++i) {
+        const pci_device_t *dev = pci_get_device(i);
+        if (dev == NULL || dev->vendor_id != 0x1AF4u ||
+            dev->device_id != 0x1050u) {
+            continue;
+        }
+        memset(out, 0, sizeof(*out));
+        out->domain = 0u;
+        out->bus = dev->bus;
+        out->dev = dev->device;
+        out->func = dev->func;
+        out->vendor = dev->vendor_id;
+        out->device = dev->device_id;
+        out->revision = dev->revision;
+        uint32_t sub = pci_read_config(dev->bus, dev->device, dev->func, 0x2Cu);
+        out->subvendor = (uint16_t)(sub & 0xFFFFu);
+        out->subdevice = (uint16_t)((sub >> 16) & 0xFFFFu);
+        if (out->subvendor == 0u || out->subvendor == 0xFFFFu) {
+            out->subvendor = dev->vendor_id;
+            out->subdevice = dev->device_id;
+        }
+        return true;
+    }
+    return false;
+}
+
 static void sysfs_default_pci(sysfs_pci_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -296,20 +326,28 @@ void sysfs_publish_drm_nodes(void)
 {
     sysfs_init();
 
-    sysfs_pci_t pci;
-    if (!sysfs_locate_display_pci(&pci)) {
-        sysfs_default_pci(&pci);
+    sysfs_pci_t display_pci;
+    if (!sysfs_locate_display_pci(&display_pci)) {
+        sysfs_default_pci(&display_pci);
     }
 
-    const char *driver_name = display_manager_get_active_driver_name();
-    if (driver_name == NULL) {
-        driver_name = "implus-display";
+    const char *display_driver = display_manager_get_active_driver_name();
+    if (display_driver == NULL) display_driver = "implus-display";
+
+    /* Mesa chooses its DRI driver from drmGetVersion() and verifies the
+     * PCI identity through sysfs. The render node may therefore name a
+     * VirtIO GPU even when Intel (or another module) owns physical scanout. */
+    sysfs_pci_t render_pci = display_pci;
+    const char *render_driver = display_driver;
+    if (display_get_3d_driver() != NULL &&
+        sysfs_locate_virtio_gpu(&render_pci)) {
+        render_driver = "virtio_gpu";
     }
 
     sysfs_publish_node(DEVFS_DRM_MAJOR, DEVFS_DRM_CARD_MINOR, "dri/card0",
-                       &pci, driver_name);
+                       &display_pci, display_driver);
     sysfs_publish_node(DEVFS_DRM_MAJOR, DEVFS_DRM_RENDER_MINOR,
-                       "dri/renderD128", &pci, driver_name);
+                       "dri/renderD128", &render_pci, render_driver);
 }
 
 /* ------------------------------------------------------------------ */
