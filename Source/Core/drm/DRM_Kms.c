@@ -1129,8 +1129,15 @@ static int render_create_resource(drm_render_session_t *sess,
     }
 
     if (!resource_created || !backing_attached) {
-        if (resource_created) (void)gpu->gpu_resource_unref(resource_id);
-        dumb_release_locked(slot);
+        if (resource_created) {
+            /* The attach may have timed out after the host consumed it. Route
+             * cleanup through the same detach/unref gate as normal GEM close;
+             * on two failures the BO remains quarantined, not DMA-freed. */
+            slot->gpu_resource_id = resource_id;
+            (void)render_dumb_release_locked(sess, slot);
+        } else {
+            dumb_release_locked(slot);
+        }
         spinlock_unlock(&g_lock);
         return E_NOMEM;
     }
@@ -1326,9 +1333,9 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         }
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = render_dumb_by_handle(sess, handle);
-        if (bo) render_dumb_release_locked(sess, bo);
+        bool released = bo == NULL || render_dumb_release_locked(sess, bo);
         spinlock_unlock(&g_lock);
-        return 0;
+        return released ? 0 : E_BUSY;
     }
     case DRM_NR_GEM_FLINK:
     case DRM_NR_GEM_OPEN:
