@@ -130,6 +130,28 @@
 #define VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK 0x0003u
 #define VIRTGPU_CONTEXT_PARAM_DEBUG_NAME      0x0004u
 
+/* Keep the ioctl argument layouts byte-for-byte compatible with
+ * include/uapi/drm/virtgpu_drm.h.  These assertions run in both kernel
+ * architecture builds and prevent silent ioctl-size drift. */
+_Static_assert(sizeof(struct drm_virtgpu_map) == 16u,
+               "DRM_VIRTGPU_MAP ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_execbuffer) == 64u,
+               "DRM_VIRTGPU_EXECBUFFER ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_getparam) == 16u,
+               "DRM_VIRTGPU_GETPARAM ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_resource_create) == 56u,
+               "DRM_VIRTGPU_RESOURCE_CREATE ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_resource_info) == 16u,
+               "DRM_VIRTGPU_RESOURCE_INFO ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_3d_transfer) == 44u,
+               "DRM_VIRTGPU_TRANSFER ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_3d_wait) == 8u,
+               "DRM_VIRTGPU_WAIT ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_get_caps) == 24u,
+               "DRM_VIRTGPU_GET_CAPS ABI mismatch");
+_Static_assert(sizeof(struct drm_virtgpu_context_init) == 16u,
+               "DRM_VIRTGPU_CONTEXT_INIT ABI mismatch");
+
 /* GEM names / open (legacy flink sharing) */
 
 /* DRM_IOCTL_GET_CAP capabilities */
