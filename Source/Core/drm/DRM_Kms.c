@@ -30,6 +30,7 @@
 #define E_AGAIN   (-11)
 #define E_NOTTY   (-25)
 #define E_NODEV   (-19)
+#define E_NOENT   (-2)
 #define E_EXIST   (-17)
 #define E_BUSY    (-16)
 #define E_NOSYS   (-38)
@@ -121,6 +122,7 @@
 #define VIRTGPU_PARAM_CONTEXT_INIT            6u
 #define VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS    7u
 #define VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME     8u
+#define VIRTGPU_PARAM_BLOB_ALIGNMENT           9u
 
 #define VIRTGPU_WAIT_NOWAIT 1u
 #define VIRTGPU_CONTEXT_PARAM_CAPSET_ID       0x0001u
@@ -944,16 +946,17 @@ static void render_dumb_release_locked(drm_render_session_t *sess,
     dumb_release_locked(bo);
 }
 
-static uint64_t render_supported_capset_mask(const driver_display_t *gpu)
+static uint32_t render_supported_capset_mask(const driver_display_t *gpu)
 {
-    uint64_t mask = 0u;
+    uint32_t mask = 0u;
     if (gpu == NULL || gpu->gpu_get_capset_info == NULL) return 0u;
     for (uint32_t index = 0u; index < 16u; ++index) {
         uint32_t id = 0u, version = 0u, size = 0u;
         if (!gpu->gpu_get_capset_info(index, &id, &version, &size)) break;
         (void)version;
         (void)size;
-        if (id < 64u) mask |= (1ull << id);
+        /* Linux's GETPARAM returns this mask through a 32-bit int. */
+        if (id < 32u) mask |= (1u << id);
     }
     return mask;
 }
@@ -1334,19 +1337,17 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
                      gpu->gpu_has_context_init()) ? 1u : 0u;
             break;
         case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS:
-            value = 0u;
+            value = render_supported_capset_mask(gpu);
             break;
         case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME:
             value = (gpu != NULL && gpu->gpu_has_context_init != NULL &&
                      gpu->gpu_has_context_init()) ? 1u : 0u;
             break;
+        case VIRTGPU_PARAM_BLOB_ALIGNMENT:
+            /* RESOURCE_CREATE_BLOB is deliberately not advertised yet. */
+            return E_NOENT;
         default:
             return E_INVAL;
-        }
-        if (param.param == VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS) {
-            uint64_t mask = render_supported_capset_mask(gpu);
-            return copy_to_user((void *)(uintptr_t)param.value,
-                                &mask, sizeof(mask)) == 0u ? 0 : E_FAULT;
         }
         return copy_to_user((void *)(uintptr_t)param.value,
                             &value, sizeof(value)) == 0u ? 0 : E_FAULT;
@@ -1546,21 +1547,35 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_VIRTGPU_GET_CAPS: {
         struct drm_virtgpu_get_caps caps;
         uint8_t *buffer;
+        uint32_t cap_size = 0u;
+        uint32_t copy_size;
         if (gpu == NULL) return E_NOSYS;
         if (!uarg || copy_from_user(&caps, uarg, sizeof(caps)) != 0u) return E_FAULT;
         if (caps.size == 0u || caps.size > (64u * 1024u) || caps.addr == 0u) {
             return E_INVAL;
         }
-        buffer = (uint8_t *)malloc(caps.size);
+        bool found = false;
+        for (uint32_t index = 0u; index < 16u; ++index) {
+            uint32_t id = 0u, version = 0u, size = 0u;
+            if (!gpu->gpu_get_capset_info(index, &id, &version, &size)) break;
+            if (id == caps.cap_set_id && caps.cap_set_ver <= version) {
+                cap_size = size;
+                found = true;
+                break;
+            }
+        }
+        if (!found || cap_size == 0u) return E_INVAL;
+        copy_size = caps.size < cap_size ? caps.size : cap_size;
+        buffer = (uint8_t *)malloc(copy_size);
         if (buffer == NULL) return E_NOMEM;
-        memset(buffer, 0, caps.size);
+        memset(buffer, 0, copy_size);
         if (!gpu->gpu_get_capset(caps.cap_set_id, caps.cap_set_ver,
-                                 buffer, caps.size)) {
+                                 buffer, copy_size)) {
             free(buffer);
             return E_INVAL;
         }
         int64_t result =
-            copy_to_user((void *)(uintptr_t)caps.addr, buffer, caps.size) == 0u
+            copy_to_user((void *)(uintptr_t)caps.addr, buffer, copy_size) == 0u
                 ? 0 : E_FAULT;
         free(buffer);
         return result;
