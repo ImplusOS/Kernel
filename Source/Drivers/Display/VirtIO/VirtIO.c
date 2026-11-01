@@ -363,6 +363,23 @@ typedef struct __attribute__((packed)) {
     uint32_t layer_stride;
 } virtio_gpu_transfer_3d_t;
 
+/* Wire-layout guards: a drift here makes the device parse unrelated
+ * bytes as virgl commands. Keep these sizes aligned with linux/virtio_gpu.h. */
+_Static_assert(sizeof(virtio_gpu_ctrl_hdr_t) == 24u,
+               "VirtIO GPU control header ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_ctx_create_t) == 96u,
+               "VirtIO GPU context-create ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_ctx_destroy_t) == 24u,
+               "VirtIO GPU context-destroy ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_ctx_resource_t) == 32u,
+               "VirtIO GPU context-resource ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_submit_3d_t) == 32u,
+               "VirtIO GPU submit-3D ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_resource_create_3d_t) == 72u,
+               "VirtIO GPU resource-create-3D ABI mismatch");
+_Static_assert(sizeof(virtio_gpu_transfer_3d_t) == 72u,
+               "VirtIO GPU transfer-3D ABI mismatch");
+
 typedef struct {
     uint32_t scanout_id;
     uint32_t resource_id;
