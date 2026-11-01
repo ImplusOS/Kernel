@@ -453,15 +453,21 @@ typedef struct {
 
 typedef struct {
     uint8_t  used;
+    uint8_t  gpu_backing_detached;
+    uint16_t reserved;
     uint32_t refs;
     void    *kva;
     uint32_t npages;
     uint64_t phys;
     uint64_t size;
     uint32_t width, height, bpp, pitch;
+    uint32_t gpu_resource_id;
 } drm_prime_t;
 
 static drm_prime_t g_primes[DRM_MAX_PRIME];
+
+/* Render-backend lookup is defined below the DRM session tables. */
+static const driver_display_t *render_gpu_backend(void);
 
 /* Take `bo`'s pages into a dma-buf block and hand the handle its reference.
  * A handle whose `prime` is < 0 owns its pages outright, so there is never an
@@ -484,6 +490,7 @@ static int32_t prime_adopt_locked(const drm_dumb_t *bo)
         p->height = bo->height;
         p->bpp = bo->bpp;
         p->pitch = bo->pitch;
+        p->gpu_resource_id = bo->gpu_resource_id;
         return i;
     }
     return -1;
@@ -497,6 +504,25 @@ static void prime_put_locked(int32_t idx)
     if (!p->used) return;
     if (p->refs > 0u) p->refs--;
     if (p->refs != 0u) return;
+
+    if (p->gpu_resource_id != 0u) {
+        const driver_display_t *gpu = render_gpu_backend();
+        if (gpu == NULL) {
+            /* Keep both the GEM backing and resource identity quarantined:
+             * never free guest pages while an unavailable device may retain
+             * a DMA mapping. */
+            p->refs = 1u;
+            return;
+        }
+        if (!p->gpu_backing_detached) {
+            p->gpu_backing_detached =
+                gpu->gpu_resource_detach_backing(p->gpu_resource_id) ? 1u : 0u;
+        }
+        if (!gpu->gpu_resource_unref(p->gpu_resource_id)) {
+            p->refs = 1u;
+            return;
+        }
+    }
     if (p->kva != NULL) pmm_free_pages(p->kva, p->npages);
     memset(p, 0, sizeof(*p));
 }
