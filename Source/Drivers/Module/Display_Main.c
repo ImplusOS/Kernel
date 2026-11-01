@@ -466,6 +466,54 @@ const char *display_main_get_active_driver_name(void)
     return g_active_display_module_name;
 }
 
+static bool display_driver_has_3d_api(const driver_display_t *candidate)
+{
+    return candidate != NULL &&
+           candidate->gpu_has_3d != NULL &&
+           candidate->gpu_resource_id_alloc != NULL &&
+           candidate->gpu_context_create != NULL &&
+           candidate->gpu_context_destroy != NULL &&
+           candidate->gpu_submit_3d != NULL &&
+           candidate->gpu_resource_create_3d != NULL &&
+           candidate->gpu_resource_attach_backing != NULL &&
+           candidate->gpu_resource_detach_backing != NULL &&
+           candidate->gpu_resource_unref != NULL &&
+           candidate->gpu_context_attach_resource != NULL &&
+           candidate->gpu_context_detach_resource != NULL &&
+           candidate->gpu_transfer_3d != NULL &&
+           candidate->gpu_get_capset_info != NULL &&
+           candidate->gpu_get_capset != NULL;
+}
+
+bool display_init_3d_backend(void)
+{
+    for (uint32_t i = 0u; i < DEVICE_REGISTRY_MAX; ++i) {
+        const device_t *dev =
+            device_registry_find_by_index(DEVICE_TYPE_DISPLAY, i);
+        if (dev == NULL) break;
+
+        const driver_display_t *candidate =
+            (const driver_display_t *)dev->ops;
+        if (candidate == NULL || candidate->gpu_has_3d == NULL ||
+            !display_driver_has_3d_api(candidate)) {
+            continue;
+        }
+
+        /* Render and scanout are independent roles. A VirtIO GPU can serve
+         * Mesa while Intel owns the physical panel. Initialize this device
+         * without changing g_active_display_driver. */
+        if (candidate->is_ready != NULL && !candidate->is_ready()) {
+            if (candidate->probe != NULL && !candidate->probe()) continue;
+            if (candidate->init == NULL || !candidate->init()) continue;
+        }
+        if ((candidate->is_ready == NULL || candidate->is_ready()) &&
+            candidate->gpu_has_3d()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const driver_display_t *display_get_3d_driver(void)
 {
     for (uint32_t i = 0u; i < DEVICE_REGISTRY_MAX; ++i) {
@@ -475,42 +523,9 @@ const driver_display_t *display_get_3d_driver(void)
 
         const driver_display_t *candidate =
             (const driver_display_t *)dev->ops;
-        if (candidate == NULL || candidate->gpu_has_3d == NULL) {
-            continue;
-        }
-
-        /* Render and scanout are independent roles. A VirtIO GPU can be the
-         * Mesa render device while Intel owns the physical panel, so bring up
-         * a ready 3D backend even when DriverSelect did not choose it for
-         * scanout. VirtIO init owns its own scanout resources and does not
-         * replace g_active_display_driver. */
-        if (candidate->is_ready != NULL && !candidate->is_ready()) {
-            if (candidate->probe != NULL && !candidate->probe()) {
-                continue;
-            }
-            if (candidate->init == NULL || !candidate->init()) {
-                continue;
-            }
-        }
-        if ((candidate->is_ready != NULL && !candidate->is_ready()) ||
-            !candidate->gpu_has_3d()) {
-            continue;
-        }
-        if (candidate->gpu_resource_id_alloc == NULL ||
-            candidate->gpu_context_create == NULL ||
-            candidate->gpu_context_destroy == NULL ||
-            candidate->gpu_submit_3d == NULL ||
-            candidate->gpu_resource_create_3d == NULL ||
-            candidate->gpu_resource_attach_backing == NULL ||
-            candidate->gpu_resource_detach_backing == NULL ||
-            candidate->gpu_resource_unref == NULL ||
-            candidate->gpu_context_attach_resource == NULL ||
-            candidate->gpu_context_detach_resource == NULL ||
-            candidate->gpu_transfer_3d == NULL ||
-            candidate->gpu_get_capset_info == NULL ||
-            candidate->gpu_get_capset == NULL) {
-            continue;
-        }
+        if (!display_driver_has_3d_api(candidate)) continue;
+        if (candidate->is_ready != NULL && !candidate->is_ready()) continue;
+        if (!candidate->gpu_has_3d()) continue;
         return candidate;
     }
     return NULL;
