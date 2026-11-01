@@ -991,32 +991,20 @@ static void render_session_release_gpu_locked(drm_render_session_t *sess)
     sess->context_capset_id = 0u;
 }
 
-static int render_attach_bo_to_context(drm_render_session_t *sess,
-                                       drm_dumb_t *bo)
+static int render_attach_bo_to_context_locked(
+    drm_render_session_t *sess, drm_dumb_t *bo,
+    const driver_display_t *gpu)
 {
-    const driver_display_t *gpu = render_gpu_backend();
-    int rc = render_ensure_context(sess);
-    if (rc < 0) return rc;
-    if (bo == NULL || bo->gpu_resource_id == 0u || gpu == NULL) {
+    if (sess == NULL || bo == NULL || !bo->used ||
+        bo->gpu_resource_id == 0u || sess->context_id == 0u || gpu == NULL) {
         return E_INVAL;
     }
-    spinlock_lock(&g_lock);
-    if (bo->gpu_attached_context == sess->context_id) {
-        spinlock_unlock(&g_lock);
-        return 0;
-    }
-    uint32_t context_id = sess->context_id;
-    uint32_t resource_id = bo->gpu_resource_id;
-    spinlock_unlock(&g_lock);
-
-    if (!gpu->gpu_context_attach_resource(context_id, resource_id)) {
+    if (bo->gpu_attached_context == sess->context_id) return 0;
+    if (!gpu->gpu_context_attach_resource(sess->context_id,
+                                          bo->gpu_resource_id)) {
         return E_INVAL;
     }
-    spinlock_lock(&g_lock);
-    if (bo->used && bo->gpu_resource_id == resource_id) {
-        bo->gpu_attached_context = context_id;
-    }
-    spinlock_unlock(&g_lock);
+    bo->gpu_attached_context = sess->context_id;
     return 0;
 }
 
@@ -1032,14 +1020,20 @@ static int render_create_resource(drm_render_session_t *sess,
     if (args->width == 0u || args->height == 0u || args->depth == 0u ||
         args->target == 0u || args->array_size == 0u) return E_INVAL;
 
-    uint32_t size = args->size != 0u ? args->size : 4096u;
-    if (size > (64u * 1024u * 1024u)) return E_NOMEM;
-    uint32_t npages = (size + 4095u) / 4096u;
+    uint32_t requested_size = args->size != 0u ? args->size : 4096u;
+    if (requested_size > (64u * 1024u * 1024u)) return E_NOMEM;
+    uint32_t npages = (requested_size + 4095u) / 4096u;
     if (npages == 0u) return E_INVAL;
     uint64_t allocation_bytes = (uint64_t)npages * 4096u;
-    if (allocation_bytes > UINT32_MAX) return E_RANGE;
+    if (allocation_bytes > UINT32_MAX ||
+        sess->next_map_off > UINT64_MAX - allocation_bytes) return E_RANGE;
 
     spinlock_lock(&g_lock);
+    if (!sess->used || sess->context_id == 0u) {
+        spinlock_unlock(&g_lock);
+        return E_NODEV;
+    }
+
     drm_dumb_t *slot = NULL;
     for (int i = 0; i < DRM_MAX_DUMB; ++i) {
         if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
@@ -1065,15 +1059,13 @@ static int render_create_resource(drm_render_session_t *sess,
     slot->height = args->height;
     slot->bpp = 0u;
     slot->pitch = args->stride;
-    slot->size = size;
+    slot->size = allocation_bytes;
     slot->npages = npages;
     slot->kva = kva;
     slot->phys = phys;
     slot->map_offset = sess->next_map_off;
     slot->prime = -1;
     sess->next_map_off += allocation_bytes;
-    uint32_t handle = slot->handle;
-    spinlock_unlock(&g_lock);
 
     uint32_t resource_id = gpu->gpu_resource_id_alloc();
     bool resource_created = false;
@@ -1088,41 +1080,26 @@ static int render_create_resource(drm_render_session_t *sess,
         backing_attached = gpu->gpu_resource_attach_backing(
             resource_id, phys, (uint32_t)allocation_bytes);
     }
+
     if (!resource_created || !backing_attached) {
-        if (resource_created) {
-            if (backing_attached) {
-                (void)gpu->gpu_resource_detach_backing(resource_id);
-            }
-            (void)gpu->gpu_resource_unref(resource_id);
-        }
-        spinlock_lock(&g_lock);
-        slot = render_dumb_by_handle(sess, handle);
-        if (slot != NULL) dumb_release_locked(slot);
+        if (resource_created) (void)gpu->gpu_resource_unref(resource_id);
+        dumb_release_locked(slot);
         spinlock_unlock(&g_lock);
         return E_NOMEM;
     }
 
-    spinlock_lock(&g_lock);
-    slot = render_dumb_by_handle(sess, handle);
-    if (slot == NULL) {
-        spinlock_unlock(&g_lock);
-        (void)gpu->gpu_resource_detach_backing(resource_id);
-        (void)gpu->gpu_resource_unref(resource_id);
-        return E_INVAL;
-    }
     slot->gpu_resource_id = resource_id;
-    args->bo_handle = handle;
+    args->bo_handle = slot->handle;
     args->res_handle = resource_id;
-    args->size = size;
-    spinlock_unlock(&g_lock);
-
+    args->size = (uint32_t)allocation_bytes;
+    /* Keep the GEM slot alive until its output handle has been copied. */
     if (copy_to_user(user_args, args, sizeof(*args)) != 0u) {
-        spinlock_lock(&g_lock);
-        slot = render_dumb_by_handle(sess, handle);
-        if (slot != NULL) render_dumb_release_locked(sess, slot);
+        render_dumb_release_locked(sess, slot);
         spinlock_unlock(&g_lock);
         return E_FAULT;
     }
+
+    spinlock_unlock(&g_lock);
     return 0;
 }
 
