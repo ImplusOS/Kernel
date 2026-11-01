@@ -90,9 +90,8 @@
 #define VIRTIO_GPU_CMD_TIMEOUT_MS 1000u
 /* Fallback busy-wait budget when the module API exposes no clock. */
 #define VIRTIO_GPU_SPIN_BUDGET  400000000u
-/* Control-queue response scratch buffer: the largest response is
- * virtio_gpu_resp_edid_t (24 + 8 + 1024 bytes). */
-/* Mesa virgl capsets are returned as variable-size control-queue payloads. */
+/* Mesa virgl capsets are returned as variable-size control-queue payloads;
+ * reserve bounded space beyond the fixed EDID response. */
 #define VIRTIO_GPU_RESP_BUF_BYTES (64u * 1024u)
 #define VIRTIO_GPU_MAX_CAPSETS 16u
 /* The desktop framebuffer is allocated with headroom so a later mode change
