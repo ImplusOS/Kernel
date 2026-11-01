@@ -479,6 +479,20 @@ const driver_display_t *display_get_3d_driver(void)
             !candidate->gpu_has_3d()) {
             continue;
         }
+
+        /* Render and scanout are independent roles. A VirtIO GPU can be the
+         * Mesa render device while Intel owns the physical panel, so bring up
+         * a ready 3D backend even when DriverSelect did not choose it for
+         * scanout. VirtIO init owns its own scanout resources and does not
+         * replace g_active_display_driver. */
+        if (candidate->is_ready != NULL && !candidate->is_ready()) {
+            if (candidate->probe != NULL && !candidate->probe()) {
+                continue;
+            }
+            if (candidate->init == NULL || !candidate->init()) {
+                continue;
+            }
+        }
         if (candidate->is_ready != NULL && !candidate->is_ready()) {
             continue;
         }
