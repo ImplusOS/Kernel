@@ -1403,6 +1403,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
     case DRM_NR_VIRTGPU_GETPARAM: {
         struct drm_virtgpu_getparam param;
         if (!uarg || copy_from_user(&param, uarg, sizeof(param)) != 0u) return E_FAULT;
+        if (param.param > UINT32_MAX) return E_INVAL;
         uint32_t value = 0u;
         switch ((uint32_t)param.param) {
         case VIRTGPU_PARAM_3D_FEATURES:
@@ -1530,8 +1531,8 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         uint32_t *handles = NULL;
         int rc = 0;
         if (gpu == NULL) return E_NOSYS;
-        if (!uarg || request_size < 40u ||
-            request_size > sizeof(exec)) return E_INVAL;
+        if (!uarg || (request_size != 40u &&
+                      request_size != sizeof(exec))) return E_INVAL;
         memset(&exec, 0, sizeof(exec));
         if (copy_from_user(&exec, uarg, request_size) != 0u) return E_FAULT;
 
