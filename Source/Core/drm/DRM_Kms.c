@@ -971,34 +971,55 @@ static int render_ensure_context(drm_render_session_t *sess)
     return rc;
 }
 
-/* Called with g_lock held. The resource is detached from the owning virgl
- * context before its guest backing is released. */
+/* Caller holds g_lock. An imported PRIME handle resolves to the same
+ * host-side resource id as the original GEM handle; the dma-buf block owns
+ * that resource until its final descriptor/handle reference is dropped. */
+static uint32_t render_bo_gpu_resource_id_locked(const drm_dumb_t *bo)
+{
+    if (bo == NULL || !bo->used) return 0u;
+    if (bo->gpu_resource_id != 0u) return bo->gpu_resource_id;
+    if (bo->prime >= 0 && bo->prime < DRM_MAX_PRIME &&
+        g_primes[bo->prime].used) {
+        return g_primes[bo->prime].gpu_resource_id;
+    }
+    return 0u;
+}
+
+/* Called with g_lock held. */
 static bool render_release_gpu_bo_locked(drm_render_session_t *sess,
                                          drm_dumb_t *bo)
 {
     const driver_display_t *gpu = render_gpu_backend();
     if (bo == NULL || !bo->used) return true;
-    if (bo->gpu_resource_id == 0u) return true;
+    uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
+    if (resource_id == 0u) return true;
     if (gpu == NULL) return false;
 
-    if (bo->gpu_attached_context != 0u) {
-        (void)gpu->gpu_context_detach_resource(
-            bo->gpu_attached_context, bo->gpu_resource_id);
+    if (bo->gpu_attached_context != 0u &&
+        !gpu->gpu_context_detach_resource(bo->gpu_attached_context,
+                                          resource_id)) {
+        return false;
     }
-    bool backing_detached =
-        gpu->gpu_resource_detach_backing(bo->gpu_resource_id);
-    bool resource_destroyed =
-        gpu->gpu_resource_unref(bo->gpu_resource_id);
+    bo->gpu_attached_context = 0u;
 
-    /* A successful unref destroys the resource and releases its backing.
-     * A successful detach is also sufficient to make guest-page reclamation
-     * safe, even if the subsequent unref must be retried. */
+    /* Once exported, g_primes owns the backing pages and host resource. The
+     * per-file GEM handle only owns its context attachment. Do not unref the
+     * host resource until prime_put_locked() drops the final PRIME reference. */
+    if (bo->prime >= 0 && bo->prime < DRM_MAX_PRIME &&
+        g_primes[bo->prime].used &&
+        g_primes[bo->prime].gpu_resource_id == resource_id) {
+        bo->gpu_resource_id = 0u;
+        (void)sess;
+        return true;
+    }
+
+    bool backing_detached = gpu->gpu_resource_detach_backing(resource_id);
+    bool resource_destroyed = gpu->gpu_resource_unref(resource_id);
     if (!backing_detached && !resource_destroyed) {
         (void)sess;
         return false;
     }
     bo->gpu_resource_id = 0u;
-    bo->gpu_attached_context = 0u;
     (void)sess;
     return true;
 }
@@ -1068,13 +1089,13 @@ static int render_attach_bo_to_context_locked(
     drm_render_session_t *sess, drm_dumb_t *bo,
     const driver_display_t *gpu)
 {
+    uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
     if (sess == NULL || bo == NULL || !bo->used ||
-        bo->gpu_resource_id == 0u || sess->context_id == 0u || gpu == NULL) {
+        resource_id == 0u || sess->context_id == 0u || gpu == NULL) {
         return E_INVAL;
     }
     if (bo->gpu_attached_context == sess->context_id) return 0;
-    if (!gpu->gpu_context_attach_resource(sess->context_id,
-                                          bo->gpu_resource_id)) {
+    if (!gpu->gpu_context_attach_resource(sess->context_id, resource_id)) {
         return E_INVAL;
     }
     bo->gpu_attached_context = sess->context_id;
@@ -1490,7 +1511,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
             spinlock_unlock(&g_lock);
             return E_INVAL;
         }
-        info.res_handle = bo->gpu_resource_id;
+        info.res_handle = render_bo_gpu_resource_id_locked(bo);
         info.size = (uint32_t)bo->size;
         info.blob_mem = 0u;
         spinlock_unlock(&g_lock);
@@ -1593,7 +1614,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = render_dumb_by_handle(sess, transfer.bo_handle);
         if (!sess->used || sess->context_id == 0u || bo == NULL ||
-            bo->gpu_resource_id == 0u ||
+            render_bo_gpu_resource_id_locked(bo) == 0u ||
             (uint64_t)transfer.offset >= bo->size) {
             spinlock_unlock(&g_lock);
             return E_INVAL;
@@ -1601,7 +1622,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         rc = render_attach_bo_to_context_locked(sess, bo, gpu);
         if (rc == 0 &&
             !gpu->gpu_transfer_3d(
-                sess->context_id, bo->gpu_resource_id,
+                sess->context_id, render_bo_gpu_resource_id_locked(bo),
                 nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST,
                 transfer.box.x, transfer.box.y, transfer.box.z,
                 transfer.box.w, transfer.box.h, transfer.box.d,
