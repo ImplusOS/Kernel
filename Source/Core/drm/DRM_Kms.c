@@ -1250,7 +1250,11 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
             copy_to_user((void *)(uintptr_t)v.date, date, dl) != 0u) return E_FAULT;
         if (v.desc && v.desc_len >= sl &&
             copy_to_user((void *)(uintptr_t)v.desc, desc, sl) != 0u) return E_FAULT;
-        v.version_major = 1;
+        /* Mesa virgl uses DRM version 0.1 to opt into sync_file fence-fd
+         * ioctls. This render node completes submissions synchronously but
+         * does not implement sync_file import/export, so advertise 0.0 and
+         * let Mesa use its legacy BO-WAIT fence path. */
+        v.version_major = 0;
         v.version_minor = 0;
         v.version_patchlevel = 0;
         v.name_len = nl;
