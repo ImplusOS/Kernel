@@ -884,7 +884,7 @@ static drm_render_session_t *render_session_for_current(void)
     return created;
 }
 
-static void render_session_release_gpu_locked(drm_render_session_t *sess);
+static bool render_session_release_gpu_locked(drm_render_session_t *sess);
 
 static void render_session_free(drm_render_session_t *s)
 {
@@ -894,7 +894,13 @@ static void render_session_free(drm_render_session_t *s)
         spinlock_unlock(&g_lock);
         return;
     }
-    render_session_release_gpu_locked(s);
+    if (!render_session_release_gpu_locked(s)) {
+        /* Never return guest pages to the allocator while the device may
+         * still DMA to them. Retain this slot as a quarantined session. */
+        s->client_pid = -1;
+        spinlock_unlock(&g_lock);
+        return;
+    }
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
         dumb_release_locked(&s->dumbs[i]);
     }
@@ -941,31 +947,43 @@ static int render_ensure_context(drm_render_session_t *sess)
 
 /* Called with g_lock held. The resource is detached from the owning virgl
  * context before its guest backing is released. */
-static void render_release_gpu_bo_locked(drm_render_session_t *sess,
+static bool render_release_gpu_bo_locked(drm_render_session_t *sess,
                                          drm_dumb_t *bo)
 {
     const driver_display_t *gpu = render_gpu_backend();
-    if (bo == NULL || bo->gpu_resource_id == 0u) return;
+    if (bo == NULL || !bo->used) return true;
+    if (bo->gpu_resource_id == 0u) return true;
+    if (gpu == NULL) return false;
 
-    if (gpu != NULL) {
-        if (bo->gpu_attached_context != 0u) {
-            (void)gpu->gpu_context_detach_resource(
-                bo->gpu_attached_context, bo->gpu_resource_id);
-        }
-        (void)gpu->gpu_resource_detach_backing(bo->gpu_resource_id);
-        (void)gpu->gpu_resource_unref(bo->gpu_resource_id);
+    if (bo->gpu_attached_context != 0u) {
+        (void)gpu->gpu_context_detach_resource(
+            bo->gpu_attached_context, bo->gpu_resource_id);
+    }
+    bool backing_detached =
+        gpu->gpu_resource_detach_backing(bo->gpu_resource_id);
+    bool resource_destroyed =
+        gpu->gpu_resource_unref(bo->gpu_resource_id);
+
+    /* A successful unref destroys the resource and releases its backing.
+     * A successful detach is also sufficient to make guest-page reclamation
+     * safe, even if the subsequent unref must be retried. */
+    if (!backing_detached && !resource_destroyed) {
+        (void)sess;
+        return false;
     }
     bo->gpu_resource_id = 0u;
     bo->gpu_attached_context = 0u;
     (void)sess;
+    return true;
 }
 
 /* Called with g_lock held. */
-static void render_dumb_release_locked(drm_render_session_t *sess,
+static bool render_dumb_release_locked(drm_render_session_t *sess,
                                        drm_dumb_t *bo)
 {
-    render_release_gpu_bo_locked(sess, bo);
+    if (!render_release_gpu_bo_locked(sess, bo)) return false;
     dumb_release_locked(bo);
+    return true;
 }
 
 static uint32_t render_supported_capset_mask(const driver_display_t *gpu)
@@ -997,20 +1015,27 @@ static int render_find_capset(const driver_display_t *gpu, uint32_t capset_id,
     return 0;
 }
 
-static void render_session_release_gpu_locked(drm_render_session_t *sess)
+static bool render_session_release_gpu_locked(drm_render_session_t *sess)
 {
-    if (sess == NULL || !sess->used) return;
+    if (sess == NULL || !sess->used) return true;
+    bool all_resources_released = true;
     for (int i = 0; i < DRM_MAX_DUMB; ++i) {
-        if (sess->dumbs[i].used) {
-            render_release_gpu_bo_locked(sess, &sess->dumbs[i]);
+        if (sess->dumbs[i].used &&
+            !render_release_gpu_bo_locked(sess, &sess->dumbs[i])) {
+            all_resources_released = false;
         }
     }
+    if (!all_resources_released) return false;
+
     const driver_display_t *gpu = render_gpu_backend();
-    if (sess->context_id != 0u && gpu != NULL) {
-        (void)gpu->gpu_context_destroy(sess->context_id);
+    if (sess->context_id != 0u) {
+        if (gpu == NULL || !gpu->gpu_context_destroy(sess->context_id)) {
+            return false;
+        }
     }
     sess->context_id = 0u;
     sess->context_capset_id = 0u;
+    return true;
 }
 
 static int render_attach_bo_to_context_locked(
