@@ -21,6 +21,20 @@ The kernel exposes two distinct roles:
   of the scanout driver. Its sysfs PCI identity and DRM driver name identify the
   VirtIO GPU so libdrm/Mesa can select the `virtio_gpu` winsys.
 
+DevFS publishes the character node with Linux DRM major 226 and minor 128,
+and its `/dev` directory enumeration exposes `dri` as a directory rather than
+a synthetic entry containing a slash. SysFS publishes
+`/sys/dev/char/226:128/uevent`, the PCI identity/driver attributes under
+`device/`, and `device/drm/renderD128`; these are the paths libdrm uses to
+validate the node and map it back to the VirtIO PCI device.
+
+Xorg must use DRI3 for applications to receive this render-node fd. The
+modesetting DDX option is `Option "DRI" "3"`; `Option "DRI3" "true"` is not
+the option name and is ignored. With DRI2, the primary KMS node intentionally
+reports `kms_swrast`, so Mesa loads software rendering for GLX clients even
+though the separate virgl render node exists. DRI3 lets Mesa query the
+render-node's `virtio_gpu` driver name and choose `virtio_gpu_dri.so`.
+
 The render node implements the Linux VirtIO-GPU DRM ioctl subset used by the
 Mesa virgl winsys:
 
@@ -98,10 +112,16 @@ yet been run in this environment. Before enabling this path on a target system:
 3. Provide a compatible Mesa/libdrm runtime, open `/dev/dri/renderD128`, and
    verify capset discovery, context creation, BO map/resource creation,
    execbuffer, transfer, WAIT, and PRIME lifecycle.
-4. Check `glxinfo -B`, a GL conformance sample, and `chrome://gpu`. A browser
-   may still choose software rendering if its own build or policy disables the
-   available GL backend.
-5. On Intel hardware, verify the existing BCS self-tests and CPU fallback. Do
+4. Check `ls -l /dev/dri`, `stat /dev/dri/renderD128`, and
+   `cat /sys/dev/char/226:128/uevent`. On boot the kernel should log
+   `[drm] published ... renderD128 (226:128)`; when Mesa opens the render node
+   it should log `[drm-render] VERSION driver=virtio_gpu version=0.0` and
+   `[drm-render] 3D_FEATURES=1`.
+5. Check `LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu glxinfo -B`,
+   a GL conformance sample, and `chrome://gpu`. The renderer must be virgl,
+   not `llvmpipe`. A browser may still choose software rendering if its own
+   build or policy disables the available GL backend.
+6. On Intel hardware, verify the existing BCS self-tests and CPU fallback. Do
    not interpret successful BLT presentation as Intel 3D acceleration.
 
 A successful boot or framebuffer presentation alone is not evidence of 3D
