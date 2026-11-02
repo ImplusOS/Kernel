@@ -136,6 +136,15 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
             }
         }
 
+        /* Serialize concurrent framebuffer-map calls by threads of the
+         * same process before examining/replacing the CR3-specific cache. */
+        if (slot != NULL && slot->busy) {
+            spinlock_unlock(&g_display_fb_map_lock);
+            irq_restore(irq);
+            hal_cpu_pause();
+            continue;
+        }
+
         if (slot == NULL && free_slot == NULL) {
             /* Recycle records left by processes that have exited. Do not call
              * process_is_alive() while holding this lock: it takes the process
@@ -187,7 +196,6 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
         } else if (slot->cr3 != cr3) {
             /* The process executed a new image; its old mappings were
              * destroyed with the previous address space. */
-            slot->busy = 0u;
             slot->cr3 = cr3;
             slot->user_base = 0u;
             slot->mapped_bytes = 0u;
@@ -195,13 +203,6 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
             newly_allocated_slot = true;
         } else {
             newly_allocated_slot = false;
-        }
-
-        if (slot->busy) {
-            spinlock_unlock(&g_display_fb_map_lock);
-            irq_restore(irq);
-            hal_cpu_pause();
-            continue;
         }
 
         /* The common path: return the exact same user pointer, without any
