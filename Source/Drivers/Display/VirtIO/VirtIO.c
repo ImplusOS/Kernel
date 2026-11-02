@@ -875,6 +875,7 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     vq->resp_buf = (uint8_t *)gpu_dma_alloc(VIRTIO_GPU_RESP_BUF_BYTES,
                                              4096u, &vq->resp_phys);
     if (vq->resp_buf == NULL || vq->resp_phys == 0u) {
+        gpu_dma_free(vq->resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
         gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
         memset(vq, 0, sizeof(*vq));
         return 0;
@@ -884,6 +885,7 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     vq->cmd_buf = (uint8_t *)gpu_dma_alloc(VIRTIO_GPU_CMD_BUF_BYTES,
                                             4096u, &vq->cmd_phys);
     if (vq->cmd_buf == NULL || vq->cmd_phys == 0u) {
+        gpu_dma_free(vq->cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
         gpu_dma_free(vq->resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
         gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
         memset(vq, 0, sizeof(*vq));
