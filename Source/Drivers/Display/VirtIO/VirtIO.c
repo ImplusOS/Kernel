@@ -93,6 +93,7 @@
 /* Mesa virgl capsets are returned as variable-size control-queue payloads;
  * reserve bounded space beyond the fixed EDID response. */
 #define VIRTIO_GPU_RESP_BUF_BYTES (64u * 1024u)
+#define VIRTIO_GPU_CMD_BUF_BYTES  (1024u * 1024u)
 #define VIRTIO_GPU_MAX_CAPSETS 16u
 /* The desktop framebuffer is allocated with headroom so a later mode change
  * usually reuses the same pages instead of moving them under user space. */
@@ -202,11 +203,17 @@ typedef struct {
     uint16_t used_idx_seen;
     volatile uint16_t *notify_addr;
     void *raw_ring;
-    /* Device-writable response buffer owned by the queue. The device must
-     * never be pointed at a caller's stack: a request that completes after the
-     * driver stopped waiting would scribble over whatever reused that frame. */
+    size_t raw_ring_bytes;
+    uint64_t ring_phys;
+    /* DMA-owned command/response staging. A timed-out request may still be
+     * in flight, so these buffers stay owned by the queue until completion is
+     * drained or the device is reset. */
+    uint8_t *cmd_buf;
+    uint32_t cmd_cap;
+    uint64_t cmd_phys;
     uint8_t *resp_buf;
     uint32_t resp_cap;
+    uint64_t resp_phys;
 } virtqueue_t;
 
 typedef struct __attribute__((packed)) {
@@ -807,18 +814,36 @@ static int virtio_pci_device_init(const virtio_gpu_pci_t *gpu, virtio_pci_transp
     return 1;
 }
 
-static void *alloc_aligned(uint32_t size, uint32_t align, void **out_raw) {
-    void *raw = malloc(size + align - 1u);
-    if (!raw) {
-        if (out_raw) *out_raw = NULL;
+/* VirtIO descriptors contain bus/physical addresses, never kernel virtual
+ * addresses. Use the module DMA pool so each region is physically contiguous. */
+static void *gpu_dma_alloc(size_t bytes, size_t alignment, uint64_t *phys_out) {
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api == NULL || g_driver_api->mem.dma_alloc_ex == NULL) {
         return NULL;
     }
-    if (out_raw) *out_raw = raw;
-    uintptr_t aligned = ((uintptr_t)raw + (align - 1u)) & ~(uintptr_t)(align - 1u);
-    return (void *)aligned;
+    return g_driver_api->mem.dma_alloc_ex(bytes, alignment, 0u, phys_out);
+#else
+    (void)alignment;
+    void *ptr = malloc(bytes);
+    if (phys_out != NULL) *phys_out = (uint64_t)(uintptr_t)ptr;
+    return ptr;
+#endif
+}
+
+static void gpu_dma_free(void *ptr, size_t bytes) {
+    if (ptr == NULL) return;
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL && g_driver_api->mem.dma_free != NULL) {
+        g_driver_api->mem.dma_free(ptr, bytes);
+    }
+#else
+    (void)bytes;
+    free(ptr);
+#endif
 }
 
 static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint16_t queue_index) {
+    memset(vq, 0, sizeof(*vq));
     common_write16(t->common_cfg, 22, queue_index);
     uint16_t qsize = common_read16(t->common_cfg, 24);
     if (qsize < 2) {
@@ -831,35 +856,45 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     uint32_t used_bytes = 6u + (uint32_t)qsize * 8u;
     uint32_t total = used_off + used_bytes;
 
-    void *raw_ring = NULL;
-    uint8_t *ring = (uint8_t *)alloc_aligned(total, 4096u, &raw_ring);
-    if (!ring) {
+    uint64_t ring_phys = 0u;
+    uint8_t *ring = (uint8_t *)gpu_dma_alloc(total, 4096u, &ring_phys);
+    if (ring == NULL || ring_phys == 0u) {
+        if (ring != NULL) gpu_dma_free(ring, total);
         return 0;
     }
-    memset(ring, 0, total);
 
     vq->queue_index = queue_index;
     vq->queue_size = qsize;
     vq->desc = (volatile virtq_desc_t *)ring;
     vq->avail = (volatile virtq_avail_t *)(ring + desc_bytes);
     vq->used = (volatile virtq_used_t *)(ring + used_off);
-    vq->avail_idx = 0;
-    vq->used_idx_seen = 0;
-    vq->raw_ring = raw_ring;
+    vq->raw_ring = ring;
+    vq->raw_ring_bytes = total;
+    vq->ring_phys = ring_phys;
 
-    vq->resp_buf = (uint8_t *)malloc(VIRTIO_GPU_RESP_BUF_BYTES);
-    if (vq->resp_buf == NULL) {
-        free(raw_ring);
-        vq->raw_ring = NULL;
+    vq->resp_buf = (uint8_t *)gpu_dma_alloc(VIRTIO_GPU_RESP_BUF_BYTES,
+                                             4096u, &vq->resp_phys);
+    if (vq->resp_buf == NULL || vq->resp_phys == 0u) {
+        gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
+        memset(vq, 0, sizeof(*vq));
         return 0;
     }
-    memset(vq->resp_buf, 0, VIRTIO_GPU_RESP_BUF_BYTES);
     vq->resp_cap = VIRTIO_GPU_RESP_BUF_BYTES;
 
+    vq->cmd_buf = (uint8_t *)gpu_dma_alloc(VIRTIO_GPU_CMD_BUF_BYTES,
+                                            4096u, &vq->cmd_phys);
+    if (vq->cmd_buf == NULL || vq->cmd_phys == 0u) {
+        gpu_dma_free(vq->resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
+        gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
+        memset(vq, 0, sizeof(*vq));
+        return 0;
+    }
+    vq->cmd_cap = VIRTIO_GPU_CMD_BUF_BYTES;
+
     common_write16(t->common_cfg, 26, 0xFFFFu);
-    common_write64(t->common_cfg, 32, (uint64_t)(uintptr_t)vq->desc);
-    common_write64(t->common_cfg, 40, (uint64_t)(uintptr_t)vq->avail);
-    common_write64(t->common_cfg, 48, (uint64_t)(uintptr_t)vq->used);
+    common_write64(t->common_cfg, 32, vq->ring_phys);
+    common_write64(t->common_cfg, 40, vq->ring_phys + desc_bytes);
+    common_write64(t->common_cfg, 48, vq->ring_phys + used_off);
     common_write16(t->common_cfg, 28, 1);
 
     uint16_t notify_off = common_read16(t->common_cfg, 30);
@@ -867,6 +902,10 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
 
     common_write16(t->common_cfg, 22, queue_index);
     if (common_read16(t->common_cfg, 28) == 0) {
+        gpu_dma_free(vq->cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
+        gpu_dma_free(vq->resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
+        gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
+        memset(vq, 0, sizeof(*vq));
         return 0;
     }
 
@@ -905,7 +944,10 @@ static int virtqueue_wait_used(virtqueue_t *vq, uint16_t prev_used)
 static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
                                  void *resp, uint32_t resp_len) {
     if (vq->queue_size < 2 || cmd == NULL || resp == NULL ||
-        vq->resp_buf == NULL || resp_len > vq->resp_cap) {
+        vq->cmd_buf == NULL || vq->resp_buf == NULL ||
+        cmd_len == 0u || cmd_len > vq->cmd_cap ||
+        vq->cmd_phys == 0u || vq->resp_phys == 0u ||
+        resp_len > vq->resp_cap) {
         return 0;
     }
 
@@ -934,13 +976,15 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     vq->used_idx_seen = prev_used;
 
     memset(vq->resp_buf, 0, resp_len);
+    memcpy(vq->cmd_buf, cmd, cmd_len);
+    memory_barrier();
 
-    vq->desc[0].addr = (uint64_t)(uintptr_t)cmd;
+    vq->desc[0].addr = vq->cmd_phys;
     vq->desc[0].len = cmd_len;
     vq->desc[0].flags = VIRTQ_DESC_F_NEXT;
     vq->desc[0].next = 1;
 
-    vq->desc[1].addr = (uint64_t)(uintptr_t)vq->resp_buf;
+    vq->desc[1].addr = vq->resp_phys;
     vq->desc[1].len = resp_len;
     vq->desc[1].flags = VIRTQ_DESC_F_WRITE;
     vq->desc[1].next = 0;
@@ -1963,14 +2007,10 @@ bool virtio_gpu_init(void) {
     vlog_done();
 
     g_gpu_ready = 0;
-    if (g_gpu_controlq.raw_ring != NULL) {
-        free(g_gpu_controlq.raw_ring);
-        g_gpu_controlq.raw_ring = NULL;
-    }
-    if (g_gpu_controlq.resp_buf != NULL) {
-        free(g_gpu_controlq.resp_buf);
-        g_gpu_controlq.resp_buf = NULL;
-    }
+    gpu_dma_free(g_gpu_controlq.cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
+    gpu_dma_free(g_gpu_controlq.resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
+    gpu_dma_free(g_gpu_controlq.raw_ring, g_gpu_controlq.raw_ring_bytes);
+    memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
     virtio_gpu_release_resources();
     memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
     memset(&g_gpu_transport, 0, sizeof(g_gpu_transport));
@@ -2056,14 +2096,10 @@ bool virtio_gpu_init(void) {
     if (!layout_ok && !virtio_gpu_apply_fallback_layout(1024u, 768u)) {
         vlog("[vgpu] layout failed\n");
         vlog_done();
-        if (g_gpu_controlq.raw_ring != NULL) {
-            free(g_gpu_controlq.raw_ring);
-            g_gpu_controlq.raw_ring = NULL;
-        }
-        if (g_gpu_controlq.resp_buf != NULL) {
-            free(g_gpu_controlq.resp_buf);
-            g_gpu_controlq.resp_buf = NULL;
-        }
+        gpu_dma_free(g_gpu_controlq.cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
+        gpu_dma_free(g_gpu_controlq.resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
+        gpu_dma_free(g_gpu_controlq.raw_ring, g_gpu_controlq.raw_ring_bytes);
+        memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
         g_gpu_fb_capacity = 0u;
         return false;
     }
@@ -2582,10 +2618,10 @@ static const driver_display_t g_virtio_display_driver = {
 static void virtio_gpu_driver_shutdown(void)
 {
     virtio_gpu_release_resources();
-    if (g_gpu_controlq.raw_ring != NULL) {
-        free(g_gpu_controlq.raw_ring);
-        g_gpu_controlq.raw_ring = NULL;
-    }
+    gpu_dma_free(g_gpu_controlq.cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
+    gpu_dma_free(g_gpu_controlq.resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
+    gpu_dma_free(g_gpu_controlq.raw_ring, g_gpu_controlq.raw_ring_bytes);
+    memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
     g_gpu_ready = 0;
     memset(&g_gpu_transport, 0, sizeof(g_gpu_transport));
     g_driver_api = NULL;
@@ -2613,8 +2649,10 @@ static const driver_module_descriptor_t g_virtio_display_module = {
 
 const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api) {
     if (!api ||
-        !api->malloc || !api->free || !api->pci_read_config ||
-        !api->pci_write_config || !api->map_mmio_virt) {
+        !api->malloc || !api->free ||
+        !api->mem.dma_alloc_ex || !api->mem.dma_free ||
+        !api->pci_read_config || !api->pci_write_config ||
+        !api->map_mmio_virt) {
         return NULL;
     }
 
