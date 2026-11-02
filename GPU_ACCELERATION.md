@@ -129,5 +129,23 @@ yet been run in this environment. Before enabling this path on a target system:
 6. On Intel hardware, verify the existing BCS self-tests and CPU fallback. Do
    not interpret successful BLT presentation as Intel 3D acceleration.
 
+### Desktop framebuffer and shell diagnostics
+
+The framebuffer syscall now keeps one mapping per process address space and
+returns the same user pointer on repeated calls. This prevents every redraw
+from allocating another 1.2 MiB framebuffer VA range and another set of page
+tables. The cache is keyed by PID and CR3, validates the cached first-page
+physical mapping before reuse, and recycles entries belonging to exited
+processes. Per-frame display and VirtIO serial diagnostics are rate-limited.
+
+The uploaded boot trace also contained repeated `/bin/busybox` exec failures
+with `elf_err=paging map failed` and exit status 127. That failure is in the
+ELF PT_LOAD page-mapping path, not proof that `ls` or `rm` applets are
+missing. The kernel now logs the failing ELF segment range, requested mapping
+flags, remaining free pages, and whether the lower-level failure came from
+physical-page allocation, identity-page reservation, or a leaf PTE map. Use
+those messages on the next boot to distinguish address-space leakage from
+physical-page exhaustion or a page-table mapping error.
+
 A successful boot or framebuffer presentation alone is not evidence of 3D
 acceleration.
