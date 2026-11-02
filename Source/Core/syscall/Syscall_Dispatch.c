@@ -136,13 +136,49 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
             }
         }
 
-        if (slot == NULL) {
-            slot = free_slot;
-            if (slot == NULL) {
+        if (slot == NULL && free_slot == NULL) {
+            /* Recycle records left by processes that have exited. Do not call
+             * process_is_alive() while holding this lock: it takes the process
+             * table lock and would invert the teardown lock order. */
+            spinlock_unlock(&g_display_fb_map_lock);
+            irq_restore(irq);
+
+            bool reclaimed = false;
+            for (uint32_t i = 0u; i < OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+                int32_t stale_pid = -1;
+                uint64_t snapshot_irq = irq_save_disable();
+                spinlock_lock(&g_display_fb_map_lock);
+                syscall_display_fb_map_t *candidate = &g_display_fb_maps[i];
+                if (candidate->used && !candidate->busy &&
+                    candidate->pid != pid) {
+                    stale_pid = candidate->pid;
+                }
                 spinlock_unlock(&g_display_fb_map_lock);
-                irq_restore(irq);
+                irq_restore(snapshot_irq);
+
+                if (stale_pid < 0 || process_is_alive(stale_pid)) {
+                    continue;
+                }
+
+                snapshot_irq = irq_save_disable();
+                spinlock_lock(&g_display_fb_map_lock);
+                if (candidate->used && !candidate->busy &&
+                    candidate->pid == stale_pid) {
+                    memset(candidate, 0, sizeof(*candidate));
+                    reclaimed = true;
+                }
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(snapshot_irq);
+                if (reclaimed) break;
+            }
+            if (!reclaimed) {
                 return false;
             }
+            continue;
+        }
+
+        if (slot == NULL) {
+            slot = free_slot;
             memset(slot, 0, sizeof(*slot));
             slot->used = 1u;
             slot->pid = pid;
@@ -173,10 +209,19 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
         if (slot->user_base != 0u &&
             slot->kernel_base == aligned_kernel &&
             slot->mapped_bytes >= map_bytes) {
-            *user_fb_out = slot->user_base + page_offset;
-            spinlock_unlock(&g_display_fb_map_lock);
-            irq_restore(irq);
-            return true;
+            /* PIDs are reused. Validate the cached first PTE as well as the
+             * CR3 value before returning a mapping left by an older process
+             * that happened to receive the same CR3 page-table frame. */
+            uint64_t expected_phys =
+                paging_virt_to_phys(paging_get_kernel_cr3(), aligned_kernel);
+            uint64_t actual_phys = paging_virt_to_phys(cr3, slot->user_base);
+            if (expected_phys != 0u && actual_phys == expected_phys) {
+                *user_fb_out = slot->user_base + page_offset;
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(irq);
+                return true;
+            }
+            /* Stale/dead address space: remap the cached VA below. */
         }
 
         if (slot->user_base == 0u || slot->mapped_bytes < map_bytes) {
