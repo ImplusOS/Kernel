@@ -56,9 +56,18 @@ The following features are not implemented and are not advertised as available:
 
 Mesa Vulkan/Venus and gfxstream paths that require blob resources or multiple
 rings are outside this implementation. The target here is Mesa's virgl OpenGL
-winsys. The Mesa source/binaries themselves are not vendored by this change;
-the OS must provide a compatible Mesa build with the `virtio_gpu` DRI driver
-and the corresponding libdrm runtime.
+winsys. The OS runtime stages Debian's `libgl1-mesa-dri` DRI modules,
+including `virtio_gpu_dri.so` when supplied by the pinned package, as well as
+the `libdrm.so.2` runtime dependency. The stage script reports a warning if
+the virgl DRI module is absent; software `swrast_dri.so` remains available as
+the fallback. Mesa's normal device discovery uses the render-node driver name
+and PCI identity. For diagnosis only, a process can be launched with
+`LIBGL_DEBUG=verbose MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`; do not force
+this override on machines where the VirtIO 3D backend is unavailable.
+
+The Mesa source/binaries themselves are not vendored by this change. The
+pinned Debian Mesa package provides the userspace virgl implementation; the
+kernel implements the matching legacy VirtIO-GPU DRM ABI subset.
 
 ## Intel Gen9 / Gen9.5
 
