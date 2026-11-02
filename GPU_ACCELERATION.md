@@ -28,12 +28,17 @@ a synthetic entry containing a slash. SysFS publishes
 `device/`, and `device/drm/renderD128`; these are the paths libdrm uses to
 validate the node and map it back to the VirtIO PCI device.
 
-Xorg must use DRI3 for applications to receive this render-node fd. The
-modesetting DDX option is `Option "DRI" "3"`; `Option "DRI3" "true"` is not
-the option name and is ignored. With DRI2, the primary KMS node intentionally
-reports `kms_swrast`, so Mesa loads software rendering for GLX clients even
-though the separate virgl render node exists. DRI3 lets Mesa query the
-render-node's `virtio_gpu` driver name and choose `virtio_gpu_dri.so`.
+The Xorg log shows that the DRI3 extension is initialized. The
+modesetting DDX's supported `PageFlip` option enables DRI3 page flipping and
+defaults to on; the generated Xorg configuration keeps it enabled. The old
+`Option "DRI3" "true"` entry was not a valid modesetting-driver option and
+has been removed. The Xorg `[DRI2] ... kms_swrast` AIGLX provider line alone
+does not prove which renderer a DRI3 client receives. For DRI3 clients, Xorg
+uses libdrm to map the KMS fd to its associated render node. The published
+`/sys/dev/char/226:0/device/drm` and
+`/sys/dev/char/226:128/device/drm` entries expose that association; Mesa
+then queries the render node's `virtio_gpu` driver name and selects
+`virtio_gpu_dri.so`.
 
 The render node implements the Linux VirtIO-GPU DRM ioctl subset used by the
 Mesa virgl winsys:
