@@ -426,7 +426,7 @@ typedef struct {
 } virtio_gpu_monitor_t;
 
 #ifdef IMPLUS_DRIVER_MODULE
-static uint32_t g_vlog_budget = 140u;
+static uint32_t g_vlog_budget = 16u;
 
 static void vlog(const char *s) {
     if (g_vlog_budget != 0u && g_driver_api != NULL &&
