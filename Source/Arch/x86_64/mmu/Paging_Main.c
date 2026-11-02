@@ -2382,6 +2382,15 @@ int paging_map_user_range_alloc(uint64_t cr3,
                 }
                 if (identity_phys == (addr & PAGE_MASK)) {
                     if (pmm_reserve_free_page(identity_phys) < 0) {
+                        serial_write_string("[pagemap] reserve failed cr3=");
+                        serial_write_uint64(cr3);
+                        serial_write_string(" vaddr=");
+                        serial_write_uint64(addr);
+                        serial_write_string(" phys=");
+                        serial_write_uint64(identity_phys);
+                        serial_write_string(" free_pages=");
+                        serial_write_uint64(memory_free_pages());
+                        serial_write_char('\n');
                         return -1;
                     }
                     phys_page = (void *)(uintptr_t)identity_phys;
@@ -2392,15 +2401,36 @@ int paging_map_user_range_alloc(uint64_t cr3,
             phys_page = alloc_page();
         }
         if (phys_page == NULL) {
+            serial_write_string("[pagemap] alloc_page failed cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string(" vaddr=");
+            serial_write_uint64(addr);
+            serial_write_string(" flags=");
+            serial_write_uint64(flags);
+            serial_write_string(" free_pages=");
+            serial_write_uint64(memory_free_pages());
+            serial_write_char('\n');
             return -1;
         }
 
         memset(phys_page, 0, PAGE_SIZE_BYTES);
 
-        if (paging_map_user_page(cr3,
-                                 addr,
-                                 (uint64_t)(uintptr_t)phys_page,
-                                 flags) < 0) {
+        int map_rc = paging_map_user_page(cr3,
+                                          addr,
+                                          (uint64_t)(uintptr_t)phys_page,
+                                          flags);
+        if (map_rc < 0) {
+            serial_write_string("[pagemap] map leaf failed cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string(" vaddr=");
+            serial_write_uint64(addr);
+            serial_write_string(" phys=");
+            serial_write_uint64((uint64_t)(uintptr_t)phys_page);
+            serial_write_string(" rc=");
+            serial_write_uint64((uint64_t)(int64_t)map_rc);
+            serial_write_string(" free_pages=");
+            serial_write_uint64(memory_free_pages());
+            serial_write_char('\n');
             free_page(phys_page);
             return -1;
         }
