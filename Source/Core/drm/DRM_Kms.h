@@ -2,12 +2,13 @@
 #include <stdint.h>
 
 /*
- * DRM_Kms — minimal Linux DRM/KMS emulation for an unmodified Xorg
- * "modesetting" DDX + Mesa software GL (llvmpipe / kms_swrast), exposed at
- * /dev/dri/card0. Unlike the older native-ABI DRM_Client.c this speaks the
- * real Linux ioctl ABI: _IOC-encoded request numbers and <drm/drm_mode.h>
- * struct layouts. One CRTC / one connector / one encoder, single dumb-buffer
- * scanout that is blitted to display_get_framebuffer() on PAGE_FLIP/DIRTYFB.
+ * DRM_Kms — Linux DRM/KMS emulation for Xorg's "modesetting" DDX and a
+ * separate VirtIO-GPU virgl render node. card0 exposes one CRTC / connector /
+ * encoder and dumb-buffer scanout blitted to display_get_framebuffer().
+ * renderD128 exposes the Linux VirtIO-GPU UAPI subset used by Mesa's virgl
+ * Gallium winsys: context init, capsets, resources, execbuffer, transfers,
+ * BO mapping/WAIT, and PRIME sharing. It intentionally does not claim blob,
+ * syncobj, or sync_file fence-FD support.
  * See Docs/Others/TODO_Doom_Xorg_MethodA.md M3.
  *
  * Entry points are called from the devfs /dev/dri/card0 node (Kernel/Core/vfs/
@@ -15,9 +16,10 @@
  *
  * Two device nodes are exposed:
  *   /dev/dri/card0      — full KMS: modeset, scanout, atomic, prime
- *   /dev/dri/renderD128 — render-only: GEM buffers, prime import/export,
- *                         syncobj. NO modesetting, no scanout, no CRTC.
- *   Mesa opens the render node for GL contexts; Xorg opens card0 for display.
+ *   /dev/dri/renderD128 — render-only: VirtIO virgl GEM resources, exec,
+ *                         transfer, mmap, WAIT, and PRIME. No modesetting,
+ *                         scanout, syncobj, or sync_file fence-FD support.
+ *   Mesa opens renderD128 for GL contexts; Xorg opens card0 for display.
  */
 
 void    drm_kms_init(void);
@@ -42,9 +44,9 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
 void    drm_kms_close(void);
 
 /* ---- renderD128 (render-only) ----------------------------------------- */
-/* Separate namespace: GEM handles, dumb buffers, prime fds, syncobj.
- * Rejects all modeset ioctls (SETCRTC, PAGE_FLIP, ATOMIC, SETPLANE).
- * Returns 0 / >=0 on success, -errno on failure. */
+/* Separate namespace: GEM buffers, VirtIO virgl resources, exec/transfer,
+ * and PRIME descriptors. Rejects modeset ioctls. Unsupported blob, syncobj,
+ * and sync_file fence-FD paths return errors rather than being advertised. */
 int64_t drm_render_ioctl(uint64_t request, uint64_t arg);
 
 /* read(2) on render fd: no events on render node, always EAGAIN. */

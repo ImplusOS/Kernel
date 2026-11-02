@@ -67,6 +67,235 @@ typedef struct __attribute__((packed)) {
 
 static int32_t g_audio_owner_pid = -1;
 
+/* SYSCALL_GET_DISPLAY_FRAMEBUFFER is called by the compositor and X clients
+ * during normal redraws. Mapping the same physical framebuffer at a fresh
+ * user VA on every call consumed virtual address space and page tables until
+ * later execve() operations began failing their PT_LOAD mappings.
+ *
+ * Cache one mapping per process address space. A PID survives execve(), but
+ * the CR3 changes; that case gets a fresh VA because the old address space has
+ * already been torn down. When the physical framebuffer pointer changes while
+ * the CR3 stays the same, remap the cached VA instead of leaking another one. */
+typedef struct {
+    uint8_t used;
+    uint8_t busy;
+    uint8_t reserved[6];
+    int32_t pid;
+    uint64_t cr3;
+    uint64_t user_base;
+    uint64_t mapped_bytes;
+    uint64_t kernel_base;
+} syscall_display_fb_map_t;
+
+static syscall_display_fb_map_t
+    g_display_fb_maps[OS_CONFIG_PROCESS_MAX_COUNT];
+static spinlock_t g_display_fb_map_lock;
+static uint64_t g_display_fb_next_user = 0x0000004800000000ULL;
+
+static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
+                                   uint64_t cr3, uint64_t *user_fb_out)
+{
+    if (kernel_fb == NULL || size == 0u || cr3 == 0u ||
+        user_fb_out == NULL) {
+        return false;
+    }
+
+    int32_t pid = process_get_current_pid();
+    if (pid < 0) {
+        return false;
+    }
+
+    uint64_t kernel_start = (uint64_t)(uintptr_t)kernel_fb;
+    uint64_t aligned_kernel = kernel_start & ~4095ULL;
+    uint64_t aligned_end = (kernel_start + size + 4095ULL) & ~4095ULL;
+    if (aligned_end <= aligned_kernel) {
+        return false;
+    }
+    uint64_t map_bytes = aligned_end - aligned_kernel;
+    uint64_t page_count = map_bytes / 4096ULL;
+    uint64_t page_offset = kernel_start & 4095ULL;
+
+    syscall_display_fb_map_t *slot = NULL;
+    uint64_t user_base = 0u;
+    bool newly_allocated_slot = false;
+
+    for (;;) {
+        uint64_t irq = irq_save_disable();
+        spinlock_lock(&g_display_fb_map_lock);
+
+        slot = NULL;
+        syscall_display_fb_map_t *free_slot = NULL;
+        for (uint32_t i = 0u; i < OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+            syscall_display_fb_map_t *candidate = &g_display_fb_maps[i];
+            if (candidate->used && candidate->pid == pid) {
+                slot = candidate;
+                break;
+            }
+            if (!candidate->used && free_slot == NULL) {
+                free_slot = candidate;
+            }
+        }
+
+        /* Serialize concurrent framebuffer-map calls by threads of the
+         * same process before examining/replacing the CR3-specific cache. */
+        if (slot != NULL && slot->busy) {
+            spinlock_unlock(&g_display_fb_map_lock);
+            irq_restore(irq);
+            hal_cpu_pause();
+            continue;
+        }
+
+        if (slot == NULL && free_slot == NULL) {
+            /* Recycle records left by processes that have exited. Do not call
+             * process_is_alive() while holding this lock: it takes the process
+             * table lock and would invert the teardown lock order. */
+            spinlock_unlock(&g_display_fb_map_lock);
+            irq_restore(irq);
+
+            bool reclaimed = false;
+            for (uint32_t i = 0u; i < OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+                int32_t stale_pid = -1;
+                uint64_t snapshot_irq = irq_save_disable();
+                spinlock_lock(&g_display_fb_map_lock);
+                syscall_display_fb_map_t *candidate = &g_display_fb_maps[i];
+                if (candidate->used && !candidate->busy &&
+                    candidate->pid != pid) {
+                    stale_pid = candidate->pid;
+                }
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(snapshot_irq);
+
+                if (stale_pid < 0 || process_is_alive(stale_pid)) {
+                    continue;
+                }
+
+                snapshot_irq = irq_save_disable();
+                spinlock_lock(&g_display_fb_map_lock);
+                if (candidate->used && !candidate->busy &&
+                    candidate->pid == stale_pid) {
+                    memset(candidate, 0, sizeof(*candidate));
+                    reclaimed = true;
+                }
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(snapshot_irq);
+                if (reclaimed) break;
+            }
+            if (!reclaimed) {
+                return false;
+            }
+            continue;
+        }
+
+        if (slot == NULL) {
+            slot = free_slot;
+            memset(slot, 0, sizeof(*slot));
+            slot->used = 1u;
+            slot->pid = pid;
+            slot->cr3 = cr3;
+            newly_allocated_slot = true;
+        } else if (slot->cr3 != cr3) {
+            /* The process executed a new image; its old mappings were
+             * destroyed with the previous address space. */
+            slot->cr3 = cr3;
+            slot->user_base = 0u;
+            slot->mapped_bytes = 0u;
+            slot->kernel_base = 0u;
+            newly_allocated_slot = true;
+        } else {
+            newly_allocated_slot = false;
+        }
+
+        /* The common path: return the exact same user pointer, without any
+         * page-table work, when the framebuffer backing has not moved. */
+        if (slot->user_base != 0u &&
+            slot->kernel_base == aligned_kernel &&
+            slot->mapped_bytes >= map_bytes) {
+            /* PIDs are reused. Validate the cached first PTE as well as the
+             * CR3 value before returning a mapping left by an older process
+             * that happened to receive the same CR3 page-table frame. */
+            uint64_t expected_phys =
+                paging_virt_to_phys(paging_get_kernel_cr3(), aligned_kernel);
+            uint64_t actual_phys = paging_virt_to_phys(cr3, slot->user_base);
+            if (expected_phys != 0u && actual_phys == expected_phys) {
+                *user_fb_out = slot->user_base + page_offset;
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(irq);
+                return true;
+            }
+            /* Stale/dead address space: remap the cached VA below. */
+        }
+
+        if (slot->user_base == 0u || slot->mapped_bytes < map_bytes) {
+            if (g_display_fb_next_user > UINT64_MAX - map_bytes) {
+                if (newly_allocated_slot) {
+                    memset(slot, 0, sizeof(*slot));
+                }
+                spinlock_unlock(&g_display_fb_map_lock);
+                irq_restore(irq);
+                return false;
+            }
+            /* Preserve the existing first allocation convention: advance
+             * before returning so the guard/stack boundary at 0x4800000000
+             * is not used as the framebuffer mapping itself. */
+            user_base = g_display_fb_next_user + map_bytes;
+            g_display_fb_next_user = user_base;
+            slot->user_base = user_base;
+            slot->mapped_bytes = map_bytes;
+        } else {
+            /* Same-sized or smaller replacement framebuffer: keep the
+             * process's stable VA and replace only the external PTEs. */
+            user_base = slot->user_base;
+        }
+        slot->busy = 1u;
+        spinlock_unlock(&g_display_fb_map_lock);
+        irq_restore(irq);
+        break;
+    }
+
+    bool ok = true;
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    for (uint64_t i = 0u; i < page_count; ++i) {
+        uint64_t kernel_page = aligned_kernel + i * 4096ULL;
+        uint64_t phys_page = paging_virt_to_phys(kernel_cr3, kernel_page);
+        if (phys_page == 0u ||
+            paging_map_user_page(cr3, user_base + i * 4096ULL,
+                                 phys_page,
+                                 PAGE_RW | PAGE_USER | PAGE_EXTERNAL) < 0) {
+            ok = false;
+            break;
+        }
+    }
+
+    {
+        uint64_t irq = irq_save_disable();
+        spinlock_lock(&g_display_fb_map_lock);
+        if (ok) {
+            slot->kernel_base = aligned_kernel;
+            if (slot->mapped_bytes < map_bytes) {
+                slot->mapped_bytes = map_bytes;
+            }
+        } else {
+            /* A partial mapping cannot safely be handed to user space. The
+             * next call retries with a fresh range rather than returning it. */
+            slot->user_base = 0u;
+            slot->mapped_bytes = 0u;
+            slot->kernel_base = 0u;
+            if (newly_allocated_slot) {
+                memset(slot, 0, sizeof(*slot));
+            }
+        }
+        slot->busy = 0u;
+        spinlock_unlock(&g_display_fb_map_lock);
+        irq_restore(irq);
+    }
+
+    if (!ok) {
+        return false;
+    }
+    *user_fb_out = user_base + page_offset;
+    return true;
+}
+
 extern int32_t kernel_boot_profile_count(void);
 extern int32_t kernel_boot_profile_get(int32_t index,
                                        boot_profile_entry_t *entry_out);
@@ -1336,68 +1565,25 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                 mode_info.stride >= w) {
                 stride = mode_info.stride;
             }
-            uint64_t size = (uint64_t)stride * (uint64_t)h * 4ULL;
-            
-            static uint64_t g_fb_virt_next = 0x0000004800000000ULL;
-            uint64_t user_virt = __atomic_add_fetch(&g_fb_virt_next, 
-                (size + 4095ULL) & ~4095ULL, __ATOMIC_RELAXED);
-            
-            uint64_t start_virt = (uint64_t)(uintptr_t)ptr;
-            uint64_t aligned_start_virt = start_virt & ~4095ULL;
-            uint64_t aligned_end_virt = (start_virt + size + 4095ULL) & ~4095ULL;
-            uint64_t num_pages = (aligned_end_virt - aligned_start_virt) / 4096ULL;
-
-            static uint32_t g_fbsys_log_budget = 40u;
-            bool fbsys_log = g_fbsys_log_budget != 0u;
-            if (fbsys_log) {
-                --g_fbsys_log_budget;
-                serial_write_string("[fbsys] ptr=");
-                serial_write_uint64((uint64_t)(uintptr_t)ptr);
-                serial_write_string(" w=");
-                serial_write_uint64(w);
-                serial_write_string(" h=");
-                serial_write_uint64(h);
-                serial_write_string(" stride=");
-                serial_write_uint64(stride);
-                serial_write_string(" size=");
-                serial_write_uint64(size);
-                serial_write_string(" pages=");
-                serial_write_uint64(num_pages);
-                serial_write_string(" user=");
-                serial_write_uint64(user_virt);
-                serial_write_string("\n");
-            }
-
-            int res = 0;
-            for (uint64_t i = 0; i < num_pages; ++i) {
-                uint64_t kvirt = aligned_start_virt + i * 4096ULL;
-
-                uint64_t phys_page = paging_virt_to_phys(paging_get_kernel_cr3(), kvirt);
-                if (phys_page == 0) {
-                    res = -1;
-                    break;
-                }
-                
-                uint64_t virt_page = user_virt + i * 4096ULL;
-
-                if (paging_map_user_page(cr3, virt_page, phys_page, PAGE_RW | PAGE_USER | PAGE_EXTERNAL) < 0) {
-                    res = -1;
-                    break;
-                }
-            }
-            if (res < 0) {
-                if (fbsys_log) {
-                    serial_write_string("[fbsys] FAIL at page\n");
-                }
+            if (stride == 0u || h == 0u ||
+                (uint64_t)stride > UINT64_MAX / ((uint64_t)h * 4ULL)) {
                 set_syscall_result(saved_rsp, 0);
-            } else {
-                if (fbsys_log) {
-                    serial_write_string("[fbsys] ok ret=");
-                    serial_write_uint64(user_virt + (start_virt & 4095ULL));
-                    serial_write_string("\n");
-                }
-                set_syscall_result(saved_rsp, user_virt + (start_virt & 4095ULL));
+                break;
             }
+            uint64_t size = (uint64_t)stride * (uint64_t)h * 4ULL;
+            uint64_t user_fb = 0u;
+            if (!syscall_display_fb_map(ptr, size, cr3, &user_fb)) {
+                serial_write_string("[fbsys] cached map failed pid=");
+                serial_write_uint64((uint64_t)process_get_current_pid());
+                serial_write_string(" cr3=");
+                serial_write_uint64(cr3);
+                serial_write_string(" bytes=");
+                serial_write_uint64(size);
+                serial_write_char('\n');
+                set_syscall_result(saved_rsp, 0);
+                break;
+            }
+            set_syscall_result(saved_rsp, user_fb);
             break;
         }
 

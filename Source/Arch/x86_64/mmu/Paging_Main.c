@@ -2176,9 +2176,12 @@ static int paging_map_user_page_locked(uint64_t cr3,
     }
 
     uint64_t old_pte = pt[i1];
-    /* A low identity page may only become user-accessible when that exact
-     * physical frame is the newly allocated backing page. This keeps the
-     * process's kernel identity pointers mapped to the same frame. */
+    /* Most low identity mappings must remain the same physical frame in
+     * every process: kernel code uses those virtual addresses as its direct
+     * physical-memory pointers. The one exception is the reserved legacy
+     * ET_EXEC window. Its physical frames are withheld from the allocator
+     * before heap init, so no kernel object can live behind an address that a
+     * fixed-address executable needs to shadow with private process pages. */
     if ((old_pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT) {
         uint64_t old_phys = old_pte & PAGE_FRAME_MASK;
         int can_map_identity_frame =
@@ -2187,7 +2190,14 @@ static int paging_map_user_page_locked(uint64_t cr3,
             old_phys == (virt_addr & PAGE_MASK) &&
             (phys_addr & PAGE_FRAME_MASK) == old_phys &&
             pmm_page_is_allocated(old_phys) == 1;
-        if (can_map_identity_frame == 0) {
+        int can_shadow_legacy_et_exec =
+            cr3 != kernel_cr3 && space != NULL &&
+            virt_addr >= PAGING_LEGACY_ET_EXEC_BASE &&
+            virt_addr < PAGING_LEGACY_ET_EXEC_LIMIT &&
+            old_phys == (virt_addr & PAGE_MASK) &&
+            pmm_page_is_allocated(old_phys) == 1;
+        if (can_map_identity_frame == 0 &&
+            can_shadow_legacy_et_exec == 0) {
 #if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
             static volatile uint32_t identity_failures;
             if (__atomic_fetch_add(&identity_failures, 1u,
@@ -2381,10 +2391,35 @@ int paging_map_user_range_alloc(uint64_t cr3,
                         (addr & (MB2 - 1ULL));
                 }
                 if (identity_phys == (addr & PAGE_MASK)) {
-                    if (pmm_reserve_free_page(identity_phys) < 0) {
-                        return -1;
+                    if (addr >= PAGING_LEGACY_ET_EXEC_BASE &&
+                        addr < PAGING_LEGACY_ET_EXEC_LIMIT) {
+                        /* This physical window was reserved before the
+                         * kernel heap was created. Do not use the identity
+                         * frame as userspace backing: allocate a private page
+                         * and let the leaf mapper shadow this reserved VA in
+                         * this process only. */
+                    } else {
+                        /* Outside the dedicated legacy ET_EXEC window, the
+                         * kernel's direct-map pointer must keep its identity
+                         * translation. Reuse the exact frame only when it is
+                         * free and can be claimed atomically. */
+                        if (pmm_reserve_free_page(identity_phys) < 0) {
+                            serial_write_string("[pagemap] identity frame busy cr3=");
+                            serial_write_uint64(cr3);
+                            serial_write_string(" vaddr=");
+                            serial_write_uint64(addr);
+                            serial_write_string(" phys=");
+                            serial_write_uint64(identity_phys);
+                            serial_write_string(" state=");
+                            serial_write_uint64((uint64_t)(int64_t)
+                                                pmm_page_is_allocated(identity_phys));
+                            serial_write_string(" free_pages=");
+                            serial_write_uint64(memory_free_pages());
+                            serial_write_char('\n');
+                            return -1;
+                        }
+                        phys_page = (void *)(uintptr_t)identity_phys;
                     }
-                    phys_page = (void *)(uintptr_t)identity_phys;
                 }
             }
         }
@@ -2392,15 +2427,36 @@ int paging_map_user_range_alloc(uint64_t cr3,
             phys_page = alloc_page();
         }
         if (phys_page == NULL) {
+            serial_write_string("[pagemap] alloc_page failed cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string(" vaddr=");
+            serial_write_uint64(addr);
+            serial_write_string(" flags=");
+            serial_write_uint64(flags);
+            serial_write_string(" free_pages=");
+            serial_write_uint64(memory_free_pages());
+            serial_write_char('\n');
             return -1;
         }
 
         memset(phys_page, 0, PAGE_SIZE_BYTES);
 
-        if (paging_map_user_page(cr3,
-                                 addr,
-                                 (uint64_t)(uintptr_t)phys_page,
-                                 flags) < 0) {
+        int map_rc = paging_map_user_page(cr3,
+                                          addr,
+                                          (uint64_t)(uintptr_t)phys_page,
+                                          flags);
+        if (map_rc < 0) {
+            serial_write_string("[pagemap] map leaf failed cr3=");
+            serial_write_uint64(cr3);
+            serial_write_string(" vaddr=");
+            serial_write_uint64(addr);
+            serial_write_string(" phys=");
+            serial_write_uint64((uint64_t)(uintptr_t)phys_page);
+            serial_write_string(" rc=");
+            serial_write_uint64((uint64_t)(int64_t)map_rc);
+            serial_write_string(" free_pages=");
+            serial_write_uint64(memory_free_pages());
+            serial_write_char('\n');
             free_page(phys_page);
             return -1;
         }

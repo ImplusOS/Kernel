@@ -229,6 +229,25 @@ const char *elf_loader_last_error(void)
 
 #define ELF_SET_ERROR(msg) do { g_last_elf_error = (msg); } while(0)
 
+static void elf_log_page_map_failure(uint64_t cr3, uint64_t start,
+                                     uint64_t size, uint64_t flags,
+                                     const char *stage)
+{
+    serial_write_string("[elfmap] failed stage=");
+    serial_write_string(stage);
+    serial_write_string(" cr3=");
+    serial_write_uint64(cr3);
+    serial_write_string(" start=");
+    serial_write_uint64(start);
+    serial_write_string(" size=");
+    serial_write_uint64(size);
+    serial_write_string(" flags=");
+    serial_write_uint64(flags);
+    serial_write_string(" free_pages=");
+    serial_write_uint64(memory_free_pages());
+    serial_write_char('\n');
+}
+
 static bool resolve_kernel_symbol(const char *name, uint64_t *addr_out)
 {
     if (name == NULL || addr_out == NULL) {
@@ -1391,7 +1410,9 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             uint64_t eager_start = align_up_u64(seg_vaddr, ELF_PAGE_SIZE);
             if (eager_start > seg_page &&
                 !ensure_user_page_alloc(target_cr3, seg_page, seg_flags)) {
-                ELF_SET_ERROR("paging map failed");
+                elf_log_page_map_failure(target_cr3, seg_page, ELF_PAGE_SIZE,
+                                          seg_flags, "demand-head");
+                ELF_SET_ERROR("paging map failed (demand head)");
                 goto fail;
             }
             uint64_t initial_size = eager_start - seg_vaddr;
@@ -1443,7 +1464,10 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                 if (paging_map_user_range_alloc(target_cr3, eager_tail,
                                                 eager_end - eager_tail,
                                                 seg_flags) < 0) {
-                    ELF_SET_ERROR("paging map failed");
+                    elf_log_page_map_failure(target_cr3, eager_tail,
+                                             eager_end - eager_tail,
+                                             seg_flags, "demand-tail");
+                    ELF_SET_ERROR("paging map failed (demand tail)");
                     goto fail;
                 }
                 stats->map_ns += timer_monotonic_ns() - map_started;
@@ -1492,7 +1516,10 @@ static bool elf_load_image_biased(uint64_t target_cr3,
                                             seg_vaddr,
                                             ph->p_memsz,
                                             seg_flags) < 0) {
-                ELF_SET_ERROR("paging map failed");
+                elf_log_page_map_failure(target_cr3, seg_vaddr,
+                                          ph->p_memsz, seg_flags,
+                                          "load-segment");
+                ELF_SET_ERROR("paging map failed (load segment)");
                 goto fail;
             }
             stats->map_ns += timer_monotonic_ns() - t;

@@ -23,6 +23,14 @@
 #define PAGE_MASK 0xFFFFFFFFFFFFF000ULL
 #define PAGE_FRAME_MASK 0x000FFFFFFFFFF000ULL
 
+/* The x86_64 kernel is linked at 0x01800000, while fixed-address static
+ * Linux ET_EXEC binaries such as BusyBox use 0x00400000. Reserve this small
+ * identity-map window before kernel heap initialization so per-process
+ * mappings can shadow it without aliasing any kernel allocation. */
+#define PAGING_LEGACY_ET_EXEC_BASE  0x00400000ULL
+#define PAGING_LEGACY_ET_EXEC_SIZE  0x00400000ULL
+#define PAGING_LEGACY_ET_EXEC_LIMIT (PAGING_LEGACY_ET_EXEC_BASE + PAGING_LEGACY_ET_EXEC_SIZE)
+
 #define PML4_INDEX(x) (((x) >> 39) & 0x1FF)
 #define PDPT_INDEX(x) (((x) >> 30) & 0x1FF)
 #define PD_INDEX(x)   (((x) >> 21) & 0x1FF)

@@ -629,7 +629,36 @@ static int32_t devfs_vfs_readdir(int32_t handle, vfs_dirent_t *out_entry)
                 continue; /* one level deeper than this directory */
             }
         } else {
-            base_name = entry->name + 5; /* skip "/dev/" */
+            /* A root /dev readdir must expose immediate children, not names
+             * containing slashes such as "dri/card0". libdrm enumerates
+             * /dev/dri and then stats the returned character nodes; normal
+             * callers also expect /dev itself to contain a "dri" directory. */
+            const char *relative = entry->name + 5; /* skip "/dev/" */
+            const char *slash = strchr(relative, '/');
+            if (slash != NULL) {
+                uint32_t component_len = (uint32_t)(slash - relative);
+                bool already_emitted = false;
+                for (uint32_t prior = 0u; prior + 1u < h->cursor; ++prior) {
+                    const char *prior_name = g_devfs_entries[prior].name + 5;
+                    const char *prior_slash = strchr(prior_name, '/');
+                    if (prior_slash != NULL &&
+                        (uint32_t)(prior_slash - prior_name) == component_len &&
+                        strncmp(prior_name, relative, component_len) == 0) {
+                        already_emitted = true;
+                        break;
+                    }
+                }
+                if (already_emitted || component_len == 0u ||
+                    component_len >= sizeof(out_entry->name)) {
+                    continue;
+                }
+                memcpy(out_entry->name, relative, component_len);
+                out_entry->name[component_len] = '\0';
+                out_entry->size = 0u;
+                out_entry->is_directory = true;
+                return 1;
+            }
+            base_name = relative;
         }
         strncpy(out_entry->name, base_name, sizeof(out_entry->name) - 1);
         out_entry->name[sizeof(out_entry->name) - 1] = '\0';

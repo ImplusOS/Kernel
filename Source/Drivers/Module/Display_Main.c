@@ -271,8 +271,15 @@ void display_present(void) {
         return;
     }
 
-    display_log("[disp] present\n");
-    display_log_done();
+    /* Present runs once per compositor frame. Logging every frame
+     * serialized the fast path through the UART and made the desktop feel
+     * sluggish; keep only a one-time boot diagnostic. */
+    static uint32_t present_log_budget = 1u;
+    if (present_log_budget != 0u) {
+        --present_log_budget;
+        display_log("[disp] present\n");
+        display_log_done();
+    }
     g_active_display_driver->present();
 }
 
@@ -294,6 +301,13 @@ void display_present_rects(const display_rect_t *rects, uint32_t count) {
 
 void display_get_framebuffer_dbg_log(void *ptr) __attribute__((unused));
 void display_get_framebuffer_dbg_log(void *ptr) {
+    /* GET_DISPLAY_FRAMEBUFFER is queried repeatedly during redraw. Emit this
+     * diagnostic once instead of writing to the serial console on every call. */
+    static uint32_t getfb_log_budget = 1u;
+    if (getfb_log_budget == 0u) {
+        return;
+    }
+    --getfb_log_budget;
     display_log("[disp] getfb ptr=");
     display_log_num((uint64_t)(uintptr_t)ptr);
     display_log(" w=");
@@ -464,4 +478,69 @@ void display_driver_detached(const char *module_name)
 const char *display_main_get_active_driver_name(void)
 {
     return g_active_display_module_name;
+}
+
+static bool display_driver_has_3d_api(const driver_display_t *candidate)
+{
+    return candidate != NULL &&
+           candidate->gpu_has_3d != NULL &&
+           candidate->gpu_resource_id_alloc != NULL &&
+           candidate->gpu_context_create != NULL &&
+           candidate->gpu_context_destroy != NULL &&
+           candidate->gpu_submit_3d != NULL &&
+           candidate->gpu_resource_create_3d != NULL &&
+           candidate->gpu_resource_attach_backing != NULL &&
+           candidate->gpu_resource_detach_backing != NULL &&
+           candidate->gpu_resource_unref != NULL &&
+           candidate->gpu_context_attach_resource != NULL &&
+           candidate->gpu_context_detach_resource != NULL &&
+           candidate->gpu_transfer_3d != NULL &&
+           candidate->gpu_get_capset_info != NULL &&
+           candidate->gpu_get_capset != NULL;
+}
+
+bool display_init_3d_backend(void)
+{
+    for (uint32_t i = 0u; i < DEVICE_REGISTRY_MAX; ++i) {
+        const device_t *dev =
+            device_registry_find_by_index(DEVICE_TYPE_DISPLAY, i);
+        if (dev == NULL) break;
+
+        const driver_display_t *candidate =
+            (const driver_display_t *)dev->ops;
+        if (candidate == NULL || candidate->gpu_has_3d == NULL ||
+            !display_driver_has_3d_api(candidate)) {
+            continue;
+        }
+
+        /* Render and scanout are independent roles. A VirtIO GPU can serve
+         * Mesa while Intel owns the physical panel. Initialize this device
+         * without changing g_active_display_driver. */
+        if (candidate->is_ready != NULL && !candidate->is_ready()) {
+            if (candidate->probe != NULL && !candidate->probe()) continue;
+            if (candidate->init == NULL || !candidate->init()) continue;
+        }
+        if ((candidate->is_ready == NULL || candidate->is_ready()) &&
+            candidate->gpu_has_3d()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const driver_display_t *display_get_3d_driver(void)
+{
+    for (uint32_t i = 0u; i < DEVICE_REGISTRY_MAX; ++i) {
+        const device_t *dev =
+            device_registry_find_by_index(DEVICE_TYPE_DISPLAY, i);
+        if (dev == NULL) break;
+
+        const driver_display_t *candidate =
+            (const driver_display_t *)dev->ops;
+        if (!display_driver_has_3d_api(candidate)) continue;
+        if (candidate->is_ready != NULL && !candidate->is_ready()) continue;
+        if (!candidate->gpu_has_3d()) continue;
+        return candidate;
+    }
+    return NULL;
 }
