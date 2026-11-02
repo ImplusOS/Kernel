@@ -283,6 +283,16 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
      * boot (kernel init done, screen already cleared, userland not yet up).
      * The legacy IVT/BDA/EBDA live down here too, so keep the whole 1 MiB. */
     physical_memory_reserve_region(0x0ULL, 0x100000ULL);
+#ifdef PLATFORM_X86_64
+    /* Static Linux ET_EXEC programs (notably BusyBox) are linked at
+     * 0x00400000. Their process page tables need to map that virtual range
+     * to private frames, shadowing the low identity map. Keep the matching
+     * physical range out of the kernel heap and page allocator first, so no
+     * kernel object can be reached through a virtual address the process
+     * will later replace. The kernel image itself starts at 0x01800000. */
+    physical_memory_reserve_region(PAGING_LEGACY_ET_EXEC_BASE,
+                                   PAGING_LEGACY_ET_EXEC_SIZE);
+#endif
     boot_profile_end("pmm", phase_ns);
 
     serial_set_screen_mirror(debug_putchar);
