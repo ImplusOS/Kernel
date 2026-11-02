@@ -738,11 +738,11 @@ void drm_kms_init(void)
      * and the slot it reports is the machine's real display controller. */
     sysfs_publish_drm_nodes();
     serial_write_string("[drm] published /dev/dri/card0 (226:0) and "
-                        "/dev/dri/renderD128 (226:128)\\n");
+                        "/dev/dri/renderD128 (226:128)\n");
     serial_write_string("[drm] render backend: ");
     serial_write_string(display_get_3d_driver() != NULL
-                            ? "virtio_gpu ready\\n"
-                            : "unavailable (Mesa will use software fallback)\\n");
+                            ? "virtio_gpu ready\n"
+                            : "unavailable (Mesa will use software fallback)\n");
     g_inited = 1;
 }
 
@@ -1254,7 +1254,7 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
          * renderD128 from Xorg's separate card0 KMS/DRI2 software path. */
         serial_write_string("[drm-render] VERSION driver=");
         serial_write_string(name);
-        serial_write_string(" version=0.0\\n");
+        serial_write_string(" version=0.0\n");
         uint64_t nl = (uint64_t)strlen(name);
         uint64_t dl = sizeof(date) - 1u;
         uint64_t sl = sizeof(desc) - 1u;
@@ -1421,8 +1421,8 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         case VIRTGPU_PARAM_3D_FEATURES:
             value = gpu != NULL ? 1u : 0u;
             serial_write_string(value != 0u
-                                    ? "[drm-render] 3D_FEATURES=1\\n"
-                                    : "[drm-render] 3D_FEATURES=0\\n");
+                                    ? "[drm-render] 3D_FEATURES=1\n"
+                                    : "[drm-render] 3D_FEATURES=0\n");
             break;
         case VIRTGPU_PARAM_CAPSET_QUERY_FIX:
             value = gpu != NULL ? 1u : 0u;
