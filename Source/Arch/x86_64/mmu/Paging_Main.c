@@ -2381,15 +2381,29 @@ int paging_map_user_range_alloc(uint64_t cr3,
                         (addr & (MB2 - 1ULL));
                 }
                 if (identity_phys == (addr & PAGE_MASK)) {
-                    /* Reuse the identity-mapped frame only when the PMM
-                     * still considers that exact physical page free. Low
-                     * identity mappings also cover kernel/boot-owned memory;
-                     * a failed reservation of such a page is not an OOM and
-                     * must not abort the ELF load. Fall through to alloc_page()
-                     * and map a different free frame at this user VA. */
-                    if (pmm_reserve_free_page(identity_phys) == 0) {
-                        phys_page = (void *)(uintptr_t)identity_phys;
+                    /* A foreign ELF linked into the low identity window
+                     * can only use the identity frame itself. Replacing it
+                     * with an unrelated frame would make the same kernel
+                     * physical pointer resolve to a different object while
+                     * this process CR3 is active. If the identity frame is
+                     * already owned, report the collision here rather than
+                     * allocating a frame that the leaf mapper must reject. */
+                    if (pmm_reserve_free_page(identity_phys) < 0) {
+                        serial_write_string("[pagemap] identity frame busy cr3=");
+                        serial_write_uint64(cr3);
+                        serial_write_string(" vaddr=");
+                        serial_write_uint64(addr);
+                        serial_write_string(" phys=");
+                        serial_write_uint64(identity_phys);
+                        serial_write_string(" state=");
+                        serial_write_uint64((uint64_t)(int64_t)
+                                            pmm_page_is_allocated(identity_phys));
+                        serial_write_string(" free_pages=");
+                        serial_write_uint64(memory_free_pages());
+                        serial_write_char('\n');
+                        return -1;
                     }
+                    phys_page = (void *)(uintptr_t)identity_phys;
                 }
             }
         }
