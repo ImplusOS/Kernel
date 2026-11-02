@@ -779,6 +779,18 @@ static int virtio_pci_device_init(const virtio_gpu_pci_t *gpu, virtio_pci_transp
         g_gpu_features0 |= VIRTIO_GPU_F_CONTEXT_INIT;
     }
 
+#ifdef IMPLUS_DRIVER_MODULE
+    /* Record what the device actually offered. A 2D-ready VirtIO GPU may
+     * still lack VIRGL when QEMU was started without a GL-capable device. */
+    vlog("[vgpu] features dev0=");
+    vlog_hex(device_features0);
+    vlog(" dev1=");
+    vlog_hex(device_features1);
+    vlog(" negotiated=");
+    vlog_hex(g_gpu_features0);
+    vlog("\n");
+#endif
+
     common_write32(t->common_cfg, 8, 0);
     common_write32(t->common_cfg, 12, g_gpu_features0);
     common_write32(t->common_cfg, 8, 1);
