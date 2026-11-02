@@ -271,8 +271,15 @@ void display_present(void) {
         return;
     }
 
-    display_log("[disp] present\n");
-    display_log_done();
+    /* Present runs once per compositor frame. Logging every frame
+     * serialized the fast path through the UART and made the desktop feel
+     * sluggish; keep only a one-time boot diagnostic. */
+    static uint32_t present_log_budget = 1u;
+    if (present_log_budget != 0u) {
+        --present_log_budget;
+        display_log("[disp] present\n");
+        display_log_done();
+    }
     g_active_display_driver->present();
 }
 
@@ -294,6 +301,13 @@ void display_present_rects(const display_rect_t *rects, uint32_t count) {
 
 void display_get_framebuffer_dbg_log(void *ptr) __attribute__((unused));
 void display_get_framebuffer_dbg_log(void *ptr) {
+    /* GET_DISPLAY_FRAMEBUFFER is queried repeatedly during redraw. Emit this
+     * diagnostic once instead of writing to the serial console on every call. */
+    static uint32_t getfb_log_budget = 1u;
+    if (getfb_log_budget == 0u) {
+        return;
+    }
+    --getfb_log_budget;
     display_log("[disp] getfb ptr=");
     display_log_num((uint64_t)(uintptr_t)ptr);
     display_log(" w=");
