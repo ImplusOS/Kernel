@@ -141,11 +141,24 @@ processes. Per-frame display and VirtIO serial diagnostics are rate-limited.
 The uploaded boot trace also contained repeated `/bin/busybox` exec failures
 with `elf_err=paging map failed` and exit status 127. That failure is in the
 ELF PT_LOAD page-mapping path, not proof that `ls` or `rm` applets are
-missing. The kernel now logs the failing ELF segment range, requested mapping
-flags, remaining free pages, and whether the lower-level failure came from
+missing. On x86_64 the kernel now reserves physical `0x00400000-0x00800000`
+before initializing the heap. This is the low identity-map window used by the
+unchanged static BusyBox `ET_EXEC` image, whose entry segments start at
+`0x00400000`. ELF pages mapped into that virtual window now use ordinary
+private PMM frames, while a narrowly scoped page-table exception permits the
+process CR3 to shadow only those reserved identity entries. All other low
+identity mappings retain the strict same-physical-frame rule. This makes the
+fixed-address mapping process-private without allowing the kernel heap or
+normal PMM allocations to occupy the physical pages whose virtual addresses
+are shadowed.
+
+The kernel also logs the failing ELF segment range, requested mapping flags,
+remaining free pages, and whether the lower-level failure came from
 physical-page allocation, identity-page reservation, or a leaf PTE map. Use
 those messages on the next boot to distinguish address-space leakage from
-physical-page exhaustion or a page-table mapping error.
+physical-page exhaustion or a page-table mapping error. Fork/COW, execve,
+unmap, and teardown for this fixed-address window still require runtime
+validation; do not treat the source change alone as a successful BusyBox boot.
 
 A successful boot or framebuffer presentation alone is not evidence of 3D
 acceleration.
