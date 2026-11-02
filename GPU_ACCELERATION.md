@@ -54,8 +54,15 @@ Mesa virgl winsys:
 The VirtIO driver uses the Linux `virtio_gpu.h` wire command identifiers and
 feature bits. 3D request layouts are guarded by compile-time size assertions.
 Command submissions, transfers, and resource lifetime operations are
-serialized. Render resources use contiguous guest physical backing; arbitrary
-user pages and scatter/gather backing are not accepted.
+serialized. The control-queue descriptor/available/used ring, command staging,
+and response staging are allocated from the kernel's physically contiguous
+DMA pool, and the device is given the allocator's physical addresses rather
+than assumed kernel virtual addresses. The persistent command staging area is
+bounded to 1 MiB; oversized command streams are rejected. Keeping the staging
+buffers alive across a timeout prevents a late device completion from DMAing
+into a freed stack or heap allocation. Render resources use contiguous guest
+physical backing; arbitrary user pages and scatter/gather backing are not
+accepted.
 
 ### Deliberate limits
 
