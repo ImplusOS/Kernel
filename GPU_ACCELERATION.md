@@ -8,7 +8,7 @@ a browser GPU process can use the device.
 
 | Backend | Display acceleration | 3D rendering |
 | --- | --- | --- |
-| VirtIO-GPU | 2D scanout and framebuffer transfer | virgl control protocol plus a Linux VirtIO-GPU DRM render-node path for Mesa's virgl Gallium winsys |
+| VirtIO-GPU | Damage-rectangle 2D scanout and framebuffer transfer | virgl control protocol plus a Linux VirtIO-GPU DRM render-node path for Mesa's virgl Gallium winsys |
 | Intel Gen9 / Gen9.5 | BCS blitter acceleration for validated framebuffer copies, with CPU fallback | Not implemented; this is not an i915-compatible 3D driver |
 
 ## VirtIO-GPU / Mesa virgl connection
@@ -95,6 +95,70 @@ The Mesa source/binaries themselves are not vendored by this change. The
 pinned Debian Mesa package provides the userspace virgl implementation; the
 kernel implements the matching legacy VirtIO-GPU DRM ABI subset.
 
+## Presentation path and damage tracking
+
+`driver_display_t::present` presents the whole desktop, but the window manager
+already tracks damaged rectangles and calls `display_present_rects()`, which
+dispatches to the active driver's optional `present_rects` callback. Drivers
+without that callback fall back to a full `present()`.
+
+The VirtIO-GPU driver implements `present_rects` as follows:
+
+- Each rectangle is clipped against the desktop and against every monitor's
+  viewport; monitors that do not intersect it are skipped.
+- For monitors that do not sample the desktop framebuffer directly, only the
+  intersecting pixels are copied into the monitor's buffer. The upload is a
+  `TRANSFER_TO_HOST_2D` limited to the rectangle. QEMU treats the command's
+  `offset` as the byte offset of the rectangle's first pixel and advances rows
+  by the resource stride, so a partial rectangle uses
+  `offset = (local_y * width + local_x) * 4`.
+- `RESOURCE_FLUSH` is issued for the same rectangle instead of the full
+  scanout.
+- The window manager already merges touching or overlapping damage, so the
+  driver does not merge rectangles a second time.
+
+`virtio_gpu_present()` remains available and presents one full-desktop
+rectangle through the same path. An empty rectangle list also degrades to a
+full present rather than skipping the frame.
+
+When a monitor's geometry exactly covers the desktop (the normal
+single-monitor case), its resource attaches `g_gpu_fb` directly as backing
+store instead of allocating a second monitor-sized buffer. The monitor is
+marked `fb_shared`, and resource teardown never frees that buffer because it is
+the kernel framebuffer userland also maps. Partial updates in this mode touch
+only the damaged pixels and still flush only the damaged rectangle.
+
+This removes the per-frame cost that scaled with resolution: previously every
+present copied the full desktop into each monitor buffer and submitted
+full-screen transfer and flush commands even when only a cursor or a window
+corner had changed. Now the work is proportional to the damaged area.
+Multi-monitor layouts keep one resource per monitor but get the same
+rectangle-limited copies and transfers.
+
+## Reporting acceleration capabilities
+
+`system_graphics_info_t` (returned by `os_get_graphics_info()`) reports the
+render backend separately from the scanout driver:
+
+- `SYSTEM_GRAPHICS_ACCEL_3D` when a display backend exposes a usable 3D
+  engine;
+- `SYSTEM_GRAPHICS_ACCEL_VIRGL` when that backend offers the virgl capset;
+- `SYSTEM_GRAPHICS_ACCEL_CONTEXT_INIT` when it supports context
+  initialisation;
+- `render_capset_id` and `render_capset_version` for the selected capset.
+
+`SystemInfo.c` queries `display_get_3d_driver()`, so a machine with only a 2D
+scanout driver leaves the 3D flags clear. This lets userland choose a render
+path from reported capabilities instead of inferring one from the mere
+presence of `/dev/dri/renderD128`.
+
+`Userland/API/Source/LinuxEnv.c` uses those flags: X11 sessions force
+`llvmpipe`/`kms_swrast` only when no 3D render backend is reported. When virgl
+is available, Mesa selects its `virtio_gpu` winsys on its own. Xorg itself
+stays pinned to `LIBGL_ALWAYS_SOFTWARE=1` with
+`MESA_LOADER_DRIVER_OVERRIDE=kms_swrast` because card0 is the scanout shim;
+DRI3 clients reach the render node independently.
+
 ## Intel Gen9 / Gen9.5
 
 The Intel display module remains deliberately conservative. It only enables
@@ -115,8 +179,11 @@ The source-level ioctl layouts and command IDs were compared with the Linux
 VirtIO-GPU UAPI and the Mesa virgl winsys interface. Compile-time assertions
 guard the wire structures and ioctl payload layouts.
 
-A full kernel/module build, QEMU virgl boot, and real Mesa GL/WebGL test have not
-yet been run in this environment. Before enabling this path on a target system:
+The x86_64 kernel, the VirtIO display module, and the userland applications
+build with the project toolchain. A QEMU virgl boot and a real Mesa GL/WebGL
+test have not been run in this environment: the WSL2 host has no DRM render
+node (`egl: no drm render node available`), so QEMU cannot expose a host 3D
+backend. Before enabling this path on a target system:
 
 1. Build the x86_64 kernel and VirtIO display module with the project toolchain.
 2. Boot QEMU with a virgl-capable VirtIO GPU (for example `virtio-vga-gl`) and
@@ -133,7 +200,12 @@ yet been run in this environment. Before enabling this path on a target system:
    a GL conformance sample, and `chrome://gpu`. The renderer must be virgl,
    not `llvmpipe`. A browser may still choose software rendering if its own
    build or policy disables the available GL backend.
-6. On Intel hardware, verify the existing BCS self-tests and CPU fallback. Do
+6. Exercise the compositor and confirm the serial log shows
+   `[vgpu] present rects=N` with N matching the damage count, that partial
+   updates are visually correct, and that moving a small window does not
+   produce full-screen transfers. Verify the same on a multi-monitor layout
+   and on a single monitor that does not cover the whole desktop.
+7. On Intel hardware, verify the existing BCS self-tests and CPU fallback. Do
    not interpret successful BLT presentation as Intel 3D acceleration.
 
 ### Desktop framebuffer and shell diagnostics

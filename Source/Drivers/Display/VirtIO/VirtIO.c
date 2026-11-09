@@ -430,6 +430,9 @@ typedef struct {
     display_mode_info_t modes[VIRTIO_GPU_MAX_MODES];
     uint32_t *fb;
     uint32_t fb_bytes;
+    /* true when fb is the desktop framebuffer (g_gpu_fb) borrowed for direct
+     * scanout; such a buffer must never be freed by the monitor cleanup. */
+    bool fb_shared;
 } virtio_gpu_monitor_t;
 
 #ifdef IMPLUS_DRIVER_MODULE
@@ -1148,6 +1151,7 @@ static int gpu_cmd_resource_detach_backing(virtqueue_t *vq, uint32_t resource_id
 
 static int gpu_cmd_set_scanout(virtqueue_t *vq, uint32_t scanout_id,
                                uint32_t resource_id,
+                               uint32_t x, uint32_t y,
                                uint32_t width, uint32_t height) {
     virtio_gpu_set_scanout_t cmd;
     virtio_gpu_resp_nodata_t resp;
@@ -1155,8 +1159,8 @@ static int gpu_cmd_set_scanout(virtqueue_t *vq, uint32_t scanout_id,
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
     cmd.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
-    cmd.rect.x = 0;
-    cmd.rect.y = 0;
+    cmd.rect.x = x;
+    cmd.rect.y = y;
     cmd.rect.width = width;
     cmd.rect.height = height;
     cmd.scanout_id = scanout_id;
@@ -1168,19 +1172,25 @@ static int gpu_cmd_set_scanout(virtqueue_t *vq, uint32_t scanout_id,
     return resp.hdr.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
+/* The 2D transfer unit is one rectangle of the resource. offset is the byte
+ * offset of that rectangle's first pixel in the backing store; QEMU uses the
+ * resource stride (width * 4) to advance between rows, so a partial update
+ * must name its top-left pixel rather than assume offset 0. */
 static int gpu_cmd_transfer_to_host_2d(virtqueue_t *vq, uint32_t resource_id,
-                                       uint32_t width, uint32_t height) {
+                                       uint32_t x, uint32_t y,
+                                       uint32_t width, uint32_t height,
+                                       uint64_t offset) {
     virtio_gpu_transfer_to_host_2d_t cmd;
     virtio_gpu_resp_nodata_t resp;
 
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
     cmd.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-    cmd.rect.x = 0;
-    cmd.rect.y = 0;
+    cmd.rect.x = x;
+    cmd.rect.y = y;
     cmd.rect.width = width;
     cmd.rect.height = height;
-    cmd.offset = 0;
+    cmd.offset = offset;
     cmd.resource_id = resource_id;
 
     if (!virtqueue_submit_sync(vq, &cmd, sizeof(cmd), &resp, sizeof(resp))) {
@@ -1190,6 +1200,7 @@ static int gpu_cmd_transfer_to_host_2d(virtqueue_t *vq, uint32_t resource_id,
 }
 
 static int gpu_cmd_resource_flush(virtqueue_t *vq, uint32_t resource_id,
+                                  uint32_t x, uint32_t y,
                                   uint32_t width, uint32_t height) {
     virtio_gpu_resource_flush_t cmd;
     virtio_gpu_resp_nodata_t resp;
@@ -1197,8 +1208,8 @@ static int gpu_cmd_resource_flush(virtqueue_t *vq, uint32_t resource_id,
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
     cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-    cmd.rect.x = 0;
-    cmd.rect.y = 0;
+    cmd.rect.x = x;
+    cmd.rect.y = y;
     cmd.rect.width = width;
     cmd.rect.height = height;
     cmd.resource_id = resource_id;
@@ -1644,15 +1655,24 @@ static void virtio_gpu_release_monitor_resource(virtio_gpu_monitor_t *monitor) {
                                               monitor->resource_id);
         (void)gpu_cmd_resource_unref(&g_gpu_controlq, monitor->resource_id);
     }
-    if (monitor->fb != NULL) {
+    if (monitor->fb != NULL && !monitor->fb_shared) {
         free(monitor->fb);
     }
     monitor->resource_id = 0u;
     monitor->fb = NULL;
     monitor->fb_bytes = 0u;
+    monitor->fb_shared = false;
 }
 
-static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor) {
+/* Create the 2D resource a scanout samples. When the monitor covers the whole
+ * desktop (the single-monitor case), shared_fb is the desktop framebuffer
+ * itself and is attached directly: the compositor then draws straight into
+ * the memory the device reads, so present() only has to transfer damage
+ * instead of copying the entire desktop into a second monitor-sized buffer. */
+static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor,
+                                               uint32_t *shared_fb,
+                                               uint32_t shared_width,
+                                               uint32_t shared_bytes) {
     if (monitor == NULL || monitor->width == 0u || monitor->height == 0u) {
         return false;
     }
@@ -1663,11 +1683,17 @@ static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor) {
     }
 
     uint32_t fb_bytes = (uint32_t)(pixel_count * sizeof(uint32_t));
-    uint32_t *fb = (uint32_t *)malloc(fb_bytes);
+    bool shared = shared_fb != NULL &&
+                  monitor->x == 0 && monitor->y == 0 &&
+                  monitor->width == shared_width &&
+                  shared_bytes >= fb_bytes;
+    uint32_t *fb = shared ? shared_fb : (uint32_t *)malloc(fb_bytes);
     if (fb == NULL) {
         return false;
     }
-    memset(fb, 0, fb_bytes);
+    if (!shared) {
+        memset(fb, 0, fb_bytes);
+    }
 
     uint32_t resource_id = virtio_gpu_next_resource_id();
     if (!gpu_cmd_resource_create_2d(&g_gpu_controlq, resource_id,
@@ -1675,17 +1701,20 @@ static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor) {
         !gpu_cmd_resource_attach_backing(&g_gpu_controlq, resource_id,
                                          fb, fb_bytes) ||
         !gpu_cmd_set_scanout(&g_gpu_controlq, monitor->scanout_id,
-                             resource_id,
+                             resource_id, 0u, 0u,
                              monitor->width, monitor->height)) {
         (void)gpu_cmd_resource_detach_backing(&g_gpu_controlq, resource_id);
         (void)gpu_cmd_resource_unref(&g_gpu_controlq, resource_id);
-        free(fb);
+        if (!shared) {
+            free(fb);
+        }
         return false;
     }
 
     monitor->resource_id = resource_id;
     monitor->fb = fb;
     monitor->fb_bytes = fb_bytes;
+    monitor->fb_shared = shared;
     return true;
 }
 
@@ -1797,10 +1826,19 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
         monitors[i].resource_id = 0u;
         monitors[i].fb = NULL;
         monitors[i].fb_bytes = 0u;
+        monitors[i].fb_shared = false;
         monitors[i].x -= origin_x;
         monitors[i].y -= origin_y;
         virtio_gpu_fix_mode_metadata(&monitors[i], i);
-        if (!virtio_gpu_create_monitor_resource(&monitors[i])) {
+        uint32_t *shared_fb = NULL;
+        if (monitors[i].x == 0 && monitors[i].y == 0 &&
+            monitors[i].width == desktop_width &&
+            monitors[i].height == desktop_height) {
+            shared_fb = virtual_fb;
+        }
+        if (!virtio_gpu_create_monitor_resource(&monitors[i], shared_fb,
+                                                desktop_width,
+                                                virtual_bytes)) {
             for (uint32_t j = 0u; j <= i; ++j) {
                 virtio_gpu_release_monitor_resource(&monitors[j]);
             }
@@ -2185,15 +2223,13 @@ void virtio_gpu_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     }
 }
 
-void virtio_gpu_present(void) {
-    if (!g_gpu_ready) {
-        return;
-    }
-
-    uint64_t irq = gpu_lock();
-
+static void virtio_gpu_present_rects_locked(const display_rect_t *rects,
+                                            uint32_t count)
+{
     if (g_vlog_budget != 0u) {
-        vlog("[vgpu] present fb=");
+        vlog("[vgpu] present rects=");
+        vlog_num(count);
+        vlog(" fb=");
         vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
         vlog(" nmon=");
         vlog_num(g_gpu_monitor_count);
@@ -2201,39 +2237,99 @@ void virtio_gpu_present(void) {
         vlog_done();
     }
 
-    for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
-        virtio_gpu_monitor_t *monitor = &g_gpu_monitors[i];
-        if (monitor->fb == NULL || monitor->resource_id == 0u ||
-            monitor->width == 0u || monitor->height == 0u || g_gpu_fb == NULL) {
+    for (uint32_t r = 0u; r < count; ++r) {
+        int64_t x0 = rects[r].x;
+        int64_t y0 = rects[r].y;
+        int64_t x1 = x0 + (int64_t)rects[r].w;
+        int64_t y1 = y0 + (int64_t)rects[r].h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int64_t)g_gpu_width) x1 = (int64_t)g_gpu_width;
+        if (y1 > (int64_t)g_gpu_height) y1 = (int64_t)g_gpu_height;
+        if (x1 <= x0 || y1 <= y0) {
             continue;
         }
-        for (uint32_t row = 0u; row < monitor->height; ++row) {
-            uint32_t src_y = (uint32_t)monitor->y + row;
-            uint32_t src_x = (uint32_t)monitor->x;
-            if (src_y >= g_gpu_height || src_x >= g_gpu_width) {
+
+        for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
+            virtio_gpu_monitor_t *monitor = &g_gpu_monitors[i];
+            if (monitor->fb == NULL || monitor->resource_id == 0u ||
+                monitor->width == 0u || monitor->height == 0u ||
+                g_gpu_fb == NULL) {
                 continue;
             }
-            uint32_t copy_width = monitor->width;
-            if (src_x + copy_width > g_gpu_width) {
-                copy_width = g_gpu_width - src_x;
+
+            int64_t mx0 = monitor->x;
+            int64_t my0 = monitor->y;
+            int64_t mx1 = mx0 + (int64_t)monitor->width;
+            int64_t my1 = my0 + (int64_t)monitor->height;
+            int64_t ix0 = x0 > mx0 ? x0 : mx0;
+            int64_t iy0 = y0 > my0 ? y0 : my0;
+            int64_t ix1 = x1 < mx1 ? x1 : mx1;
+            int64_t iy1 = y1 < my1 ? y1 : my1;
+            if (ix1 <= ix0 || iy1 <= iy0) {
+                continue;
             }
-            memcpy(&monitor->fb[(uint64_t)row * monitor->width],
-                   &g_gpu_fb[(uint64_t)src_y * g_gpu_width + src_x],
-                   (size_t)copy_width * sizeof(uint32_t));
-        }
-        if (!gpu_cmd_transfer_to_host_2d(&g_gpu_controlq,
+
+            uint32_t w = (uint32_t)(ix1 - ix0);
+            uint32_t h = (uint32_t)(iy1 - iy0);
+            uint32_t local_x = (uint32_t)(ix0 - mx0);
+            uint32_t local_y = (uint32_t)(iy0 - my0);
+
+            /* A full-desktop monitor samples g_gpu_fb directly; every other
+             * monitor keeps a compact, monitor-local copy and only the
+             * damaged part of it is refreshed here. */
+            if (!monitor->fb_shared) {
+                for (uint32_t row = 0u; row < h; ++row) {
+                    memcpy(&monitor->fb[(uint64_t)(local_y + row) *
+                                            monitor->width + local_x],
+                           &g_gpu_fb[(uint64_t)((uint32_t)iy0 + row) *
+                                         g_gpu_width + (uint32_t)ix0],
+                           (size_t)w * sizeof(uint32_t));
+                }
+            }
+
+            uint64_t offset = ((uint64_t)local_y * monitor->width +
+                               (uint64_t)local_x) * sizeof(uint32_t);
+            if (!gpu_cmd_transfer_to_host_2d(&g_gpu_controlq,
+                                             monitor->resource_id,
+                                             local_x, local_y, w, h,
+                                             offset)) {
+                continue;
+            }
+            (void)gpu_cmd_resource_flush(&g_gpu_controlq,
                                          monitor->resource_id,
-                                         monitor->width,
-                                         monitor->height)) {
-            continue;
+                                         local_x, local_y, w, h);
         }
-        (void)gpu_cmd_resource_flush(&g_gpu_controlq,
-                                     monitor->resource_id,
-                                     monitor->width,
-                                     monitor->height);
+    }
+}
+
+void virtio_gpu_present_rects(const display_rect_t *rects, uint32_t count) {
+    if (!g_gpu_ready) {
+        return;
+    }
+
+    uint64_t irq = gpu_lock();
+    if (!g_gpu_ready) {
+        gpu_unlock(irq);
+        return;
+    }
+
+    if (rects == NULL || count == 0u) {
+        display_rect_t full;
+        full.x = 0;
+        full.y = 0;
+        full.w = g_gpu_width;
+        full.h = g_gpu_height;
+        virtio_gpu_present_rects_locked(&full, 1u);
+    } else {
+        virtio_gpu_present_rects_locked(rects, count);
     }
 
     gpu_unlock(irq);
+}
+
+void virtio_gpu_present(void) {
+    virtio_gpu_present_rects(NULL, 0u);
 }
 
 /* ---- 3D (virgl) public API ---- */
@@ -2550,6 +2646,7 @@ static bool virtio_gpu_set_mode(uint32_t monitor_index, uint32_t mode_index) {
         monitors[i].resource_id = 0u;
         monitors[i].fb = NULL;
         monitors[i].fb_bytes = 0u;
+        monitors[i].fb_shared = false;
     }
 
     const display_mode_info_t *selected =
@@ -2592,6 +2689,7 @@ static const driver_display_t g_virtio_display_driver = {
     .draw_pixel = virtio_gpu_draw_pixel,
     .fill_rect = virtio_gpu_fill_rect,
     .present = virtio_gpu_present,
+    .present_rects = virtio_gpu_present_rects,
     .get_framebuffer = virtio_gpu_get_framebuffer,
     .get_generation = virtio_gpu_generation,
     .poll_config = virtio_gpu_poll_config,

@@ -87,7 +87,15 @@ typedef struct __attribute__((packed)) {
     uint32_t display_width;
     uint32_t display_height;
     uint32_t bits_per_pixel;
+    /* Non-zero when a render node exists; see SYSTEM_GRAPHICS_ACCEL_*. */
+    uint32_t acceleration_flags;
+    uint32_t render_capset_id;
+    uint32_t render_capset_version;
 } system_graphics_info_t;
+
+#define SYSTEM_GRAPHICS_ACCEL_3D           (1u << 0)
+#define SYSTEM_GRAPHICS_ACCEL_VIRGL        (1u << 1)
+#define SYSTEM_GRAPHICS_ACCEL_CONTEXT_INIT (1u << 2)
 
 typedef struct __attribute__((packed)) {
     uint8_t bits;

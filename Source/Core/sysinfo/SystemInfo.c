@@ -1,6 +1,7 @@
 #include "SystemInfo.h"
 #include "Drivers/Module/PCI_Main.h"
 #include "Drivers/Module/DriverManager.h"
+#include "Drivers/Module/Display_Main.h"
 #include "Platform/io/IO_Main.h"
 #include "kernel/config.h"
 #include "Core/sync/Spinlock.h"
@@ -401,7 +402,41 @@ os_status_t sysinfo_get_graphics_info(system_graphics_info_t *out_info)
     out_info->display_width = driver_manager_display_width();
     out_info->display_height = driver_manager_display_height();
     out_info->bits_per_pixel = 32;
-    
+
+    /* Render acceleration is a separate role from scanout: the active display
+     * driver may be a plain framebuffer while a VirtIO GPU still serves Mesa
+     * through /dev/dri/renderD128. Report what that render node actually
+     * offers so userland does not have to hardcode a software rasteriser. */
+    out_info->acceleration_flags = 0u;
+    out_info->render_capset_id = 0u;
+    out_info->render_capset_version = 0u;
+    const driver_display_t *gpu = display_get_3d_driver();
+    if (gpu != NULL && gpu->gpu_has_3d != NULL && gpu->gpu_has_3d()) {
+        out_info->acceleration_flags |= SYSTEM_GRAPHICS_ACCEL_3D;
+        if (gpu->gpu_has_context_init != NULL &&
+            gpu->gpu_has_context_init()) {
+            out_info->acceleration_flags |= SYSTEM_GRAPHICS_ACCEL_CONTEXT_INIT;
+        }
+        if (gpu->gpu_get_capset_info != NULL) {
+            for (uint32_t i = 0u; i < 16u; ++i) {
+                uint32_t capset_id = 0u;
+                uint32_t version = 0u;
+                uint32_t size = 0u;
+                if (!gpu->gpu_get_capset_info(i, &capset_id,
+                                              &version, &size)) {
+                    break;
+                }
+                if (capset_id == 1u) { /* VIRTIO_GPU_CAPSET_VIRGL */
+                    out_info->acceleration_flags |=
+                        SYSTEM_GRAPHICS_ACCEL_VIRGL;
+                    out_info->render_capset_id = capset_id;
+                    out_info->render_capset_version = version;
+                    break;
+                }
+            }
+        }
+    }
+
     return OS_STATUS_OK;
 }
 

@@ -22,6 +22,10 @@
 #endif
 #define GENERIC_FB_MAX_MAPPINGS 1028
 
+/* fb_present() の差分転送で、変更スパンを丸める単位(ピクセル)。
+ * 16px = 64B = WC バッファ 1 本分。部分ライン書き込みを避ける。 */
+#define GENERIC_FB_DIFF_ALIGN_PIXELS 16u
+
 #ifdef IMPLUS_DRIVER_MODULE
 static const driver_binary_t *g_driver_api = NULL;
 
@@ -76,12 +80,19 @@ typedef struct {
 typedef struct {
     uint32_t *buffer;
     uint64_t buffer_size;
+    /* 最後に実フレームバッファへ書いた内容のキャッシュ(通常RAM)。
+     * フレームバッファ(WC/UC)は読み出しが極端に遅いので、差分検出は
+     * VRAM ではなくこのシャドウとバックバッファの比較で行う。 */
+    uint32_t *shadow;
+    bool shadow_valid;
 } double_buffer_t;
 
 static framebuffer_t g_fb;
 static double_buffer_t g_double_buffer = {
     .buffer = NULL,
     .buffer_size = 0u,
+    .shadow = NULL,
+    .shadow_valid = false,
 };
 static int g_ready = 0;
 static uint32_t g_generation = 1u;
@@ -124,8 +135,8 @@ static bool generic_cpu_has_sse2(void)
 /* Slicing bound for generic_copy_bytes(): the SSE blit to (potentially)
  * write-through framebuffer memory runs one bounded cli window per slice,
  * with the interrupts a pending timer tick needs enabled in between. The
- * whole shadow buffer is ~8 MB at 1080p; copying all of it under a single
- * cli once took long enough to drop timer ticks (tick loss,
+ * whole shadow buffer is ~8 MB at 1080p (~14 MB at WQHD); copying all of it
+ * under a single cli once took long enough to drop timer ticks (tick loss,
  * TODO_Performance_LinuxApps.md §10.8), which showed up as input stalls and
  * a lagging clock on slow framebuffer memory. 64 KiB per window stays well
  * under a millisecond even at sluggish (hundreds of MB/s) WC/WT rates while
@@ -134,34 +145,55 @@ static bool generic_cpu_has_sse2(void)
 
 /* Copies exactly `bytes` (a multiple of 16) with interrupts OFF on entry.
  * Interrupt handling lives in generic_copy_bytes() so the slicing there can
- * open bounded gaps between windows. */
+ * open bounded gaps between windows.
+ *
+ * 1 反復 16B だった旧ループ(命令8本/16B)を、64B(=キャッシュライン/WC
+ * バッファ 1 本)単位に展開した。WC バッファへ 1 ライン分を連続して
+ * 書き切ることでバーストとしてフラッシュされやすくなり、解像度が上がって
+ * 転送量が増えた時の命令オーバーヘッドも約 1/4 になる。端数(16B 単位)は
+ * 後段の 16B ループで処理する。 */
 static void generic_copy_sse2(void *destination, const void *source,
                               size_t bytes)
 {
     uint8_t fpu_state[512] __attribute__((aligned(16)));
     uint8_t *dst = (uint8_t *)destination;
     const uint8_t *src = (const uint8_t *)source;
-    size_t blocks = bytes / 16u;
 
     /* Kernel entry paths do not save XMM state; preserve it around the store. */
     __asm__ volatile(
         "fxsave %[state]\n\t"
         "1:\n\t"
-        "test %[blocks], %[blocks]\n\t"
+        "cmp $64, %[bytes]\n\t"
+        "jb 3f\n\t"
+        "prefetcht0 256(%[src])\n\t"
+        "movdqu 0(%[src]), %%xmm0\n\t"
+        "movdqu 16(%[src]), %%xmm1\n\t"
+        "movdqu 32(%[src]), %%xmm2\n\t"
+        "movdqu 48(%[src]), %%xmm3\n\t"
+        "movntdq %%xmm0, 0(%[dst])\n\t"
+        "movntdq %%xmm1, 16(%[dst])\n\t"
+        "movntdq %%xmm2, 32(%[dst])\n\t"
+        "movntdq %%xmm3, 48(%[dst])\n\t"
+        "add $64, %[src]\n\t"
+        "add $64, %[dst]\n\t"
+        "sub $64, %[bytes]\n\t"
+        "jmp 1b\n\t"
+        "3:\n\t"
+        "test %[bytes], %[bytes]\n\t"
         "jz 2f\n\t"
         "movdqu (%[src]), %%xmm0\n\t"
         "movntdq %%xmm0, (%[dst])\n\t"
         "add $16, %[src]\n\t"
         "add $16, %[dst]\n\t"
-        "dec %[blocks]\n\t"
-        "jmp 1b\n\t"
+        "sub $16, %[bytes]\n\t"
+        "jmp 3b\n\t"
         "2:\n\t"
         "sfence\n\t"
         "fxrstor %[state]"
-        : [dst] "+r"(dst), [src] "+r"(src), [blocks] "+r"(blocks),
+        : [dst] "+r"(dst), [src] "+r"(src), [bytes] "+r"(bytes),
           [state] "+m"(fpu_state)
         :
-        /* XMM0 is deliberately omitted from the clobber list: this file is
+        /* XMM0-3 are deliberately omitted from the clobber list: this file is
          * compiled with -mgeneral-regs-only, and the FXSAVE/FXRSTOR pair
          * restores the complete vector state before returning. */
         : "cc", "memory");
@@ -327,6 +359,11 @@ bool generic_fb_set(const driver_boot_framebuffer_t *framebuffer) {
     g_fb.mapped_chunks = 0;
     ++g_generation;
 
+    g_double_buffer.shadow_valid = false;
+    if (g_double_buffer.shadow != NULL) {
+        free(g_double_buffer.shadow);
+        g_double_buffer.shadow = NULL;
+    }
     if (g_double_buffer.buffer != NULL) {
         free(g_double_buffer.buffer);
         g_double_buffer.buffer = NULL;
@@ -388,12 +425,22 @@ bool generic_fb_set(const driver_boot_framebuffer_t *framebuffer) {
         return false;
     }
 
-    for (uint64_t i = 0; i < buffer_size / sizeof(uint32_t); ++i) {
-        buffer[i] = 0;
-    }
+    memset(buffer, 0, (size_t)buffer_size);
 
     g_double_buffer.buffer = buffer;
     g_double_buffer.buffer_size = buffer_size;
+
+    /* シャドウは任意。確保に失敗したら従来どおり毎回全面転送にフォールバック。
+     * 差分比較は 64bit 単位で行うので、両バッファの 8B アライメントが
+     * 一致していることを要求する。 */
+    uint32_t *shadow = (uint32_t *)malloc(buffer_size);
+    if (shadow != NULL &&
+        (((uintptr_t)shadow ^ (uintptr_t)buffer) & 7u) == 0u) {
+        g_double_buffer.shadow = shadow;
+        g_double_buffer.shadow_valid = false; /* 初回 present で全面同期 */
+    } else if (shadow != NULL) {
+        free(shadow);
+    }
 
     g_ready = 1;
     generic_publish_display_event(was_ready ?
@@ -635,8 +682,103 @@ static bool clip_rect_to_framebuffer(const display_rect_t *input,
     return true;
 }
 
+/* バックバッファ a とシャドウ b の n ピクセルを比較し、変更のあった範囲
+ * [*first, *last) を返す。変更が無ければ false。
+ * 比較は通常RAM同士(キャッシュ可能)なので、WC/UC の VRAM への書き込みに
+ * 比べて桁違いに速い。a と b は 8B アライメントが一致している前提
+ * (generic_fb_set で保証)。 */
+static bool find_changed_span(const uint32_t *a, const uint32_t *b, uint32_t n,
+                              uint32_t *first, uint32_t *last)
+{
+    uint32_t lo = 0u;
+
+    if ((((uintptr_t)a) & 7u) != 0u && n != 0u) {
+        if (a[0] != b[0]) {
+            goto lo_found;
+        }
+        lo = 1u;
+    }
+    while (lo + 2u <= n &&
+           *(const uint64_t *)(a + lo) == *(const uint64_t *)(b + lo)) {
+        lo += 2u;
+    }
+    while (lo < n && a[lo] == b[lo]) {
+        ++lo;
+    }
+    if (lo >= n) {
+        return false;
+    }
+
+lo_found:;
+    uint32_t hi = n;
+    while (hi > lo && (((uintptr_t)(a + hi)) & 7u) != 0u) {
+        if (a[hi - 1u] != b[hi - 1u]) {
+            *first = lo;
+            *last = hi;
+            return true;
+        }
+        --hi;
+    }
+    while (hi >= lo + 2u &&
+           *(const uint64_t *)(a + hi - 2u) == *(const uint64_t *)(b + hi - 2u)) {
+        hi -= 2u;
+    }
+    while (hi > lo && a[hi - 1u] == b[hi - 1u]) {
+        --hi;
+    }
+    *first = lo;
+    *last = hi;
+    return true;
+}
+
+/* 変更のあった行・範囲だけを実フレームバッファへ転送する。
+ * 静止画面が多いデスクトップでは転送量が劇的に減り、解像度に比例して
+ * 増える WC 書き込みコストをほぼ回避できる。 */
+static void present_diff(void)
+{
+    const uint32_t ppl = g_fb.pixels_per_scan_line;
+    const uint32_t width = g_fb.width;
+    uint32_t *back = g_double_buffer.buffer;
+    uint32_t *shadow = g_double_buffer.shadow;
+
+    for (uint32_t y = 0u; y < g_fb.height; ++y) {
+        uint64_t row_pix = (uint64_t)y * ppl;
+        uint32_t first = 0u;
+        uint32_t last = 0u;
+        if (!find_changed_span(back + row_pix, shadow + row_pix, width,
+                               &first, &last)) {
+            continue;
+        }
+
+        first &= ~(GENERIC_FB_DIFF_ALIGN_PIXELS - 1u);
+        last = (last + GENERIC_FB_DIFF_ALIGN_PIXELS - 1u) &
+               ~(GENERIC_FB_DIFF_ALIGN_PIXELS - 1u);
+        if (last > width) {
+            last = width;
+        }
+
+        uint64_t pixel_index = row_pix + first;
+        uint64_t bytes = (uint64_t)(last - first) * sizeof(uint32_t);
+        const uint8_t *src = (const uint8_t *)(back + pixel_index);
+
+        if (g_fb.is_linear) {
+            generic_copy_bytes(g_fb.mapped_linear +
+                                   pixel_index * sizeof(uint32_t),
+                               src, bytes);
+        } else {
+            copy_row_to_framebuffer(pixel_index, src, bytes);
+        }
+        memcpy(shadow + pixel_index, src, (size_t)bytes);
+    }
+}
+
 void fb_present(void) {
     if (!g_ready || !g_double_buffer.buffer) {
+        return;
+    }
+
+    if (g_double_buffer.shadow != NULL && g_double_buffer.shadow_valid) {
+        present_diff();
         return;
     }
 
@@ -647,13 +789,19 @@ void fb_present(void) {
     if (g_fb.is_linear) {
         generic_copy_bytes(g_fb.mapped_linear, src_bytes,
                            scan_line_bytes * g_fb.height);
-        return;
+    } else {
+        for (uint32_t y = 0; y < g_fb.height; ++y) {
+            uint64_t pixel_index = (uint64_t)y * g_fb.pixels_per_scan_line;
+            uint8_t *src = src_bytes + (y * scan_line_bytes);
+            copy_row_to_framebuffer(pixel_index, src, row_bytes);
+        }
     }
 
-    for (uint32_t y = 0; y < g_fb.height; ++y) {
-        uint64_t pixel_index = (uint64_t)y * g_fb.pixels_per_scan_line;
-        uint8_t *src = src_bytes + (y * scan_line_bytes);
-        copy_row_to_framebuffer(pixel_index, src, row_bytes);
+    /* 全面転送した内容でシャドウを同期し、以降は差分転送に切り替える。 */
+    if (g_double_buffer.shadow != NULL) {
+        memcpy(g_double_buffer.shadow, g_double_buffer.buffer,
+               (size_t)g_double_buffer.buffer_size);
+        g_double_buffer.shadow_valid = true;
     }
 }
 
@@ -666,6 +814,8 @@ void fb_present_rects(const display_rect_t *rects, uint32_t count)
 
     uint8_t *src_bytes = (uint8_t *)g_double_buffer.buffer;
     uint64_t scan_line_bytes = (uint64_t)g_fb.pixels_per_scan_line * sizeof(uint32_t);
+    bool sync_shadow = (g_double_buffer.shadow != NULL &&
+                        g_double_buffer.shadow_valid);
 
     for (uint32_t i = 0u; i < count; ++i) {
         uint32_t x = 0u;
@@ -684,6 +834,12 @@ void fb_present_rects(const display_rect_t *rects, uint32_t count)
                 src_bytes + ((uint64_t)(y + row) * scan_line_bytes) +
                 ((uint64_t)x * sizeof(uint32_t));
             copy_row_to_framebuffer(pixel_index, src, row_bytes);
+            /* VRAM に書いた分はシャドウにも反映する。反映しないと、後の
+             * fb_present() の差分判定が実際の VRAM 内容とずれる。 */
+            if (sync_shadow) {
+                memcpy(g_double_buffer.shadow + pixel_index, src,
+                       (size_t)row_bytes);
+            }
         }
     }
 }
