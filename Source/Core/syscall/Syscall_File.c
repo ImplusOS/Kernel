@@ -2026,6 +2026,26 @@ int32_t syscall_file_share_pages(int32_t fd, uint64_t length)
 {
     if (fd < 0 || fd >= FILE_MAX_FD || g_files[fd].used != FILE_USED_FILE ||
         !fd_is_owned_by_current_process(fd)) {
+        /* The caller checked syscall_file_is_shareable() just before this,
+         * so a refusal here means the descriptor exists and names a shareable
+         * file but this address space does not own it. That distinction is
+         * invisible from the outside -- the mapping silently becomes private
+         * -- so name the owners. */
+        if (fd >= 0 && fd < FILE_MAX_FD && g_files[fd].used == FILE_USED_FILE) {
+            static volatile uint32_t denied;
+            if (__atomic_fetch_add(&denied, 1u, __ATOMIC_RELAXED) < 16u) {
+                serial_write_string("[fdshare] deny fd=");
+                serial_write_uint32((uint32_t)fd);
+                serial_write_string(" owner=");
+                serial_write_uint32((uint32_t)g_files[fd].owner_pid);
+                serial_write_string(" current=");
+                serial_write_uint32((uint32_t)process_get_current_pid());
+                serial_write_string(" extra=");
+                serial_write_uint32((uint32_t)fd_extra_owner_test(
+                    &g_files[fd], process_get_current_pid()));
+                serial_write_string("\n");
+            }
+        }
         return -1;
     }
     kernel_open_file_t *open_file = fd_open_file(fd);

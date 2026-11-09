@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "Compat/Linux/Syscall_LinuxCompat.h"
+#include "Compat/Linux/SysvShm.h"
 #include "Compat/compat_registry.h"
 #include "Core/process/ProcessManager.h"
 #include "Core/process/ProcessScheduler.h"
@@ -1171,6 +1172,10 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_SYS_MPROTECT      10u
 #define LINUX_SYS_MUNMAP        11u
 #define LINUX_SYS_BRK           12u
+#define LINUX_SYS_SHMGET        29u
+#define LINUX_SYS_SHMAT         30u
+#define LINUX_SYS_SHMCTL        31u
+#define LINUX_SYS_SHMDT         67u
 #define LINUX_SYS_RT_SIGACTION  13u
 #define LINUX_SYS_RT_SIGPROCMASK 14u
 #define LINUX_SYS_RT_SIGRETURN  15u
@@ -1847,6 +1852,32 @@ static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
 }
 #endif
 
+/* Rate-limited report of a MAP_SHARED mapping that could not be backed by
+ * shared pages. `why` separates a filesystem that would not publish the file
+ * ("share") from a shared object that exists but could not be mapped
+ * ("map-new"); the two have completely different fixes. */
+static void linux_mmap_shared_fail_log(const char *why, int32_t fd,
+                                       uint64_t length, int32_t handle)
+{
+    static volatile uint32_t reported;
+    if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) >= 32u) {
+        return;
+    }
+    serial_write_string("[mmap] shared MAP_SHARED fell back to a private copy (");
+    serial_write_string(why);
+    serial_write_string("), len=");
+    serial_write_uint64(length);
+    serial_write_string(" fd=");
+    serial_write_uint32((uint32_t)fd);
+    serial_write_string(" handle=");
+    serial_write_uint32((uint32_t)handle);
+    serial_write_string(" maps=");
+    serial_write_uint32(shared_memory_mapping_count(handle));
+    serial_write_string(" objects=");
+    serial_write_uint32(shared_memory_object_count());
+    serial_write_string("\n");
+}
+
 static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                           uint64_t flags, uint64_t fd, uint64_t offset)
 {
@@ -2051,16 +2082,16 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                      (uint64_t)(uint32_t)share_handle, (uint64_t)(uintptr_t)p);
                 return (int64_t)(uintptr_t)p;
             }
-        }
-        if (syscall_file_is_shareable((int32_t)fd)) {
-            /* Falling back to a private copy silently breaks whoever shares
-             * this file; say so. */
-            static volatile uint32_t reported;
-            if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 16u) {
-                serial_write_string("[mmap] shared MAP_SHARED fell back to a private copy, len=");
-                serial_write_uint64(length);
-                serial_write_string("\n");
+            if (syscall_file_is_shareable((int32_t)fd)) {
+                /* Falling back to a private copy silently breaks whoever
+                 * shares this file; say so. */
+                linux_mmap_shared_fail_log("map-new", (int32_t)fd, length,
+                                           share_handle);
+                shm2("mmap-map-failed", (uint64_t)(uint32_t)fd, length,
+                     (uint64_t)(uint32_t)share_handle);
             }
+        } else if (syscall_file_is_shareable((int32_t)fd)) {
+            linux_mmap_shared_fail_log("share", (int32_t)fd, length, 0);
             shm2("mmap-share-failed", (uint64_t)(uint32_t)fd, length, offset);
         }
     }
@@ -6965,8 +6996,10 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
              * by the shared-memory layer, which has to release it itself: the
              * pages are shared and the range has to leave the object's
              * mapping table, or a later map of the same object returns this
-             * address after the allocator has reused it. */
-            if (shared_memory_unmap_any((void *)(uintptr_t)arg1)) {
+             * address after the allocator has reused it. munmap names a
+             * range: release every mapping the range intersects, since
+             * allocators coalesce neighbouring regions before unmapping. */
+            if (shared_memory_unmap_range((void *)(uintptr_t)arg1, arg2)) {
                 result = 0;
                 break;
             }
@@ -6974,6 +7007,22 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                                                   arg2);
             break;
         }
+
+        case LINUX_SYS_SHMGET:
+            result = linux_sysv_shmget(arg1, arg2, arg3);
+            break;
+
+        case LINUX_SYS_SHMAT:
+            result = linux_sysv_shmat(arg1, arg2, arg3);
+            break;
+
+        case LINUX_SYS_SHMCTL:
+            result = linux_sysv_shmctl(arg1, arg2, arg3);
+            break;
+
+        case LINUX_SYS_SHMDT:
+            result = linux_sysv_shmdt(arg1);
+            break;
 
         case 26u: { /* msync */
             int32_t self = process_get_current_pid();

@@ -10,15 +10,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SHARED_MEMORY_OBJECT_MAX 256u
+#define SHARED_MEMORY_OBJECT_MAX 1024u
 #define SHARED_MEMORY_MAPPING_MAX 32u
 #define SHARED_MEMORY_MAX_BYTES (64u * 1024u * 1024u)
-#define SHARED_MEMORY_HANDLE_INDEX_BITS 8u
-#define SHARED_MEMORY_HANDLE_INDEX_MASK 0xffu
+#define SHARED_MEMORY_HANDLE_INDEX_BITS 10u
+#define SHARED_MEMORY_HANDLE_INDEX_MASK 0x3ffu
 
 typedef struct {
     int32_t pid;
     uint64_t address;
+    /* Byte length of the mapping (the object's page-rounded size). Stored so
+     * munmap(2) can match a range instead of only an exact start address. */
+    uint64_t size;
     void *allocation_base;
     /* How many times this address space has mapped the object. A second
      * mmap() of the same object aliases the first mapping rather than making
@@ -145,7 +148,7 @@ int32_t shared_memory_create(uint32_t size)
         shared_object_t *object = &g_shared_objects[index];
         if (object->used) continue;
         uint32_t generation = object->generation + 1u;
-        if (generation == 0u || generation > 0x7fffffu) generation = 1u;
+        if (generation == 0u || generation > 0x1fffffu) generation = 1u;
         memset(object, 0, sizeof(*object));
         object->used = 1u;
         object->generation = generation;
@@ -226,13 +229,17 @@ static void *shared_memory_map_ex(int32_t handle, int allow_alias)
         }
     }
     ++object->references;
-    uint32_t size = object->size;
     uint32_t page_count = object->page_count;
     uint64_t **pages = object->pages;
     uint32_t generation = object->generation;
     spinlock_unlock(&g_shared_memory_lock);
 
-    uint32_t allocation_size = size + (uint32_t)PAGE_SIZE - 1u;
+    /* Reserve exactly the pages this mapping will use. The old size+0xFFF
+     * rounded up past the object on non-page-multiple sizes, and the extra
+     * tail could land in the next allocation's first page. process_user_alloc()
+     * now returns page-aligned, page-sized slots, so the address needs no
+     * further rounding either. */
+    uint64_t allocation_size = (uint64_t)page_count * PAGE_SIZE;
     void *allocation_base = process_user_alloc(allocation_size);
     if (!allocation_base) {
         spinlock_lock(&g_shared_memory_lock);
@@ -245,8 +252,7 @@ static void *shared_memory_map_ex(int32_t handle, int allow_alias)
         return NULL;
     }
 
-    uint64_t address =
-        ((uint64_t)(uintptr_t)allocation_base + PAGE_SIZE - 1u) & PAGE_MASK;
+    uint64_t address = (uint64_t)(uintptr_t)allocation_base;
     uint64_t cr3 = process_get_current_cr3();
     uint32_t mapped_pages = 0u;
     for (; mapped_pages < page_count; ++mapped_pages) {
@@ -288,6 +294,7 @@ static void *shared_memory_map_ex(int32_t handle, int allow_alias)
     shared_mapping_t *mapping = &object->mappings[object->mapping_count++];
     mapping->pid = caller;
     mapping->address = address;
+    mapping->size = allocation_size;
     mapping->allocation_base = allocation_base;
     mapping->map_refs = 1u;
     spinlock_unlock(&g_shared_memory_lock);
@@ -355,68 +362,114 @@ int32_t shared_memory_unmap(int32_t handle, void *address)
     return 0;
 }
 
-int shared_memory_unmap_any(void *address)
+int shared_memory_unmap_range(void *address, uint64_t length)
 {
     int32_t caller = shm_current_asid();
     if (caller < 0 || address == NULL) {
         return 0;
     }
 
-    shared_memory_init_once();
-    spinlock_lock(&g_shared_memory_lock);
-
-    shared_object_t *object = NULL;
-    void *allocation_base = NULL;
-    uint32_t generation = 0u;
-    int found = 0;
-
-    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX && !found; ++o) {
-        shared_object_t *candidate = &g_shared_objects[o];
-        if (!candidate->used) {
-            continue;
+    uint64_t start = (uint64_t)(uintptr_t)address;
+    uint64_t end = 0u;
+    if (length != 0u) {
+        end = start + length;
+        if (end <= start) {
+            return 0;
         }
-        for (uint32_t i = 0u; i < candidate->mapping_count; ++i) {
-            shared_mapping_t *mapping = &candidate->mappings[i];
-            if (mapping->pid != caller ||
-                mapping->address != (uint64_t)(uintptr_t)address) {
+    }
+
+    shared_memory_init_once();
+    int handled = 0;
+
+    /* A single munmap(2) may cover several adjacent shared mappings (some
+     * allocators coalesce neighbouring regions before unmapping them), so
+     * release every mapping the range touches, not just one whose start
+     * happens to equal the requested address. Leftovers kept both the
+     * address range and the object's reference alive, and the next
+     * allocation at that range then fought over the page tables with a
+     * mapping userland had already forgotten. */
+    for (;;) {
+        shared_object_t *object = NULL;
+        shared_mapping_t *mapping = NULL;
+        uint32_t mapping_index = 0u;
+        uint32_t generation = 0u;
+
+        spinlock_lock(&g_shared_memory_lock);
+        for (uint32_t o = 0u;
+             o < SHARED_MEMORY_OBJECT_MAX && mapping == NULL; ++o) {
+            shared_object_t *candidate = &g_shared_objects[o];
+            if (!candidate->used) {
                 continue;
             }
-            found = 1;
-            object = candidate;
-            generation = candidate->generation;
-            if (mapping->map_refs > 1u) {
-                --mapping->map_refs;
-            } else {
-                allocation_base = mapping->allocation_base;
-                candidate->mappings[i] =
-                    candidate->mappings[--candidate->mapping_count];
+            for (uint32_t i = 0u; i < candidate->mapping_count; ++i) {
+                shared_mapping_t *m = &candidate->mappings[i];
+                if (m->pid != caller) {
+                    continue;
+                }
+                int match;
+                if (length == 0u) {
+                    match = (m->address == start);
+                } else {
+                    uint64_t m_end = m->address + m->size;
+                    match = (m_end > start) && (m->address < end);
+                }
+                if (!match) {
+                    continue;
+                }
+                object = candidate;
+                mapping = m;
+                mapping_index = i;
+                generation = candidate->generation;
+                break;
             }
+        }
+
+        if (mapping == NULL) {
+            spinlock_unlock(&g_shared_memory_lock);
+            break;
+        }
+
+        handled = 1;
+        if (mapping->map_refs > 1u) {
+            /* An aliased native SYS_SHM_MAP mapping is released one
+             * reference at a time. */
+            --mapping->map_refs;
+            --object->references;
+            shared_memory_destroy_locked(object);
+            spinlock_unlock(&g_shared_memory_lock);
+            break;
+        }
+
+        void *allocation_base = mapping->allocation_base;
+        object->mappings[mapping_index] =
+            object->mappings[--object->mapping_count];
+        spinlock_unlock(&g_shared_memory_lock);
+
+        if (allocation_base != NULL) {
+            (void)process_user_free(allocation_base);
+        }
+
+        spinlock_lock(&g_shared_memory_lock);
+        /* Re-find by generation: the table may have moved under us. */
+        if (object->used && object->generation == generation) {
+            --object->references;
+            shared_memory_destroy_locked(object);
+        }
+        spinlock_unlock(&g_shared_memory_lock);
+
+        /* shmdt(2) names exactly one mapping; munmap(2) has to release
+         * every mapping its range covers. */
+        if (length == 0u) {
             break;
         }
     }
-    spinlock_unlock(&g_shared_memory_lock);
 
-    if (!found) {
-        return 0;
-    }
+    return handled;
+}
 
-    if (allocation_base != NULL) {
-        (void)process_user_free(allocation_base);
-    }
-
-    spinlock_lock(&g_shared_memory_lock);
-    /* Re-find by generation: the table may have moved under us. */
-    for (uint32_t o = 0u; o < SHARED_MEMORY_OBJECT_MAX; ++o) {
-        if (&g_shared_objects[o] == object &&
-            g_shared_objects[o].used &&
-            g_shared_objects[o].generation == generation) {
-            --g_shared_objects[o].references;
-            shared_memory_destroy_locked(&g_shared_objects[o]);
-            break;
-        }
-    }
-    spinlock_unlock(&g_shared_memory_lock);
-    return 1;
+int shared_memory_unmap_any(void *address)
+{
+    return shared_memory_unmap_range(address, 0u);
 }
 
 int shared_memory_addr_is_mapped(uint64_t addr)
@@ -598,6 +651,30 @@ uint32_t shared_memory_size(int32_t handle)
     return size;
 }
 
+uint32_t shared_memory_object_count(void)
+{
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    uint32_t used = 0u;
+    for (uint32_t i = 0u; i < SHARED_MEMORY_OBJECT_MAX; ++i) {
+        if (g_shared_objects[i].used) {
+            ++used;
+        }
+    }
+    spinlock_unlock(&g_shared_memory_lock);
+    return used;
+}
+
+uint32_t shared_memory_mapping_count(int32_t handle)
+{
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    shared_object_t *object = shared_memory_find_locked(handle, NULL);
+    uint32_t count = object ? object->mapping_count : 0u;
+    spinlock_unlock(&g_shared_memory_lock);
+    return count;
+}
+
 void shared_memory_cleanup_process(int32_t pid)
 {
     if (pid < 0) return;
@@ -619,7 +696,18 @@ void shared_memory_cleanup_process(int32_t pid)
         if (object->owner_pid == pid) {
             object->owner_pid = -1;
             object->granted_pid = -1;
-            --object->references;
+            /* A public object is kept alive by whatever published it -- a
+             * tmpfs slot or a memfd -- not by the process that happened to
+             * create it first. That publisher holds its own reference and
+             * releases it when the file dies. Dropping the reference here
+             * as well freed the pages out from under another process that
+             * still had them mapped: Chromium maps a /dev/shm file in the
+             * browser and the renderer, the browser exits first, and the
+             * renderer's next write lands in a frame the allocator has
+             * already handed to someone else. */
+            if (!object->is_public) {
+                --object->references;
+            }
         } else if (object->granted_pid == pid) {
             object->granted_pid = -1;
         }

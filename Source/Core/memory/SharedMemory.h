@@ -24,6 +24,14 @@ int32_t shared_memory_close(int32_t handle);
  * back the stale address, by then owned by some other allocation. */
 int shared_memory_unmap_any(void *address);
 
+/* As shared_memory_unmap_any(), but releases every mapping of the calling
+ * address space that intersects [address, address + length). munmap(2) names
+ * a range, and allocators coalesce neighbouring regions before unmapping
+ * them, so matching only the exact start address left mappings behind and
+ * let the next allocation at that range fight over the page tables. A
+ * length of 0 keeps the exact-address behaviour shmdt(2) needs. */
+int shared_memory_unmap_range(void *address, uint64_t length);
+
 /* 1 if `addr` lies inside a shared-memory object this address space has
  * mapped. Shared pages are not private anonymous memory, so
  * madvise(MADV_DONTNEED) must leave them alone. */
@@ -51,6 +59,13 @@ int32_t shared_memory_release(int32_t handle);
 
 /* Size in bytes of the object behind `handle`, or 0 if unknown/invalid. */
 uint32_t shared_memory_size(int32_t handle);
+
+/* Number of shared-memory objects currently in use (diagnostics). */
+uint32_t shared_memory_object_count(void);
+
+/* Number of mappings the object behind `handle` has in this address space
+ * (diagnostics; useful when shared_memory_map_new() refuses). */
+uint32_t shared_memory_mapping_count(int32_t handle);
 
 /* Let any address space map the object (see shared_object_t.is_public). */
 int32_t shared_memory_set_public(int32_t handle);

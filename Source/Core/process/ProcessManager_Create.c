@@ -8,6 +8,7 @@
 #include "Core/vfs/ProcFS.h"
 #include "Core/elf/ELF_Loader.h"
 #include "Core/memory/SharedMemory.h"
+#include "Compat/Linux/SysvShm.h"
 #include "Core/memory/FileMap.h"
 #include "Core/vfs/VFS.h"
 #include "cpu/GDT_Main.h"
@@ -4205,6 +4206,7 @@ int32_t process_execve(const char *path, const char *const *argv,
      */
     syscall_file_close_cloexec_for_pid(proc_pid);
     shared_memory_cleanup_process(proc_pid);
+    linux_sysv_shm_cleanup_process(proc_pid);
     drm_kms_notify_process_exit(proc_pid);
 
     /* POSIX: execve resets every caught signal to SIG_DFL. The new image has
@@ -4740,6 +4742,7 @@ void process_exit_current(void)
         g_exit_hook(pid_to_exit, -1);
     }
     shared_memory_cleanup_process(pid_to_exit);
+    linux_sysv_shm_cleanup_process(pid_to_exit);
     drm_kms_notify_process_exit(pid_to_exit);
     filemap_release_pid(pid_to_exit);
     /* After the fds: closing the last slave fd is what tells the terminal
@@ -6050,8 +6053,20 @@ void *process_user_alloc(uint64_t size)
         irq_restore(irq_flags);
         return NULL;
     }
+    /* Page granularity, not 16 bytes: every allocation is backed by page
+     * mappings (paging_map_user_range_alloc() maps whole pages and zeroes
+     * them). Two allocations whose 16-byte-aligned boundaries share a page
+     * would fight over that page: mapping the second one allocated a fresh
+     * frame and replaced the first one's last page with zeros, and freeing
+     * either one unmapped the page under the other. Sizes that are not page
+     * multiples (tmpfs shared mappings use the file's exact size) walked the
+     * bump cursor off page alignment, and the next shared mapping then
+     * clobbered the previous object's tail page -- Chromium's buffers came
+     * back zeroed and a return address read back as garbage (RIP=0x4246).
+     * Keeping the cursor and every slot page-aligned makes the page table
+     * and the allocator describe the same ranges. */
     uint64_t alloc_size = 0;
-    if (align_up_u64_checked((uint64_t)size, 16ULL, &alloc_size) < 0 ||
+    if (align_up_u64_checked((uint64_t)size, PAGE_SIZE, &alloc_size) < 0 ||
         alloc_size == 0) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
@@ -6109,7 +6124,7 @@ void *process_user_alloc(uint64_t size)
     }
 
     uint64_t addr = 0;
-    if (align_up_u64_checked(proc->user_heap_cursor, 16ULL, &addr) < 0) {
+    if (align_up_u64_checked(proc->user_heap_cursor, PAGE_SIZE, &addr) < 0) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
         return NULL;

@@ -682,9 +682,43 @@ static bool tmpfs_vfs_close_file(vfs_file_t *file)
     return true;
 }
 
+/* Rate-limited diagnosis for a MAP_SHARED file mapping that could not be
+ * turned into shared pages. Without the reason the caller only reports a
+ * silent private copy, which is what a cross-process buffer looks like after
+ * its first write. */
+static void tmpfs_share_fail_log(const char *why, const tmpfs_slot_t *slot,
+                                 uint64_t length)
+{
+    static uint32_t budget = 32u;
+    if (budget == 0u) {
+        return;
+    }
+    --budget;
+    serial_write_string("[tmpfs] share_map ");
+    serial_write_string(why);
+    serial_write_string(" path=");
+    serial_write_string(slot->path[0] != '\0' ? slot->path : "(unlinked)");
+    serial_write_string(" size=");
+    serial_write_uint32(slot->size);
+    serial_write_string(" shm_size=");
+    serial_write_uint32(slot->shm_size);
+    serial_write_string(" len=");
+    serial_write_uint64(length);
+    serial_write_string("\n");
+}
+
 int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
 {
-    if (file == NULL || file->fs_driver != &g_tmpfs_vfs_driver ||
+    /* Identify tmpfs by its share_map hook, not by the address of
+     * g_tmpfs_vfs_driver: vfs_mount() stores a *copy* of the driver struct
+     * (so it can stamp the mount prefix into it), and a mounted file's
+     * fs_driver therefore never equals the address of the original. An
+     * identity test here made every MAP_SHARED tmpfs mapping answer "not
+     * mine" and silently become a private snapshot -- which is what broke
+     * Chromium's cross-process command buffers. See DevFS.c
+     * devfs_file_is_pty() for the same trap. */
+    if (file == NULL || file->fs_driver == NULL ||
+        file->fs_driver->share_map != tmpfs_share_mapping ||
         file->driver_data == NULL) {
         return -1;
     }
@@ -696,12 +730,16 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
     }
     if (slot->shm_handle > 0) {
         int32_t existing = length <= (uint64_t)slot->shm_size ? slot->shm_handle : -1;
+        if (existing < 0) {
+            tmpfs_share_fail_log("too-small", slot, length);
+        }
         spinlock_unlock(&g_tmpfs_lock);
         return existing;
     }
     uint64_t want = slot->size > length ? (uint64_t)slot->size : length;
     spinlock_unlock(&g_tmpfs_lock);
     if (want == 0u || want > 64ull * 1024ull * 1024ull) {
+        tmpfs_share_fail_log("bad-size", slot, length);
         return -1;
     }
 
@@ -709,6 +747,7 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
      * nobody else shared (or removed) the slot meanwhile. */
     int32_t handle = shared_memory_create((uint32_t)want);
     if (handle <= 0) {
+        tmpfs_share_fail_log("create", slot, length);
         return -1;
     }
     (void)shared_memory_set_public(handle);
@@ -718,6 +757,9 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
         (uint64_t)slot->size > want) {
         int32_t existing = (slot->in_use && slot->shm_handle > 0 &&
                             length <= (uint64_t)slot->shm_size) ? slot->shm_handle : -1;
+        if (existing < 0) {
+            tmpfs_share_fail_log("race", slot, length);
+        }
         spinlock_unlock(&g_tmpfs_lock);
         (void)shared_memory_release(handle);
         return existing;
