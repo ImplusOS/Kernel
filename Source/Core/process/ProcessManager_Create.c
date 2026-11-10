@@ -6205,10 +6205,31 @@ int process_user_free(void *ptr)
         if (slot->used && slot->addr == addr) {
             uint64_t cr3 = proc->cr3;
             uint64_t size = slot->size;
-            slot->used = 0;
+            /* Keep the slot marked used while its pages are being torn down:
+             * process_user_alloc() reuses !used slots, and clearing the flag
+             * first let another thread map a fresh object at this address,
+             * which this unmap then pulled out from under it. */
             spinlock_unlock(&g_process_table_lock);
             irq_restore(irq_flags);
             (void)paging_unmap_range(cr3, addr, size);
+            irq_flags = irq_save_disable();
+            spinlock_lock(&g_process_table_lock);
+            if (is_valid_pid(current_pid_get())) {
+                process_t *owner =
+                    process_memory_owner_locked(&g_processes[current_pid_get()]);
+                if (owner != NULL) {
+                    for (uint32_t j = 0; j < PROCESS_USER_ALLOC_MAX; ++j) {
+                        user_alloc_t *candidate = &owner->user_allocs[j];
+                        if (candidate->used && candidate->addr == addr &&
+                            candidate->size == size) {
+                            candidate->used = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            spinlock_unlock(&g_process_table_lock);
+            irq_restore(irq_flags);
             return 0;
         }
     }
@@ -6246,22 +6267,36 @@ int process_user_munmap(void *ptr, uint64_t length)
         return -1;
     }
     uint64_t cr3 = proc->cr3;
-    for (uint32_t i = 0; i < PROCESS_USER_ALLOC_MAX; ++i) {
-        user_alloc_t *slot = &proc->user_allocs[i];
-        if (slot->size == 0) {
-            continue;
-        }
-        uint64_t slot_start = slot->addr;
-        uint64_t slot_end = slot->addr + slot->size;
-        if (slot_start >= start && slot_end <= end) {
-            slot->used = 0;
-        }
-    }
-
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
 
-    return paging_unmap_range(cr3, start, end - start);
+    int result = paging_unmap_range(cr3, start, end - start);
+
+    /* Clear the slots only after their pages are gone. Clearing first let
+     * process_user_alloc() reuse a slot while the old range was still being
+     * unmapped, so the fresh mapping was torn down instead. */
+    irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    if (is_valid_pid(current_pid_get())) {
+        process_t *owner =
+            process_memory_owner_locked(&g_processes[current_pid_get()]);
+        if (owner != NULL) {
+            for (uint32_t i = 0; i < PROCESS_USER_ALLOC_MAX; ++i) {
+                user_alloc_t *slot = &owner->user_allocs[i];
+                if (slot->size == 0) {
+                    continue;
+                }
+                uint64_t slot_start = slot->addr;
+                uint64_t slot_end = slot->addr + slot->size;
+                if (slot_start >= start && slot_end <= end) {
+                    slot->used = 0;
+                }
+            }
+        }
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return result;
 }
 
 uint64_t process_get_heap_cursor(void)
