@@ -946,6 +946,40 @@ static int virtqueue_wait_used(virtqueue_t *vq, uint16_t prev_used)
  * vq->resp_buf, never into the caller's buffer, so a request that completes
  * late cannot corrupt a stack frame that has already been reused.
  */
+/* Failures on the control queue are logged regardless of g_vlog_budget
+ * (which only throttles the boot-time trace): with virgl a timed-out or
+ * rejected command surfaces in userland as an unexplained GL_OUT_OF_MEMORY,
+ * and this line is the only place the cause is visible. Capped so a broken
+ * device cannot flood the serial port. */
+static uint32_t g_gpu_fail_log_budget = 64u;
+
+static void gpu_log_failure(const char *what, const void *cmd,
+                            uint32_t cmd_len, uint32_t resp_type) {
+#ifndef IMPLUS_DRIVER_MODULE
+    (void)what; (void)cmd; (void)cmd_len; (void)resp_type;
+    (void)g_gpu_fail_log_budget;
+#else
+    if (g_gpu_fail_log_budget == 0u || g_driver_api == NULL ||
+        g_driver_api->serial_write_string == NULL ||
+        g_driver_api->serial_write_uint32 == NULL) {
+        return;
+    }
+    --g_gpu_fail_log_budget;
+    const uint32_t *words = (const uint32_t *)cmd;
+    g_driver_api->serial_write_string("[vgpu] ");
+    g_driver_api->serial_write_string(what);
+    g_driver_api->serial_write_string(" cmd=");
+    g_driver_api->serial_write_uint32(words[0]);
+    g_driver_api->serial_write_string(" ctx=");
+    g_driver_api->serial_write_uint32(words[5]);
+    g_driver_api->serial_write_string(" arg0=");
+    g_driver_api->serial_write_uint32(cmd_len > 24u ? words[6] : 0u);
+    g_driver_api->serial_write_string(" resp=");
+    g_driver_api->serial_write_uint32(resp_type);
+    g_driver_api->serial_write_string("\n");
+#endif
+}
+
 static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
                                  void *resp, uint32_t resp_len) {
     if (vq->queue_size < 2 || cmd == NULL || resp == NULL ||
@@ -953,6 +987,9 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
         cmd_len == 0u || cmd_len > vq->cmd_cap ||
         vq->cmd_phys == 0u || vq->resp_phys == 0u ||
         resp_len > vq->resp_cap) {
+        if (cmd != NULL && cmd_len >= 28u) {
+            gpu_log_failure("REJECT", cmd, cmd_len, cmd_len);
+        }
         return 0;
     }
 
@@ -974,6 +1011,7 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
      * reading them. */
     if ((uint16_t)(vq->used->idx - vq->used_idx_seen) != 0u) {
         if (!virtqueue_wait_used(vq, vq->used_idx_seen)) {
+            gpu_log_failure("STALE", cmd, cmd_len, 0u);
             return 0;
         }
     }
@@ -1003,6 +1041,7 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     *vq->notify_addr = vq->queue_index;
 
     if (!virtqueue_wait_used(vq, prev_used)) {
+        gpu_log_failure("TIMEOUT", cmd, cmd_len, 0u);
         vlog("[vgpu] submit TIMEOUT t=");
         vlog_num(cmd != NULL ? (uint64_t)(*(const uint32_t *)cmd) : 0u);
         vlog(" avail=");
@@ -1020,12 +1059,19 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     /* Only consume the entry that belongs to this request (descriptor 0). */
     uint16_t slot = (uint16_t)(prev_used % vq->queue_size);
     if ((uint16_t)vq->used->ring[slot].id != 0u) {
+        gpu_log_failure("BADSLOT", cmd, cmd_len, vq->used->ring[slot].id);
         vq->used_idx_seen = vq->used->idx;
         return 0;
     }
 
     vq->used_idx_seen = vq->used->idx;
     memcpy(resp, vq->resp_buf, resp_len);
+    if (resp_len >= 4u) {
+        uint32_t resp_type = *(const uint32_t *)resp;
+        if (resp_type >= 0x1200u) { /* VIRTIO_GPU_RESP_ERR_* */
+            gpu_log_failure("ERR", cmd, cmd_len, resp_type);
+        }
+    }
     return 1;
 }
 
@@ -1384,8 +1430,9 @@ static int gpu_cmd_resource_create_3d(virtqueue_t *vq, uint32_t resource_id,
     virtio_gpu_resource_create_3d_t cmd;
     virtio_gpu_resp_nodata_t resp;
 
+    /* target 0 is PIPE_BUFFER, the commonest resource Mesa creates. */
     if (resource_id == 0u || width == 0u || height == 0u ||
-        depth == 0u || target == 0u) return 0;
+        depth == 0u || target >= 9u) return 0;
 
     memset(&cmd, 0, sizeof(cmd));
     memset(&resp, 0, sizeof(resp));
@@ -1651,9 +1698,13 @@ static void virtio_gpu_release_monitor_resource(virtio_gpu_monitor_t *monitor) {
         return;
     }
     if (monitor->resource_id != 0u && g_gpu_controlq.queue_size != 0u) {
+        /* The control queue is shared with the 3D paths, which run on any
+         * CPU: every submission takes g_gpu_lock (see gpu_lock()). */
+        uint64_t irq_state = gpu_lock();
         (void)gpu_cmd_resource_detach_backing(&g_gpu_controlq,
                                               monitor->resource_id);
         (void)gpu_cmd_resource_unref(&g_gpu_controlq, monitor->resource_id);
+        gpu_unlock(irq_state);
     }
     if (monitor->fb != NULL && !monitor->fb_shared) {
         free(monitor->fb);
@@ -1695,6 +1746,12 @@ static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor,
         memset(fb, 0, fb_bytes);
     }
 
+    /* Mode changes and config polls reach here from userland on any CPU
+     * while Mesa's 3D commands use the same control queue: the id counter
+     * and every submission must be under g_gpu_lock. Without it the two
+     * interleaved on the ring -- responses landed on the wrong request and
+     * ids were handed out twice (RESOURCE_CREATE_3D: "already exists"). */
+    uint64_t irq_state = gpu_lock();
     uint32_t resource_id = virtio_gpu_next_resource_id();
     if (!gpu_cmd_resource_create_2d(&g_gpu_controlq, resource_id,
                                     monitor->width, monitor->height) ||
@@ -1705,12 +1762,14 @@ static bool virtio_gpu_create_monitor_resource(virtio_gpu_monitor_t *monitor,
                              monitor->width, monitor->height)) {
         (void)gpu_cmd_resource_detach_backing(&g_gpu_controlq, resource_id);
         (void)gpu_cmd_resource_unref(&g_gpu_controlq, resource_id);
+        gpu_unlock(irq_state);
         if (!shared) {
             free(fb);
         }
         return false;
     }
 
+    gpu_unlock(irq_state);
     monitor->resource_id = resource_id;
     monitor->fb = fb;
     monitor->fb_bytes = fb_bytes;
@@ -1949,8 +2008,10 @@ static uint32_t virtio_gpu_build_layout_from_info(
 
         virtio_gpu_resp_edid_t edid;
         memset(&edid, 0, sizeof(edid));
-        virtio_gpu_build_modes(monitor,
-            gpu_cmd_get_edid(&g_gpu_controlq, i, &edid) ? &edid : NULL);
+        uint64_t irq_state = gpu_lock();
+        int have_edid = gpu_cmd_get_edid(&g_gpu_controlq, i, &edid);
+        gpu_unlock(irq_state);
+        virtio_gpu_build_modes(monitor, have_edid ? &edid : NULL);
 
         ++count;
         if (count >= VIRTIO_GPU_MAX_SCANOUTS) {
@@ -1997,7 +2058,10 @@ static bool virtio_gpu_layout_matches(const virtio_gpu_monitor_t *monitors,
 static bool virtio_gpu_refresh_layout_from_device(void) {
     virtio_gpu_resp_display_info_t info;
     memset(&info, 0, sizeof(info));
-    if (!gpu_cmd_get_display_info(&g_gpu_controlq, &info)) {
+    uint64_t irq_state = gpu_lock();
+    int have_info = gpu_cmd_get_display_info(&g_gpu_controlq, &info);
+    gpu_unlock(irq_state);
+    if (!have_info) {
         return false;
     }
 
@@ -2418,7 +2482,7 @@ bool virtio_gpu_resource_create_3d_ex(uint32_t resource_id,
                                       uint32_t last_level,
                                       uint32_t nr_samples, uint32_t flags) {
     if (!virtio_gpu_has_3d() || resource_id == 0u || width == 0u ||
-        height == 0u || depth == 0u || array_size == 0u || target == 0u) {
+        height == 0u || depth == 0u || array_size == 0u || target >= 9u) {
         return false;
     }
     uint64_t irq_state = gpu_lock();

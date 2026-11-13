@@ -408,8 +408,25 @@ static bool devfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
             devfs_set_pty_index(file, DEVFS_KIND_SND_PCM, index);
             return true;
         }
-        case DEVFS_KIND_DRM_CARD:
-        case DEVFS_KIND_DRM_RENDER:
+        case DEVFS_KIND_DRM_RENDER: {
+            /* Each open file is its own DRM client (Linux's drm_file): its
+             * render-session slot rides in driver_data, and travels with the
+             * file -- DRI3Open hands the X server's open to the client. */
+            int32_t slot = drm_render_open();
+            if (slot < 0) {
+                return false;
+            }
+            devfs_set_pty_index(file, DEVFS_KIND_DRM_RENDER, slot);
+            return true;
+        }
+        case DEVFS_KIND_DRM_CARD: {
+            /* card0 too: with a virgl backend its GEM/VIRTGPU ioctls are
+             * served from a render session (DRM_Kms.c). A full session table
+             * is not fatal for plain dumb-buffer modesetting. */
+            int32_t slot = drm_render_open();
+            devfs_set_pty_index(file, DEVFS_KIND_DRM_CARD, slot);
+            return true;
+        }
         default:
             return true;
     }
@@ -684,8 +701,9 @@ static bool devfs_vfs_close_file(vfs_file_t *file)
         devfs_kind_t kind = devfs_kind_of(file);
         if (kind == DEVFS_KIND_DRM_CARD) {
             drm_kms_close();
+            drm_render_close(devfs_pty_index_of(file));
         } else if (kind == DEVFS_KIND_DRM_RENDER) {
-            drm_render_close();
+            drm_render_close(devfs_pty_index_of(file));
         } else if (kind == DEVFS_KIND_PTMX) {
             pty_master_release(devfs_pty_index_of(file));
         } else if (kind == DEVFS_KIND_PTS) {
@@ -721,9 +739,9 @@ static int64_t devfs_vfs_dev_ioctl(vfs_file_t *file, uint64_t request, uint64_t 
     devfs_kind_t kind = devfs_kind_of(file);
     switch (kind) {
         case DEVFS_KIND_DRM_CARD:
-            return drm_kms_ioctl(request, arg);
+            return drm_kms_ioctl(devfs_pty_index_of(file), request, arg);
         case DEVFS_KIND_DRM_RENDER:
-            return drm_render_ioctl(request, arg);
+            return drm_render_ioctl(devfs_pty_index_of(file), request, arg);
         case DEVFS_KIND_INPUT_EVENT0:
         case DEVFS_KIND_INPUT_EVENT1:
             return evdev_ioctl(devfs_evdev_fd(kind), request, arg);
@@ -855,10 +873,12 @@ static int64_t devfs_vfs_dev_mmap(vfs_file_t *file, uint64_t offset,
     if (file == NULL) return -25;
     devfs_kind_t kind = devfs_kind_of(file);
     if (kind == DEVFS_KIND_DRM_CARD) {
-        return drm_kms_mmap(offset, length, prot, flags);
+        return drm_kms_mmap(devfs_pty_index_of(file), offset, length, prot,
+                            flags);
     }
     if (kind == DEVFS_KIND_DRM_RENDER) {
-        return drm_render_mmap(offset, length, prot, flags);
+        return drm_render_mmap(devfs_pty_index_of(file), offset, length,
+                               prot, flags);
     }
     if (kind == DEVFS_KIND_DRM_PRIME) {
         return drm_prime_mmap(devfs_pty_index_of(file), offset, length, prot,

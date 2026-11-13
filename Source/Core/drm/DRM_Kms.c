@@ -43,10 +43,12 @@
 #define IOC_SIZE(cmd) ((uint32_t)((cmd) >> 16) & 0x3fffu)
 #define DRM_IOCTL_BASE 'd'
 #define DRM_COMMAND_BASE 0x40u
+#define DRM_COMMAND_END  0xA0u
 
 /* command numbers (nr) */
 #define DRM_NR_VERSION            0x00
 #define DRM_NR_SET_VERSION        0x07
+#define DRM_NR_WAIT_VBLANK        0x3A
 #define DRM_NR_GET_MAGIC          0x02
 #define DRM_NR_AUTH_MAGIC         0x11 /* DRM_IOCTL_AUTH_MAGIC, *not* 0x03 */
 #define DRM_NR_GET_CAP            0x0c
@@ -145,6 +147,7 @@
 #define DRM_CAP_SYNCOBJ               0x13
 
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
+#define DRM_EVENT_VBLANK         0x01
 #define DRM_EVENT_FLIP_COMPLETE  0x02
 
 /* Distinct object IDs — atomic mode setting queries OBJ_GETPROPERTIES per
@@ -618,6 +621,18 @@ static int64_t prime_fd_to_handle(drm_dumb_t *dumbs, void *uarg,
 
     spinlock_lock(&g_lock);
     if (!g_primes[slot].used) { spinlock_unlock(&g_lock); return E_INVAL; }
+    /* Linux hands back the existing handle when this file already has one
+     * for the same buffer (including the exporter re-importing its own
+     * export). Mesa's virgl winsys keys its BO table by handle and relies on
+     * that: a fresh handle per import gives one dma-buf two winsys objects,
+     * and closing either one releases the other's attachment. */
+    for (int i = 0; i < DRM_MAX_DUMB; i++) {
+        if (dumbs[i].used && dumbs[i].prime == slot) {
+            p.handle = dumbs[i].handle;
+            spinlock_unlock(&g_lock);
+            return copy_to_user(uarg, &p, sizeof(p)) == 0u ? 0 : E_FAULT;
+        }
+    }
     drm_dumb_t *bo = NULL;
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
         if (!dumbs[i].used) { bo = &dumbs[i]; break; }
@@ -864,7 +879,19 @@ static drm_session_t *session_for_owner(int32_t owner_pid)
  * session). The session is keyed by client pid only (no launcher binding).
  */
 
-#define DRM_MAX_RENDER_SESSIONS 16
+/* One session per open file of renderD128 (or of card0, whose GEM/VIRTGPU
+ * ioctls are served from here in virgl mode), as Linux has one drm_file per
+ * open: each carries its own GEM handle namespace and its own host GL
+ * context. Mesa relies on that -- every pipe screen it creates opens (or is
+ * handed through DRI3) its own descriptor and issues CONTEXT_INIT on it, and
+ * a per-process session answered the second one with EEXIST, which is how
+ * Chromium's GPU process fell back to llvmpipe. */
+#define DRM_MAX_RENDER_SESSIONS 64
+#define DRM_RENDER_MMAP_OFFSET_BASE 0x800000000ull
+_Static_assert(DRM_MMAP_OFFSET_BASE +
+               DRM_MAX_SESSIONS * DRM_MMAP_OFFSET_STRIDE <=
+               DRM_RENDER_MMAP_OFFSET_BASE,
+               "card and render mmap token ranges overlap");
 
 typedef struct {
     uint8_t  used;
@@ -890,29 +917,19 @@ static drm_render_session_t *render_session_alloc(int32_t pid)
         s->next_handle = 1u;
         /* Separate mmap-offset space from card sessions (0x100000000 base,
          * sessions at +0x40000000 stride; render uses 0x80000000000). */
-        s->next_map_off = 0x800000000ull + (uint64_t)i * DRM_MMAP_OFFSET_STRIDE;
+        s->next_map_off = DRM_RENDER_MMAP_OFFSET_BASE +
+                          (uint64_t)i * DRM_MMAP_OFFSET_STRIDE;
         return s;
     }
     return NULL;
 }
 
-static drm_render_session_t *render_session_for_current(void)
+/* The session an open file was given by drm_render_open(), or NULL. */
+static drm_render_session_t *render_session_by_slot(int32_t slot)
 {
-    int32_t pid = process_get_current_pid();
-    if (pid <= 0) return NULL;
-
-    spinlock_lock(&g_lock);
-    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++) {
-        if (g_render_sessions[i].used &&
-            g_render_sessions[i].client_pid == pid) {
-            drm_render_session_t *found = &g_render_sessions[i];
-            spinlock_unlock(&g_lock);
-            return found;
-        }
-    }
-    drm_render_session_t *created = render_session_alloc(pid);
-    spinlock_unlock(&g_lock);
-    return created;
+    if (slot < 0 || slot >= DRM_MAX_RENDER_SESSIONS) return NULL;
+    drm_render_session_t *s = &g_render_sessions[slot];
+    return s->used ? s : NULL;
 }
 
 static bool render_session_release_gpu_locked(drm_render_session_t *sess);
@@ -1116,8 +1133,12 @@ static int render_create_resource(drm_render_session_t *sess,
 
     int rc = render_ensure_context(sess);
     if (rc < 0) return rc;
+    /* target is a gallium pipe_texture_target. 0 is PIPE_BUFFER -- every
+     * vertex, index, uniform and staging buffer Mesa makes -- so it is the
+     * most common value, not an invalid one; refusing it turned each
+     * glBufferData() into GL_OUT_OF_MEMORY. 9 is PIPE_MAX_TEXTURE_TYPES. */
     if (args->width == 0u || args->height == 0u || args->depth == 0u ||
-        args->target == 0u || args->array_size == 0u) return E_INVAL;
+        args->target >= 9u || args->array_size == 0u) return E_INVAL;
     /* The kernel currently allocates the backing BO together with the
      * resource. Rebinding an existing GEM handle is not implemented. */
     if (args->bo_handle != 0u) return E_NOTSUPP;
@@ -1212,10 +1233,10 @@ static int render_create_resource(drm_render_session_t *sess,
     return 0;
 }
 
-int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
+int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
 {
     ensure_init();
-    drm_render_session_t *sess = render_session_for_current();
+    drm_render_session_t *sess = render_session_by_slot(file_slot);
     if (!sess) return E_NOMEM;
     if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
     uint32_t nr = IOC_NR(request);
@@ -1292,7 +1313,10 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         case DRM_CAP_DUMB_PREFERRED_DEPTH:  cap.value = 24u; break;
         case DRM_CAP_DUMB_PREFER_SHADOW:    cap.value = 1u; break;
         case DRM_CAP_TIMESTAMP_MONOTONIC:   cap.value = 1u; break;
-        case DRM_CAP_PRIME:                 cap.value = 1u; break;
+        /* DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT: both directions are
+         * implemented, and Mesa only offers dma-buf export (DRI3 buffers,
+         * EGL_MESA_image_dma_buf_export) when the EXPORT bit is set. */
+        case DRM_CAP_PRIME:                 cap.value = 3u; break;
         /* We do not implement modifier-aware GEM or syncobj semantics yet.
          * Returning 1 here makes Mesa select unsupported paths. */
         case DRM_CAP_ADDFB2_MODIFIERS:      cap.value = 0u; break;
@@ -1529,11 +1553,17 @@ int64_t drm_render_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&info, uarg, sizeof(info)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = render_dumb_by_handle(sess, info.bo_handle);
-        if (bo == NULL || bo->gpu_resource_id == 0u) {
+        /* An imported PRIME handle carries no resource id of its own -- it
+         * resolves through the dma-buf block. Mesa's virgl winsys calls
+         * RESOURCE_INFO on every import (DRI3 pixmaps, EGLImages), so
+         * testing bo->gpu_resource_id directly made each cross-process
+         * buffer share fail. */
+        uint32_t res_handle = render_bo_gpu_resource_id_locked(bo);
+        if (bo == NULL || res_handle == 0u) {
             spinlock_unlock(&g_lock);
             return E_INVAL;
         }
-        info.res_handle = render_bo_gpu_resource_id_locked(bo);
+        info.res_handle = res_handle;
         info.size = (uint32_t)bo->size;
         info.blob_mem = 0u;
         spinlock_unlock(&g_lock);
@@ -1722,11 +1752,11 @@ uint32_t drm_render_poll(uint32_t events)
     return 0; /* no pollable events on render node */
 }
 
-int64_t drm_render_mmap(uint64_t offset, uint64_t length, uint64_t prot,
-                        uint64_t flags)
+int64_t drm_render_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                        uint64_t prot, uint64_t flags)
 {
     ensure_init();
-    drm_render_session_t *sess = render_session_for_current();
+    drm_render_session_t *sess = render_session_by_slot(slot);
     if (!sess) return E_NOMEM;
     (void)prot; (void)flags;
     spinlock_lock(&g_lock);
@@ -1767,23 +1797,23 @@ int64_t drm_render_mmap(uint64_t offset, uint64_t length, uint64_t prot,
     return (int64_t)uva;
 }
 
-void drm_render_close(void)
+int32_t drm_render_open(void)
 {
     ensure_init();
-    drm_render_session_t *sess = render_session_for_current();
-    if (!sess) return;
-    {
-        uint32_t n = 0;
-        for (int i = 0; i < DRM_MAX_DUMB; i++)
-            if (sess->dumbs[i].used && sess->dumbs[i].kva) n++;
-        serial_write_string("[drm] render close pid=");
-        serial_write_uint32((uint32_t)process_get_current_pid());
-        serial_write_string(" sess=");
-        serial_write_uint64((uint64_t)(uintptr_t)sess);
-        serial_write_string(" dumbs=");
-        serial_write_uint32(n);
-        serial_write_string("\n");
-    }
+    int32_t pid = process_get_current_pid();
+    if (pid <= 0) return -1;
+    spinlock_lock(&g_lock);
+    drm_render_session_t *sess = render_session_alloc(pid);
+    int32_t slot = sess != NULL ? (int32_t)(sess - g_render_sessions) : -1;
+    spinlock_unlock(&g_lock);
+    return slot;
+}
+
+void drm_render_close(int32_t slot)
+{
+    ensure_init();
+    drm_render_session_t *sess = render_session_by_slot(slot);
+    if (sess == NULL) return;
     render_session_free(sess);
 }
 
@@ -1845,13 +1875,10 @@ void drm_kms_notify_process_exit(int32_t pid)
          * launcher starts, but unbinds it so that one can claim it. */
         if (s->client_pid == pid) s->client_pid = -1;
     }
-    /* Clean up render-node sessions for this pid. */
-    for (int i = 0; i < DRM_MAX_RENDER_SESSIONS; i++) {
-        if (g_render_sessions[i].used &&
-            g_render_sessions[i].client_pid == pid) {
-            render_session_free(&g_render_sessions[i]);
-        }
-    }
+    /* Render sessions belong to open files, not to processes: exit closes
+     * the process's descriptors first (syscall_file_close_all_for_pid), and
+     * a file that is still shared -- inherited, or in flight over a socket
+     * -- must keep its session. */
 }
 
 int drm_kms_mirror_take_dirty(void)
@@ -1864,6 +1891,53 @@ int drm_kms_mirror_take_dirty(void)
 }
 
 /* memcpy into the page-scattered mirror at a byte offset. */
+/* ---- card0 on a virgl backend --------------------------------------------
+ *
+ * On Linux, virtio_gpu's card node is the same driver as its render node: a
+ * GEM handle made by RESOURCE_CREATE on card0 can be scanned out with
+ * ADDFB. Xorg depends on that -- glamor builds its GBM device on the card
+ * fd its modesetting DDX opened, and DRI3Open hands every GL client another
+ * open of that same card0. So when a 3D backend exists, card0 forwards the
+ * buffer half of the API (GEM, PRIME, every DRM_VIRTGPU_* command) to the
+ * render-node code, which keys its handles by process exactly as it does for
+ * renderD128, and keeps only modesetting for itself. A framebuffer handle is
+ * then looked up in the calling server's render session. */
+static int kms_virgl_mode(void)
+{
+    return render_gpu_backend() != NULL;
+}
+
+/* Caller holds g_lock. A card session's own dumb buffer, else (virgl mode)
+ * a buffer of the render session behind the card0 file the server is
+ * calling through. */
+static drm_dumb_t *kms_bo_by_handle_locked(drm_session_t *s,
+                                           drm_render_session_t *rs,
+                                           uint32_t h)
+{
+    drm_dumb_t *bo = dumb_by_handle(s, h);
+    if (bo != NULL || !kms_virgl_mode() || rs == NULL) return bo;
+    return render_dumb_by_handle(rs, h);
+}
+
+/* Caller holds g_lock. A virgl resource is drawn on the host; its guest
+ * backing only holds what was last transferred. Read the frame back before
+ * the CPU copies it into the window manager's surface. */
+static void kms_bo_sync_from_host_locked(drm_render_session_t *rs,
+                                         drm_dumb_t *bo, uint32_t width,
+                                         uint32_t height, uint32_t pitch)
+{
+    uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
+    if (resource_id == 0u || rs == NULL) return;
+    const driver_display_t *gpu = render_gpu_backend();
+    if (gpu == NULL || rs->context_id == 0u) return;
+    if (render_attach_bo_to_context_locked(rs, bo, gpu) < 0) return;
+    if (bo->width != 0u && width > bo->width) width = bo->width;
+    if (bo->height != 0u && height > bo->height) height = bo->height;
+    (void)gpu->gpu_transfer_3d(rs->context_id, resource_id, false,
+                               0u, 0u, 0u, width, height, 1u,
+                               0u, 0u, pitch, 0u);
+}
+
 static void mirror_write(drm_session_t *s, uint64_t offset,
                          const uint8_t *src, uint32_t len)
 {
@@ -1882,10 +1956,11 @@ static void mirror_write(drm_session_t *s, uint64_t offset,
 
 /* Blit a dumb buffer to the hardware framebuffer (XRGB8888, 32bpp assumed),
  * or into the redirection surface when one is registered. */
-static void blit_fb_to_display(drm_session_t *s, drm_fb_t *fb)
+static void blit_fb_to_display(drm_session_t *s, drm_render_session_t *rs,
+                               drm_fb_t *fb)
 {
     if (!fb) return;
-    drm_dumb_t *bo = dumb_by_handle(s, fb->handle);
+    drm_dumb_t *bo = kms_bo_by_handle_locked(s, rs, fb->handle);
     if (!bo || !bo->kva) return;
     /* A framebuffer only ever reaches this as 32bpp (the copies below are
      * fixed 4-byte rows). Mesa allocates non-32bpp buffers too -- an 8-bit R8
@@ -1896,6 +1971,7 @@ static void blit_fb_to_display(drm_session_t *s, drm_fb_t *fb)
         (uint64_t)src_pitch * (uint64_t)fb->height > bo->size) {
         return;
     }
+    kms_bo_sync_from_host_locked(rs, bo, fb->width, fb->height, src_pitch);
 
     if (s->mirror_page_count != 0u) {
         uint32_t cw = (fb->width  < s->mirror_w) ? fb->width  : s->mirror_w;
@@ -1931,23 +2007,42 @@ static void blit_fb_to_display(drm_session_t *s, drm_fb_t *fb)
     display_present();
 }
 
-static void queue_flip_event(drm_session_t *s, uint64_t user_data,
-                             uint32_t crtc_id)
+/* There is no real scanout timing behind this shim, so vblanks are a
+ * virtual 60 Hz clock derived from the system timer. Page-flip events and
+ * WAIT_VBLANK replies both report from it, which keeps the MSC Xorg's
+ * Present extension tracks monotonic and consistent between the two. */
+static uint32_t drm_vblank_now(uint32_t *out_sec, uint32_t *out_usec)
+{
+    uint32_t hz = timer_hz(); if (!hz) hz = 60u;
+    uint64_t ms = (timer_ticks() * 1000ull) / hz;
+    if (out_sec) *out_sec = (uint32_t)(ms / 1000ull);
+    if (out_usec) *out_usec = (uint32_t)((ms % 1000ull) * 1000ull);
+    return (uint32_t)((ms * 60ull) / 1000ull);
+}
+
+static void queue_vblank_event(drm_session_t *s, uint32_t type,
+                               uint64_t user_data, uint32_t sequence,
+                               uint32_t crtc_id)
 {
     uint32_t next = (s->evq_head + 1u) % DRM_EVQ_MAX;
     if (next == s->evq_tail) return; /* drop on overflow */
     struct drm_event_vblank *e = &s->evq[s->evq_head];
     memset(e, 0, sizeof(*e));
-    e->base.type = DRM_EVENT_FLIP_COMPLETE;
+    e->base.type = type;
     e->base.length = (uint32_t)sizeof(*e);
     e->user_data = user_data;
-    uint32_t hz = timer_hz(); if (!hz) hz = 60u;
-    uint64_t ms = (timer_ticks() * 1000ull) / hz;
-    e->tv_sec = (uint32_t)(ms / 1000ull);
-    e->tv_usec = (uint32_t)((ms % 1000ull) * 1000ull);
-    e->sequence = ++s->flip_seq;
+    (void)drm_vblank_now(&e->tv_sec, &e->tv_usec);
+    e->sequence = sequence;
     e->crtc_id = crtc_id;
     s->evq_head = next;
+}
+
+static void queue_flip_event(drm_session_t *s, uint64_t user_data,
+                             uint32_t crtc_id)
+{
+    s->flip_seq = drm_vblank_now(NULL, NULL);
+    queue_vblank_event(s, DRM_EVENT_FLIP_COMPLETE, user_data, s->flip_seq,
+                       crtc_id);
 }
 
 /* Append decimal `v` to buf at *pos (buf is >= 32); no NUL. */
@@ -2025,11 +2120,36 @@ static int64_t write_id_array(uint64_t uptr, uint32_t cap, const uint32_t *ids,
 }
 
 /* ---- ioctl ------------------------------------------------------------- */
-int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
+int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
 {
     ensure_init();
+    if (kms_virgl_mode() && IOC_TYPE(request) == (uint32_t)DRM_IOCTL_BASE) {
+        uint32_t fwd = IOC_NR(request);
+        switch (fwd) {
+        case DRM_NR_VERSION:          /* name it virtio_gpu, as Linux does */
+        case DRM_NR_MODE_CREATE_DUMB:
+        case DRM_NR_MODE_MAP_DUMB:
+        case DRM_NR_MODE_DESTROY_DUMB:
+        case DRM_NR_GEM_CLOSE:
+        case DRM_NR_GEM_FLINK:
+        case DRM_NR_GEM_OPEN:
+        case DRM_NR_PRIME_HANDLE_TO_FD:
+        case DRM_NR_PRIME_FD_TO_HANDLE:
+            return drm_render_ioctl(file_slot, request, arg);
+        default:
+            /* Driver-private commands (DRM_VIRTGPU_*) only: 0xA0 and up
+             * is the core KMS range again (DRM_COMMAND_END). */
+            if (fwd >= DRM_COMMAND_BASE && fwd < DRM_COMMAND_END) {
+                return drm_render_ioctl(file_slot, request, arg);
+            }
+            break;
+        }
+    }
     drm_session_t *sess = session_for_current();
     if (!sess) return E_NOMEM;
+    /* The render session behind this card0 file: where a framebuffer's
+     * GEM handle lives in virgl mode. */
+    drm_render_session_t *kms_rs = render_session_by_slot(file_slot);
     if (IOC_TYPE(request) != (uint32_t)DRM_IOCTL_BASE) return E_NOTTY;
     uint32_t nr = IOC_NR(request);
     void *uarg = (void *)(uintptr_t)arg;
@@ -2086,7 +2206,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         case DRM_CAP_CRTC_IN_VBLANK_EVENT:   c.value = 1; break;
         case DRM_CAP_CURSOR_WIDTH:
         case DRM_CAP_CURSOR_HEIGHT:          c.value = 64; break;
-        case DRM_CAP_PRIME:                  c.value = 1; break; /* dma-buf */
+        case DRM_CAP_PRIME:                  c.value = 3; break; /* import|export */
         case DRM_CAP_ADDFB2_MODIFIERS:       c.value = 1; break;
         case DRM_CAP_SYNCOBJ:                c.value = 1; break;
         default:                             c.value = 0; break;
@@ -2180,7 +2300,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         spinlock_lock(&g_lock);
         sess->scanout_fb_id = cc.fb_id;
         drm_fb_t *fb = fb_by_id(sess, cc.fb_id);
-        if (fb) blit_fb_to_display(sess, fb);
+        if (fb) blit_fb_to_display(sess, kms_rs, fb);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -2292,13 +2412,44 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         spinlock_unlock(&g_lock);
         return copy_to_user(uarg, &f, sizeof(f)) == 0u ? 0 : E_FAULT;
     }
+    case DRM_NR_WAIT_VBLANK: {
+        /* union drm_wait_vblank. Xorg's Present (modesetting vblank.c)
+         * issues one per frame once glamor is up; answering ENOTTY sent it
+         * down a fallback that retried -- and logged -- thousands of times.
+         * A wait for a future vblank completes now: there is no hardware
+         * vblank to wait for, and clients pace themselves. */
+        struct {
+            uint32_t type;
+            uint32_t sequence;
+            uint64_t signal_or_sec;
+            uint64_t usec;
+        } wv;
+        _Static_assert(sizeof(wv) == 24u, "drm_wait_vblank ABI");
+        if (!uarg || copy_from_user(&wv, uarg, sizeof(wv)) != 0u) return E_FAULT;
+        uint32_t sec = 0u, usec = 0u;
+        uint32_t now = drm_vblank_now(&sec, &usec);
+        uint32_t target = (wv.type & 0x1u) ? now + wv.sequence : wv.sequence;
+        /* _DRM_VBLANK_NEXTONMISS or an absolute target already passed. */
+        if ((int32_t)(target - now) < 0) target = now;
+        if ((wv.type & 0x04000000u) != 0u) { /* _DRM_VBLANK_EVENT */
+            spinlock_lock(&g_lock);
+            queue_vblank_event(sess, DRM_EVENT_VBLANK, wv.signal_or_sec,
+                               target, DRM_CRTC_ID);
+            spinlock_unlock(&g_lock);
+        }
+        wv.type &= 0x1u;
+        wv.sequence = target;
+        wv.signal_or_sec = sec;
+        wv.usec = usec;
+        return copy_to_user(uarg, &wv, sizeof(wv)) == 0u ? 0 : E_FAULT;
+    }
     case DRM_NR_MODE_PAGE_FLIP: {
         struct drm_mode_crtc_page_flip pf;
         if (!uarg || copy_from_user(&pf, uarg, sizeof(pf)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         sess->scanout_fb_id = pf.fb_id;
         drm_fb_t *fb = fb_by_id(sess, pf.fb_id);
-        if (fb) blit_fb_to_display(sess, fb);
+        if (fb) blit_fb_to_display(sess, kms_rs, fb);
         if (pf.flags & DRM_MODE_PAGE_FLIP_EVENT)
             queue_flip_event(sess, pf.user_data, pf.crtc_id ? pf.crtc_id : DRM_CRTC_ID);
         spinlock_unlock(&g_lock);
@@ -2309,7 +2460,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
         if (!uarg || copy_from_user(&d, uarg, sizeof(d)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
         drm_fb_t *fb = fb_by_id(sess, d.fb_id);
-        if (fb) blit_fb_to_display(sess, fb);
+        if (fb) blit_fb_to_display(sess, kms_rs, fb);
         spinlock_unlock(&g_lock);
         return 0;
     }
@@ -2491,7 +2642,7 @@ int64_t drm_kms_ioctl(uint64_t request, uint64_t arg)
             spinlock_lock(&g_lock);
             sess->scanout_fb_id = new_fb_id;
             drm_fb_t *fb = fb_by_id(sess, new_fb_id);
-            if (fb) blit_fb_to_display(sess, fb);
+            if (fb) blit_fb_to_display(sess, kms_rs, fb);
             spinlock_unlock(&g_lock);
 
             /* Queue flip event if requested. */
@@ -2618,10 +2769,15 @@ uint32_t drm_kms_poll(uint32_t events)
 }
 
 /* ---- mmap ------------------------------------------------------------- */
-int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
-                     uint64_t flags)
+int64_t drm_kms_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                     uint64_t prot, uint64_t flags)
 {
     ensure_init();
+    /* In virgl mode every buffer card0 hands out lives in this file's
+     * render session (its GEM ioctls are forwarded there). */
+    if (kms_virgl_mode()) {
+        return drm_render_mmap(slot, offset, length, prot, flags);
+    }
     drm_session_t *sess = session_for_current();
     if (!sess) return E_NOMEM;
     ensure_init();
@@ -2667,6 +2823,21 @@ int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
 void drm_kms_close(void)
 {
     ensure_init();
+    if (kms_virgl_mode()) {
+        /* In virgl mode card0 is also every DRI3 client's GPU device, so a
+         * close from Chromium's GPU process must not reach the panel
+         * session the way an unbound caller's ioctls do. Only the server a
+         * session is bound to resets it. */
+        int32_t pid = process_get_current_pid();
+        bool bound = false;
+        for (int i = 0; i < DRM_MAX_SESSIONS; i++) {
+            if (g_sessions[i].used && g_sessions[i].client_pid == pid) {
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) return;
+    }
     drm_session_t *sess = session_for_current();
     if (!sess) return ;
     /* Xorg is the only DRM client; on its exit reclaim everything. */

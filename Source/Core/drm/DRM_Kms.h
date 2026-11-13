@@ -26,7 +26,7 @@ void    drm_kms_init(void);
 
 /* ---- card0 (full KMS) ------------------------------------------------- */
 /* Linux _IOC-encoded request. Returns 0 / >=0 on success, -errno on failure. */
-int64_t drm_kms_ioctl(uint64_t request, uint64_t arg);
+int64_t drm_kms_ioctl(int32_t slot, uint64_t request, uint64_t arg);
 
 /* read(2) on the DRM fd: drains completed page-flip events as struct
  * drm_event_vblank records. nonblock != 0 -> return -11 (EAGAIN) when empty. */
@@ -38,8 +38,8 @@ uint32_t drm_kms_poll(uint32_t events);
 /* mmap(2) on the DRM fd at the offset a prior MODE_MAP_DUMB handed back:
  * maps the dumb buffer's pages into the current process. Returns user VA or
  * -errno. */
-int64_t drm_kms_mmap(uint64_t offset, uint64_t length, uint64_t prot,
-                     uint64_t flags);
+int64_t drm_kms_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                     uint64_t prot, uint64_t flags);
 
 void    drm_kms_close(void);
 
@@ -47,7 +47,7 @@ void    drm_kms_close(void);
 /* Separate namespace: GEM buffers, VirtIO virgl resources, exec/transfer,
  * and PRIME descriptors. Rejects modeset ioctls. Unsupported blob, syncobj,
  * and sync_file fence-FD paths return errors rather than being advertised. */
-int64_t drm_render_ioctl(uint64_t request, uint64_t arg);
+int64_t drm_render_ioctl(int32_t slot, uint64_t request, uint64_t arg);
 
 /* read(2) on render fd: no events on render node, always EAGAIN. */
 int64_t drm_render_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock);
@@ -56,11 +56,18 @@ int64_t drm_render_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock);
 uint32_t drm_render_poll(uint32_t events);
 
 /* mmap(2) on render fd: maps dumb buffer pages (same as card0 path). */
-int64_t drm_render_mmap(uint64_t offset, uint64_t length, uint64_t prot,
-                        uint64_t flags);
+int64_t drm_render_mmap(int32_t slot, uint64_t offset, uint64_t length,
+                        uint64_t prot, uint64_t flags);
 
-/* close(2) on render fd: frees render-node buffers. */
-void    drm_render_close(void);
+/* open(2) of renderD128 or card0: gives the new open file its own render
+ * session -- GEM handle namespace plus host GL context, Linux's drm_file --
+ * and returns its slot, which the file keeps and passes to every call below
+ * (ioctl/mmap), or -1 when the table is full. `slot` is that value. */
+int32_t drm_render_open(void);
+
+/* Last close of that open file (whichever process it ends up in): frees
+ * the session's buffers and its GPU context. */
+void    drm_render_close(int32_t slot);
 
 /* ---- PRIME dma-buf descriptors -----------------------------------------
  *

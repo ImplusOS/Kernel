@@ -345,6 +345,15 @@ void sysfs_publish_drm_nodes(void)
         render_driver = "virtio_gpu";
     }
 
+    /* With a virgl backend card0 speaks virtio_gpu too (DRM_Kms.c forwards
+     * its GEM/VIRTGPU ioctls to the render backend, as Linux's virtio_gpu
+     * card node does). It has to say so here as well: Xorg's glamor builds
+     * its GBM device on card0, Mesa picks the driver from this PCI identity,
+     * and glamor's DRI3Open hands that same card0 to every GL client. */
+    if (render_driver != display_driver) {
+        display_pci = render_pci;
+        display_driver = render_driver;
+    }
     sysfs_publish_node(DEVFS_DRM_MAJOR, DEVFS_DRM_CARD_MINOR, "dri/card0",
                        &display_pci, display_driver);
     sysfs_publish_node(DEVFS_DRM_MAJOR, DEVFS_DRM_RENDER_MINOR,
