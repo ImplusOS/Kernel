@@ -43,4 +43,12 @@ uint64_t get_phys_base(void);
 uint64_t get_virt_base(void);
 uint64_t paging_virt_to_phys(uint64_t address_space, uint64_t virt_addr);
 
+/* x86_64 shadows parts of its low identity map per process (see the x86_64
+ * Paging_Main.h); arm64 user space has no such overlap. */
+static inline int paging_is_user_shadow_window(uint64_t va)
+{
+    (void)va;
+    return 0;
+}
+
 #endif

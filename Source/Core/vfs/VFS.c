@@ -195,6 +195,54 @@ static const char *vfs_normalize_path(const char *path, char *buf, size_t cap)
     return buf;
 }
 
+/* Fold "//", "." and ".." out of an absolute path in place, lexically: the
+ * VFS drivers walk components literally and know neither "." nor "..". Wine
+ * builds its data directory relative to its own binaries --
+ * "/usr/lib/x86_64-linux-gnu/wine/../../wine/../../share/wine/nls/locale.nls"
+ * -- and every such open came back ENOENT, so ntdll could not load its NLS
+ * tables. ".." at "/" stays at "/", as on Linux. A trailing '/' is dropped
+ * (the VFS strips it anyway). */
+void vfs_canonicalize_path(char *path)
+{
+    if (path[0] != '/') {
+        return;
+    }
+    uint64_t in = 0u;
+    uint64_t out = 0u;
+    while (path[in] != '\0') {
+        while (path[in] == '/') {
+            ++in;
+        }
+        if (path[in] == '\0') {
+            break;
+        }
+        uint64_t start = in;
+        while (path[in] != '\0' && path[in] != '/') {
+            ++in;
+        }
+        uint64_t len = in - start;
+        if (len == 1u && path[start] == '.') {
+            continue;
+        }
+        if (len == 2u && path[start] == '.' && path[start + 1u] == '.') {
+            while (out > 0u) {
+                --out;
+                if (path[out] == '/') {
+                    break; /* out now sits on the parent's '/' */
+                }
+            }
+            continue;
+        }
+        path[out++] = '/';
+        memmove(path + out, path + start, len);
+        out += len;
+    }
+    if (out == 0u) {
+        out = 1u; /* everything folded away: the root itself */
+    }
+    path[out] = '\0';
+}
+
 static int vfs_resolve_candidates(const char *path,
                                   const vfs_driver_t *out[VFS_MAX_CANDIDATES])
 {

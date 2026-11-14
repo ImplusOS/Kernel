@@ -704,6 +704,9 @@ static void reset_process_slot(process_t *proc)
     memset(proc->exe_path, 0, sizeof(proc->exe_path));
     memset(proc->launch_argument, 0, sizeof(proc->launch_argument));
     proc->parent_pid = -1;
+    proc->pgid = -1;
+    proc->sid = -1;
+    proc->teardown_pending = 0u;
     proc->memory_owner_pid = -1;
     proc->exit_status = 0;
     proc->exit_by_signal = 0;
@@ -1120,6 +1123,40 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
     return 0;
 }
 
+/* A process killed by a signal's default action.
+ *
+ * This runs in the scheduler, under the process table lock, as the victim is
+ * about to be resumed -- not in the victim's own context, so it cannot run
+ * process_exit_current(). Marking the slot a zombie used to be all that
+ * happened: its descriptors, sockets, pty, shared memory and DRM session
+ * stayed open with nobody to close them. A SIGKILLed Xorg went on
+ * "listening" on its socket, and a shell killed by SIGHUP kept its pty slave
+ * open, so the xterm waiting for EOF on it never closed its window. The
+ * teardown is queued instead (process_run_pending_teardowns()), and the
+ * parent is told only once it has run -- reaping before it would release a
+ * slot whose descriptors were still being closed. */
+static volatile uint32_t g_teardown_pending;
+
+static void process_signal_kill_locked(process_t *proc, int32_t signum)
+{
+    process_t *owner = process_memory_owner_locked(proc);
+    if (owner == NULL) owner = proc;
+    if (owner->state != PROCESS_STATE_ZOMBIE || owner->teardown_pending) {
+        owner->exit_status = 128 + signum;
+        owner->exit_by_signal = 1u;
+        owner->exit_term_signal = (uint8_t)signum;
+    }
+    proc->exit_status = owner->exit_status;
+    proc->exit_by_signal = owner->exit_by_signal;
+    proc->exit_term_signal = owner->exit_term_signal;
+    if (owner->state != PROCESS_STATE_ZOMBIE && !owner->teardown_pending) {
+        owner->teardown_pending = 1u;
+        __atomic_fetch_add(&g_teardown_pending, 1u, __ATOMIC_RELEASE);
+    }
+    owner->state = PROCESS_STATE_ZOMBIE;
+    proc->state = PROCESS_STATE_ZOMBIE;
+}
+
 static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
 {
     if (proc == NULL || signum <= 0 || signum >= PROCESS_SIGNAL_MAX) {
@@ -1142,21 +1179,31 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
         return 0;
     }
     if (handler == 0) {
-        proc->exit_status = 128 + signum;
-        proc->exit_by_signal = 1u;
-        proc->exit_term_signal = (uint8_t)signum;
-        proc->state = PROCESS_STATE_ZOMBIE;
+        process_signal_kill_locked(proc, signum);
         return -1;
     }
 
 #if defined(__x86_64__)
     uint64_t *frame = (uint64_t *)(uintptr_t)proc->saved_rsp;
     if (frame == NULL || proc->saved_user_rsp < (proc->user_stack_base + 16ULL)) {
-        proc->exit_status = 128 + signum;
-        proc->exit_by_signal = 1u;
-        proc->exit_term_signal = (uint8_t)signum;
-        proc->state = PROCESS_STATE_ZOMBIE;
+        process_signal_kill_locked(proc, signum);
         return -1;
+    }
+
+    /* The task is parked in poll/select/epoll_wait with its frame rewound to
+     * re-run the syscall. Linux interrupts those waits with EINTR when a
+     * handler runs, so make the frame the handler returns to an EINTR
+     * return rather than the re-run (see linux_signal_interrupts_wait()). */
+    {
+        extern int linux_signal_interrupts_wait(int32_t tid, uint64_t frame_num,
+                                                uint64_t frame_rip);
+        if (!proc->full_restore &&
+            linux_signal_interrupts_wait((int32_t)(proc - g_processes),
+                                         frame[SYSCALL_FRAME_RAX],
+                                         frame[SYSCALL_FRAME_RCX])) {
+            frame[SYSCALL_FRAME_RAX] = (uint64_t)(int64_t)-4; /* -EINTR */
+            frame[SYSCALL_FRAME_RCX] += 2u; /* past the 2-byte SYSCALL */
+        }
     }
 
     linux_gpregs_t regs;
@@ -1195,10 +1242,7 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
                                   old_rsp, old_rflags, 0, 0 /* SI_USER */,
                                   proc->fpu_state, 0, 0,
                                   &new_rip, &new_rsp) < 0) {
-        proc->exit_status = 128 + signum;
-        proc->exit_by_signal = 1u;
-        proc->exit_term_signal = (uint8_t)signum;
-        proc->state = PROCESS_STATE_ZOMBIE;
+        process_signal_kill_locked(proc, signum);
         return -1;
     }
 
@@ -1216,10 +1260,7 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
     proc->pending_signals &= ~(1u << (uint32_t)signum);
     return 0;
 #else
-    proc->exit_status = 128 + signum;
-    proc->exit_by_signal = 1u;
-    proc->exit_term_signal = (uint8_t)signum;
-    proc->state = PROCESS_STATE_ZOMBIE;
+    process_signal_kill_locked(proc, signum);
     return -1;
 #endif
 }
@@ -1266,7 +1307,9 @@ static void process_deliver_pending_signals_locked(process_t *proc)
         }
         if (process_push_signal_frame_locked(proc, (int32_t)signum) < 0) {
             proc->pending_signals &= ~bit;
-            if (proc->state == PROCESS_STATE_ZOMBIE) {
+            process_t *owner = process_memory_owner_locked(proc);
+            if (proc->state == PROCESS_STATE_ZOMBIE &&
+                (owner == NULL || !owner->teardown_pending)) {
                 process_notify_parent_sigchld_locked(proc);
             }
         }
@@ -1657,6 +1700,11 @@ static void mark_process_runnable(process_t *proc, uint64_t entry, int32_t paren
     uint64_t now_ns = process_perf_now_ns();
     proc->entry = entry;
     proc->parent_pid = parent_pid;
+    /* A spawned program is launched, not forked: it leads a process group
+     * and a session of its own, the way a program started from a desktop
+     * does. */
+    proc->pgid = (int32_t)(proc - g_processes);
+    proc->sid = proc->pgid;
     /* A spawned program runs as whoever spawned it. */
     if (is_valid_pid(parent_pid)) {
         process_t *parent = process_memory_owner_locked(&g_processes[parent_pid]);
@@ -2964,6 +3012,8 @@ static int32_t process_create_user_internal(uint64_t entry,
     proc->timeslice = g_timeslice_ticks;
     proc->priority = 1;
     proc->parent_pid = parent_pid;
+    proc->pgid = pid;
+    proc->sid = pid;
     if (is_valid_pid(parent_pid)) {
         process_t *parent = process_memory_owner_locked(&g_processes[parent_pid]);
         if (parent != NULL) {
@@ -3057,6 +3107,8 @@ int32_t process_create_thread_ex(uint64_t entry,
     thread->is_thread = 1;
     thread->memory_owner_pid = owner_pid;
     thread->parent_pid = owner_pid;
+    thread->pgid = owner->pgid;
+    thread->sid = owner->sid;
     thread->cr3 = owner->cr3;
     thread->capability_mask = owner->capability_mask;
     thread->user_code_base = owner->user_code_base;
@@ -3903,6 +3955,8 @@ static int32_t process_fork_impl(uint64_t child_user_rsp, uint32_t opts,
 
     child->entry = parent->entry;
     child->parent_pid = parent_pid_saved;
+    child->pgid = parent->pgid >= 0 ? parent->pgid : parent_pid_saved;
+    child->sid = parent->sid >= 0 ? parent->sid : parent_pid_saved;
     child->timeslice = g_timeslice_ticks;
     child->state = PROCESS_STATE_READY;
     process_perf_mark_ready_locked(child, process_perf_now_ns());
@@ -4004,6 +4058,11 @@ int32_t process_execve(const char *path, const char *const *argv,
         path_buf[cwd_len] = '/';
         path_len += (uint64_t)cwd_len + 1u;
     }
+    /* Wine spawns its server as
+     * "/usr/lib/x86_64-linux-gnu/wine/../../wine/wineserver"; the
+     * filesystems walk components literally and know no "..". */
+    vfs_canonicalize_path(path_buf);
+    path_len = strlen(path_buf);
 
     uint64_t argc = 0;
     uint64_t envc = 0;
@@ -4688,6 +4747,8 @@ int32_t process_register_boot_process_from_memory(const void *data, uint64_t siz
 
 static int process_group_has_living_member_locked(int32_t leader_pid);
 
+static void process_teardown(int32_t pid_to_exit);
+
 void process_exit_current(void)
 {
     uint64_t irq_flags = irq_save_disable();
@@ -4717,12 +4778,24 @@ void process_exit_current(void)
         irq_restore(irq_flags);
         return;
     }
-    int32_t exit_status_log = owner->exit_status;
-    uint8_t abi_mode_log = (owner->abi_mode == PROCESS_ABI_LINUX) ? 1u : 0u;
     /* Claim the teardown before dropping the lock. */
     owner->state = PROCESS_STATE_ZOMBIE;
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+
+    process_teardown(pid_to_exit);
+}
+
+/* Everything a dead process leaves behind except its slot and address space
+ * (those go when the parent reaps it). Runs once per process, after it has
+ * been marked a zombie: from its own exit, or -- for a process killed by a
+ * signal -- from process_run_pending_teardowns(). */
+static void process_teardown(int32_t pid_to_exit)
+{
+    uint64_t irq_flags;
+    process_t *owner = &g_processes[pid_to_exit];
+    int32_t exit_status_log = owner->exit_status;
+    uint8_t abi_mode_log = (owner->abi_mode == PROCESS_ABI_LINUX) ? 1u : 0u;
 
     if (OS_CONFIG_FOREIGN_TRACE) {
         serial_write_string("[exit] pid=");
@@ -4790,6 +4863,36 @@ void process_exit_current(void)
      * serve out the slice: Xorg's Pclose() waits for xkbcomp this way, twice,
      * for every keyboard it configures. */
     poll_wait_notify();
+}
+
+/* Run the teardown of every process a signal killed (see
+ * process_signal_kill_locked()). Called on the way into every syscall: one
+ * atomic load when there is nothing to do. */
+void process_run_pending_teardowns(void)
+{
+    while (__atomic_load_n(&g_teardown_pending, __ATOMIC_ACQUIRE) != 0u) {
+        int32_t victim = -1;
+        uint64_t irq_flags = irq_save_disable();
+        spinlock_lock(&g_process_table_lock);
+        for (int32_t i = 1; i < g_process_capacity; ++i) {
+            process_t *p = &g_processes[i];
+            if (p->teardown_pending && !p->is_thread &&
+                !process_group_on_cpu_locked(i)) {
+                p->teardown_pending = 0u;
+                victim = i;
+                break;
+            }
+        }
+        if (victim >= 0) {
+            __atomic_fetch_sub(&g_teardown_pending, 1u, __ATOMIC_ACQ_REL);
+        }
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        if (victim < 0) {
+            return; /* still on a CPU somewhere: the next syscall retries */
+        }
+        process_teardown(victim);
+    }
 }
 
 void process_exit_current_signaled(int32_t signum)
@@ -6706,6 +6809,8 @@ static void signal_trace(const char *what, int32_t target, int32_t signum)
     serial_write_char('\n');
 }
 
+static int process_signal_blocked_locked(const process_t *proc, int32_t signum);
+
 int process_signal_deliver(int32_t pid, int32_t signum)
 {
     signal_trace("deliver", pid, signum);
@@ -6733,8 +6838,21 @@ int process_signal_deliver(int32_t pid, int32_t signum)
     }
 
     proc->pending_signals |= (1u << (uint32_t)signum);
+    /* A thread asleep somewhere other than a poll park -- a futex wait, a
+     * timed sleep -- has to be woken too, or the signal waits until whatever
+     * it sleeps on happens on its own. wineserver interrupts a client thread
+     * with SIGUSR1 to make it run a system APC and then waits for the
+     * result; a thread parked in a pthread condvar never took the signal,
+     * and the requester (and everything waiting on it) hung. Woken, the
+     * thread takes the signal on its way back to user space and then
+     * re-enters its wait (Linux futex/sleep waits restart here). */
+    int wake_blocked = proc->state == PROCESS_STATE_BLOCKED &&
+                       !process_signal_blocked_locked(proc, signum);
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+    if (wake_blocked) {
+        (void)process_wake_pid(pid);
+    }
     /* A signal is not an fd event, and nothing else would tell a process
      * parked in poll()/epoll_wait()/ppoll() that one is waiting for it: it
      * would otherwise sit out its whole park slice before coming back to
@@ -6776,6 +6894,159 @@ int process_signal_validate_group(int32_t tgid, int32_t tid)
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
     return valid;
+}
+
+/* ---- process groups and sessions ---------------------------------- */
+
+static process_t *pg_owner_locked(int32_t pid)
+{
+    if (!is_valid_pid(pid)) return NULL;
+    process_t *p = &g_processes[pid];
+    if (p->state == PROCESS_STATE_UNUSED || p->state == PROCESS_STATE_DEAD) {
+        return NULL;
+    }
+    return process_memory_owner_locked(p);
+}
+
+/* pid 0: the caller. -1 when there is no such process. */
+int32_t process_get_pgid(int32_t pid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    process_t *p = pg_owner_locked(pid == 0 ? current_pid_get() : pid);
+    int32_t r = -1;
+    if (p != NULL) r = p->pgid >= 0 ? p->pgid : (int32_t)(p - g_processes);
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return r;
+}
+
+int32_t process_get_sid(int32_t pid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    process_t *p = pg_owner_locked(pid == 0 ? current_pid_get() : pid);
+    int32_t r = -1;
+    if (p != NULL) r = p->sid >= 0 ? p->sid : (int32_t)(p - g_processes);
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return r;
+}
+
+/* setpgid(2): pid 0 is the caller, pgid 0 means "pid's own". The target must
+ * be the caller or a child of it, in the caller's session. */
+int32_t process_set_pgid(int32_t pid, int32_t pgid)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    process_t *self = pg_owner_locked(current_pid_get());
+    process_t *p = pg_owner_locked(pid == 0 ? current_pid_get() : pid);
+    int32_t r = 0;
+    if (self == NULL || p == NULL) {
+        r = -3; /* ESRCH */
+    } else if (p != self && p->parent_pid != (int32_t)(self - g_processes)) {
+        r = -3;
+    } else if (pgid < 0) {
+        r = -22; /* EINVAL */
+    } else {
+        int32_t target = (int32_t)(p - g_processes);
+        p->pgid = (pgid == 0) ? target : pgid;
+        if (p->sid < 0) p->sid = self->sid >= 0 ? self->sid : target;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return r;
+}
+
+/* setsid(2). Linux refuses a process-group leader (EPERM); here a program
+ * spawned from the desktop already leads both its group and its session,
+ * and refusing it would only break programs that call setsid() "to be
+ * sure", so a leader simply becomes the leader of a new session. */
+int32_t process_setsid(void)
+{
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    process_t *self = pg_owner_locked(current_pid_get());
+    int32_t r = -1;
+    if (self != NULL) {
+        r = (int32_t)(self - g_processes);
+        self->pgid = r;
+        self->sid = r;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    return r;
+}
+
+/* kill(2) with pid <= 0: 0 = the caller's group, -1 = every process of the
+ * caller's session (not the whole system -- the desktop, its services and
+ * other programs' processes are not the caller's to signal), < -1 = group
+ * -pid. Returns 0 if at least one process was signalled, -1 otherwise. */
+int process_signal_deliver_pgrp(int32_t pid, int32_t signum)
+{
+    int32_t self = current_pid_get();
+    int32_t own_pgid = process_get_pgid(0);
+    int32_t own_sid = process_get_sid(0);
+    int32_t targets[OS_CONFIG_PROCESS_MAX_COUNT];
+    int32_t count = 0;
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    process_t *me = pg_owner_locked(self);
+    for (int32_t i = 1; i < g_process_capacity &&
+                        count < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+        process_t *p = &g_processes[i];
+        if (p->is_thread || p->state == PROCESS_STATE_UNUSED ||
+            p->state == PROCESS_STATE_DEAD || p->state == PROCESS_STATE_ZOMBIE) {
+            continue;
+        }
+        bool match;
+        if (pid == 0) {
+            match = p->pgid == own_pgid;
+        } else if (pid == -1) {
+            match = p->sid == own_sid && p != me;
+        } else {
+            match = p->pgid == -pid;
+        }
+        if (match) targets[count++] = i;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+
+    int delivered = 0;
+    for (int32_t i = 0; i < count; ++i) {
+        if (process_signal_deliver_group(targets[i], signum) == 0) delivered = 1;
+    }
+    return delivered ? 0 : -1;
+}
+
+/* Signal every live process whose session or process group is `sid`.
+ * 0 if at least one was signalled (or, for signum 0, exists). */
+int process_signal_deliver_session(int32_t sid, int32_t signum)
+{
+    if (sid <= 0) return -1;
+    int32_t targets[OS_CONFIG_PROCESS_MAX_COUNT];
+    int32_t count = 0;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+    for (int32_t i = 1; i < g_process_capacity &&
+                        count < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+        process_t *p = &g_processes[i];
+        if (p->is_thread || p->state == PROCESS_STATE_UNUSED ||
+            p->state == PROCESS_STATE_DEAD || p->state == PROCESS_STATE_ZOMBIE) {
+            continue;
+        }
+        if (p->sid == sid || p->pgid == sid) targets[count++] = i;
+    }
+    spinlock_unlock(&g_process_table_lock);
+    irq_restore(irq_flags);
+    if (count == 0) return -1;
+    if (signum == 0) return 0;
+    int delivered = 0;
+    for (int32_t i = 0; i < count; ++i) {
+        if (process_signal_deliver_group(targets[i], signum) == 0) delivered = 1;
+    }
+    return delivered ? 0 : -1;
 }
 
 int process_signal_deliver_group(int32_t pid, int32_t signum)
@@ -6827,8 +7098,10 @@ int process_signal_deliver_group(int32_t pid, int32_t signum)
         return -1;
     }
 
+    int32_t wake_target = -1;
     if (!process_signal_blocked_locked(leader, signum)) {
         leader->pending_signals |= (1u << (uint32_t)signum);
+        wake_target = leader_pid;
     } else {
         int32_t target = leader_pid;
         for (int32_t i = 1; i < g_process_capacity; ++i) {
@@ -6847,9 +7120,17 @@ int process_signal_deliver_group(int32_t pid, int32_t signum)
             }
         }
         g_processes[target].pending_signals |= (1u << (uint32_t)signum);
+        wake_target = target;
     }
+    int wake_blocked = wake_target >= 0 &&
+                       g_processes[wake_target].state == PROCESS_STATE_BLOCKED &&
+                       !process_signal_blocked_locked(&g_processes[wake_target], signum);
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+    /* See process_signal_deliver(): a blocked thread must take it now. */
+    if (wake_blocked) {
+        (void)process_wake_pid(wake_target);
+    }
     /* Same reason as process_signal_deliver(): a parked waiter has to be
      * told, or the signal waits out its park slice. Done outside the table
      * lock -- poll_wait_notify() takes it again in process_wake_pid(). */
@@ -7221,6 +7502,7 @@ int32_t process_waitpid_ex(int32_t pid, int32_t *status_out, int32_t options,
             return -1;
         }
         if (g_processes[pid].state == PROCESS_STATE_ZOMBIE &&
+            !g_processes[pid].teardown_pending &&
             !process_group_on_cpu_locked(pid)) {
             int32_t exit_code = g_processes[pid].exit_status;
             int32_t term_sig = g_processes[pid].exit_by_signal
@@ -7246,6 +7528,7 @@ int32_t process_waitpid_ex(int32_t pid, int32_t *status_out, int32_t options,
     for (int32_t i = 0; i < g_process_capacity; ++i) {
         if (g_processes[i].state == PROCESS_STATE_ZOMBIE &&
             !g_processes[i].is_thread &&
+            !g_processes[i].teardown_pending &&
             g_processes[i].parent_pid == my_pid &&
             !process_group_on_cpu_locked(i)) {
             int32_t exit_code = g_processes[i].exit_status;

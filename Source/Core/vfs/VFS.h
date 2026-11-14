@@ -29,6 +29,8 @@ bool vfs_set_default_fs_for_file(const char *path,
  * driver reports that media kind. */
 bool vfs_set_default_fs_by_kind(vfs_media_kind_t kind);
 bool vfs_find_file(const char *path, vfs_file_t *out_file);
+/* Fold "//", "." and ".." out of an absolute path in place (lexically). */
+void vfs_canonicalize_path(char *path);
 bool vfs_read_file(vfs_file_t *file, uint8_t *buffer);
 bool vfs_write_file(vfs_file_t *file, const uint8_t *buffer);
 bool vfs_read_at(vfs_file_t *file, uint32_t offset, uint8_t *buffer, uint32_t size);

@@ -27,6 +27,10 @@ int32_t devfs_prime_fd(int32_t slot, uint32_t size);
 
 /* The PRIME slot a vfs_file_t names, or -1 if it is not a dma-buf. */
 int32_t devfs_prime_slot(const vfs_file_t *file);
+/* Same for a sync_file (DRM fence fd): install one for sync slot `slot`, and
+ * map a descriptor back to its slot (-1 when it is not a sync_file). */
+int32_t devfs_sync_fd(int32_t slot);
+int32_t devfs_sync_slot(const vfs_file_t *file);
 
 /* True if `path` names one of the fixed /dev character-device nodes
  * (used by stat()/fstat() in the Linux ABI layer to report S_IFCHR

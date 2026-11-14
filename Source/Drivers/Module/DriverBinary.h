@@ -28,8 +28,14 @@ typedef struct __attribute__((packed)) {
     uint16_t y;
     uint8_t buttons;
     int8_t wheel;
-    uint8_t reserved[2];
+    uint8_t flags;          /* DRIVER_MOUSE_FLAG_* */
+    uint8_t reserved;
 } driver_mouse_event_t;
+
+/* x/y are an absolute position, 0..DRIVER_MOUSE_ABS_MAX across the screen,
+ * instead of signed relative deltas (USB tablets, QEMU usb-tablet). */
+#define DRIVER_MOUSE_FLAG_ABSOLUTE 0x01u
+#define DRIVER_MOUSE_ABS_MAX       32767u
 
 typedef struct {
     void (*msleep)(uint32_t ms);
@@ -685,6 +691,40 @@ typedef struct {
                             uint32_t width, uint32_t height, uint32_t depth,
                             uint64_t offset, uint32_t level,
                             uint32_t stride, uint32_t layer_stride);
+
+    /* Optional fenced (asynchronous) submission. Each returns the fence id
+     * of the queued request, or 0 when it could not be queued; the call
+     * does not wait for the host. gpu_fence_completed() returns the largest
+     * fence id at or below which every fence has retired, and must be safe
+     * to call from the timer interrupt. Drivers without them leave NULL and
+     * the synchronous calls above are used. */
+    uint64_t (*gpu_submit_3d_async)(uint32_t context_id, const void *commands,
+                                    uint32_t command_bytes);
+    uint64_t (*gpu_transfer_3d_async)(uint32_t context_id,
+                                      uint32_t resource_id, bool to_host,
+                                      uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t depth, uint64_t offset,
+                                      uint32_t level, uint32_t stride,
+                                      uint32_t layer_stride);
+    uint64_t (*gpu_fence_completed)(void);
+    /* Optional: `callback` is invoked -- possibly from an interrupt -- when
+     * gpu_fence_completed() advances, so waiters can be woken at once. */
+    void (*gpu_set_fence_callback)(void (*callback)(void));
+
+    /* Optional direct scanout of a 3D render target (GPU compositing).
+     * gpu_scanout_set() points every monitor at its viewport of
+     * `resource_id`, a desktop-sized (width x height) 3D resource the caller
+     * renders into; resource_id 0 hands the monitors back to the driver's
+     * own framebuffer resources and repaints them from it. Any layout or
+     * mode change also drops the external resource. gpu_scanout_flush()
+     * shows the given desktop rectangle of the current external resource,
+     * and fails once that resource is no longer the one on scanout -- the
+     * caller's cue to re-query the topology and set it again. */
+    bool (*gpu_scanout_set)(uint32_t resource_id, uint32_t width,
+                            uint32_t height);
+    bool (*gpu_scanout_flush)(uint32_t resource_id, int32_t x, int32_t y,
+                              uint32_t width, uint32_t height);
 } driver_display_t;
 
 #define DRIVER_KBD_MOD_SHIFT (1u << 0)

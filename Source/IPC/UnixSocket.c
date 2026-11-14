@@ -64,6 +64,9 @@ struct usock_passed {
      * that arrives O_RDWR fails PlatformSharedMemoryRegion::Take() (the
      * pseudonymization salt, first thing every child process maps). */
     uint32_t status_flags;
+    /* Stream sockets: the byte position (unix_sock_t.in_pos at the time of
+     * the send) the descriptor was sent with. See usock_dequeue(). */
+    uint32_t at;
 };
 
 typedef struct {
@@ -114,6 +117,9 @@ typedef struct {
      * Syscall_Epoll.c's epoll_check_once() and TODO_Chromium_LinuxABI.md
      * section 10.-5. This counter is the arrival event epoll compares against. */
     uint32_t rx_seq;
+    /* Stream sockets: bytes ever queued into / taken out of this endpoint's
+     * ring (mod 2^32), the coordinates usock_passed.at is given in. */
+    uint32_t in_pos, out_pos;
     /* Pending SCM_RIGHTS transfers, oldest first. See usock_passed_t. */
     struct usock_passed fd_queue[UNIX_SOCK_FD_MAX];
     uint32_t fds_head, fds_tail;
@@ -313,6 +319,17 @@ int64_t unix_socket_bind(int32_t fd, const char *path) {
     return 0;
 }
 
+int unix_socket_path_bound(const char *path) {
+    if (path == NULL || path[0] != '/') return 0;
+    size_t clen = 0; while (path[clen]) clen++;
+    for (int i = 0; i < UNIX_SOCK_MAX; i++) {
+        if (!g_usocks[i].used) continue;
+        size_t plen = 0; while (g_usocks[i].path[plen]) plen++;
+        if (plen == clen && memcmp(g_usocks[i].path, path, plen) == 0) return 1;
+    }
+    return 0;
+}
+
 int64_t unix_socket_listen(int32_t fd, int32_t backlog) {
     (void)backlog;
     unix_sock_t *s = usock_get(fd);
@@ -391,6 +408,9 @@ int64_t unix_socket_accept(int32_t fd) {
                  * any pending SCM_RIGHTS handles and message records, onto
                  * the accepted socket. */
                 spinlock_lock(&s->lock);
+                /* The moved bytes and descriptors keep their coordinates. */
+                ns->in_pos = s->in_pos;
+                ns->out_pos = s->out_pos;
                 while (s->buf_tail != s->buf_head) {
                     uint32_t nx = (ns->buf_head + 1) % UNIX_SOCK_BUF_SIZE;
                     if (nx == ns->buf_tail) break;
@@ -507,6 +527,7 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
     }
     for (uint32_t i = 0; i < nobjs; ++i) {
         if (i < fd_space) {
+            objs[i].at = peer->in_pos;
             peer->fd_queue[peer->fds_head] = objs[i];
             peer->fds_head = (peer->fds_head + 1u) % UNIX_SOCK_FD_MAX;
         } else {
@@ -518,6 +539,7 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
         peer->buf[peer->buf_head] = data[written++];
         peer->buf_head = (peer->buf_head + 1u) % UNIX_SOCK_BUF_SIZE;
     }
+    peer->in_pos += (uint32_t)written;
     if (peer->seqpacket) {
         peer->msgs[peer->msg_head].len = (uint32_t)len;
         peer->msgs[peer->msg_head].nfds = (uint16_t)nobjs;
@@ -593,12 +615,34 @@ static int64_t usock_dequeue(unix_sock_t *s, uint8_t *dst, uint64_t len,
         }
         take_fds = have ? mfds : 0u;
     } else {
-        while (rd < len && s->buf_tail != s->buf_head) {
+        /* A stream still keeps descriptors with the bytes they were sent
+         * with, as Linux does: a read takes the descriptors attached at or
+         * before its starting position and stops short of the next send
+         * that carried any. Handing every queued descriptor to the first
+         * read broke wineserver, whose clients send two 8-byte messages
+         * with one fd each back to back: the first recvmsg() took both fds
+         * (receive_fd() keeps one), the second found none, and the server
+         * dropped the client as a protocol violator. */
+        take_fds = 0u;
+        uint64_t limit = len;
+        for (uint32_t q = s->fds_tail; q != s->fds_head;
+             q = (q + 1u) % UNIX_SOCK_FD_MAX) {
+            int32_t d = (int32_t)(s->fd_queue[q].at - s->out_pos);
+            if (d <= 0) {
+                ++take_fds;
+                continue;
+            }
+            if ((uint64_t)d < limit) {
+                limit = (uint64_t)d;
+            }
+            break;
+        }
+        while (rd < limit && s->buf_tail != s->buf_head) {
             dst[rd++] = s->buf[s->buf_tail];
             s->buf_tail = (s->buf_tail + 1u) % UNIX_SOCK_BUF_SIZE;
         }
-        have = (rd != 0u) || (s->fds_tail != s->fds_head);
-        take_fds = UNIX_SOCK_FD_MAX;
+        s->out_pos += (uint32_t)rd;
+        have = (rd != 0u) || (take_fds != 0u);
     }
     struct usock_passed dropped[UNIX_SOCK_FD_MAX];
     uint32_t ndropped = 0;
@@ -1045,6 +1089,11 @@ int unix_socket_set_nonblock(int32_t fd, int on)
     return 0;
 }
 
+int unix_socket_exists(int32_t fd)
+{
+    return usock_get(fd) != NULL;
+}
+
 int unix_socket_is_nonblock(int32_t fd)
 {
     unix_sock_t *s = usock_get(fd);
@@ -1196,6 +1245,23 @@ uint32_t unix_socket_poll(int32_t fd, uint32_t events) {
                   (s->seqpacket && s->msg_tail != s->msg_head);
         spinlock_unlock(&s->lock);
         if (has) r |= 0x1u;
+        /* A listening socket is readable while a connection is waiting to be
+         * accept()ed: a connected client whose peer is still the listener
+         * (unix_socket_accept() re-points it at the new endpoint). X11 and
+         * Wayland clients happened to work without this because they write
+         * first, which leaves bytes in the listener's ring; wineserver's
+         * clients wait for the server to speak first, so the server sat in
+         * poll() and the client in recvmsg() forever. */
+        if (!has && s->listening) {
+            int32_t self = UNIX_SOCK_FD_BASE + (int32_t)(s - g_usocks);
+            for (int i = 0; i < UNIX_SOCK_MAX; i++) {
+                if (g_usocks[i].used && g_usocks[i].connected &&
+                    g_usocks[i].peer_fd == self) {
+                    r |= 0x1u;
+                    break;
+                }
+            }
+        }
     }
     if ((events & 0x4u) != 0u) {          /* POLLOUT: approximate as always
                                            * writable (ring is large) */

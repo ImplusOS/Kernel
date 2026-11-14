@@ -13,9 +13,14 @@
 int64_t syscall_vm_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 {
     enum { PROT_READ = 1u, PROT_WRITE = 2u, PROT_EXEC = 4u };
-    if (len == 0 || (addr & (PAGE_SIZE - 1ULL)) != 0u ||
+    if ((addr & (PAGE_SIZE - 1ULL)) != 0u ||
         (prot & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0u)
         return -22;
+    /* mprotect(addr, 0, ...) succeeds on Linux. Wine's PE mapper protects
+     * every section, empty ones included, and took the EINVAL as a failure
+     * to map the image ("could not load kernel32.dll, status c0000135"). */
+    if (len == 0)
+        return 0;
 
     uint64_t cr3 = process_get_current_cr3();
     if (cr3 == 0) return -14;

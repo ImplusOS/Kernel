@@ -292,6 +292,10 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
      * will later replace. The kernel image itself starts at 0x01800000. */
     physical_memory_reserve_region(PAGING_LEGACY_ET_EXEC_BASE,
                                    PAGING_LEGACY_ET_EXEC_SIZE);
+    /* Same for Windows' fixed KUSER_SHARED_DATA page, which Wine maps at
+     * 0x7FFE0000 in every Windows process (see Paging_Main.h). */
+    physical_memory_reserve_region(PAGING_WIN_SHARED_DATA_BASE,
+                                   PAGING_WIN_SHARED_DATA_SIZE);
 #endif
     boot_profile_end("pmm", phase_ns);
 

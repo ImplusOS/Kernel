@@ -45,6 +45,7 @@ static uint8_t  g_hid_mouse_ep_in     = 0;
 static uint16_t g_hid_mouse_ep_mps    = 0;
 static uint16_t g_hid_mouse_vendor_id = 0;
 static uint16_t g_hid_mouse_device_id = 0;
+static bool     g_hid_mouse_boot      = true;
 
 static usb_hc_type_t g_hc_type = USB_HC_NONE;
 static bool g_ohci_ready = false;
@@ -497,6 +498,7 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     uint16_t kbd_ep_mps = 0;
 
     uint8_t mouse_iface = 0xFF;
+    bool mouse_boot = true;
     uint8_t mouse_ep_in = 0;
     uint16_t mouse_ep_mps = 0;
 
@@ -598,6 +600,13 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                         kbd_iface = current_iface;
                     } else if (effective_protocol == 2) {
                         mouse_iface = current_iface;
+                        mouse_boot = true;
+                    } else if (mouse_iface == 0xFF) {
+                        /* Non-boot HID (e.g. an absolute tablet): try it as
+                         * a pointer; usb_hid_add_mouse() checks its report
+                         * descriptor for X/Y and ignores it otherwise. */
+                        mouse_iface = current_iface;
+                        mouse_boot = false;
                     }
                 } else if (effective_class == 0xFFu) {
                     bool known = false;
@@ -791,13 +800,17 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
             g_hid_kbd_device_id = desc.idProduct;
         }
 
-        if (mouse_iface != 0xFF && mouse_ep_in != 0) {
+        /* A non-boot HID interface is only a pointer candidate; never let it
+         * displace a mouse that is already attached. */
+        if (mouse_iface != 0xFF && mouse_ep_in != 0 &&
+            (mouse_boot || g_hid_mouse_addr == 0u)) {
             g_hid_mouse_addr = current_addr;
             g_hid_mouse_interface = mouse_iface;
             g_hid_mouse_ep_in = mouse_ep_in;
             g_hid_mouse_ep_mps = mouse_ep_mps ? mouse_ep_mps : 8;
             g_hid_mouse_vendor_id = desc.idVendor;
             g_hid_mouse_device_id = desc.idProduct;
+            g_hid_mouse_boot = mouse_boot;
         }
     }
 
@@ -815,7 +828,8 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
     }
 
     if (g_hid_mouse_addr == current_addr && g_hid_mouse_ep_in != 0) {
-        usb_hid_add_mouse(g_hid_mouse_addr, g_hid_mouse_interface, g_hid_mouse_ep_in, g_hid_mouse_ep_mps);
+        usb_hid_add_mouse(g_hid_mouse_addr, g_hid_mouse_interface, g_hid_mouse_ep_in, g_hid_mouse_ep_mps,
+                          g_hid_mouse_boot);
         usb_publish_hid_event(PNP_CLASS_MOUSE,
                               PNP_EVENT_DEVICE_ADDED,
                               "USB HID mouse",

@@ -7,7 +7,11 @@
 void usb_hid_init(void);
 
 void usb_hid_add_keyboard(uint8_t dev_addr, uint8_t interface, uint8_t ep_in, uint16_t mps);
-void usb_hid_add_mouse(uint8_t dev_addr, uint8_t interface, uint8_t ep_in, uint16_t mps);
+/* boot_protocol: the interface advertises the boot mouse protocol (2). When
+ * false the report layout is read from the HID report descriptor, which is
+ * how absolute pointers such as QEMU's usb-tablet are supported. */
+void usb_hid_add_mouse(uint8_t dev_addr, uint8_t interface, uint8_t ep_in,
+                       uint16_t mps, bool boot_protocol);
 void usb_hid_remove_keyboard(uint8_t dev_addr);
 void usb_hid_remove_mouse(uint8_t dev_addr);
 

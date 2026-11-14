@@ -28,6 +28,8 @@ void     smp_tlb_shootdown(uint64_t vaddr, uint64_t pages);
 void     smp_tlb_shootdown_all(void);
 void     smp_tlb_shootdown_handler(void);
 void     smp_send_resched_ipi(uint32_t cpu);
+/* Fixed-delivery IPI with `vector` to CPU `cpu`. */
+void     smp_send_vector_ipi(uint32_t cpu, uint8_t vector);
 
 /* Publish the address space this CPU has just loaded, so shootdowns for other
  * address spaces need not wait for it. Called from paging_switch_cr3(). */

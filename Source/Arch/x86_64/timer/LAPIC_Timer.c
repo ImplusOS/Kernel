@@ -10,6 +10,7 @@
 #include "Debug/serial/Serial.h"
 #include "interfaces/hal_cpu.h"
 #include "Platform/timer/HPET.h"
+#include "Core/timer/Timer.h"
 
 #define PIT_CHANNEL0_DATA 0x40
 #define PIT_COMMAND       0x43
@@ -54,6 +55,53 @@ static void pit_set_frequency(uint32_t hz) {
 static volatile uint32_t g_tick_by_lapic[TIMER_TICK_TRACE_LAPICS];
 #endif
 
+/* ---- BSP one-shot mode ----------------------------------------------------
+ *
+ * The APs keep the periodic LAPIC timer. The BSP -- which alone counts
+ * g_ticks -- runs its LAPIC timer one-shot instead and re-arms it on every
+ * interrupt for whichever comes first: the next periodic tick (kept on a
+ * timer_monotonic_ns() schedule, so the tick rate is exactly what periodic
+ * mode gave) or the earliest high-resolution deadline a client registered
+ * (timer_hires_next_due_ns(): vblank events and waits). An early interrupt
+ * does not count a tick. A deadline registered on another CPU that is
+ * earlier than what the BSP armed is delivered by sending the BSP the timer
+ * vector as an IPI, which runs this same handler and re-arms. */
+#define LAPIC_HIRES_MIN_NS   20000ull   /* shortest one-shot we program */
+#define LAPIC_TICK_SLACK_NS  50000ull   /* "close enough" to a tick */
+
+static volatile uint8_t  g_bsp_oneshot;
+static uint64_t          g_lapic_counts_per_sec;
+static uint64_t          g_tick_period_ns;
+static uint64_t          g_next_tick_ns;
+static volatile uint64_t g_bsp_armed_ns = UINT64_MAX;
+
+static void lapic_bsp_arm(uint64_t now)
+{
+    uint64_t due = g_next_tick_ns;
+    uint64_t hires = timer_hires_next_due_ns();
+    if (hires < due) due = hires;
+    uint64_t delta = due > now ? due - now : 0u;
+    if (delta < LAPIC_HIRES_MIN_NS) delta = LAPIC_HIRES_MIN_NS;
+    uint64_t count = (delta * g_lapic_counts_per_sec) / 1000000000ull;
+    if (count == 0u) count = 1u;
+    if (count > 0xFFFFFFFFull) count = 0xFFFFFFFFull;
+    __atomic_store_n(&g_bsp_armed_ns, now + delta, __ATOMIC_RELEASE);
+    (void)lapic_timer_start(VECTOR_TIMER, (uint32_t)count, 0, 16u);
+}
+
+static void lapic_hires_request(uint64_t due_ns)
+{
+    if (!g_bsp_oneshot) return;
+    uint64_t armed = __atomic_load_n(&g_bsp_armed_ns, __ATOMIC_ACQUIRE);
+    if (due_ns + LAPIC_HIRES_MIN_NS >= armed) return; /* fires early enough */
+    /* Claim it so concurrent requests do not each send an IPI. */
+    if (!__atomic_compare_exchange_n(&g_bsp_armed_ns, &armed, due_ns, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        return;
+    }
+    smp_send_vector_ipi(0u, VECTOR_TIMER);
+}
+
 static void lapic_timer_handler(void) {
 #if TIMER_TICK_TRACE
     {
@@ -87,6 +135,25 @@ static void lapic_timer_handler(void) {
             g_timer_callback();
         }
         return;
+    }
+    if (g_bsp_oneshot) {
+        uint64_t now = timer_monotonic_ns();
+        int tick = 0;
+        if (now + LAPIC_TICK_SLACK_NS >= g_next_tick_ns) {
+            tick = 1;
+            g_next_tick_ns += g_tick_period_ns;
+            if (g_next_tick_ns <= now) {
+                /* Interrupts were held off for more than a period. */
+                g_next_tick_ns = now + g_tick_period_ns;
+            }
+        }
+        timer_hires_service(now);
+        /* Re-arm before the tick work: the scheduler may switch tasks from
+         * inside the callback. */
+        lapic_bsp_arm(timer_monotonic_ns());
+        if (!tick) {
+            return;
+        }
     }
     __atomic_fetch_add(&g_ticks, 1u, __ATOMIC_RELAXED);
 #if TIMER_TICK_TRACE
@@ -211,6 +278,7 @@ static void lapic_switch_to_local(void) {
     }
 
     uint32_t initial = 0u;
+    uint64_t rate = 0u;
 
     if (hpet_is_available()) {
         /* One-shot at full count: 2^32 ticks is over a minute even at the
@@ -237,6 +305,7 @@ static void lapic_switch_to_local(void) {
             return;
         }
         uint64_t per_second = (counted * 1000000000ull) / span_ns;
+        rate = per_second;
         uint64_t count = per_second / (uint64_t)g_timer_hz;
         if (count == 0u || count > 0xFFFFFFFFull) {
             return;
@@ -270,6 +339,18 @@ static void lapic_switch_to_local(void) {
 
     g_lapic_timer_initial = initial;
     platform_interrupts_mask_pit();
+    if (rate != 0u && smp_get_current_cpu_id() == 0u) {
+        /* BSP: one-shot with software-scheduled ticks (see above). Needs the
+         * measured rate, so only on the HPET-calibrated path. */
+        g_lapic_counts_per_sec = rate;
+        g_tick_period_ns = 1000000000ull / (uint64_t)g_timer_hz;
+        uint64_t now = timer_monotonic_ns();
+        g_next_tick_ns = now + g_tick_period_ns;
+        __atomic_store_n(&g_bsp_oneshot, 1u, __ATOMIC_RELEASE);
+        lapic_bsp_arm(now);
+        serial_write_string("[lapic] BSP one-shot (hires deadlines)\n");
+        return;
+    }
     (void)lapic_timer_start(VECTOR_TIMER, initial, 1, 16u);
 }
 
@@ -286,5 +367,6 @@ const timer_hal_t lapic_timer_hal = {
     .msleep = lapic_msleep,
     .set_handler = lapic_set_handler,
     .disable_irq = lapic_disable_irq,
-    .switch_to_local = lapic_switch_to_local
+    .switch_to_local = lapic_switch_to_local,
+    .hires_request = lapic_hires_request
 };

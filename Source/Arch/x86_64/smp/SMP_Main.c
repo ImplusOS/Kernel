@@ -668,6 +668,14 @@ void smp_tlb_shootdown_handler(void)
 
 /* Wakes CPU `cpu` out of hlt (and, if it is running user code, has it check
  * whether to switch): see isr_resched in IDT.asm. */
+void smp_send_vector_ipi(uint32_t cpu, uint8_t vector)
+{
+    if (cpu >= g_cpu_apic_count || cpu >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+        return;
+    }
+    lapic_send_ipi(g_cpu_apic_ids[cpu], (uint32_t)vector);
+}
+
 void smp_send_resched_ipi(uint32_t cpu)
 {
     if (cpu >= g_cpu_apic_count || cpu >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {

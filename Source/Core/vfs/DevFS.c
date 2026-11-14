@@ -49,6 +49,9 @@ typedef enum {
      * the pty kinds it is a per-open object, and the prime slot travels in
      * driver_data's index field -- the whole identity of the descriptor. */
     DEVFS_KIND_DRM_PRIME,
+    /* A sync_file: a DRM fence fd. Pathless like a dma-buf; the sync slot
+     * rides in driver_data's index field. */
+    DEVFS_KIND_DRM_SYNC,
     DEVFS_KIND_COUNT
 } devfs_kind_t;
 
@@ -719,6 +722,8 @@ static bool devfs_vfs_close_file(vfs_file_t *file)
              * which frees the pages if no GEM handle and no other descriptor
              * still holds one. */
             drm_prime_close(devfs_pty_index_of(file));
+        } else if (kind == DEVFS_KIND_DRM_SYNC) {
+            drm_sync_file_close(devfs_pty_index_of(file));
         }
     }
     return true;
@@ -754,8 +759,10 @@ static int64_t devfs_vfs_dev_ioctl(vfs_file_t *file, uint64_t request, uint64_t 
         case DEVFS_KIND_SND_PCM:
             return alsa_pcm_ioctl(devfs_pty_index_of(file), request, arg);
         case DEVFS_KIND_DRM_PRIME:
-            /* DMA_BUF_IOCTL_SYNC / DMA_BUF_SET_NAME only. */
+            /* DMA_BUF_IOCTL_SYNC, SET_NAME, EXPORT/IMPORT_SYNC_FILE. */
             return drm_prime_ioctl(devfs_pty_index_of(file), request, arg);
+        case DEVFS_KIND_DRM_SYNC:
+            return drm_sync_file_ioctl(devfs_pty_index_of(file), request, arg);
         default:
             return -25; /* ENOTTY */
     }
@@ -821,8 +828,9 @@ static int64_t devfs_vfs_dev_read(vfs_file_t *file, uint8_t *buffer,
             return (int64_t)done;
         }
         case DEVFS_KIND_DRM_PRIME:
-            /* A dma-buf has no read(2); Linux answers EINVAL for the same
-             * reason -- no f_op->read. */
+        case DEVFS_KIND_DRM_SYNC:
+            /* Neither a dma-buf nor a sync_file has read(2); Linux answers
+             * EINVAL for the same reason -- no f_op->read. */
             return -22;
         default:
             return -14;
@@ -839,11 +847,10 @@ static uint32_t devfs_vfs_dev_poll(vfs_file_t *file, uint32_t events)
         case DEVFS_KIND_DRM_RENDER:
             return drm_render_poll(events);
         case DEVFS_KIND_DRM_PRIME:
-            /* No fences behind these buffers, so there is nothing that could
-             * ever make one not ready to write into. Claiming POLLOUT keeps a
-             * blocking poll() from waiting for a signal that cannot come;
-             * POLLIN stays unsignalled because the object is not readable. */
-            return (events & 0x4u);
+            /* Ready once the buffer's implicit fence has retired. */
+            return drm_prime_poll(devfs_pty_index_of(file), events);
+        case DEVFS_KIND_DRM_SYNC:
+            return drm_sync_file_poll(devfs_pty_index_of(file), events);
         case DEVFS_KIND_INPUT_EVENT0:
         case DEVFS_KIND_INPUT_EVENT1:
             /* Only readable when the ring actually holds an event. Claiming
@@ -993,6 +1000,26 @@ int32_t devfs_prime_fd(int32_t slot, uint32_t size)
     file.driver_data = devfs_pack(DEVFS_KIND_DRM_PRIME, slot);
     file.fs_driver = devfs_vfs_get_driver();
     return syscall_file_install_dev(&file);
+}
+
+int32_t devfs_sync_fd(int32_t slot)
+{
+    if (slot < 0) return -22;
+    vfs_file_t file;
+    memset(&file, 0, sizeof(file));
+    file.internal_id = 0xE1000000ull | (uint64_t)(uint32_t)slot;
+    file.size = 0u;
+    file.driver_data = devfs_pack(DEVFS_KIND_DRM_SYNC, slot);
+    file.fs_driver = devfs_vfs_get_driver();
+    return syscall_file_install_dev(&file);
+}
+
+int32_t devfs_sync_slot(const vfs_file_t *file)
+{
+    if (file == NULL || devfs_kind_of(file) != DEVFS_KIND_DRM_SYNC) {
+        return -1;
+    }
+    return devfs_pty_index_of(file);
 }
 
 /* Which dma-buf `file` names, or -1 when it is not one. */

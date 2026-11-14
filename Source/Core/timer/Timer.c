@@ -1,3 +1,4 @@
+#include "Core/drm/DRM_Kms.h"
 #include "Core/process/ProcessScheduler.h"
 #include "Timer.h"
 #include "Core/sound/ALSA.h"
@@ -195,6 +196,7 @@ static void timer_core_handler(void) {
     if (__atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) != 0u) {
         syscall_futex_on_timer_tick();
         alsa_timer_tick();
+        drm_timer_tick();
         input_manager_schedule_poll();
         uint32_t hotplug_interval = g_requested_hz != 0u ?
                                     g_requested_hz :
@@ -331,6 +333,23 @@ void timer_start_clock(void) {
 void timer_start_services(void) {
     timer_start_clock();
     __atomic_store_n(&g_timer_services_started, 1u, __ATOMIC_RELEASE);
+}
+
+void timer_hires_request(uint64_t due_ns)
+{
+    if (g_timer_hal != NULL && g_timer_hal->hires_request != NULL) {
+        g_timer_hal->hires_request(due_ns);
+    }
+}
+
+uint64_t timer_hires_next_due_ns(void)
+{
+    return drm_hires_next_due_ns();
+}
+
+void timer_hires_service(uint64_t now_ns)
+{
+    drm_hires_service(now_ns);
 }
 
 void timer_set_callback(timer_callback_t cb) {

@@ -233,6 +233,12 @@
  * application- and service-specific environment lives in userland
  * (Userland/API/Source/LinuxEnv.c), never in the kernel. */
 #define SYSCALL_PROCESS_SPAWN_ELF_ENV  277
+/* dev_mmap(fd, offset, length): map a character device's memory (a DRM
+ * render-node GEM buffer at the offset DRM_IOCTL_VIRTGPU_MAP returned) into
+ * the caller, as Linux mmap() on that fd does. Returns the user address or a
+ * negative status. Native processes reach DRM ioctls through
+ * SYSCALL_IOCTL_EX; this is the matching mmap. */
+#define SYSCALL_FILE_DEV_MMAP          278
 
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241

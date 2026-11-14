@@ -94,6 +94,21 @@
  * reserve bounded space beyond the fixed EDID response. */
 #define VIRTIO_GPU_RESP_BUF_BYTES (64u * 1024u)
 #define VIRTIO_GPU_CMD_BUF_BYTES  (1024u * 1024u)
+
+/* Asynchronous (fenced) submissions. SUBMIT_3D and the 3D transfers do not
+ * wait for the host: each goes out with VIRTIO_GPU_FLAG_FENCE and a fresh
+ * fence id, its bytes live in a DMA ring until the device hands the request
+ * back, and the device only does that once the fence has retired on the host
+ * GPU. Callers learn about completion through virtio_gpu_fence_completed().
+ *
+ * Descriptor layout: 0/1 is the synchronous request (cmd_buf/resp_buf above,
+ * one at a time under g_gpu_lock); async slot i uses 2+2i (out) and 3+2i (in).
+ * Used-ring entries are matched by head id, because a fenced request
+ * completes after any synchronous request queued behind it. */
+#define VIRTIO_GPU_FLAG_FENCE        (1u << 0)
+#define VGPU_ASYNC_SLOTS             64u
+#define VGPU_ASYNC_RING_BYTES        (4u * 1024u * 1024u)
+#define VGPU_ASYNC_RESP_STRIDE       64u
 #define VIRTIO_GPU_MAX_CAPSETS 16u
 /* The desktop framebuffer is allocated with headroom so a later mode change
  * usually reuses the same pages instead of moving them under user space. */
@@ -214,6 +229,32 @@ typedef struct {
     uint8_t *resp_buf;
     uint32_t resp_cap;
     uint64_t resp_phys;
+
+    /* Synchronous request (descriptor 0) still owned by the device: it
+     * timed out, and must complete before descriptor 0 is rewritten. */
+    uint8_t sync_inflight;
+    uint8_t sync_done;
+
+    /* Fenced asynchronous requests. */
+    uint32_t async_slots;               /* usable slots (<= VGPU_ASYNC_SLOTS) */
+    uint8_t *async_ring;                /* payload ring (DMA) */
+    uint64_t async_ring_phys;
+    uint32_t async_head;                /* next free byte */
+    uint32_t async_tail;                /* oldest live byte */
+    uint32_t async_used;                /* bytes held, including wrap waste */
+    uint8_t *async_resp;                /* VGPU_ASYNC_SLOTS * RESP_STRIDE */
+    uint64_t async_resp_phys;
+    struct {
+        uint8_t  busy;
+        uint8_t  done;
+        uint32_t ring_off;
+        uint32_t ring_len;              /* aligned length at ring_off */
+        uint32_t ring_consumed;         /* ring_len plus wrap waste */
+        uint64_t fence;
+    } async[VGPU_ASYNC_SLOTS];
+    uint8_t  async_fifo[VGPU_ASYNC_SLOTS]; /* slots in submission order */
+    uint32_t async_fifo_head;
+    uint32_t async_fifo_count;
 } virtqueue_t;
 
 typedef struct __attribute__((packed)) {
@@ -520,6 +561,29 @@ static uint64_t gpu_lock(void)
     return irq_state;
 }
 
+/* gpu_lock() that gives up instead of spinning. */
+static int gpu_trylock(uint64_t *irq_state_out)
+{
+    uint64_t irq_state = 0u;
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL &&
+        g_driver_api->hal.cpu_save_interrupts != NULL) {
+        irq_state = g_driver_api->hal.cpu_save_interrupts();
+    }
+#endif
+    if (__atomic_exchange_n(&g_gpu_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+#ifdef IMPLUS_DRIVER_MODULE
+        if (g_driver_api != NULL &&
+            g_driver_api->hal.cpu_restore_interrupts != NULL) {
+            g_driver_api->hal.cpu_restore_interrupts(irq_state);
+        }
+#endif
+        return 0;
+    }
+    *irq_state_out = irq_state;
+    return 1;
+}
+
 static void gpu_unlock(uint64_t irq_state)
 {
     __atomic_store_n(&g_gpu_lock, 0, __ATOMIC_RELEASE);
@@ -567,6 +631,10 @@ static uint32_t g_gpu_next_resource_id = 1u;
 static int32_t g_gpu_origin_x = 0;
 static int32_t g_gpu_origin_y = 0;
 static uint32_t g_gpu_features0 = 0;
+/* A client-owned 3D render target currently on every scanout in place of the
+ * driver's own monitor resources (GPU compositing), or 0. See
+ * virtio_gpu_scanout_set(). */
+static volatile uint32_t g_gpu_ext_scanout = 0u;
 static virtio_gpu_monitor_t g_gpu_monitors[VIRTIO_GPU_MAX_SCANOUTS];
 static virtqueue_t g_gpu_controlq;
 static virtio_pci_transport_t g_gpu_transport;
@@ -845,6 +913,14 @@ static void gpu_dma_free(void *ptr, size_t bytes) {
 #endif
 }
 
+/* Control-queue completion interrupt (MSI-X), when the platform gives us
+ * one. Without it completions are collected by polling (every driver call
+ * and the kernel's timer tick); with it a retired fence wakes its waiters
+ * at once through g_gpu_fence_cb (the kernel's poll_wait_notify()). */
+static volatile uint8_t g_gpu_msix_ok;
+static uint32_t g_gpu_msix_vector;
+static void (*volatile g_gpu_fence_cb)(void);
+
 static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint16_t queue_index) {
     memset(vq, 0, sizeof(*vq));
     common_write16(t->common_cfg, 22, queue_index);
@@ -896,7 +972,36 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     }
     vq->cmd_cap = VIRTIO_GPU_CMD_BUF_BYTES;
 
-    common_write16(t->common_cfg, 26, 0xFFFFu);
+    /* Fenced requests. A failure here is not fatal: without the ring every
+     * submission simply stays synchronous. */
+    vq->async_slots = 0u;
+    if (qsize >= 4u) {
+        uint32_t slots = ((uint32_t)qsize - 2u) / 2u;
+        if (slots > VGPU_ASYNC_SLOTS) slots = VGPU_ASYNC_SLOTS;
+        vq->async_ring = (uint8_t *)gpu_dma_alloc(VGPU_ASYNC_RING_BYTES,
+                                                  4096u, &vq->async_ring_phys);
+        vq->async_resp = (uint8_t *)gpu_dma_alloc(
+            VGPU_ASYNC_SLOTS * VGPU_ASYNC_RESP_STRIDE, 4096u,
+            &vq->async_resp_phys);
+        if (vq->async_ring != NULL && vq->async_ring_phys != 0u &&
+            vq->async_resp != NULL && vq->async_resp_phys != 0u) {
+            vq->async_slots = slots;
+        } else {
+            gpu_dma_free(vq->async_ring, VGPU_ASYNC_RING_BYTES);
+            gpu_dma_free(vq->async_resp,
+                         VGPU_ASYNC_SLOTS * VGPU_ASYNC_RESP_STRIDE);
+            vq->async_ring = NULL;
+            vq->async_resp = NULL;
+        }
+    }
+
+    /* queue_msix_vector: MSI-X table entry 0 when we have it. The device
+     * answers 0xFFFF (NO_VECTOR) if it could not map it; then poll. */
+    uint16_t msix_entry = g_gpu_msix_ok ? 0u : 0xFFFFu;
+    common_write16(t->common_cfg, 26, msix_entry);
+    if (msix_entry != 0xFFFFu && common_read16(t->common_cfg, 26) != msix_entry) {
+        common_write16(t->common_cfg, 26, 0xFFFFu);
+    }
     common_write64(t->common_cfg, 32, vq->ring_phys);
     common_write64(t->common_cfg, 40, vq->ring_phys + desc_bytes);
     common_write64(t->common_cfg, 48, vq->ring_phys + used_off);
@@ -907,6 +1012,8 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
 
     common_write16(t->common_cfg, 22, queue_index);
     if (common_read16(t->common_cfg, 28) == 0) {
+        gpu_dma_free(vq->async_ring, VGPU_ASYNC_RING_BYTES);
+        gpu_dma_free(vq->async_resp, VGPU_ASYNC_SLOTS * VGPU_ASYNC_RESP_STRIDE);
         gpu_dma_free(vq->cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
         gpu_dma_free(vq->resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
         gpu_dma_free(vq->raw_ring, vq->raw_ring_bytes);
@@ -917,27 +1024,6 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
     return 1;
 }
 
-/*
- * Wait for the used ring to advance past `prev_used`. Returns false when the
- * device did not respond within VIRTIO_GPU_CMD_TIMEOUT_MS.
- */
-static int virtqueue_wait_used(virtqueue_t *vq, uint16_t prev_used)
-{
-    uint64_t start_ms = gpu_now_ms();
-    uint32_t spins = 0u;
-
-    while ((uint16_t)(vq->used->idx - prev_used) == 0u) {
-        memory_barrier();
-        if (start_ms != 0ull) {
-            if (gpu_now_ms() - start_ms >= VIRTIO_GPU_CMD_TIMEOUT_MS) {
-                return 0;
-            }
-        } else if (++spins >= VIRTIO_GPU_SPIN_BUDGET) {
-            return 0;
-        }
-    }
-    return 1;
-}
 
 /*
  * Submit one command on the control queue and wait for its completion.
@@ -971,7 +1057,7 @@ static void gpu_log_failure(const char *what, const void *cmd,
     g_driver_api->serial_write_string(" cmd=");
     g_driver_api->serial_write_uint32(words[0]);
     g_driver_api->serial_write_string(" ctx=");
-    g_driver_api->serial_write_uint32(words[5]);
+    g_driver_api->serial_write_uint32(words[4]);
     g_driver_api->serial_write_string(" arg0=");
     g_driver_api->serial_write_uint32(cmd_len > 24u ? words[6] : 0u);
     g_driver_api->serial_write_string(" resp=");
@@ -980,6 +1066,225 @@ static void gpu_log_failure(const char *what, const void *cmd,
 #endif
 }
 
+/* ---- used-ring bookkeeping -------------------------------------------- */
+
+/* Fences are issued from one global, monotonically increasing timeline (no
+ * VIRTIO_GPU_FLAG_INFO_RING_IDX), and g_gpu_fence_done is the largest id at
+ * or below which every fence has retired. */
+static uint64_t g_gpu_fence_next = 1u;
+static volatile uint64_t g_gpu_fence_done = 0u;
+
+static uint32_t vgpu_align64(uint32_t v) { return (v + 63u) & ~63u; }
+
+static inline void vgpu_cpu_relax(void) {
+#ifdef PLATFORM_X86_64
+    __asm__ volatile ("pause" ::: "memory");
+#else
+    __asm__ volatile ("yield" ::: "memory");
+#endif
+}
+
+/* Reserve `len` contiguous bytes of the payload ring. Caller holds the lock. */
+static int vgpu_ring_alloc(virtqueue_t *vq, uint32_t len, uint32_t *off,
+                           uint32_t *consumed) {
+    len = vgpu_align64(len);
+    if (len == 0u || len > VGPU_ASYNC_RING_BYTES) return 0;
+    if (vq->async_used == 0u) {
+        vq->async_head = 0u;
+        vq->async_tail = 0u;
+    }
+    uint32_t head = vq->async_head;
+    uint32_t tail = vq->async_tail;
+    if (vq->async_used == 0u || head > tail) {
+        /* live data is [tail, head) (or nothing) */
+        if (VGPU_ASYNC_RING_BYTES - head >= len) {
+            *off = head;
+            *consumed = len;
+        } else if (vq->async_used != 0u && tail >= len) {
+            *off = 0u;                                  /* wrap */
+            *consumed = len + (VGPU_ASYNC_RING_BYTES - head);
+        } else if (vq->async_used == 0u) {
+            *off = 0u;
+            *consumed = len;
+        } else {
+            return 0;
+        }
+    } else if (head < tail) {
+        /* wrapped: live data is [tail, END) + [0, head) */
+        if (tail - head < len) return 0;
+        *off = head;
+        *consumed = len;
+    } else {
+        return 0;                                       /* full */
+    }
+    vq->async_head = *off + len;
+    if (vq->async_head == VGPU_ASYNC_RING_BYTES) vq->async_head = 0u;
+    vq->async_used += *consumed;
+    return 1;
+}
+
+static void gpu_log_failure(const char *what, const void *cmd,
+                            uint32_t cmd_len, uint32_t resp_type);
+
+/* Retire the completed slots at the front of the submission FIFO: release
+ * their ring bytes and advance g_gpu_fence_done. Caller holds the lock. */
+static void vgpu_retire_async(virtqueue_t *vq) {
+    while (vq->async_fifo_count != 0u) {
+        uint32_t slot = vq->async_fifo[vq->async_fifo_head];
+        if (!vq->async[slot].done) break;
+        if (vq->async_used >= vq->async[slot].ring_consumed) {
+            vq->async_used -= vq->async[slot].ring_consumed;
+        } else {
+            vq->async_used = 0u;
+        }
+        vq->async_tail = vq->async[slot].ring_off + vq->async[slot].ring_len;
+        if (vq->async_tail >= VGPU_ASYNC_RING_BYTES) vq->async_tail = 0u;
+        if (vq->async[slot].fence > g_gpu_fence_done) {
+            __atomic_store_n(&g_gpu_fence_done, vq->async[slot].fence,
+                             __ATOMIC_RELEASE);
+        }
+        vq->async[slot].busy = 0u;
+        vq->async[slot].done = 0u;
+        vq->async_fifo_head = (vq->async_fifo_head + 1u) % VGPU_ASYNC_SLOTS;
+        vq->async_fifo_count--;
+    }
+}
+
+/* Consume every used-ring entry the device has published. Caller holds the
+ * lock. */
+static void vgpu_drain_used(virtqueue_t *vq) {
+    if (vq->queue_size == 0u) return;
+    while ((uint16_t)(vq->used->idx - vq->used_idx_seen) != 0u) {
+        memory_barrier();
+        uint32_t id = vq->used->ring[vq->used_idx_seen % vq->queue_size].id;
+        vq->used_idx_seen++;
+        if (id == 0u) {
+            vq->sync_done = 1u;
+            vq->sync_inflight = 0u;
+            continue;
+        }
+        if (id < 2u || (id & 1u) != 0u) continue;
+        uint32_t slot = (id - 2u) / 2u;
+        if (slot >= vq->async_slots || !vq->async[slot].busy) continue;
+        uint32_t resp_type = *(volatile uint32_t *)(vq->async_resp +
+                                                    slot * VGPU_ASYNC_RESP_STRIDE);
+        if (resp_type >= 0x1200u) {
+            gpu_log_failure("ERR(async)",
+                            vq->async_ring + vq->async[slot].ring_off,
+                            vq->async[slot].ring_len, resp_type);
+        }
+        vq->async[slot].done = 1u;
+    }
+    vgpu_retire_async(vq);
+}
+
+/* Spin until `cond` holds, draining completions, for at most the command
+ * timeout. Caller holds the lock (interrupts are off). */
+#define VGPU_SPIN_UNTIL(vq, cond, ok_out)                                   \
+    do {                                                                    \
+        uint64_t start_ms_ = gpu_now_ms();                                  \
+        uint32_t spins_ = 0u;                                               \
+        (ok_out) = 1;                                                       \
+        for (;;) {                                                          \
+            vgpu_drain_used(vq);                                            \
+            if (cond) break;                                                \
+            if (start_ms_ != 0ull) {                                        \
+                if (gpu_now_ms() - start_ms_ >= VIRTIO_GPU_CMD_TIMEOUT_MS) {\
+                    (ok_out) = 0; break;                                    \
+                }                                                           \
+            } else if (++spins_ >= VIRTIO_GPU_SPIN_BUDGET) {                \
+                (ok_out) = 0; break;                                        \
+            }                                                               \
+            vgpu_cpu_relax();                                               \
+        }                                                                   \
+    } while (0)
+
+static void vgpu_publish(virtqueue_t *vq, uint16_t head) {
+    vq->avail->ring[vq->avail_idx % vq->queue_size] = head;
+    memory_barrier();
+    vq->avail_idx++;
+    vq->avail->idx = vq->avail_idx;
+    memory_barrier();
+    *vq->notify_addr = vq->queue_index;
+}
+
+/* Queue a fenced command without waiting for it. `cmd` starts with a
+ * virtio_gpu_ctrl_hdr_t; `payload` (optional) is appended to it. Returns the
+ * fence id, or 0 when the request could not be queued. Caller holds the
+ * lock. */
+static uint64_t virtqueue_submit_async(virtqueue_t *vq, const void *cmd,
+                                       uint32_t cmd_len, const void *payload,
+                                       uint32_t payload_len) {
+    if (vq->async_slots == 0u || cmd == NULL ||
+        cmd_len < sizeof(virtio_gpu_ctrl_hdr_t) ||
+        payload_len > VGPU_ASYNC_RING_BYTES - cmd_len) {
+        return 0u;
+    }
+    uint32_t total = cmd_len + payload_len;
+    uint32_t slot = VGPU_ASYNC_SLOTS;
+    uint32_t off = 0u, consumed = 0u;
+    int ok = 1;
+    /* Wait (bounded) for a free slot and ring space: the device is working
+     * through earlier fences. */
+    VGPU_SPIN_UNTIL(vq, (vq->async_fifo_count < vq->async_slots), ok);
+    if (!ok) {
+        gpu_log_failure("ASYNC-FULL", cmd, cmd_len, vq->async_fifo_count);
+        return 0u;
+    }
+    for (uint32_t i = 0u; i < vq->async_slots; ++i) {
+        if (!vq->async[i].busy) { slot = i; break; }
+    }
+    if (slot == VGPU_ASYNC_SLOTS) return 0u;
+    VGPU_SPIN_UNTIL(vq, vgpu_ring_alloc(vq, total, &off, &consumed), ok);
+    if (!ok) {
+        gpu_log_failure("RING-FULL", cmd, cmd_len, total);
+        return 0u;
+    }
+
+    uint64_t fence = g_gpu_fence_next++;
+    uint8_t *dst = vq->async_ring + off;
+    memcpy(dst, cmd, cmd_len);
+    if (payload_len != 0u) memcpy(dst + cmd_len, payload, payload_len);
+    virtio_gpu_ctrl_hdr_t *hdr = (virtio_gpu_ctrl_hdr_t *)dst;
+    hdr->flags |= VIRTIO_GPU_FLAG_FENCE;
+    hdr->fence_id = fence;
+    memset(vq->async_resp + slot * VGPU_ASYNC_RESP_STRIDE, 0,
+           VGPU_ASYNC_RESP_STRIDE);
+
+    vq->async[slot].busy = 1u;
+    vq->async[slot].done = 0u;
+    vq->async[slot].ring_off = off;
+    vq->async[slot].ring_len = vgpu_align64(total);
+    vq->async[slot].ring_consumed = consumed;
+    vq->async[slot].fence = fence;
+    vq->async_fifo[(vq->async_fifo_head + vq->async_fifo_count) %
+                   VGPU_ASYNC_SLOTS] = (uint8_t)slot;
+    vq->async_fifo_count++;
+
+    uint16_t d_out = (uint16_t)(2u + 2u * slot);
+    uint16_t d_in = (uint16_t)(d_out + 1u);
+    vq->desc[d_out].addr = vq->async_ring_phys + off;
+    vq->desc[d_out].len = total;
+    vq->desc[d_out].flags = VIRTQ_DESC_F_NEXT;
+    vq->desc[d_out].next = d_in;
+    vq->desc[d_in].addr = vq->async_resp_phys + slot * VGPU_ASYNC_RESP_STRIDE;
+    vq->desc[d_in].len = (uint32_t)sizeof(virtio_gpu_ctrl_hdr_t);
+    vq->desc[d_in].flags = VIRTQ_DESC_F_WRITE;
+    vq->desc[d_in].next = 0;
+    memory_barrier();
+    vgpu_publish(vq, d_out);
+    return fence;
+}
+
+/*
+ * Submit one command on the control queue and wait for its completion.
+ *
+ * The caller must hold g_gpu_lock. The device always writes its response into
+ * vq->resp_buf, never into the caller's buffer, so a request that completes
+ * late cannot corrupt a stack frame that has already been reused. Fenced
+ * asynchronous requests may be in flight around it; completions are matched
+ * by descriptor head, so their order does not matter.
+ */
 static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
                                  void *resp, uint32_t resp_len) {
     if (vq->queue_size < 2 || cmd == NULL || resp == NULL ||
@@ -995,28 +1300,25 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
 
     if (g_vlog_budget != 0u) {
         vlog("[vgpu] submit t=");
-        vlog_num(cmd != NULL ? (uint64_t)(*(const uint32_t *)cmd) : 0u);
+        vlog_num(*(const uint32_t *)cmd);
         vlog(" avail=");
         vlog_num(vq->avail_idx);
         vlog(" used=");
         vlog_num(vq->used->idx);
-        vlog(" resp=");
-        vlog_hex((uint64_t)(uintptr_t)resp);
         vlog("\n");
         vlog_done();
     }
 
-    /* Retire a completion we never consumed (a previous request timed out).
-     * The descriptors must not be rewritten while the device may still be
-     * reading them. */
-    if ((uint16_t)(vq->used->idx - vq->used_idx_seen) != 0u) {
-        if (!virtqueue_wait_used(vq, vq->used_idx_seen)) {
+    int ok = 1;
+    /* A previous synchronous request timed out and the device may still be
+     * reading descriptor 0 / cmd_buf: let it finish first. */
+    if (vq->sync_inflight) {
+        VGPU_SPIN_UNTIL(vq, (!vq->sync_inflight), ok);
+        if (!ok) {
             gpu_log_failure("STALE", cmd, cmd_len, 0u);
             return 0;
         }
     }
-    uint16_t prev_used = vq->used->idx;
-    vq->used_idx_seen = prev_used;
 
     memset(vq->resp_buf, 0, resp_len);
     memcpy(vq->cmd_buf, cmd, cmd_len);
@@ -1032,39 +1334,17 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     vq->desc[1].flags = VIRTQ_DESC_F_WRITE;
     vq->desc[1].next = 0;
 
-    vq->avail->ring[vq->avail_idx % vq->queue_size] = 0;
-    memory_barrier();
-    vq->avail_idx++;
-    vq->avail->idx = vq->avail_idx;
-    memory_barrier();
+    vq->sync_done = 0u;
+    vq->sync_inflight = 1u;
+    vgpu_publish(vq, 0u);
 
-    *vq->notify_addr = vq->queue_index;
-
-    if (!virtqueue_wait_used(vq, prev_used)) {
+    VGPU_SPIN_UNTIL(vq, (vq->sync_done), ok);
+    if (!ok) {
+        /* sync_inflight stays set; the next request waits it out. */
         gpu_log_failure("TIMEOUT", cmd, cmd_len, 0u);
-        vlog("[vgpu] submit TIMEOUT t=");
-        vlog_num(cmd != NULL ? (uint64_t)(*(const uint32_t *)cmd) : 0u);
-        vlog(" avail=");
-        vlog_num(vq->avail_idx);
-        vlog(" used=");
-        vlog_num(vq->used->idx);
-        vlog("\n");
-        vlog_done();
-        /* Leave used_idx_seen behind: the next submit drains it first. The
-         * response buffer stays owned by the queue, so a late completion is
-         * harmless. */
         return 0;
     }
 
-    /* Only consume the entry that belongs to this request (descriptor 0). */
-    uint16_t slot = (uint16_t)(prev_used % vq->queue_size);
-    if ((uint16_t)vq->used->ring[slot].id != 0u) {
-        gpu_log_failure("BADSLOT", cmd, cmd_len, vq->used->ring[slot].id);
-        vq->used_idx_seen = vq->used->idx;
-        return 0;
-    }
-
-    vq->used_idx_seen = vq->used->idx;
     memcpy(resp, vq->resp_buf, resp_len);
     if (resp_len >= 4u) {
         uint32_t resp_type = *(const uint32_t *)resp;
@@ -1802,6 +2082,7 @@ static void virtio_gpu_retire_framebuffer(uint32_t *fb)
 }
 
 static void virtio_gpu_release_resources(void) {
+    g_gpu_ext_scanout = 0u;
     for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
         virtio_gpu_release_monitor_resource(&g_gpu_monitors[i]);
     }
@@ -1951,6 +2232,10 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
         g_gpu_monitors[i] = monitors[i];
         virtio_gpu_publish_monitor_event(&g_gpu_monitors[i], i, pnp_actions[i]);
     }
+    /* The new monitor resources were just put on scanout, replacing any
+     * GPU-composited render target: its owner sees the next flush fail and
+     * the generation change, and sets it up again for the new layout. */
+    g_gpu_ext_scanout = 0u;
     ++g_gpu_generation;
     return true;
 }
@@ -2102,6 +2387,65 @@ static bool virtio_gpu_apply_fallback_layout(uint32_t width, uint32_t height) {
     return virtio_gpu_apply_layout(&monitor, 1u, 0, 0, width, height);
 }
 
+#ifdef IMPLUS_DRIVER_MODULE
+static void vgpu_irq_handler(void *context)
+{
+    (void)context;
+    if (!g_gpu_ready || g_gpu_controlq.queue_size == 0u) return;
+    uint64_t before = __atomic_load_n(&g_gpu_fence_done, __ATOMIC_ACQUIRE);
+    uint64_t irq_state = 0u;
+    /* The lock holder (another CPU, interrupts off) drains as it goes; give
+     * it a moment rather than spinning on it indefinitely in an interrupt. */
+    for (uint32_t tries = 0u; tries < 2000u; ++tries) {
+        if (gpu_trylock(&irq_state)) {
+            vgpu_drain_used(&g_gpu_controlq);
+            gpu_unlock(irq_state);
+            break;
+        }
+        vgpu_cpu_relax();
+    }
+    if (__atomic_load_n(&g_gpu_fence_done, __ATOMIC_ACQUIRE) != before) {
+        void (*cb)(void) = g_gpu_fence_cb;
+        if (cb != NULL) cb();
+    }
+}
+#endif
+
+static void vgpu_setup_msix(const virtio_gpu_pci_t *gpu)
+{
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_gpu_msix_ok || g_driver_api == NULL ||
+        g_driver_api->pci.enable_msix == NULL ||
+        g_driver_api->pci.register_irq == NULL) {
+        return;
+    }
+    uint32_t vector = 0u;
+    if (g_driver_api->pci.enable_msix(gpu->bus, gpu->device, gpu->func,
+                                      1u, &vector) <= 0) {
+        return;
+    }
+    if (g_driver_api->pci.register_irq(vector, vgpu_irq_handler, NULL) < 0) {
+        if (g_driver_api->pci.disable_msix != NULL) {
+            g_driver_api->pci.disable_msix(gpu->bus, gpu->device, gpu->func,
+                                           &vector, 1u);
+        }
+        return;
+    }
+    g_gpu_msix_vector = vector;
+    g_gpu_msix_ok = 1u;
+    if (g_driver_api->serial_write_string != NULL) {
+        g_driver_api->serial_write_string("[vgpu] control-queue MSI-X enabled\n");
+    }
+#else
+    (void)gpu;
+#endif
+}
+
+void virtio_gpu_set_fence_callback(void (*callback)(void))
+{
+    g_gpu_fence_cb = callback;
+}
+
 bool virtio_gpu_init(void) {
     virtio_gpu_pci_t gpu;
     virtio_pci_transport_t t;
@@ -2111,6 +2455,13 @@ bool virtio_gpu_init(void) {
     vlog_done();
 
     g_gpu_ready = 0;
+    /* The device is about to be reset, which drops every request still in
+     * flight: count all fences issued so far as retired. */
+    __atomic_store_n(&g_gpu_fence_done, g_gpu_fence_next - 1u,
+                     __ATOMIC_RELEASE);
+    gpu_dma_free(g_gpu_controlq.async_ring, VGPU_ASYNC_RING_BYTES);
+    gpu_dma_free(g_gpu_controlq.async_resp,
+                 VGPU_ASYNC_SLOTS * VGPU_ASYNC_RESP_STRIDE);
     gpu_dma_free(g_gpu_controlq.cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
     gpu_dma_free(g_gpu_controlq.resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
     gpu_dma_free(g_gpu_controlq.raw_ring, g_gpu_controlq.raw_ring_bytes);
@@ -2159,6 +2510,7 @@ bool virtio_gpu_init(void) {
         return false;
     }
 
+    vgpu_setup_msix(&gpu);
     if (!virtqueue_init_ctrl(&t, &controlq, 0)) {
         vlog("[vgpu] queue init failed\n");
         vlog_done();
@@ -2368,7 +2720,10 @@ static void virtio_gpu_present_rects_locked(const display_rect_t *rects,
 }
 
 void virtio_gpu_present_rects(const display_rect_t *rects, uint32_t count) {
-    if (!g_gpu_ready) {
+    if (!g_gpu_ready || g_gpu_ext_scanout != 0u) {
+        /* While a GPU-composited render target is on scanout, the desktop
+         * framebuffer is not what the monitors show: transferring it would
+         * only cost a copy nobody sees. */
         return;
     }
 
@@ -2394,6 +2749,113 @@ void virtio_gpu_present_rects(const display_rect_t *rects, uint32_t count) {
 
 void virtio_gpu_present(void) {
     virtio_gpu_present_rects(NULL, 0u);
+}
+
+bool virtio_gpu_has_3d(void);
+
+/* ---- GPU-composited scanout ----
+ *
+ * A compositor that renders the desktop with virgl owns a desktop-sized 3D
+ * resource. Each monitor scans out its own viewport of that resource (the
+ * SET_SCANOUT rectangle), so a multi-monitor layout needs no per-monitor
+ * copies; RESOURCE_FLUSH of a desktop rectangle updates every monitor that
+ * shows part of it. Handing the scanouts back re-attaches the driver's own
+ * resources and repaints them from the desktop framebuffer, which is what
+ * the CPU compositor (and the panic/boot paths) draw into. */
+bool virtio_gpu_scanout_set(uint32_t resource_id, uint32_t width,
+                            uint32_t height) {
+    if (!g_gpu_ready || !virtio_gpu_has_3d()) {
+        return false;
+    }
+    uint64_t irq = gpu_lock();
+    if (!g_gpu_ready || g_gpu_monitor_count == 0u) {
+        gpu_unlock(irq);
+        return false;
+    }
+
+    if (resource_id == 0u) {
+        bool ok = true;
+        if (g_gpu_ext_scanout != 0u) {
+            g_gpu_ext_scanout = 0u;
+            for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
+                virtio_gpu_monitor_t *m = &g_gpu_monitors[i];
+                if (m->resource_id == 0u) continue;
+                if (!gpu_cmd_set_scanout(&g_gpu_controlq, m->scanout_id,
+                                         m->resource_id, 0u, 0u,
+                                         m->width, m->height)) {
+                    ok = false;
+                }
+            }
+            display_rect_t full = {0, 0, g_gpu_width, g_gpu_height};
+            virtio_gpu_present_rects_locked(&full, 1u);
+        }
+        gpu_unlock(irq);
+        return ok;
+    }
+
+    if (width != g_gpu_width || height != g_gpu_height) {
+        /* Sized for another layout: the caller re-reads the topology. */
+        gpu_unlock(irq);
+        return false;
+    }
+    for (uint32_t i = 0u; i < g_gpu_monitor_count; ++i) {
+        virtio_gpu_monitor_t *m = &g_gpu_monitors[i];
+        if (m->x < 0 || m->y < 0 ||
+            (uint64_t)(uint32_t)m->x + m->width > width ||
+            (uint64_t)(uint32_t)m->y + m->height > height ||
+            !gpu_cmd_set_scanout(&g_gpu_controlq, m->scanout_id, resource_id,
+                                 (uint32_t)m->x, (uint32_t)m->y,
+                                 m->width, m->height)) {
+            /* Put back what was already switched; never leave a monitor
+             * pointing at a resource its owner thinks is not shown. */
+            for (uint32_t j = 0u; j <= i; ++j) {
+                virtio_gpu_monitor_t *r = &g_gpu_monitors[j];
+                if (r->resource_id == 0u) continue;
+                (void)gpu_cmd_set_scanout(&g_gpu_controlq, r->scanout_id,
+                                          r->resource_id, 0u, 0u,
+                                          r->width, r->height);
+            }
+            g_gpu_ext_scanout = 0u;
+            gpu_unlock(irq);
+            return false;
+        }
+    }
+    g_gpu_ext_scanout = resource_id;
+    vlog("[vgpu] GPU-composited scanout res=");
+    vlog_num(resource_id);
+    vlog(" nmon=");
+    vlog_num(g_gpu_monitor_count);
+    vlog("\n");
+    vlog_done();
+    gpu_unlock(irq);
+    return true;
+}
+
+bool virtio_gpu_scanout_flush(uint32_t resource_id, int32_t x, int32_t y,
+                              uint32_t width, uint32_t height) {
+    if (!g_gpu_ready || resource_id == 0u) {
+        return false;
+    }
+    int64_t x0 = x, y0 = y;
+    int64_t x1 = x0 + (int64_t)width, y1 = y0 + (int64_t)height;
+    uint64_t irq = gpu_lock();
+    if (g_gpu_ext_scanout != resource_id) {
+        gpu_unlock(irq);
+        return false;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int64_t)g_gpu_width) x1 = (int64_t)g_gpu_width;
+    if (y1 > (int64_t)g_gpu_height) y1 = (int64_t)g_gpu_height;
+    bool ok = true;
+    if (x1 > x0 && y1 > y0) {
+        ok = gpu_cmd_resource_flush(&g_gpu_controlq, resource_id,
+                                    (uint32_t)x0, (uint32_t)y0,
+                                    (uint32_t)(x1 - x0),
+                                    (uint32_t)(y1 - y0)) != 0;
+    }
+    gpu_unlock(irq);
+    return ok;
 }
 
 /* ---- 3D (virgl) public API ---- */
@@ -2472,6 +2934,76 @@ bool virtio_gpu_submit_3d(uint32_t context_id, const void *blob, uint32_t blob_s
     int ok = gpu_cmd_submit_3d(&g_gpu_controlq, context_id, blob, blob_size);
     gpu_unlock(irq_state);
     return ok != 0;
+}
+
+/* ---- fenced (asynchronous) submission --------------------------------- */
+
+uint64_t virtio_gpu_submit_3d_async(uint32_t context_id, const void *blob,
+                                    uint32_t blob_size) {
+    if (!virtio_gpu_has_3d() || context_id == 0u || blob == NULL ||
+        blob_size == 0u || (blob_size & 3u) != 0u) {
+        return 0u;
+    }
+    virtio_gpu_submit_3d_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    hdr.hdr.ctx_id = context_id;
+    hdr.size = blob_size;
+    uint64_t irq_state = gpu_lock();
+    uint64_t fence = virtqueue_submit_async(&g_gpu_controlq, &hdr,
+                                            (uint32_t)sizeof(hdr),
+                                            blob, blob_size);
+    gpu_unlock(irq_state);
+    return fence;
+}
+
+uint64_t virtio_gpu_transfer_3d_async(uint32_t context_id,
+                                      uint32_t resource_id, bool to_host,
+                                      uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t depth, uint64_t offset,
+                                      uint32_t level, uint32_t stride,
+                                      uint32_t layer_stride) {
+    if (!virtio_gpu_has_3d() || context_id == 0u || resource_id == 0u ||
+        width == 0u || height == 0u || depth == 0u) {
+        return 0u;
+    }
+    virtio_gpu_transfer_3d_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.hdr.type = to_host ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
+                           : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    cmd.hdr.ctx_id = context_id;
+    cmd.box.x = x;
+    cmd.box.y = y;
+    cmd.box.z = z;
+    cmd.box.w = width;
+    cmd.box.h = height;
+    cmd.box.d = depth;
+    cmd.offset = offset;
+    cmd.resource_id = resource_id;
+    cmd.level = level;
+    cmd.stride = stride;
+    cmd.layer_stride = layer_stride;
+    uint64_t irq_state = gpu_lock();
+    uint64_t fence = virtqueue_submit_async(&g_gpu_controlq, &cmd,
+                                            (uint32_t)sizeof(cmd), NULL, 0u);
+    gpu_unlock(irq_state);
+    return fence;
+}
+
+/* Largest fence id at or below which everything has retired. Collects
+ * completions first, unless another CPU holds the queue -- this is also
+ * called from the timer interrupt, which must never spin on the lock. */
+uint64_t virtio_gpu_fence_completed(void) {
+    if (g_gpu_ready && g_gpu_controlq.async_slots != 0u &&
+        g_gpu_controlq.async_fifo_count != 0u) {
+        uint64_t irq_state = 0u;
+        if (gpu_trylock(&irq_state)) {
+            vgpu_drain_used(&g_gpu_controlq);
+            gpu_unlock(irq_state);
+        }
+    }
+    return __atomic_load_n(&g_gpu_fence_done, __ATOMIC_ACQUIRE);
 }
 
 bool virtio_gpu_resource_create_3d_ex(uint32_t resource_id,
@@ -2777,6 +3309,12 @@ static const driver_display_t g_virtio_display_driver = {
     .gpu_context_attach_resource = virtio_gpu_ctx_attach_resource,
     .gpu_context_detach_resource = virtio_gpu_ctx_detach_resource,
     .gpu_transfer_3d = virtio_gpu_transfer_3d_ex,
+    .gpu_submit_3d_async = virtio_gpu_submit_3d_async,
+    .gpu_transfer_3d_async = virtio_gpu_transfer_3d_async,
+    .gpu_fence_completed = virtio_gpu_fence_completed,
+    .gpu_set_fence_callback = virtio_gpu_set_fence_callback,
+    .gpu_scanout_set = virtio_gpu_scanout_set,
+    .gpu_scanout_flush = virtio_gpu_scanout_flush,
 };
 
 static void virtio_gpu_driver_shutdown(void)

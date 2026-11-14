@@ -19,7 +19,15 @@
 #define MAX_PDPT_ENTRIES (((USER_STACK_TOP >> 30) & 0x1FF) + 1)
 #define MMIO_WINDOW_BASE 0xFFFF800000000000ULL
 #define MMIO_WINDOW_SLOTS 512
-#define PAGING_BOOT_IDENTITY_GB 64ULL
+/* The low identity map covers the 32-bit MMIO hole and every physical
+ * address that holds RAM (see init_paging()); MMIO above that goes through
+ * the MMIO window. It used to be a flat 64 GiB, and since process page
+ * tables carry it, those 64 GiB of address space were unusable to every
+ * Linux program: Wine places each 64-bit DLL "anywhere above 4 GiB" by
+ * probing upwards 64 KiB at a time, and on an 8 GiB machine spent ~900,000
+ * failed mmap() calls per DLL crossing 55 GiB of identity map with no RAM
+ * behind it. */
+#define PAGING_BOOT_IDENTITY_GB 4ULL
 #define SWAP_TRACK_MAX 4096
 #define PAGE_SWAP (1ULL << 9)
 
@@ -414,7 +422,7 @@ static int copy_present_page(uint64_t child_cr3, uint64_t vaddr,
  *
  * Every level is filtered on PAGE_USER, not just PAGE_PRESENT. A process's
  * page tables also carry the kernel's own mappings, and the kernel
- * identity-maps PAGING_BOOT_IDENTITY_GB (64 GB) of physical memory at low
+ * identity-maps all physical memory (PAGING_BOOT_IDENTITY_GB at least) at low
  * virtual addresses -- squarely inside the range fork walks. Without the
  * filter this function walked into those kernel tables and copied physical
  * memory into the child until the machine ran out: a measured fork spent
@@ -604,7 +612,17 @@ int paging_cow_clone_user_range(uint64_t child_cr3, uint64_t parent_cr3,
                                     k == pd_last) ? PT_INDEX(last) : 511;
 
                 for (uint64_t l = pt_first; l <= pt_last; ++l) {
-                    if ((pt[l] & PAGE_PRESENT) == 0) continue;
+                    /* PAGE_USER on the leaf too, as the eager copy does. A
+                     * page table under the low identity map holds a process
+                     * page only where it shadows a reserved window (Wine's
+                     * 0x7FFE0000 shared data, a fixed-address ET_EXEC); its
+                     * other entries are the kernel's own direct-map pages.
+                     * Sharing those failed the fork -- every fork of a Wine
+                     * process came back EAGAIN, so wineserver never
+                     * started -- after already downgrading the parent's
+                     * kernel mappings to read-only COW. */
+                    if ((pt[l] & (PAGE_PRESENT | PAGE_USER)) !=
+                        (PAGE_PRESENT | PAGE_USER)) continue;
                     uint64_t v = region_base + (l << 12);
                     if (v < first || v > last) continue;
                     if (cow_share_one_page(child_cr3, v, &pt[l]) < 0) {
@@ -950,7 +968,7 @@ static void *map_mmio_virt_internal(uint64_t phys_addr, bool write_combining)
         return NULL;
     }
 
-    if (!write_combining && phys_addr < (PAGING_BOOT_IDENTITY_GB * GB)) {
+    if (!write_combining && phys_addr < (g_kernel_identity_entries * GB)) {
         paging_identity_mark_2mb_uncached(phys_addr);
         return (void *)(uintptr_t)phys_addr;
     }
@@ -2192,8 +2210,7 @@ static int paging_map_user_page_locked(uint64_t cr3,
             pmm_page_is_allocated(old_phys) == 1;
         int can_shadow_legacy_et_exec =
             cr3 != kernel_cr3 && space != NULL &&
-            virt_addr >= PAGING_LEGACY_ET_EXEC_BASE &&
-            virt_addr < PAGING_LEGACY_ET_EXEC_LIMIT &&
+            paging_is_user_shadow_window(virt_addr) &&
             old_phys == (virt_addr & PAGE_MASK) &&
             pmm_page_is_allocated(old_phys) == 1;
         if (can_map_identity_frame == 0 &&
@@ -2391,8 +2408,7 @@ int paging_map_user_range_alloc(uint64_t cr3,
                         (addr & (MB2 - 1ULL));
                 }
                 if (identity_phys == (addr & PAGE_MASK)) {
-                    if (addr >= PAGING_LEGACY_ET_EXEC_BASE &&
-                        addr < PAGING_LEGACY_ET_EXEC_LIMIT) {
+                    if (paging_is_user_shadow_window(addr)) {
                         /* This physical window was reserved before the
                          * kernel heap was created. Do not use the identity
                          * frame as userspace backing: allocate a private page

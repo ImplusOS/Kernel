@@ -114,7 +114,14 @@ int poll_wait_park(uint64_t generation, uint32_t ms)
         __atomic_load_n(&g_generation, __ATOMIC_ACQUIRE) != generation) {
         ++g_declines[pid];
         poll_unlock_irq(flags);
-        return 1;   /* switch away and rescan, rather than spin */
+        /* Rescan at once, without giving up the CPU. Something became ready
+         * since the caller's scan, possibly the very thing it waits for, and
+         * a forced switch here put the task at the back of the run queue: on
+         * a busy system (any notify anywhere bumps the generation) every
+         * other wait cost up to a 4 ms tick, which is what made each
+         * wineserver round trip take ~3 ms. The decline count above bounds
+         * this -- the next park sleeps for real. */
+        return 0;
     }
     g_parked[word] |= bit;
     poll_unlock_irq(flags);

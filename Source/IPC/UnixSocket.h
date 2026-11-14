@@ -26,6 +26,8 @@
  * an empty ring has to park the caller instead of reporting EAGAIN. */
 int unix_socket_set_nonblock(int32_t fd, int on);
 int unix_socket_is_nonblock(int32_t fd);
+/* Nonzero when `fd` (a global descriptor) is a live AF_UNIX endpoint. */
+int unix_socket_exists(int32_t fd);
 /* SO_PASSCRED / SO_PEERCRED for an AF_UNIX endpoint. See UnixSocket.c. */
 int unix_socket_set_passcred(int32_t fd, int on);
 int unix_socket_peer_pid(int32_t fd, int32_t *pid_out);
@@ -40,6 +42,9 @@ int64_t unix_socket_bind(int32_t fd, const char *path);
 int64_t unix_socket_listen(int32_t fd, int32_t backlog);
 int64_t unix_socket_accept(int32_t fd);
 int64_t unix_socket_connect(int32_t fd, const char *path);
+/* Nonzero when a socket is bound to the filesystem name `path` -- what a
+ * stat() of that name has to report as S_IFSOCK. */
+int unix_socket_path_bound(const char *path);
 int64_t unix_socket_send(int32_t fd, const void *buf, uint64_t len);
 int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len);
 int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr);

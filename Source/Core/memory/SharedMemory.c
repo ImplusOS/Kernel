@@ -301,6 +301,66 @@ static void *shared_memory_map_ex(int32_t handle, int allow_alias)
     return (void *)(uintptr_t)address;
 }
 
+void *shared_memory_map_fixed(int32_t handle, uint64_t address,
+                              uint64_t offset, uint64_t length)
+{
+    int32_t caller = shm_current_asid();
+    if (caller < 0 || length == 0u || (address & (PAGE_SIZE - 1u)) != 0u ||
+        (offset & (PAGE_SIZE - 1u)) != 0u) {
+        return NULL;
+    }
+    uint64_t first = offset / PAGE_SIZE;
+    uint64_t count = (length + PAGE_SIZE - 1u) / PAGE_SIZE;
+
+    shared_memory_init_once();
+    spinlock_lock(&g_shared_memory_lock);
+    shared_object_t *object = shared_memory_find_locked(handle, NULL);
+    if (!object ||
+        (!object->is_public &&
+         object->owner_pid != caller && object->granted_pid != caller) ||
+        object->mapping_count >= SHARED_MEMORY_MAPPING_MAX ||
+        first + count > (uint64_t)object->page_count) {
+        spinlock_unlock(&g_shared_memory_lock);
+        return NULL;
+    }
+    ++object->references;
+    uint64_t **pages = object->pages;
+    uint32_t generation = object->generation;
+    spinlock_unlock(&g_shared_memory_lock);
+
+    uint64_t cr3 = process_get_current_cr3();
+    uint64_t mapped = 0u;
+    for (; mapped < count; ++mapped) {
+        if (paging_map_user_page(cr3, address + mapped * PAGE_SIZE,
+                                 (uint64_t)(uintptr_t)pages[first + mapped],
+                                 PAGE_RW | PAGE_USER | PAGE_EXTERNAL) < 0) {
+            break;
+        }
+    }
+    spinlock_lock(&g_shared_memory_lock);
+    object = shared_memory_find_locked(handle, NULL);
+    if (mapped != count || !object || object->generation != generation ||
+        object->mapping_count >= SHARED_MEMORY_MAPPING_MAX) {
+        if (object && object->generation == generation) {
+            --object->references;
+            shared_memory_destroy_locked(object);
+        }
+        spinlock_unlock(&g_shared_memory_lock);
+        if (mapped != 0u) {
+            (void)paging_unmap_range(cr3, address, mapped * PAGE_SIZE);
+        }
+        return NULL;
+    }
+    shared_mapping_t *mapping = &object->mappings[object->mapping_count++];
+    mapping->pid = caller;
+    mapping->address = address;
+    mapping->size = count * PAGE_SIZE;
+    mapping->allocation_base = NULL; /* the caller's range, not ours to free */
+    mapping->map_refs = 1u;
+    spinlock_unlock(&g_shared_memory_lock);
+    return (void *)(uintptr_t)address;
+}
+
 void *shared_memory_map(int32_t handle)
 {
     return shared_memory_map_ex(handle, 1);
@@ -441,12 +501,20 @@ int shared_memory_unmap_range(void *address, uint64_t length)
         }
 
         void *allocation_base = mapping->allocation_base;
+        uint64_t fixed_address = mapping->address;
+        uint64_t fixed_size = mapping->size;
         object->mappings[mapping_index] =
             object->mappings[--object->mapping_count];
         spinlock_unlock(&g_shared_memory_lock);
 
         if (allocation_base != NULL) {
             (void)process_user_free(allocation_base);
+        } else {
+            /* A MAP_FIXED mapping (shared_memory_map_fixed()): the range is
+             * the caller's, so only the page-table entries go. They must, or
+             * the object's pages stay reachable after it is freed. */
+            (void)paging_unmap_range(process_get_current_cr3(),
+                                     fixed_address, fixed_size);
         }
 
         spinlock_lock(&g_shared_memory_lock);

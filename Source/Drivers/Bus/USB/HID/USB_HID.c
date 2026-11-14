@@ -110,6 +110,8 @@ static spinlock_t g_mouse_lock = {0};
 
 static uint8_t  g_last_kbd_report[8] = {0};
 static uint8_t  g_last_mouse_buttons = 0;
+static uint16_t g_last_abs_x = 0xFFFFu;
+static uint16_t g_last_abs_y = 0xFFFFu;
 
 static uint32_t g_mouse_recover_polls = USB_HID_PENDING_RECOVER_POLLS;
 static uint64_t g_mouse_recover_ns = USB_HID_PENDING_RECOVER_NS;
@@ -207,6 +209,220 @@ static void hid_mark_mouse_pending(void)
 }
 
 
+/* Pointer report layout. Boot-protocol mice use the fixed 3/4-byte boot
+ * report; anything else (QEMU's usb-tablet, touch screens, KVM dongles) is
+ * described by its HID report descriptor, which hid_parse_pointer_layout()
+ * reads once at attach time. */
+typedef struct {
+    bool     absolute;      /* X/Y are absolute positions */
+    uint8_t  report_id;     /* 0 = the device does not use report IDs */
+    uint16_t report_bytes;  /* bytes to request per interrupt IN */
+    uint16_t btn_bit[3];    /* bit offsets of buttons 1..3 (0xFFFF = none) */
+    uint16_t x_bit, x_size; /* bit offset / size; offsets exclude report ID */
+    uint16_t y_bit, y_size;
+    uint16_t wheel_bit, wheel_size;
+    int32_t  x_min, x_max, y_min, y_max;
+} hid_pointer_layout_t;
+
+static hid_pointer_layout_t g_mouse_layout;
+
+#define HID_FIELD_NONE 0xFFFFu
+
+static void hid_zero(void *p, uint32_t n)
+{
+    volatile uint8_t *b = (volatile uint8_t *)p;
+    for (uint32_t i = 0u; i < n; ++i) b[i] = 0u;
+}
+
+static void hid_layout_set_boot(hid_pointer_layout_t *l)
+{
+    hid_zero(l, (uint32_t)sizeof(*l));
+    l->absolute = false;
+    l->report_bytes = 4u;
+    l->btn_bit[0] = 0u; l->btn_bit[1] = 1u; l->btn_bit[2] = 2u;
+    l->x_bit = 8u;  l->x_size = 8u;
+    l->y_bit = 16u; l->y_size = 8u;
+    l->wheel_bit = 24u; l->wheel_size = 8u;
+}
+
+static uint32_t hid_item_udata(const uint8_t *p, uint32_t size)
+{
+    uint32_t v = 0u;
+    for (uint32_t i = 0u; i < size; ++i) v |= (uint32_t)p[i] << (8u * i);
+    return v;
+}
+
+static int32_t hid_item_sdata(const uint8_t *p, uint32_t size)
+{
+    uint32_t v = hid_item_udata(p, size);
+    if (size == 1u) return (int32_t)(int8_t)v;
+    if (size == 2u) return (int32_t)(int16_t)v;
+    return (int32_t)v;
+}
+
+/* Minimal HID report-descriptor walk: find the first input report that
+ * carries Generic Desktop X and Y, and record where X, Y, wheel and buttons
+ * 1..3 live in it. Returns false when no such report exists. */
+static bool hid_parse_pointer_layout(const uint8_t *d, uint32_t len,
+                                     hid_pointer_layout_t *out)
+{
+    enum { MAX_USAGES = 16, MAX_IDS = 8 };
+    uint32_t usage_page = 0u, report_size = 0u, report_count = 0u;
+    int32_t  logical_min = 0, logical_max = 0;
+    uint8_t  report_id = 0u;
+    uint32_t usages[MAX_USAGES];
+    uint32_t usage_count = 0u, usage_min = 0u, usage_max = 0u;
+    bool     have_usage_range = false;
+    uint8_t  ids[MAX_IDS];
+    uint32_t bits[MAX_IDS];
+    uint32_t id_count = 0u;
+    hid_pointer_layout_t l;
+    bool found_x = false, found_y = false;
+    uint8_t found_id = 0u;
+
+    hid_zero(&l, (uint32_t)sizeof(l));
+    l.btn_bit[0] = l.btn_bit[1] = l.btn_bit[2] = HID_FIELD_NONE;
+    l.wheel_bit = HID_FIELD_NONE;
+
+    for (uint32_t pos = 0u; pos < len;) {
+        uint8_t prefix = d[pos];
+        if (prefix == 0xFEu) {                   /* long item: skip */
+            if (pos + 2u >= len) break;
+            pos += 3u + d[pos + 1u];
+            continue;
+        }
+        uint32_t size = prefix & 0x3u;
+        if (size == 3u) size = 4u;
+        uint8_t type = (uint8_t)((prefix >> 2) & 0x3u);
+        uint8_t tag  = (uint8_t)(prefix >> 4);
+        if (pos + 1u + size > len) break;
+        const uint8_t *data = &d[pos + 1u];
+        pos += 1u + size;
+
+        if (type == 1u) {                        /* global */
+            switch (tag) {
+            case 0x0: usage_page = hid_item_udata(data, size); break;
+            case 0x1: logical_min = hid_item_sdata(data, size); break;
+            case 0x2: logical_max = hid_item_sdata(data, size); break;
+            case 0x7: report_size = hid_item_udata(data, size); break;
+            case 0x8: report_id = (uint8_t)hid_item_udata(data, size); break;
+            case 0x9: report_count = hid_item_udata(data, size); break;
+            default: break;
+            }
+        } else if (type == 2u) {                 /* local */
+            uint32_t u = hid_item_udata(data, size);
+            if (size < 4u) u |= usage_page << 16;
+            if (tag == 0x0) {
+                if (usage_count < MAX_USAGES) usages[usage_count++] = u;
+            } else if (tag == 0x1) {
+                usage_min = u; have_usage_range = true;
+            } else if (tag == 0x2) {
+                usage_max = u; have_usage_range = true;
+            }
+        } else if (type == 0u) {                 /* main */
+            if (tag == 0x8) {                    /* Input */
+                uint32_t flags = hid_item_udata(data, size);
+                uint32_t slot = 0u;
+                while (slot < id_count && ids[slot] != report_id) ++slot;
+                if (slot == id_count && id_count < MAX_IDS) {
+                    ids[id_count] = report_id; bits[id_count] = 0u; ++id_count;
+                }
+                uint32_t base = (slot < id_count) ? bits[slot] : 0u;
+                bool constant = (flags & 0x1u) != 0u;
+                bool variable = (flags & 0x2u) != 0u;
+                bool relative = (flags & 0x4u) != 0u;
+                if (!constant && variable &&
+                    (!found_x || found_id == report_id)) {
+                    for (uint32_t i = 0u; i < report_count; ++i) {
+                        uint32_t u;
+                        if (i < usage_count) {
+                            u = usages[i];
+                        } else if (have_usage_range &&
+                                   usage_min + i <= usage_max) {
+                            u = usage_min + i;
+                        } else if (usage_count > 0u) {
+                            u = usages[usage_count - 1u];
+                        } else {
+                            continue;
+                        }
+                        uint32_t bit = base + i * report_size;
+                        if (bit > 0xFFF0u) break;
+                        if (u == 0x00010030u && !found_x) {
+                            l.x_bit = (uint16_t)bit;
+                            l.x_size = (uint16_t)report_size;
+                            l.x_min = logical_min; l.x_max = logical_max;
+                            l.absolute = !relative;
+                            found_x = true; found_id = report_id;
+                        } else if (u == 0x00010031u && !found_y) {
+                            l.y_bit = (uint16_t)bit;
+                            l.y_size = (uint16_t)report_size;
+                            l.y_min = logical_min; l.y_max = logical_max;
+                            found_y = true;
+                        } else if (u == 0x00010038u &&
+                                   l.wheel_bit == HID_FIELD_NONE) {
+                            l.wheel_bit = (uint16_t)bit;
+                            l.wheel_size = (uint16_t)report_size;
+                        } else if ((u >> 16) == 0x0009u &&
+                                   (u & 0xFFFFu) >= 1u &&
+                                   (u & 0xFFFFu) <= 3u) {
+                            l.btn_bit[(u & 0xFFFFu) - 1u] = (uint16_t)bit;
+                        }
+                    }
+                }
+                if (slot < id_count) bits[slot] += report_size * report_count;
+            }
+            /* Every main item clears the local state. */
+            usage_count = 0u;
+            have_usage_range = false;
+            usage_min = usage_max = 0u;
+        }
+    }
+
+    if (!found_x || !found_y || l.x_size == 0u || l.x_size > 32u ||
+        l.y_size == 0u || l.y_size > 32u) {
+        return false;
+    }
+    l.report_id = found_id;
+    uint32_t total_bits = 0u;
+    for (uint32_t i = 0u; i < id_count; ++i) {
+        if (ids[i] == found_id) total_bits = bits[i];
+    }
+    uint32_t bytes = (total_bits + 7u) / 8u + (found_id != 0u ? 1u : 0u);
+    if (bytes == 0u || bytes > 64u) return false;
+    l.report_bytes = (uint16_t)bytes;
+    *out = l;
+    return true;
+}
+
+static uint32_t hid_get_bits(const uint8_t *r, uint32_t bit, uint32_t size)
+{
+    uint32_t v = 0u;
+    for (uint32_t i = 0u; i < size; ++i) {
+        uint32_t b = bit + i;
+        if ((r[b >> 3] >> (b & 7u)) & 1u) v |= 1u << i;
+    }
+    return v;
+}
+
+static int32_t hid_get_signed(const uint8_t *r, uint32_t bit, uint32_t size)
+{
+    uint32_t v = hid_get_bits(r, bit, size);
+    if (size < 32u && (v & (1u << (size - 1u))) != 0u) {
+        v |= ~((1u << size) - 1u);
+    }
+    return (int32_t)v;
+}
+
+/* Scale an absolute coordinate to 0..DRIVER_MOUSE_ABS_MAX. */
+static uint16_t hid_scale_abs(int32_t v, int32_t lo, int32_t hi)
+{
+    if (hi <= lo) return 0u;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    int64_t num = (int64_t)(v - lo) * (int64_t)DRIVER_MOUSE_ABS_MAX;
+    return (uint16_t)(num / (int64_t)(hi - lo));
+}
+
 void usb_hid_init(void)
 {
     g_usd_kbd.valid     = false;
@@ -271,19 +487,53 @@ void usb_hid_add_keyboard(uint8_t dev_addr, uint8_t interface,
 }
 
 void usb_hid_add_mouse(uint8_t dev_addr, uint8_t interface,
-                        uint8_t ep_in, uint16_t mps)
+                        uint8_t ep_in, uint16_t mps, bool boot_protocol)
 {
+    hid_pointer_layout_t layout;
+    hid_layout_set_boot(&layout);
+    if (boot_protocol) {
+        /* SET_PROTOCOL(boot): the fixed report hid_layout_set_boot() expects. */
+        usb_submit_control_timeout(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL,
+                                   USB_HID_CTRL_TIMEOUT_MS);
+    } else {
+        /* No boot protocol (e.g. an absolute tablet): learn the report
+         * format from the HID report descriptor. Not a pointer -> ignore. */
+        uint8_t rdesc[512];
+        hid_zero(rdesc, (uint32_t)sizeof(rdesc));
+        if (!usb_submit_control_timeout(dev_addr, 0x81, 0x06, 0x2200u,
+                                        interface, (uint16_t)sizeof(rdesc),
+                                        rdesc, USB_HID_CTRL_TIMEOUT_MS) ||
+            !hid_parse_pointer_layout(rdesc, (uint32_t)sizeof(rdesc),
+                                      &layout)) {
+            return;
+        }
+        if (mps != 0u && layout.report_bytes > mps) {
+            layout.report_bytes = mps;
+        }
+    }
+    usb_submit_control_timeout(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL,
+                               USB_HID_CTRL_TIMEOUT_MS);
+
+    uint64_t flags = irq_save_disable();
+    spinlock_lock(&g_mouse_lock);
+    g_usd_mouse.valid     = false;
     g_usd_mouse.dev_addr  = dev_addr;
     g_usd_mouse.interface = interface;
     g_usd_mouse.ep_in     = ep_in;
     g_usd_mouse.mps       = mps;
     g_usd_mouse.hc_type   = usb_get_device_hc_type(dev_addr);
     if (g_usd_mouse.hc_type == USB_HC_NONE) g_usd_mouse.hc_type = usb_get_hc_type();
+    g_mouse_layout = layout;
+    g_last_abs_x = 0xFFFFu;
+    g_last_abs_y = 0xFFFFu;
+    spinlock_unlock(&g_mouse_lock);
+    irq_restore(flags);
 
-    usb_submit_control_timeout(dev_addr, 0x21, 0x0B, 0, interface, 0, NULL,
-                               USB_HID_CTRL_TIMEOUT_MS);
-    usb_submit_control_timeout(dev_addr, 0x21, 0x0A, 0, interface, 0, NULL,
-                               USB_HID_CTRL_TIMEOUT_MS);
+    if (g_api != NULL && g_api->serial_write_string != NULL) {
+        g_api->serial_write_string(layout.absolute ?
+                                   "[USB-HID] absolute pointer\n" :
+                                   "[USB-HID] relative pointer\n");
+    }
 
     if (!hid_alloc_dma(&g_usd_mouse)) {
         return;
@@ -468,18 +718,53 @@ static void poll_keyboard(void)
 
 static void process_mouse_report(uint8_t *report)
 {
-    int8_t  dx      = (int8_t)report[1];
-    int8_t  dy      = (int8_t)report[2];
-    uint8_t raw_buttons = report[0];
-    uint8_t buttons = raw_buttons & 0x07u;
+    const hid_pointer_layout_t *l = &g_mouse_layout;
+    driver_mouse_event_t evt = {0};
+    uint8_t buttons = 0u;
 
-    if ((raw_buttons & 0xC0u) != 0u) {
-        return;
+    if (l->report_id != 0u) {
+        if (report[0] != l->report_id) {
+            return;
+        }
+        ++report;
+    } else if (!l->absolute && (report[0] & 0xC0u) != 0u) {
+        return;   /* boot report with X/Y overflow: drop it */
     }
 
-    if (dx == 0 && dy == 0 && buttons == g_last_mouse_buttons) {
-        return;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (l->btn_bit[i] != HID_FIELD_NONE &&
+            hid_get_bits(report, l->btn_bit[i], 1u) != 0u) {
+            buttons |= (uint8_t)(1u << i);
+        }
     }
+    int32_t wheel = 0;
+    if (l->wheel_bit != HID_FIELD_NONE && l->wheel_size != 0u) {
+        wheel = hid_get_signed(report, l->wheel_bit, l->wheel_size);
+    }
+
+    if (l->absolute) {
+        evt.x = hid_scale_abs((int32_t)hid_get_bits(report, l->x_bit, l->x_size),
+                              l->x_min, l->x_max);
+        evt.y = hid_scale_abs((int32_t)hid_get_bits(report, l->y_bit, l->y_size),
+                              l->y_min, l->y_max);
+        evt.flags = DRIVER_MOUSE_FLAG_ABSOLUTE;
+        if (evt.x == g_last_abs_x && evt.y == g_last_abs_y && wheel == 0 &&
+            buttons == g_last_mouse_buttons) {
+            return;
+        }
+        g_last_abs_x = evt.x;
+        g_last_abs_y = evt.y;
+    } else {
+        int32_t dx = hid_get_signed(report, l->x_bit, l->x_size);
+        int32_t dy = hid_get_signed(report, l->y_bit, l->y_size);
+        if (dx == 0 && dy == 0 && wheel == 0 && buttons == g_last_mouse_buttons) {
+            return;
+        }
+        evt.x = (uint16_t)(int16_t)dx;
+        evt.y = (uint16_t)(int16_t)dy;
+    }
+    evt.buttons = buttons;
+    evt.wheel = (int8_t)(wheel > 127 ? 127 : (wheel < -127 ? -127 : wheel));
 
     uint64_t flags = irq_save_disable();
     spinlock_lock(&g_mouse_lock);
@@ -490,15 +775,10 @@ static void process_mouse_report(uint8_t *report)
         g_mouse_tail = (g_mouse_tail + 1u) % USB_HID_QUEUE_SIZE;
         --g_mouse_count;
     }
-
-    driver_mouse_event_t evt = {0};
-    evt.x = (uint16_t)(int16_t)dx;
-    evt.y = (uint16_t)(int16_t)dy;
-    evt.buttons = buttons;
     g_mouse_queue[g_mouse_head] = evt;
     g_mouse_head = (g_mouse_head + 1u) % USB_HID_QUEUE_SIZE;
     ++g_mouse_count;
-    
+
     spinlock_unlock(&g_mouse_lock);
     irq_restore(flags);
 }
@@ -511,7 +791,7 @@ static void poll_mouse(void)
         if (!g_usd_mouse.pending) {
             if (usb_submit_interrupt_in_async(g_usd_mouse.dev_addr, g_usd_mouse.ep_in,
                                               g_usd_mouse.mps,
-                                              g_usd_mouse.dma_buf, g_usd_mouse.dma_phys, 4)) {
+                                              g_usd_mouse.dma_buf, g_usd_mouse.dma_phys, g_mouse_layout.report_bytes)) {
                 hid_mark_mouse_pending();
             } else {
                 hid_clear_pending(&g_usd_mouse);
@@ -531,7 +811,7 @@ static void poll_mouse(void)
             }
             if (usb_submit_interrupt_in_async(g_usd_mouse.dev_addr, g_usd_mouse.ep_in,
                                               g_usd_mouse.mps,
-                                              g_usd_mouse.dma_buf, g_usd_mouse.dma_phys, 4)) {
+                                              g_usd_mouse.dma_buf, g_usd_mouse.dma_phys, g_mouse_layout.report_bytes)) {
                 hid_mark_mouse_pending();
             } else {
                 hid_clear_pending(&g_usd_mouse);
@@ -553,7 +833,7 @@ static void poll_mouse(void)
                                                   g_usd_mouse.mps,
                                                   g_usd_mouse.dma_buf,
                                                   g_usd_mouse.dma_phys,
-                                                  4)) {
+                                                  g_mouse_layout.report_bytes)) {
                     hid_mark_mouse_pending();
                 }
             }
@@ -562,7 +842,7 @@ static void poll_mouse(void)
         g_mouse_poll_timer++;
         if (g_mouse_poll_timer >= 10) {
             g_mouse_poll_timer = 0;
-            if (hid_sync_interrupt_in(&g_usd_mouse, 4)) {
+            if (hid_sync_interrupt_in(&g_usd_mouse, g_mouse_layout.report_bytes)) {
                 process_mouse_report((uint8_t *)g_usd_mouse.dma_buf);
             }
         }

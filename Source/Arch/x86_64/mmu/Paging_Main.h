@@ -31,6 +31,25 @@
 #define PAGING_LEGACY_ET_EXEC_SIZE  0x00400000ULL
 #define PAGING_LEGACY_ET_EXEC_LIMIT (PAGING_LEGACY_ET_EXEC_BASE + PAGING_LEGACY_ET_EXEC_SIZE)
 
+/* Windows' KUSER_SHARED_DATA lives at the fixed address 0x7FFE0000 in every
+ * process, and Wine's ntdll exits ("failed to map the shared user data")
+ * unless it can map it exactly there. That is inside the low identity map,
+ * so it gets the same treatment as the ET_EXEC window: the physical frames
+ * are withheld before heap init and each process may shadow the range with
+ * private pages. The whole 0x7FFE0000..0x80000000 tail is covered (Wine also
+ * places its hypervisor shared page right after the user shared data). */
+#define PAGING_WIN_SHARED_DATA_BASE  0x7FFE0000ULL
+#define PAGING_WIN_SHARED_DATA_SIZE  0x00020000ULL
+#define PAGING_WIN_SHARED_DATA_LIMIT (PAGING_WIN_SHARED_DATA_BASE + PAGING_WIN_SHARED_DATA_SIZE)
+
+/* Low identity-mapped ranges whose physical frames are never handed to the
+ * kernel allocator, so a process may map private pages over them. */
+static inline int paging_is_user_shadow_window(uint64_t va)
+{
+    return (va >= PAGING_LEGACY_ET_EXEC_BASE && va < PAGING_LEGACY_ET_EXEC_LIMIT) ||
+           (va >= PAGING_WIN_SHARED_DATA_BASE && va < PAGING_WIN_SHARED_DATA_LIMIT);
+}
+
 #define PML4_INDEX(x) (((x) >> 39) & 0x1FF)
 #define PDPT_INDEX(x) (((x) >> 30) & 0x1FF)
 #define PD_INDEX(x)   (((x) >> 21) & 0x1FF)

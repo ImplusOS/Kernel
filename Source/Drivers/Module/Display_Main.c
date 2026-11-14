@@ -99,6 +99,8 @@ static void display_log_done(void)
     }
 }
 
+static volatile uint32_t g_display_picking;
+
 static bool display_refresh_driver(void)
 {
     if (g_active_display_driver != NULL && g_active_display_module_name != NULL) {
@@ -109,7 +111,17 @@ static bool display_refresh_driver(void)
         }
     }
 
-    g_active_display_driver = driver_select_pick_display_driver();
+    /* display_is_ready() is reached from every CPU (printf, syscalls, the
+     * present path), so several can arrive here at once. Picking may call a
+     * driver's init(), which resets hardware; two concurrent resets of the
+     * same VirtIO GPU wedge its control queue. Let exactly one CPU pick and
+     * have the others report "not ready" until it is done. */
+    if (__atomic_exchange_n(&g_display_picking, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        return false;
+    }
+    const driver_display_t *picked = driver_select_pick_display_driver();
+    g_active_display_driver = picked;
+    __atomic_store_n(&g_display_picking, 0u, __ATOMIC_RELEASE);
     if (g_active_display_driver == NULL) {
         g_active_display_module_name = NULL;
         g_fb_width = 0;

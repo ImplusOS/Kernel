@@ -69,7 +69,14 @@ enum {
  * BSS, so 256 costs ~1 MiB -- the same trade OS_CONFIG_FILE_MAX_FD already
  * made when Chromium's descriptor count outgrew that table. */
 #define PIPE_MAX_COUNT       256
-#define PIPE_BUF_SIZE        4096u
+/* Linux's default pipe capacity. It was 4 KiB, and a blocking write larger
+ * than the free space came back short -- legal for a pipe only past
+ * PIPE_BUF, but Wine sends every wineserver request with one write() and
+ * treats a short one as fatal ("wine client error:24: partial write 4096"),
+ * and requests carrying a process's startup environment are well over 4 KiB.
+ * The buffer is allocated per pipe (see syscall_pipe_create) rather than
+ * kept in BSS. */
+#define PIPE_BUF_SIZE        65536u
 
 /* Extra owners of a descriptor slot, beyond `owner_pid`.
  *
@@ -130,10 +137,10 @@ typedef struct {
 
 typedef struct {
     uint8_t  in_use;
-    uint8_t  data[PIPE_BUF_SIZE];
-    uint16_t read_pos;
-    uint16_t write_pos;
-    uint16_t count;
+    uint8_t *data;       /* PIPE_BUF_SIZE bytes, heap */
+    uint32_t read_pos;
+    uint32_t write_pos;
+    uint32_t count;
     uint16_t reader_count;
     uint16_t writer_count;
     spinlock_t lock;
@@ -222,6 +229,15 @@ static uint8_t g_std_closed[OS_CONFIG_PROCESS_MAX_COUNT];
 static kernel_file_t g_files[FILE_MAX_FD];
 static kernel_open_file_t g_open_files[FILE_MAX_FD];
 static kernel_dir_t g_dirs[FILE_MAX_DIR_HANDLE];
+/* g_dirs[].used: a native directory handle (opendir syscall) belongs to the
+ * process that opened it and goes when that process exits. A handle behind a
+ * directory *descriptor* (open(dir), O_DIRECTORY) lives exactly as long as
+ * the descriptor, which fork() shares between processes and
+ * release_fd_locked() frees with the last owner. Sweeping those by creator
+ * pid closed them under a forked child: wineserver daemonizes, its parent
+ * exits, and the daemon's fchdir(config_dir_fd) failed with EBADF. */
+#define DIR_USED_BY_HANDLE 1u
+#define DIR_USED_BY_FD     2u
 static kernel_pipe_t g_pipes[PIPE_MAX_COUNT];
 static kernel_timerfd_t g_timerfds[FILE_MAX_FD];
 static kernel_memfd_t *g_memfds[FILE_MAX_FD];
@@ -603,6 +619,7 @@ static void release_fd_locked(int32_t fd)
                 --pipe->writer_count;
             }
             if (pipe->reader_count == 0u && pipe->writer_count == 0u) {
+                free(pipe->data);
                 memset(pipe, 0, sizeof(*pipe));
             }
         }
@@ -1604,7 +1621,7 @@ void syscall_file_close_all_for_pid(int32_t pid, uint32_t *closed_fds_out, uint3
     irq_flags = irq_save_disable();
     spinlock_lock(&g_dir_table_lock);
     for (int32_t i = 0; i < FILE_MAX_DIR_HANDLE; ++i) {
-        if (g_dirs[i].used != 0 && g_dirs[i].owner_pid == pid) {
+        if (g_dirs[i].used == DIR_USED_BY_HANDLE && g_dirs[i].owner_pid == pid) {
             (void)vfs_closedir(g_dirs[i].vfs_handle);
             memset(&g_dirs[i], 0, sizeof(g_dirs[i]));
             ++closed_dirs;
@@ -1643,7 +1660,7 @@ void syscall_file_close_cloexec_for_pid(int32_t pid)
     irq_flags = irq_save_disable();
     spinlock_lock(&g_dir_table_lock);
     for (int32_t i = 0; i < FILE_MAX_DIR_HANDLE; ++i) {
-        if (g_dirs[i].used != 0 && g_dirs[i].owner_pid == pid) {
+        if (g_dirs[i].used == DIR_USED_BY_HANDLE && g_dirs[i].owner_pid == pid) {
             (void)vfs_closedir(g_dirs[i].vfs_handle);
             memset(&g_dirs[i], 0, sizeof(g_dirs[i]));
         }
@@ -1785,6 +1802,18 @@ int32_t syscall_file_pipe(int32_t fds_out[2])
     kernel_pipe_t *pipe = &g_pipes[pipe_idx];
     memset(pipe, 0, sizeof(*pipe));
     spinlock_init(&pipe->lock);
+    pipe->data = (uint8_t *)malloc(PIPE_BUF_SIZE);
+    if (pipe->data == NULL) {
+        irq_flags = irq_save_disable();
+        spinlock_lock(&g_file_table_lock);
+        memset(&g_files[read_fd], 0, sizeof(g_files[read_fd]));
+        memset(&g_files[write_fd], 0, sizeof(g_files[write_fd]));
+        g_files[read_fd].open_index = -1;
+        g_files[write_fd].open_index = -1;
+        spinlock_unlock(&g_file_table_lock);
+        irq_restore(irq_flags);
+        return (int32_t)OS_STATUS_LIMIT_REACHED;
+    }
     pipe->in_use = 1;
     pipe->reader_count = 1u;
     pipe->writer_count = 1u;
@@ -1837,7 +1866,7 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
         uint64_t bytes_read = 0;
         while (bytes_read < len && pipe->count > 0) {
             buffer[bytes_read++] = pipe->data[pipe->read_pos];
-            pipe->read_pos = (uint16_t)((pipe->read_pos + 1u) % PIPE_BUF_SIZE);
+            pipe->read_pos = (pipe->read_pos + 1u) % PIPE_BUF_SIZE;
             pipe->count--;
         }
         uint16_t writers = pipe->writer_count;
@@ -1931,7 +1960,7 @@ static int64_t syscall_pipe_write_wait(int32_t fd, kernel_pipe_t *pipe,
         uint64_t bytes_written = 0;
         while (bytes_written < len && pipe->count < PIPE_BUF_SIZE) {
             pipe->data[pipe->write_pos] = buffer[bytes_written++];
-            pipe->write_pos = (uint16_t)((pipe->write_pos + 1u) % PIPE_BUF_SIZE);
+            pipe->write_pos = (pipe->write_pos + 1u) % PIPE_BUF_SIZE;
             pipe->count++;
         }
 
@@ -1970,7 +1999,7 @@ static int64_t syscall_pipe_write(int32_t fd, const uint8_t *buffer, uint64_t le
     uint64_t bytes_written = 0;
     while (bytes_written < len && pipe->count < PIPE_BUF_SIZE) {
         pipe->data[pipe->write_pos] = buffer[bytes_written++];
-        pipe->write_pos = (uint16_t)((pipe->write_pos + 1u) % PIPE_BUF_SIZE);
+        pipe->write_pos = (pipe->write_pos + 1u) % PIPE_BUF_SIZE;
         pipe->count++;
     }
 
@@ -2226,6 +2255,18 @@ uint32_t syscall_file_poll(int32_t fd, uint32_t events)
         ready |= POLL_IN;
     if (!is_read_end && (events & POLL_OUT) != 0u && pipe->count < PIPE_BUF_SIZE)
         ready |= POLL_OUT;
+    /* The other end is gone: Linux reports POLLHUP on a read end whose
+     * writers have all closed (read() then returns 0), and POLLERR on a
+     * write end with no readers -- whether or not they were asked for.
+     * Neither was reported, so a poller only learnt of a closed pipe by
+     * reading it. wineserver learns that a client process has died exactly
+     * this way (its request pipe hangs up); without it a dead process stayed
+     * alive in the server and everything waiting for it -- wineboot for the
+     * rundll32 that installs the prefix -- waited forever. */
+    if (is_read_end && pipe->writer_count == 0u)
+        ready |= 0x0010u; /* POLLHUP */
+    if (!is_read_end && pipe->reader_count == 0u)
+        ready |= POLL_ERROR;
     spinlock_unlock(&pipe->lock);
     irq_restore(irq_flags);
     return ready;
@@ -2915,7 +2956,8 @@ int32_t syscall_file_register_dir(const char *path)
         spinlock_lock(&g_dir_table_lock);
         for (int32_t i = 0; i < FILE_MAX_DIR_HANDLE; ++i) {
             if (g_dirs[i].used == 0) {
-                g_dirs[i].used = 1;
+                /* 2 = owned by a descriptor (see DIR_USED_BY_FD). */
+                g_dirs[i].used = DIR_USED_BY_FD;
                 g_dirs[i].owner_pid = current_pid;
                 g_dirs[i].vfs_handle = vfs_handle;
                 strncpy(g_dirs[i].path, path, FILE_DIR_PATH_MAX - 1u);

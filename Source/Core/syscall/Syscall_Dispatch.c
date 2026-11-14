@@ -573,6 +573,7 @@ static process_capability_mask_t syscall_required_capability(uint64_t syscall_nu
         case SYSCALL_FILE_UNLINK:
             return PROCESS_CAP_FILE;
 
+        case SYSCALL_FILE_DEV_MMAP:
         case SYSCALL_FILE_STAT:
         case SYSCALL_FILE_PIPE:
         case SYSCALL_FILE_DUP:
@@ -681,6 +682,9 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                          uint64_t arg6)
 {
     syscall_arch_enable_interrupts();
+    /* Close what processes killed by a signal left open (one atomic load
+     * when there is none). */
+    process_run_pending_teardowns();
 
     (void)arg5;
     int32_t current_pid = current_pid_get();
@@ -2156,6 +2160,14 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
                 (uint64_t)(int64_t)syscall_file_rename(old_path, new_path));
             break;
         }
+        case SYSCALL_FILE_DEV_MMAP: {
+            /* PROT_READ|PROT_WRITE, MAP_SHARED: the only mapping a device
+             * buffer has. */
+            set_syscall_result(saved_rsp,
+                (uint64_t)syscall_file_dev_mmap((int32_t)arg1, arg2, arg3,
+                                                0x3u, 0x1u));
+            break;
+        }
         case SYSCALL_IOCTL_EX: {
             extern int64_t syscall_ioctl_ex(int32_t, uint64_t, uint64_t);
             set_syscall_result(saved_rsp, (uint64_t)syscall_ioctl_ex((int32_t)arg1, arg2, arg3));
@@ -2234,7 +2246,15 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
         case SYSCALL_TKILL: {
             int32_t target_pid = (int32_t)arg1;
             int32_t rc;
-            if ((int32_t)arg2 == 0) {
+            if (target_pid < 0) {
+                /* -sid: every process of that session (and group). A
+                 * launcher ending a program takes the processes it forked
+                 * with it -- Chromium's zygote and renderers outlive the
+                 * browser otherwise. */
+                rc = process_signal_deliver_session(-target_pid,
+                                                    (int32_t)arg2);
+                if (rc < 0) rc = -3;
+            } else if ((int32_t)arg2 == 0) {
                 rc = process_is_alive(target_pid) ? 0 : -3;
             } else {
                 rc = process_signal_deliver(target_pid, (int32_t)arg2);

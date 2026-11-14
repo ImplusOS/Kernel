@@ -135,6 +135,44 @@ corner had changed. Now the work is proportional to the damaged area.
 Multi-monitor layouts keep one resource per monitor but get the same
 rectangle-limited copies and transfers.
 
+## GPU-composited desktop (window manager)
+
+With a virgl-capable VirtIO-GPU the window manager composites the desktop on
+the host GPU instead of the CPU
+(`Userland/Application/com.ImplusOS.windowmanager/Compositor/WM_Gpu.c`):
+
+- It opens `/dev/dri/renderD128` like any native file and drives it with
+  the Linux VirtIO-GPU ioctls (`SYSCALL_IOCTL_EX`), mapping GEM buffers
+  with the native `SYSCALL_FILE_DEV_MMAP` (278).
+- Each window (frame, shadow and client pixels, at rest), the background,
+  the shell overlay (taskbar, Start menu, notifications, panels, dialogs)
+  and the pointer are separate B8G8R8A8 textures holding premultiplied
+  alpha. A window layer is re-rasterized only where the client drew or when
+  its decoration inputs change; the overlay only in damaged tiles that can
+  hold shell pixels.
+- Every frame is a virgl command stream (`WM_Virgl.c`: TGSI shaders,
+  ONE/ONE_MINUS_SRC_ALPHA blending, a vertex buffer written inline) that
+  draws textured quads into a desktop-sized render target. Moving,
+  raising, fading and zooming windows therefore need no CPU raster and no
+  upload.
+- The render target is put on scanout directly by the ImplusOS-private
+  render-node ioctl `DRM_NR_IMPLUS_SCANOUT` (`DRM_COMMAND_BASE + 0x30`:
+  SET / FLUSH / RELEASE), which reaches the display driver's new optional
+  `gpu_scanout_set` / `gpu_scanout_flush` hooks. VirtIO-GPU points every
+  monitor at its viewport of that resource (`SET_SCANOUT` sub-rectangle)
+  and skips its own framebuffer transfers while it is shown. A layout or
+  mode change, destroying the resource, or closing the session (the WM
+  exiting or crashing) hands the monitors back to the driver's own
+  resources and repaints them from the desktop framebuffer.
+- Without a 3D backend, or after any GPU error, the WM uses the CPU
+  compositor as before. Creating `/var/System/wm-cpu-compositor` forces the
+  CPU path. The serial log says `[wm-gpu] compositing on the GPU (virgl)`
+  when the GPU path is live.
+
+Verified on QEMU `virtio-gpu-gl-pci` with `-display sdl,gl=es` (WSLg):
+desktop, overlapping windows with shadows, dragging, client redraws, the
+Start menu and the minimize fade/zoom animation render correctly.
+
 ## Reporting acceleration capabilities
 
 `system_graphics_info_t` (returned by `os_get_graphics_info()`) reports the

@@ -17,6 +17,7 @@
 #include "Core/vfs/DevFS.h"
 #include "Core/vfs/SysFS.h"
 #include "Core/syscall/Syscall_File.h"
+#include "Core/syscall/Poll_Wait.h"
 #include "mmu/Paging_Main.h"
 #include "Debug/serial/Serial.h"
 
@@ -48,7 +49,25 @@
 /* command numbers (nr) */
 #define DRM_NR_VERSION            0x00
 #define DRM_NR_SET_VERSION        0x07
+#define DRM_NR_MODESET_CTL        0x08
 #define DRM_NR_WAIT_VBLANK        0x3A
+#define DRM_NR_CRTC_GET_SEQUENCE  0x3B
+#define DRM_NR_CRTC_QUEUE_SEQUENCE 0x3C
+
+/* drm_wait_vblank request.type */
+#define DRM_VBLANK_RELATIVE      0x00000001u
+#define DRM_VBLANK_EVENT         0x04000000u
+#define DRM_VBLANK_FLIP          0x08000000u
+#define DRM_VBLANK_NEXTONMISS    0x10000000u
+#define DRM_VBLANK_SECONDARY     0x20000000u
+#define DRM_VBLANK_SIGNAL        0x40000000u
+#define DRM_VBLANK_HIGH_CRTC_MASK 0x0000003Eu
+#define DRM_VBLANK_TYPES_MASK    (DRM_VBLANK_RELATIVE)
+#define DRM_VBLANK_FLAGS_MASK    (DRM_VBLANK_EVENT | DRM_VBLANK_SIGNAL | \
+                                  DRM_VBLANK_SECONDARY | DRM_VBLANK_NEXTONMISS)
+/* drm_crtc_queue_sequence.flags */
+#define DRM_CRTC_SEQUENCE_RELATIVE     0x00000001u
+#define DRM_CRTC_SEQUENCE_NEXT_ON_MISS 0x00000002u
 #define DRM_NR_GET_MAGIC          0x02
 #define DRM_NR_AUTH_MAGIC         0x11 /* DRM_IOCTL_AUTH_MAGIC, *not* 0x03 */
 #define DRM_NR_GET_CAP            0x0c
@@ -108,6 +127,26 @@
 #define DRM_NR_VIRTGPU_WAIT            (DRM_COMMAND_BASE + 0x08u)
 #define DRM_NR_VIRTGPU_GET_CAPS        (DRM_COMMAND_BASE + 0x09u)
 #define DRM_NR_VIRTGPU_CONTEXT_INIT    (DRM_COMMAND_BASE + 0x0Bu)
+/* ImplusOS-private render-node command, well clear of the VIRTGPU range:
+ * scan a GEM render target out directly (the window manager's GPU
+ * compositor). Linux has no equivalent on a render node; there the same
+ * thing takes a PRIME export to card0 plus ADDFB2/SETCRTC, which this
+ * kernel's card0 would turn back into a CPU read-back. */
+#define DRM_NR_IMPLUS_SCANOUT          (DRM_COMMAND_BASE + 0x30u)
+#define DRM_IMPLUS_SCANOUT_SET     (1u << 0)
+#define DRM_IMPLUS_SCANOUT_FLUSH   (1u << 1)
+#define DRM_IMPLUS_SCANOUT_RELEASE (1u << 2)
+
+struct drm_implus_scanout {
+    uint32_t bo_handle;
+    uint32_t flags;
+    int32_t  x;          /* FLUSH: desktop rectangle */
+    int32_t  y;
+    uint32_t width;      /* SET: desktop size the target was made for */
+    uint32_t height;
+};
+_Static_assert(sizeof(struct drm_implus_scanout) == 24u,
+               "drm_implus_scanout ABI mismatch");
 
 #define VIRTGPU_EXECBUF_FENCE_FD_IN  0x01u
 #define VIRTGPU_EXECBUF_FENCE_FD_OUT 0x02u
@@ -149,6 +188,7 @@
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
 #define DRM_EVENT_VBLANK         0x01
 #define DRM_EVENT_FLIP_COMPLETE  0x02
+#define DRM_EVENT_CRTC_SEQUENCE  0x03
 
 /* Distinct object IDs — atomic mode setting queries OBJ_GETPROPERTIES per
  * object, so CRTC/PLANE/CONNECTOR must not collide. */
@@ -409,7 +449,8 @@ struct drm_event_vblank {
 /* ---- state ---------------------------------------------------------------- */
 #define DRM_MAX_DUMB 128
 #define DRM_MAX_FB   16
-#define DRM_EVQ_MAX  16
+#define DRM_EVQ_MAX  64
+#define DRM_VPEND_MAX 32
 #define DRM_MMAP_OFFSET_BASE 0x100000000ull  /* fake mmap offset space */
 
 /* Declared with the rest of the state rather than down by the ioctl switch:
@@ -419,6 +460,14 @@ struct drm_event_vblank {
  * block) and split locking would let a free run between the two lookups. */
 static spinlock_t g_lock;
 static int g_inited;
+
+/* Vblank clock origin, the earliest time a pending vblank event or wait is
+ * due (read lock-free by drm_timer_tick), and how many events are pending. */
+static uint64_t g_vbl_epoch_ns;
+static volatile uint64_t g_vbl_next_due_ns = UINT64_MAX;
+static volatile uint32_t g_vbl_pending_total;
+/* The 3D backend, cached for the timer interrupt (no registry walk there). */
+static const driver_display_t *volatile g_tick_gpu;
 
 typedef struct {
     uint8_t  used;
@@ -437,6 +486,10 @@ typedef struct {
     int32_t  prime;
     uint32_t gpu_resource_id;
     uint32_t gpu_attached_context;
+    /* Fence of the last host command that used this buffer (an EXECBUFFER
+     * naming it, or a transfer). DRM_VIRTGPU_WAIT is satisfied once the
+     * driver reports that fence retired. 0 = never used. */
+    uint64_t gpu_fence;
 } drm_dumb_t;
 
 /* ---- PRIME (dma-buf) ----------------------------------------------------
@@ -464,9 +517,30 @@ typedef struct {
     uint64_t size;
     uint32_t width, height, bpp, pitch;
     uint32_t gpu_resource_id;
+    /* Latest fence of any handle on this buffer, so a wait through an
+     * imported handle (another process) sees work the exporter queued. */
+    uint64_t gpu_fence;
 } drm_prime_t;
 
 static drm_prime_t g_primes[DRM_MAX_PRIME];
+
+/* ---- sync_file ------------------------------------------------------------
+ *
+ * A sync_file is an fd that signals when one GPU fence retires: what
+ * EXECBUFFER's FENCE_FD_OUT returns, what DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+ * makes, and what Mesa polls (libsync's sync_wait) or hands back as an
+ * in-fence. Like a dma-buf it has no path; DevFS builds the descriptor and
+ * its slot here is its whole identity. Every fence of this device lives on
+ * one in-order timeline, so a merged sync_file is just the later fence. */
+#define DRM_MAX_SYNC 1024
+
+typedef struct {
+    uint8_t  used;
+    uint64_t fence;      /* 0 = already signaled */
+} drm_sync_t;
+
+static drm_sync_t g_syncs[DRM_MAX_SYNC];
+static int drm_sync_fence_of_fd(int32_t fd, uint64_t *out_fence);
 
 /* Render-backend lookup is defined below the DRM session tables. */
 static const driver_display_t *render_gpu_backend(void);
@@ -685,10 +759,15 @@ typedef struct {
  * ioctl is then served out of that server's own state, so N launchers run N
  * servers that never see each other.
  */
-/* 8 MiB of redirection surface: 1600x1200x4 with room over. */
-#define DRM_MIRROR_MAX_PAGES 2048u
+/* 32 MiB of redirection surface. An X server hosted by XSession.c drives a
+ * screen twice the display's width (every X top-level gets its own ImplusOS
+ * window, cut out of that screen, and the second half is where a program's
+ * dialogs go so they do not land on top of its main window): 2x1920x1080x4
+ * is 16.6 MB, and 2x2560x1440x4 is 29.5 MB. */
+#define DRM_MIRROR_MAX_PAGES 8192u
 
-#define DRM_MAX_SESSIONS 4
+/* One per running X server -- XSession.c starts one per launched program. */
+#define DRM_MAX_SESSIONS 8
 
 /* Each session's mmap tokens live in their own slice of the fake offset
  * space, so an offset identifies a session as well as a buffer. */
@@ -710,6 +789,42 @@ typedef struct {
     struct drm_event_vblank evq[DRM_EVQ_MAX];
     uint32_t evq_head, evq_tail;
 
+    /* Vblank timeline of this session's one CRTC: a virtual scanout clock at
+     * the mode's refresh rate (pixel clock / (htotal * vtotal)), so the
+     * period userspace derives from the mode is exactly the one used here.
+     * Rebased (base_seq, base_ns) whenever the period changes, which keeps
+     * the counter monotonic across a mode change. */
+    uint64_t vbl_base_seq;
+    uint64_t vbl_base_ns;
+    uint64_t vbl_period_ns;
+    /* Events waiting for their vblank: WAIT_VBLANK(EVENT), page flips and
+     * CRTC_QUEUE_SEQUENCE. Moved into evq once that vblank has passed. */
+    struct {
+        uint8_t  used;
+        uint8_t  type;          /* DRM_EVENT_* */
+        uint64_t seq;
+        uint64_t user_data;
+    } vpend[DRM_VPEND_MAX];
+    /* A page flip whose completion event has not been delivered yet. */
+    uint8_t  flip_pending;
+
+    /* Asynchronous scanout readback (virgl framebuffers). A frame that has
+     * to reach the window manager's surface is first read back from the
+     * host with a fenced TRANSFER_FROM_HOST; the copy into the surface runs
+     * once that fence retires -- in the launcher's take_dirty poll or the
+     * server's next KMS call -- instead of the X server waiting for it.
+     * rb_cur is the frame in flight; a newer frame that arrives meanwhile is
+     * parked in rb_next and read back as soon as rb_cur lands. */
+    uint8_t  rb_inflight;
+    uint8_t  rb_again;
+    uint64_t rb_fence;
+    struct {
+        int32_t  slot;              /* render session holding the BO */
+        uint32_t handle;
+        uint32_t resource;
+        uint32_t w, h, pitch;
+    } rb_cur, rb_next;
+
     /* Scanout redirection, described by physical pages rather than by a
      * virtual address: the blit runs in whatever process issued the flip
      * (Xorg), while the buffer belongs to the launcher, and the two do not
@@ -728,9 +843,20 @@ typedef struct {
      * those frames would otherwise be blitted straight over the window
      * manager. */
     uint8_t  mirror_released;
+    /* Trailing refresh. The server announces a frame (DIRTYFB / flip) when
+     * it has *submitted* the rendering, and with glamor on llvmpipe the
+     * worker threads may still be writing the buffer when it is copied: the
+     * mirror then holds the frame before, and if nothing else is drawn it
+     * keeps holding it -- the last keystroke's echo never appears, or a
+     * window stays black. So the scanout buffer is copied once more a little
+     * after the last frame (stage 1) and again later (stage 2). */
+    uint64_t trail_ns;
+    uint8_t  trail_stage;
 } drm_session_t;
 
 static drm_session_t g_sessions[DRM_MAX_SESSIONS];
+/* Set while drm_kms_mirror_take_dirty() re-copies a frame (trail_ns). */
+static int g_trailing_copy;
 
 void drm_kms_init(void)
 {
@@ -752,6 +878,13 @@ void drm_kms_init(void)
      * has definitely been enumerated (fs_init is after driver_module_critical)
      * and the slot it reports is the machine's real display controller. */
     sysfs_publish_drm_nodes();
+    g_vbl_epoch_ns = timer_monotonic_ns();
+    g_tick_gpu = display_get_3d_driver();
+    /* Fence retirement interrupts wake DRM_VIRTGPU_WAIT / sync_file pollers
+     * immediately instead of at the next timer tick. */
+    if (g_tick_gpu != NULL && g_tick_gpu->gpu_set_fence_callback != NULL) {
+        g_tick_gpu->gpu_set_fence_callback(poll_wait_notify);
+    }
     serial_write_string("[drm] published /dev/dri/card0 (226:0) and "
                         "/dev/dri/renderD128 (226:128)\n");
     serial_write_string("[drm] render backend: ");
@@ -802,9 +935,22 @@ static drm_session_t *session_alloc(int32_t owner_pid)
     return NULL;
 }
 
+/* Caller holds g_lock (or owns `s` exclusively). Drop undelivered events. */
+static void vbl_clear_locked(drm_session_t *s)
+{
+    for (int i = 0; i < DRM_VPEND_MAX; i++) {
+        if (s->vpend[i].used) {
+            s->vpend[i].used = 0u;
+            __atomic_fetch_sub(&g_vbl_pending_total, 1u, __ATOMIC_RELAXED);
+        }
+    }
+    s->flip_pending = 0u;
+}
+
 static void session_free(drm_session_t *s)
 {
     if (!s || !s->used) return;
+    vbl_clear_locked(s);
     for (int i = 0; i < DRM_MAX_DUMB; i++) {
         dumb_release_locked(&s->dumbs[i]);
     }
@@ -903,6 +1049,14 @@ typedef struct {
     uint32_t   context_id;
     uint32_t   context_capset_id;
 } drm_render_session_t;
+
+/* The host resource a render session put on scanout (DRM_NR_IMPLUS_SCANOUT),
+ * and that session. Guarded by g_lock. Released -- monitors handed back to
+ * the display driver -- before that resource is destroyed, so a scanout
+ * never samples a freed resource, and when the session closes (its owner
+ * exited or crashed), so the desktop does not freeze on a stale frame. */
+static uint32_t g_render_scanout_resource;
+static const void *g_render_scanout_session;
 
 static drm_render_session_t g_render_sessions[DRM_MAX_RENDER_SESSIONS];
 
@@ -1007,7 +1161,45 @@ static uint32_t render_bo_gpu_resource_id_locked(const drm_dumb_t *bo)
     return 0u;
 }
 
+/* Caller holds g_lock. */
+static uint64_t bo_fence_locked(const drm_dumb_t *bo)
+{
+    uint64_t f = bo->gpu_fence;
+    if (bo->prime >= 0 && bo->prime < DRM_MAX_PRIME &&
+        g_primes[bo->prime].used && g_primes[bo->prime].gpu_fence > f) {
+        f = g_primes[bo->prime].gpu_fence;
+    }
+    return f;
+}
+
+/* Caller holds g_lock. */
+static void bo_fence_set_locked(drm_dumb_t *bo, uint64_t fence)
+{
+    if (fence > bo->gpu_fence) bo->gpu_fence = fence;
+    if (bo->prime >= 0 && bo->prime < DRM_MAX_PRIME &&
+        g_primes[bo->prime].used && fence > g_primes[bo->prime].gpu_fence) {
+        g_primes[bo->prime].gpu_fence = fence;
+    }
+}
+
+static uint64_t gpu_fence_done(const driver_display_t *gpu)
+{
+    if (gpu == NULL || gpu->gpu_fence_completed == NULL) return UINT64_MAX;
+    return gpu->gpu_fence_completed();
+}
+
 /* Called with g_lock held. */
+/* Caller holds g_lock. */
+static void render_scanout_release_locked(const driver_display_t *gpu)
+{
+    if (g_render_scanout_resource == 0u) return;
+    g_render_scanout_resource = 0u;
+    g_render_scanout_session = NULL;
+    if (gpu != NULL && gpu->gpu_scanout_set != NULL) {
+        (void)gpu->gpu_scanout_set(0u, 0u, 0u);
+    }
+}
+
 static bool render_release_gpu_bo_locked(drm_render_session_t *sess,
                                          drm_dumb_t *bo)
 {
@@ -1016,6 +1208,9 @@ static bool render_release_gpu_bo_locked(drm_render_session_t *sess,
     uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
     if (resource_id == 0u) return true;
     if (gpu == NULL) return false;
+    if (resource_id == g_render_scanout_resource) {
+        render_scanout_release_locked(gpu);
+    }
 
     if (bo->gpu_attached_context != 0u &&
         !gpu->gpu_context_detach_resource(bo->gpu_attached_context,
@@ -1087,6 +1282,9 @@ static int render_find_capset(const driver_display_t *gpu, uint32_t capset_id,
 static bool render_session_release_gpu_locked(drm_render_session_t *sess)
 {
     if (sess == NULL || !sess->used) return true;
+    if (g_render_scanout_session == (const void *)sess) {
+        render_scanout_release_locked(render_gpu_backend());
+    }
     bool all_resources_released = true;
     for (int i = 0; i < DRM_MAX_DUMB; ++i) {
         if (sess->dumbs[i].used &&
@@ -1275,7 +1473,8 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
          * renderD128 from Xorg's separate card0 KMS/DRI2 software path. */
         serial_write_string("[drm-render] VERSION driver=");
         serial_write_string(name);
-        serial_write_string(" version=0.0\n");
+        serial_write_string((gpu != NULL && gpu->gpu_submit_3d_async != NULL)
+                                ? " version=0.1\n" : " version=0.0\n");
         uint64_t nl = (uint64_t)strlen(name);
         uint64_t dl = sizeof(date) - 1u;
         uint64_t sl = sizeof(desc) - 1u;
@@ -1285,12 +1484,13 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
             copy_to_user((void *)(uintptr_t)v.date, date, dl) != 0u) return E_FAULT;
         if (v.desc && v.desc_len >= sl &&
             copy_to_user((void *)(uintptr_t)v.desc, desc, sl) != 0u) return E_FAULT;
-        /* Mesa virgl uses DRM version 0.1 to opt into sync_file fence-fd
-         * ioctls. This render node completes submissions synchronously but
-         * does not implement sync_file import/export, so advertise 0.0 and
-         * let Mesa use its legacy BO-WAIT fence path. */
+        /* 0.1: sync_file fence fds (EXECBUFFER FENCE_FD_IN/OUT) are
+         * supported, which is what Mesa's virgl winsys checks before using
+         * them -- and what gives EGL_ANDROID_native_fence_sync. Only with a
+         * fencing backend; otherwise 0.0 and Mesa's BO-wait fences. */
         v.version_major = 0;
-        v.version_minor = 0;
+        v.version_minor = (gpu != NULL && gpu->gpu_submit_3d_async != NULL)
+                              ? 1 : 0;
         v.version_patchlevel = 0;
         v.name_len = nl;
         v.date_len = dl;
@@ -1581,18 +1781,26 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         memset(&exec, 0, sizeof(exec));
         if (copy_from_user(&exec, uarg, request_size) != 0u) return E_FAULT;
 
-        /* The synchronous backend exposes only ring zero.  A selected ring
-         * zero is equivalent to the implicit default ring.  Fence-fd and
-         * syncobj interoperability need a separate Linux sync_file layer. */
-        if ((exec.flags & ~VIRTGPU_EXECBUF_RING_IDX) != 0u ||
+        /* One timeline, ring zero (a selected ring zero is the implicit
+         * default). Fence fds are sync_files; DRM syncobjs are not
+         * implemented and not advertised (DRM_CAP_SYNCOBJ = 0). */
+        if ((exec.flags & ~VIRTGPU_EXECBUF_FLAGS) != 0u ||
             ((exec.flags & VIRTGPU_EXECBUF_RING_IDX) != 0u &&
              exec.ring_idx != 0u) ||
             exec.num_in_syncobjs != 0u || exec.num_out_syncobjs != 0u ||
             exec.syncobj_stride != 0u ||
-            exec.in_syncobjs != 0u || exec.out_syncobjs != 0u ||
-            ((exec.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN |
-                            VIRTGPU_EXECBUF_FENCE_FD_OUT)) != 0u)) {
+            exec.in_syncobjs != 0u || exec.out_syncobjs != 0u) {
             return E_NOTSUPP;
+        }
+        if ((exec.flags & VIRTGPU_EXECBUF_FENCE_FD_IN) != 0u) {
+            /* The in-fence (a global fd -- the Linux ABI layer rewrote it)
+             * must be ours: every fence of this device is on the same
+             * in-order control queue, so work queued now already runs after
+             * it and there is nothing to wait for here. */
+            uint64_t in_fence = 0u;
+            if (drm_sync_fence_of_fd(exec.fence_fd, &in_fence) < 0) {
+                return E_INVAL;
+            }
         }
         if (exec.size == 0u || exec.size > (16u * 1024u * 1024u) ||
             (exec.size & 3u) != 0u || exec.command == 0u ||
@@ -1641,14 +1849,40 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
             }
             rc = render_attach_bo_to_context_locked(sess, bo, gpu);
         }
-        if (rc == 0 &&
-            !gpu->gpu_submit_3d(sess->context_id, commands, exec.size)) {
-            rc = E_INVAL;
+        uint64_t out_fence = 0u;
+        if (rc == 0) {
+            if (gpu->gpu_submit_3d_async != NULL) {
+                /* Fenced: queue it and return. The buffers it names are
+                 * busy until the fence retires (DRM_VIRTGPU_WAIT). */
+                uint64_t fence = gpu->gpu_submit_3d_async(sess->context_id,
+                                                          commands, exec.size);
+                if (fence == 0u) {
+                    rc = E_INVAL;
+                } else {
+                    out_fence = fence;
+                    for (uint32_t i = 0u; i < exec.num_bo_handles; ++i) {
+                        drm_dumb_t *bo = render_dumb_by_handle(sess, handles[i]);
+                        if (bo != NULL) bo_fence_set_locked(bo, fence);
+                    }
+                }
+            } else if (!gpu->gpu_submit_3d(sess->context_id, commands,
+                                           exec.size)) {
+                rc = E_INVAL;
+            }
         }
         spinlock_unlock(&g_lock);
 
         if (handles != NULL) free(handles);
         free(commands);
+        if (rc == 0 && (exec.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0u) {
+            /* Outside g_lock: installing the descriptor takes the file
+             * table lock. The Linux ABI layer publishes the global number
+             * into the caller's own fd table on the way out. */
+            int32_t fd = drm_sync_file_create(out_fence);
+            if (fd < 0) return fd;
+            exec.fence_fd = fd;
+            if (copy_to_user(uarg, &exec, request_size) != 0u) return E_FAULT;
+        }
         return rc;
     }
     case DRM_NR_VIRTGPU_TRANSFER_TO_HOST:
@@ -1672,7 +1906,19 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
             return E_INVAL;
         }
         rc = render_attach_bo_to_context_locked(sess, bo, gpu);
-        if (rc == 0 &&
+        if (rc == 0 && gpu->gpu_transfer_3d_async != NULL) {
+            /* Fenced as well: Mesa waits on the buffer (DRM_VIRTGPU_WAIT)
+             * before it reads what a TRANSFER_FROM_HOST brought back. */
+            uint64_t fence = gpu->gpu_transfer_3d_async(
+                sess->context_id, render_bo_gpu_resource_id_locked(bo),
+                nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST,
+                transfer.box.x, transfer.box.y, transfer.box.z,
+                transfer.box.w, transfer.box.h, transfer.box.d,
+                (uint64_t)transfer.offset, transfer.level,
+                transfer.stride, transfer.layer_stride);
+            if (fence == 0u) rc = E_INVAL;
+            else bo_fence_set_locked(bo, fence);
+        } else if (rc == 0 &&
             !gpu->gpu_transfer_3d(
                 sess->context_id, render_bo_gpu_resource_id_locked(bo),
                 nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST,
@@ -1691,11 +1937,16 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         if ((wait.flags & ~VIRTGPU_WAIT_NOWAIT) != 0u) return E_INVAL;
         spinlock_lock(&g_lock);
         drm_dumb_t *bo = render_dumb_by_handle(sess, wait.handle);
-        bool valid = bo != NULL;
+        uint64_t fence = bo != NULL ? bo_fence_locked(bo) : 0u;
         spinlock_unlock(&g_lock);
-        /* GPU submissions and transfers complete synchronously on our
-         * control queue, so a live BO is already signaled. */
-        return valid ? 0 : E_INVAL;
+        if (bo == NULL) return E_INVAL;
+        if (fence == 0u || fence <= gpu_fence_done(gpu)) return 0;
+        /* Still busy on the host. NOWAIT is Mesa's "is it busy?" probe
+         * (buffer cache reuse); a blocking wait parks the thread and runs
+         * the ioctl again (see DRM_WOULD_BLOCK), woken by drm_timer_tick()
+         * when fences retire. */
+        if ((wait.flags & VIRTGPU_WAIT_NOWAIT) != 0u) return E_BUSY;
+        return DRM_WOULD_BLOCK;
     }
     case DRM_NR_VIRTGPU_GET_CAPS: {
         struct drm_virtgpu_get_caps caps;
@@ -1735,6 +1986,61 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
     }
     case DRM_COMMAND_BASE + 0x0Au: /* RESOURCE_CREATE_BLOB */
         return E_NOTSUPP;
+    case DRM_NR_IMPLUS_SCANOUT: {
+        struct drm_implus_scanout so;
+        if (gpu == NULL || gpu->gpu_scanout_set == NULL ||
+            gpu->gpu_scanout_flush == NULL) return E_NOSYS;
+        if (!uarg || copy_from_user(&so, uarg, sizeof(so)) != 0u) return E_FAULT;
+        if (so.flags == 0u ||
+            (so.flags & ~(DRM_IMPLUS_SCANOUT_SET | DRM_IMPLUS_SCANOUT_FLUSH |
+                          DRM_IMPLUS_SCANOUT_RELEASE)) != 0u) return E_INVAL;
+        int64_t rc = 0;
+        spinlock_lock(&g_lock);
+        if ((so.flags & DRM_IMPLUS_SCANOUT_RELEASE) != 0u) {
+            if (g_render_scanout_session == (const void *)sess) {
+                render_scanout_release_locked(gpu);
+            }
+            spinlock_unlock(&g_lock);
+            return 0;
+        }
+        drm_dumb_t *bo = render_dumb_by_handle(sess, so.bo_handle);
+        uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
+        if (bo == NULL || resource_id == 0u) {
+            spinlock_unlock(&g_lock);
+            return E_INVAL;
+        }
+        if ((so.flags & DRM_IMPLUS_SCANOUT_SET) != 0u) {
+            /* One compositor at a time: a second session may not take the
+             * screen away from a live one. */
+            if (g_render_scanout_session != NULL &&
+                g_render_scanout_session != (const void *)sess) {
+                spinlock_unlock(&g_lock);
+                return E_BUSY;
+            }
+            rc = render_attach_bo_to_context_locked(sess, bo, gpu);
+            if (rc == 0 &&
+                gpu->gpu_scanout_set(resource_id, so.width, so.height)) {
+                g_render_scanout_resource = resource_id;
+                g_render_scanout_session = sess;
+            } else if (rc == 0) {
+                rc = E_INVAL;
+            }
+        }
+        if (rc == 0 && (so.flags & DRM_IMPLUS_SCANOUT_FLUSH) != 0u) {
+            if (g_render_scanout_resource != resource_id ||
+                g_render_scanout_session != (const void *)sess) {
+                rc = E_NODEV;
+            } else if (!gpu->gpu_scanout_flush(resource_id, so.x, so.y,
+                                               so.width, so.height)) {
+                /* The driver dropped it (layout or mode change). */
+                g_render_scanout_resource = 0u;
+                g_render_scanout_session = NULL;
+                rc = E_NODEV;
+            }
+        }
+        spinlock_unlock(&g_lock);
+        return rc;
+    }
     default:
         return E_NOTTY;
     }
@@ -1881,10 +2187,39 @@ void drm_kms_notify_process_exit(int32_t pid)
      * -- must keep its session. */
 }
 
+static void kms_readback_service_locked(drm_session_t *s);
+static int kms_virgl_mode(void);
+static void blit_fb_to_display(drm_session_t *s, drm_render_session_t *rs,
+                               drm_fb_t *fb);
+
+#define DRM_TRAIL_FIRST_NS   (30ull * 1000000ull)
+#define DRM_TRAIL_SECOND_NS (150ull * 1000000ull)
+
 int drm_kms_mirror_take_dirty(void)
 {
     drm_session_t *s = session_for_owner(process_get_current_pid());
     if (!s) return 0;
+    /* The launcher polls this every frame: it is where a finished
+     * asynchronous readback is copied into its surface, and where the
+     * trailing refresh runs. */
+    spinlock_lock(&g_lock);
+    kms_readback_service_locked(s);
+    if (s->trail_stage != 0u && s->mirror_page_count != 0u &&
+        s->scanout_fb_id != 0u && !kms_virgl_mode()) {
+        uint64_t waited = timer_monotonic_ns() - s->trail_ns;
+        uint64_t due = s->trail_stage == 1u ? DRM_TRAIL_FIRST_NS
+                                            : DRM_TRAIL_SECOND_NS;
+        if (waited >= due) {
+            drm_fb_t *fb = fb_by_id(s, s->scanout_fb_id);
+            g_trailing_copy = 1;
+            if (fb) blit_fb_to_display(s, NULL, fb);
+            g_trailing_copy = 0;
+            s->trail_stage = s->trail_stage == 1u ? 2u : 0u;
+        }
+    } else if (s->trail_stage != 0u && kms_virgl_mode()) {
+        s->trail_stage = 0u;
+    }
+    spinlock_unlock(&g_lock);
     uint32_t d = s->mirror_dirty;
     s->mirror_dirty = 0u;
     return d != 0u;
@@ -1956,6 +2291,115 @@ static void mirror_write(drm_session_t *s, uint64_t offset,
 
 /* Blit a dumb buffer to the hardware framebuffer (XRGB8888, 32bpp assumed),
  * or into the redirection surface when one is registered. */
+/* Caller holds g_lock. Copy a framebuffer's pixels (already in guest
+ * memory) to the window manager's surface, or to the panel. */
+static void kms_copy_bo_locked(drm_session_t *s, const drm_dumb_t *bo,
+                               uint32_t width, uint32_t height, uint32_t pitch)
+{
+    if (s->mirror_page_count != 0u) {
+        uint32_t cw = (width  < s->mirror_w) ? width  : s->mirror_w;
+        uint32_t ch = (height < s->mirror_h) ? height : s->mirror_h;
+        uint32_t dst_pitch = s->mirror_w * 4u;
+        for (uint32_t y = 0; y < ch; y++) {
+            mirror_write(s, (uint64_t)y * dst_pitch,
+                         (const uint8_t *)bo->kva + (size_t)y * pitch,
+                         cw * 4u);
+        }
+        s->mirror_dirty = 1u;
+        if (!g_trailing_copy) {
+            s->trail_ns = timer_monotonic_ns();
+            s->trail_stage = 1u;
+        }
+        /* No display_present(): the window manager owns the panel now and
+         * will composite this surface on its own schedule. */
+        return;
+    }
+
+    /* A server that never had a mirror drives the panel as before; one
+     * whose mirror has been withdrawn draws nowhere. */
+    if (s->mirror_released) return;
+
+    void *hw = display_get_framebuffer();
+    if (!hw) return;
+    uint32_t hw_w = display_width();
+    uint32_t hw_h = display_height();
+    uint32_t hw_pitch = hw_w * 4u;
+    uint32_t cw = (width  < hw_w) ? width  : hw_w;
+    uint32_t ch = (height < hw_h) ? height : hw_h;
+    for (uint32_t y = 0; y < ch; y++) {
+        memcpy((uint8_t *)hw + (size_t)y * hw_pitch,
+               (uint8_t *)bo->kva + (size_t)y * pitch,
+               (size_t)cw * 4u);
+    }
+    display_present();
+}
+
+/* Caller holds g_lock. Issue a fenced readback of `bo` for the surface. */
+static bool kms_readback_issue_locked(drm_session_t *s,
+                                      drm_render_session_t *rs,
+                                      drm_dumb_t *bo, uint32_t width,
+                                      uint32_t height, uint32_t pitch)
+{
+    const driver_display_t *gpu = render_gpu_backend();
+    uint32_t resource_id = render_bo_gpu_resource_id_locked(bo);
+    if (gpu == NULL || gpu->gpu_transfer_3d_async == NULL || rs == NULL ||
+        rs->context_id == 0u || resource_id == 0u) {
+        return false;
+    }
+    if (render_attach_bo_to_context_locked(rs, bo, gpu) < 0) return false;
+    if (bo->width != 0u && width > bo->width) width = bo->width;
+    if (bo->height != 0u && height > bo->height) height = bo->height;
+    uint64_t fence = gpu->gpu_transfer_3d_async(rs->context_id, resource_id,
+                                                false, 0u, 0u, 0u, width,
+                                                height, 1u, 0u, 0u, pitch, 0u);
+    if (fence == 0u) return false;
+    bo_fence_set_locked(bo, fence);
+    s->rb_inflight = 1u;
+    s->rb_fence = fence;
+    s->rb_cur.slot = (int32_t)(rs - g_render_sessions);
+    s->rb_cur.handle = bo->handle;
+    s->rb_cur.resource = resource_id;
+    s->rb_cur.w = width;
+    s->rb_cur.h = height;
+    s->rb_cur.pitch = pitch;
+    return true;
+}
+
+/* Caller holds g_lock. Land a readback whose fence has retired, then start
+ * the one that was waiting behind it. */
+static void kms_readback_service_locked(drm_session_t *s)
+{
+    if (!s->rb_inflight) return;
+    const driver_display_t *gpu = render_gpu_backend();
+    if (gpu_fence_done(gpu) < s->rb_fence) return;
+    s->rb_inflight = 0u;
+
+    /* Re-resolve: the server may have freed the buffer meanwhile, and a
+     * recycled handle must not be read as this frame. */
+    drm_render_session_t *rs = render_session_by_slot(s->rb_cur.slot);
+    drm_dumb_t *bo = rs != NULL ? render_dumb_by_handle(rs, s->rb_cur.handle)
+                                : NULL;
+    if (bo != NULL && bo->kva != NULL &&
+        render_bo_gpu_resource_id_locked(bo) == s->rb_cur.resource &&
+        (uint64_t)s->rb_cur.pitch * s->rb_cur.h <= bo->size) {
+        kms_copy_bo_locked(s, bo, s->rb_cur.w, s->rb_cur.h, s->rb_cur.pitch);
+    }
+
+    if (s->rb_again) {
+        s->rb_again = 0u;
+        rs = render_session_by_slot(s->rb_next.slot);
+        bo = rs != NULL ? render_dumb_by_handle(rs, s->rb_next.handle) : NULL;
+        if (bo != NULL && bo->kva != NULL &&
+            !kms_readback_issue_locked(s, rs, bo, s->rb_next.w,
+                                       s->rb_next.h, s->rb_next.pitch)) {
+            kms_bo_sync_from_host_locked(rs, bo, s->rb_next.w, s->rb_next.h,
+                                         s->rb_next.pitch);
+            kms_copy_bo_locked(s, bo, s->rb_next.w, s->rb_next.h,
+                               s->rb_next.pitch);
+        }
+    }
+}
+
 static void blit_fb_to_display(drm_session_t *s, drm_render_session_t *rs,
                                drm_fb_t *fb)
 {
@@ -1971,79 +2415,30 @@ static void blit_fb_to_display(drm_session_t *s, drm_render_session_t *rs,
         (uint64_t)src_pitch * (uint64_t)fb->height > bo->size) {
         return;
     }
-    kms_bo_sync_from_host_locked(rs, bo, fb->width, fb->height, src_pitch);
-
-    if (s->mirror_page_count != 0u) {
-        uint32_t cw = (fb->width  < s->mirror_w) ? fb->width  : s->mirror_w;
-        uint32_t ch = (fb->height < s->mirror_h) ? fb->height : s->mirror_h;
-        uint32_t dst_pitch = s->mirror_w * 4u;
-        for (uint32_t y = 0; y < ch; y++) {
-            mirror_write(s, (uint64_t)y * dst_pitch,
-                         (const uint8_t *)bo->kva + (size_t)y * src_pitch,
-                         cw * 4u);
+    /* A virgl frame for the window manager's surface: read it back
+     * asynchronously (see rb_cur). The panel path stays synchronous -- it
+     * has no consumer polling for the result. */
+    if (s->mirror_page_count != 0u && rs != NULL &&
+        render_bo_gpu_resource_id_locked(bo) != 0u) {
+        kms_readback_service_locked(s);
+        if (s->rb_inflight) {
+            s->rb_again = 1u;
+            s->rb_next.slot = (int32_t)(rs - g_render_sessions);
+            s->rb_next.handle = bo->handle;
+            s->rb_next.w = fb->width;
+            s->rb_next.h = fb->height;
+            s->rb_next.pitch = src_pitch;
+            return;
         }
-        s->mirror_dirty = 1u;
-        /* No display_present(): the window manager owns the panel now and
-         * will composite this surface on its own schedule. */
-        return;
+        if (kms_readback_issue_locked(s, rs, bo, fb->width, fb->height,
+                                      src_pitch)) {
+            return;
+        }
     }
-
-    /* A server that never had a mirror drives the panel as before; one
-     * whose mirror has been withdrawn draws nowhere. */
-    if (s->mirror_released) return;
-
-    void *hw = display_get_framebuffer();
-    if (!hw) return;
-    uint32_t hw_w = display_width();
-    uint32_t hw_h = display_height();
-    uint32_t hw_pitch = hw_w * 4u;
-    uint32_t cw = (fb->width  < hw_w) ? fb->width  : hw_w;
-    uint32_t ch = (fb->height < hw_h) ? fb->height : hw_h;
-    for (uint32_t y = 0; y < ch; y++) {
-        memcpy((uint8_t *)hw + (size_t)y * hw_pitch,
-               (uint8_t *)bo->kva + (size_t)y * src_pitch,
-               (size_t)cw * 4u);
-    }
-    display_present();
+    kms_bo_sync_from_host_locked(rs, bo, fb->width, fb->height, src_pitch);
+    kms_copy_bo_locked(s, bo, fb->width, fb->height, src_pitch);
 }
 
-/* There is no real scanout timing behind this shim, so vblanks are a
- * virtual 60 Hz clock derived from the system timer. Page-flip events and
- * WAIT_VBLANK replies both report from it, which keeps the MSC Xorg's
- * Present extension tracks monotonic and consistent between the two. */
-static uint32_t drm_vblank_now(uint32_t *out_sec, uint32_t *out_usec)
-{
-    uint32_t hz = timer_hz(); if (!hz) hz = 60u;
-    uint64_t ms = (timer_ticks() * 1000ull) / hz;
-    if (out_sec) *out_sec = (uint32_t)(ms / 1000ull);
-    if (out_usec) *out_usec = (uint32_t)((ms % 1000ull) * 1000ull);
-    return (uint32_t)((ms * 60ull) / 1000ull);
-}
-
-static void queue_vblank_event(drm_session_t *s, uint32_t type,
-                               uint64_t user_data, uint32_t sequence,
-                               uint32_t crtc_id)
-{
-    uint32_t next = (s->evq_head + 1u) % DRM_EVQ_MAX;
-    if (next == s->evq_tail) return; /* drop on overflow */
-    struct drm_event_vblank *e = &s->evq[s->evq_head];
-    memset(e, 0, sizeof(*e));
-    e->base.type = type;
-    e->base.length = (uint32_t)sizeof(*e);
-    e->user_data = user_data;
-    (void)drm_vblank_now(&e->tv_sec, &e->tv_usec);
-    e->sequence = sequence;
-    e->crtc_id = crtc_id;
-    s->evq_head = next;
-}
-
-static void queue_flip_event(drm_session_t *s, uint64_t user_data,
-                             uint32_t crtc_id)
-{
-    s->flip_seq = drm_vblank_now(NULL, NULL);
-    queue_vblank_event(s, DRM_EVENT_FLIP_COMPLETE, user_data, s->flip_seq,
-                       crtc_id);
-}
 
 /* Append decimal `v` to buf at *pos (buf is >= 32); no NUL. */
 static void append_u32(char *buf, int *pos, uint32_t v)
@@ -2087,7 +2482,12 @@ static void fill_mode(const drm_session_t *s, struct drm_mode_modeinfo *m)
         h = 768u;
     }
     memset(m, 0, sizeof(*m));
-    m->clock = (uint32_t)(((uint64_t)w * h * 60ull) / 1000ull);
+    /* Pixel clock (kHz) from the *total* timings, so that
+     * clock / (htotal * vtotal) -- the refresh rate userspace derives, and
+     * the vblank period this file uses -- is 60 Hz. Computing it from the
+     * visible size made the refresh 57.5 Hz at 1024x680. */
+    m->clock = (uint32_t)((((uint64_t)w + 32u) * ((uint64_t)h + 8u) * 60ull +
+                           500ull) / 1000ull);
     m->hdisplay = (uint16_t)w;
     m->hsync_start = (uint16_t)(w + 8u);
     m->hsync_end = (uint16_t)(w + 16u);
@@ -2120,6 +2520,207 @@ static int64_t write_id_array(uint64_t uptr, uint32_t cap, const uint32_t *ids,
 }
 
 /* ---- ioctl ------------------------------------------------------------- */
+/* ---- vblank ------------------------------------------------------------
+ *
+ * The CRTC is virtual (its frames go to a window manager surface), but its
+ * vblank timeline is kept the way a real one behaves: a counter that
+ * advances once per refresh period, events that are delivered when the
+ * vblank they target has actually passed -- not when they are requested --
+ * stamped with that vblank's CLOCK_MONOTONIC time, and waits that block
+ * until then. Xorg's Present extension and Mesa's DRI3 swap pacing schedule
+ * frames from exactly these numbers.
+ *
+ * Delivery: an event becomes readable on the next read()/poll() after its
+ * vblank; drm_timer_tick() makes sure a parked poller gets that poll by
+ * waking it at the earliest due time (g_vbl_next_due_ns). */
+
+static uint64_t vbl_mode_period_ns(const drm_session_t *s)
+{
+    struct drm_mode_modeinfo m;
+    fill_mode(s, &m);
+    if (m.clock == 0u || m.htotal == 0u || m.vtotal == 0u) return 16666667ull;
+    uint64_t p = ((uint64_t)m.htotal * (uint64_t)m.vtotal * 1000000ull) /
+                 (uint64_t)m.clock;
+    return p != 0u ? p : 16666667ull;
+}
+
+/* Caller holds g_lock. The current vblank count and its timestamp. */
+static uint64_t vbl_now_locked(drm_session_t *s, uint64_t *out_ns)
+{
+    uint64_t now = timer_monotonic_ns();
+    uint64_t period = vbl_mode_period_ns(s);
+    if (s->vbl_period_ns == 0u) {
+        s->vbl_period_ns = period;
+        s->vbl_base_seq = 0u;
+        s->vbl_base_ns = g_vbl_epoch_ns;
+    } else if (period != s->vbl_period_ns) {
+        /* Mode changed: continue the count from the last vblank of the old
+         * timing, on the new period. */
+        uint64_t old = s->vbl_period_ns;
+        uint64_t n = now > s->vbl_base_ns ? (now - s->vbl_base_ns) / old : 0u;
+        s->vbl_base_seq += n;
+        s->vbl_base_ns += n * old;
+        s->vbl_period_ns = period;
+    }
+    uint64_t n = now > s->vbl_base_ns
+                     ? (now - s->vbl_base_ns) / s->vbl_period_ns : 0u;
+    if (out_ns) *out_ns = s->vbl_base_ns + n * s->vbl_period_ns;
+    return s->vbl_base_seq + n;
+}
+
+/* Caller holds g_lock (vbl_now_locked() ran). Timestamp of vblank `seq`. */
+static uint64_t vbl_time_of_locked(const drm_session_t *s, uint64_t seq)
+{
+    if (seq <= s->vbl_base_seq) return s->vbl_base_ns;
+    return s->vbl_base_ns + (seq - s->vbl_base_seq) * s->vbl_period_ns;
+}
+
+/* Lower the tick's wake-up deadline to `due_ns` (lock-free). */
+static void vbl_arm_due(uint64_t due_ns)
+{
+    uint64_t cur = __atomic_load_n(&g_vbl_next_due_ns, __ATOMIC_RELAXED);
+    while (due_ns < cur) {
+        if (__atomic_compare_exchange_n(&g_vbl_next_due_ns, &cur, due_ns, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            /* Ask the timer for an interrupt at exactly this time instead
+             * of the next 4 ms tick. */
+            timer_hires_request(due_ns);
+            break;
+        }
+    }
+}
+
+uint64_t drm_hires_next_due_ns(void)
+{
+    return __atomic_load_n(&g_vbl_next_due_ns, __ATOMIC_ACQUIRE);
+}
+
+void drm_hires_service(uint64_t now_ns)
+{
+    uint64_t due = __atomic_load_n(&g_vbl_next_due_ns, __ATOMIC_ACQUIRE);
+    if (due == UINT64_MAX || now_ns < due) return;
+    /* Only clear what was read: a deadline armed in between stays. */
+    if (__atomic_compare_exchange_n(&g_vbl_next_due_ns, &due, UINT64_MAX, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        poll_wait_notify();
+    }
+}
+
+/* Caller holds g_lock. Append a delivered event to the read queue. */
+static void vbl_emit_locked(drm_session_t *s, uint8_t type, uint64_t seq,
+                            uint64_t user_data)
+{
+    uint32_t next = (s->evq_head + 1u) % DRM_EVQ_MAX;
+    if (next == s->evq_tail) {
+        serial_write_string("[drm] event queue full, dropping\n");
+        return;
+    }
+    uint64_t ts = vbl_time_of_locked(s, seq);
+    struct drm_event_vblank *e = &s->evq[s->evq_head];
+    memset(e, 0, sizeof(*e));
+    if (type == DRM_EVENT_CRTC_SEQUENCE) {
+        /* struct drm_event_crtc_sequence: same 32 bytes, other layout. */
+        struct {
+            struct drm_event base;
+            uint64_t user_data;
+            int64_t  time_ns;
+            uint64_t sequence;
+        } cs;
+        _Static_assert(sizeof(cs) == sizeof(*e), "drm_event_crtc_sequence ABI");
+        memset(&cs, 0, sizeof(cs));
+        cs.base.type = DRM_EVENT_CRTC_SEQUENCE;
+        cs.base.length = (uint32_t)sizeof(cs);
+        cs.user_data = user_data;
+        cs.time_ns = (int64_t)ts;
+        cs.sequence = seq;
+        memcpy(e, &cs, sizeof(cs));
+    } else {
+        e->base.type = type;
+        e->base.length = (uint32_t)sizeof(*e);
+        e->user_data = user_data;
+        e->tv_sec = (uint32_t)(ts / 1000000000ull);
+        e->tv_usec = (uint32_t)((ts % 1000000000ull) / 1000ull);
+        e->sequence = (uint32_t)seq;
+        e->crtc_id = DRM_CRTC_ID;
+    }
+    s->evq_head = next;
+}
+
+/* Caller holds g_lock. Deliver every pending event whose vblank has passed
+ * and re-arm the tick for the earliest one that has not. */
+static void vbl_promote_locked(drm_session_t *s)
+{
+    uint64_t cur = vbl_now_locked(s, NULL);
+    for (int i = 0; i < DRM_VPEND_MAX; i++) {
+        if (!s->vpend[i].used) continue;
+        if (s->vpend[i].seq <= cur) {
+            if (s->vpend[i].type == DRM_EVENT_FLIP_COMPLETE) {
+                s->flip_pending = 0u;
+            }
+            vbl_emit_locked(s, s->vpend[i].type, s->vpend[i].seq,
+                            s->vpend[i].user_data);
+            s->vpend[i].used = 0u;
+            __atomic_fetch_sub(&g_vbl_pending_total, 1u, __ATOMIC_RELAXED);
+        } else {
+            vbl_arm_due(vbl_time_of_locked(s, s->vpend[i].seq));
+        }
+    }
+}
+
+/* Caller holds g_lock. Queue an event for vblank `seq`. */
+static int vbl_queue_locked(drm_session_t *s, uint8_t type, uint64_t seq,
+                            uint64_t user_data)
+{
+    for (int i = 0; i < DRM_VPEND_MAX; i++) {
+        if (s->vpend[i].used) continue;
+        s->vpend[i].used = 1u;
+        s->vpend[i].type = type;
+        s->vpend[i].seq = seq;
+        s->vpend[i].user_data = user_data;
+        __atomic_fetch_add(&g_vbl_pending_total, 1u, __ATOMIC_RELAXED);
+        vbl_promote_locked(s);   /* already due? deliver now; else arm */
+        return 0;
+    }
+    return E_BUSY;
+}
+
+/* Caller holds g_lock. A flip shows its frame at the next vblank, and that
+ * is when its completion event arrives. */
+static void queue_flip_event(drm_session_t *s, uint64_t user_data,
+                             uint32_t crtc_id)
+{
+    (void)crtc_id; /* one CRTC */
+    uint64_t cur = vbl_now_locked(s, NULL);
+    s->flip_seq = (uint32_t)(cur + 1u);
+    if (vbl_queue_locked(s, DRM_EVENT_FLIP_COMPLETE, cur + 1u, user_data) == 0) {
+        s->flip_pending = 1u;
+    }
+}
+
+void drm_timer_tick(void)
+{
+    if (!g_inited) return;
+    int wake = 0;
+
+    /* Vblank events and waits (normally already serviced at their exact
+     * time by the high-resolution timer; this is the tick-rate fallback). */
+    drm_hires_service(timer_monotonic_ns());
+
+    /* GPU fences: wake waiters (DRM_VIRTGPU_WAIT) when the retired fence
+     * advances. The driver hook drains completions with a try-lock. */
+    static uint64_t last_fence;
+    const driver_display_t *gpu = g_tick_gpu;
+    if (gpu != NULL && gpu->gpu_fence_completed != NULL) {
+        uint64_t done = gpu->gpu_fence_completed();
+        if (done != last_fence) {
+            last_fence = done;
+            wake = 1;
+        }
+    }
+
+    if (wake) poll_wait_notify();
+}
+
 int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
 {
     ensure_init();
@@ -2204,6 +2805,7 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         case DRM_CAP_DUMB_PREFER_SHADOW:     c.value = 1; break;
         case DRM_CAP_TIMESTAMP_MONOTONIC:    c.value = 1; break;
         case DRM_CAP_CRTC_IN_VBLANK_EVENT:   c.value = 1; break;
+        case DRM_CAP_VBLANK_HIGH_CRTC:       c.value = 1; break;
         case DRM_CAP_CURSOR_WIDTH:
         case DRM_CAP_CURSOR_HEIGHT:          c.value = 64; break;
         case DRM_CAP_PRIME:                  c.value = 3; break; /* import|export */
@@ -2412,12 +3014,14 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         spinlock_unlock(&g_lock);
         return copy_to_user(uarg, &f, sizeof(f)) == 0u ? 0 : E_FAULT;
     }
+    case DRM_NR_MODESET_CTL:
+        /* Pre/post-modeset vblank bookkeeping for old DDXes: the virtual
+         * counter never stops, so there is nothing to save or restore. */
+        return 0;
     case DRM_NR_WAIT_VBLANK: {
-        /* union drm_wait_vblank. Xorg's Present (modesetting vblank.c)
-         * issues one per frame once glamor is up; answering ENOTTY sent it
-         * down a fallback that retried -- and logged -- thousands of times.
-         * A wait for a future vblank completes now: there is no hardware
-         * vblank to wait for, and clients pace themselves. */
+        /* union drm_wait_vblank. One CRTC (pipe 0). Without _DRM_VBLANK_EVENT
+         * this blocks until the target vblank; with it, the event is queued
+         * and arrives (with that vblank's timestamp) once it has passed. */
         struct {
             uint32_t type;
             uint32_t sequence;
@@ -2426,27 +3030,113 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         } wv;
         _Static_assert(sizeof(wv) == 24u, "drm_wait_vblank ABI");
         if (!uarg || copy_from_user(&wv, uarg, sizeof(wv)) != 0u) return E_FAULT;
-        uint32_t sec = 0u, usec = 0u;
-        uint32_t now = drm_vblank_now(&sec, &usec);
-        uint32_t target = (wv.type & 0x1u) ? now + wv.sequence : wv.sequence;
-        /* _DRM_VBLANK_NEXTONMISS or an absolute target already passed. */
-        if ((int32_t)(target - now) < 0) target = now;
-        if ((wv.type & 0x04000000u) != 0u) { /* _DRM_VBLANK_EVENT */
-            spinlock_lock(&g_lock);
-            queue_vblank_event(sess, DRM_EVENT_VBLANK, wv.signal_or_sec,
-                               target, DRM_CRTC_ID);
-            spinlock_unlock(&g_lock);
+        uint32_t type = wv.type;
+        if ((type & ~(DRM_VBLANK_TYPES_MASK | DRM_VBLANK_FLAGS_MASK |
+                      DRM_VBLANK_HIGH_CRTC_MASK)) != 0u ||
+            (type & DRM_VBLANK_SIGNAL) != 0u) {
+            return E_INVAL;
         }
-        wv.type &= 0x1u;
-        wv.sequence = target;
-        wv.signal_or_sec = sec;
-        wv.usec = usec;
+        uint32_t pipe = (type & DRM_VBLANK_HIGH_CRTC_MASK) >> 1;
+        if ((type & DRM_VBLANK_SECONDARY) != 0u) pipe = 1u;
+        if (pipe != 0u) return E_INVAL;
+
+        spinlock_lock(&g_lock);
+        uint64_t now_ts = 0u;
+        uint64_t cur = vbl_now_locked(sess, &now_ts);
+        uint32_t cur32 = (uint32_t)cur;
+        uint32_t req = wv.sequence;
+        if ((type & DRM_VBLANK_RELATIVE) != 0u) req = cur32 + req;
+        if ((type & DRM_VBLANK_NEXTONMISS) != 0u &&
+            (int32_t)(req - cur32) <= 0) {
+            req = cur32 + 1u;
+        }
+        /* The ABI counts in 32 bits; widen relative to now. */
+        int32_t delta = (int32_t)(req - cur32);
+        uint64_t target = delta > 0 ? cur + (uint64_t)delta : cur;
+
+        if ((type & DRM_VBLANK_EVENT) != 0u) {
+            int rc = vbl_queue_locked(sess, DRM_EVENT_VBLANK, target,
+                                      wv.signal_or_sec);
+            spinlock_unlock(&g_lock);
+            if (rc < 0) return rc;
+            wv.sequence = req;
+            return copy_to_user(uarg, &wv, sizeof(wv)) == 0u ? 0 : E_FAULT;
+        }
+        if (delta > 0) {
+            /* Not there yet. Rewrite the request as absolute -- what Linux
+             * does before restarting this ioctl -- so the re-run waits for
+             * the same vblank instead of one further on. */
+            vbl_arm_due(vbl_time_of_locked(sess, target));
+            spinlock_unlock(&g_lock);
+            wv.type = type & ~(DRM_VBLANK_RELATIVE | DRM_VBLANK_NEXTONMISS);
+            wv.sequence = req;
+            if (copy_to_user(uarg, &wv, sizeof(wv)) != 0u) return E_FAULT;
+            return DRM_WOULD_BLOCK;
+        }
+        spinlock_unlock(&g_lock);
+        wv.type = type & DRM_VBLANK_TYPES_MASK;
+        wv.sequence = cur32;
+        wv.signal_or_sec = now_ts / 1000000000ull;
+        wv.usec = (now_ts % 1000000000ull) / 1000ull;
         return copy_to_user(uarg, &wv, sizeof(wv)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_CRTC_GET_SEQUENCE: {
+        struct {
+            uint32_t crtc_id;
+            uint32_t active;
+            uint64_t sequence;
+            int64_t  sequence_ns;
+        } gs;
+        _Static_assert(sizeof(gs) == 24u, "drm_crtc_get_sequence ABI");
+        if (!uarg || copy_from_user(&gs, uarg, sizeof(gs)) != 0u) return E_FAULT;
+        if (gs.crtc_id != DRM_CRTC_ID) return E_INVAL;
+        uint64_t ts = 0u;
+        spinlock_lock(&g_lock);
+        gs.sequence = vbl_now_locked(sess, &ts);
+        spinlock_unlock(&g_lock);
+        gs.active = 1u;
+        gs.sequence_ns = (int64_t)ts;
+        return copy_to_user(uarg, &gs, sizeof(gs)) == 0u ? 0 : E_FAULT;
+    }
+    case DRM_NR_CRTC_QUEUE_SEQUENCE: {
+        struct {
+            uint32_t crtc_id;
+            uint32_t flags;
+            uint64_t sequence;
+            uint64_t user_data;
+        } qs;
+        _Static_assert(sizeof(qs) == 24u, "drm_crtc_queue_sequence ABI");
+        if (!uarg || copy_from_user(&qs, uarg, sizeof(qs)) != 0u) return E_FAULT;
+        if (qs.crtc_id != DRM_CRTC_ID ||
+            (qs.flags & ~(DRM_CRTC_SEQUENCE_RELATIVE |
+                          DRM_CRTC_SEQUENCE_NEXT_ON_MISS)) != 0u) {
+            return E_INVAL;
+        }
+        spinlock_lock(&g_lock);
+        uint64_t cur = vbl_now_locked(sess, NULL);
+        uint64_t target = (qs.flags & DRM_CRTC_SEQUENCE_RELATIVE) != 0u
+                              ? cur + qs.sequence : qs.sequence;
+        if ((qs.flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0u && target <= cur) {
+            target = cur + 1u;
+        }
+        int rc = vbl_queue_locked(sess, DRM_EVENT_CRTC_SEQUENCE,
+                                  target > cur ? target : cur, qs.user_data);
+        spinlock_unlock(&g_lock);
+        if (rc < 0) return rc;
+        qs.sequence = target;
+        return copy_to_user(uarg, &qs, sizeof(qs)) == 0u ? 0 : E_FAULT;
     }
     case DRM_NR_MODE_PAGE_FLIP: {
         struct drm_mode_crtc_page_flip pf;
         if (!uarg || copy_from_user(&pf, uarg, sizeof(pf)) != 0u) return E_FAULT;
         spinlock_lock(&g_lock);
+        /* As on hardware: one flip in flight per CRTC. The previous one
+         * completes (and its event is delivered) at its vblank. */
+        vbl_promote_locked(sess);
+        if (sess->flip_pending) {
+            spinlock_unlock(&g_lock);
+            return E_BUSY;
+        }
         sess->scanout_fb_id = pf.fb_id;
         drm_fb_t *fb = fb_by_id(sess, pf.fb_id);
         if (fb) blit_fb_to_display(sess, kms_rs, fb);
@@ -2598,6 +3288,13 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         struct drm_mode_atomic a;
         if (!uarg || copy_from_user(&a, uarg, sizeof(a)) != 0u) return E_FAULT;
         if (a.count_objs == 0) return 0;
+        if ((a.flags & DRM_MODE_PAGE_FLIP_EVENT) != 0u) {
+            spinlock_lock(&g_lock);
+            vbl_promote_locked(sess);
+            uint8_t busy = sess->flip_pending;
+            spinlock_unlock(&g_lock);
+            if (busy) return E_BUSY;
+        }
 
         uint32_t new_fb_id = 0;
         /* Walk objects: each has obj_id, then count_props entries of
@@ -2645,9 +3342,11 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
             if (fb) blit_fb_to_display(sess, kms_rs, fb);
             spinlock_unlock(&g_lock);
 
-            /* Queue flip event if requested. */
+            /* Completion event at the next vblank, if requested. */
             if (a.flags & DRM_MODE_PAGE_FLIP_EVENT) {
+                spinlock_lock(&g_lock);
                 queue_flip_event(sess, a.user_data, DRM_CRTC_ID);
+                spinlock_unlock(&g_lock);
             }
         }
         return 0;
@@ -2735,6 +3434,7 @@ int64_t drm_kms_read(uint8_t *user_buf, uint64_t len, uint32_t nonblock)
     ensure_init();
     (void)nonblock;
     spinlock_lock(&g_lock);
+    vbl_promote_locked(sess);
     if (sess->evq_tail == sess->evq_head) {
         spinlock_unlock(&g_lock);
         return E_AGAIN; /* caller (drmHandleEvent) polls first anyway */
@@ -2763,6 +3463,7 @@ uint32_t drm_kms_poll(uint32_t events)
     ensure_init();
     uint32_t r = 0;
     spinlock_lock(&g_lock);
+    vbl_promote_locked(sess);
     if (sess->evq_tail != sess->evq_head) r |= 0x1u; /* POLLIN */
     spinlock_unlock(&g_lock);
     return r & (events | 0x1u);
@@ -2850,6 +3551,9 @@ void drm_kms_close(void)
         dumb_release_locked(&sess->dumbs[i]);
     }
     memset(sess->fbs, 0, sizeof(sess->fbs));
+    vbl_clear_locked(sess);
+    sess->rb_inflight = 0u;
+    sess->rb_again = 0u;
     sess->evq_head = sess->evq_tail = 0;
     sess->scanout_fb_id = 0;
     sess->mirror_released = 0u;
@@ -2881,8 +3585,36 @@ int64_t drm_prime_ioctl(int32_t slot, uint64_t request, uint64_t arg)
               * flush; answering 0 is what keeps Mesa's explicit flush quiet. */
     case 1:  /* DMA_BUF_SET_NAME_A / DMA_BUF_SET_NAME_B: a debug label. */
         return 0;
-    default: /* sync_file export/import (nr 2/3): no sync objects on these. */
-        return -95;
+    case 2: { /* DMA_BUF_IOCTL_EXPORT_SYNC_FILE: the buffer's implicit fence */
+        struct { uint32_t flags; int32_t fd; } ex;
+        if (arg == 0u || copy_from_user(&ex, (void *)(uintptr_t)arg,
+                                        sizeof(ex)) != 0u) return E_FAULT;
+        if ((ex.flags & ~3u) != 0u || (ex.flags & 3u) == 0u) return E_INVAL;
+        spinlock_lock(&g_lock);
+        uint64_t fence = g_primes[slot].gpu_fence;
+        spinlock_unlock(&g_lock);
+        int32_t fd = drm_sync_file_create(fence);
+        if (fd < 0) return fd;
+        ex.fd = fd;
+        return copy_to_user((void *)(uintptr_t)arg, &ex, sizeof(ex)) == 0u
+                   ? 0 : E_FAULT;
+    }
+    case 3: { /* DMA_BUF_IOCTL_IMPORT_SYNC_FILE: add a fence to the buffer */
+        struct { uint32_t flags; int32_t fd; } im;
+        if (arg == 0u || copy_from_user(&im, (void *)(uintptr_t)arg,
+                                        sizeof(im)) != 0u) return E_FAULT;
+        if ((im.flags & ~3u) != 0u || (im.flags & 3u) == 0u) return E_INVAL;
+        uint64_t fence = 0u;
+        if (drm_sync_fence_of_fd(im.fd, &fence) < 0) return E_INVAL;
+        spinlock_lock(&g_lock);
+        if (g_primes[slot].used && fence > g_primes[slot].gpu_fence) {
+            g_primes[slot].gpu_fence = fence;
+        }
+        spinlock_unlock(&g_lock);
+        return 0;
+    }
+    default:
+        return E_NOTTY;
     }
 }
 
@@ -2934,6 +3666,171 @@ void drm_prime_close(int32_t slot)
     spinlock_lock(&g_lock);
     prime_put_locked(slot);
     spinlock_unlock(&g_lock);
+}
+
+/* POLLIN/POLLOUT on a dma-buf wait for the implicit fences on the buffer,
+ * as on Linux: ready once the last GPU work that touched it has retired. */
+uint32_t drm_prime_poll(int32_t slot, uint32_t events)
+{
+    ensure_init();
+    if (slot < 0 || slot >= DRM_MAX_PRIME) return 0u;
+    spinlock_lock(&g_lock);
+    uint64_t fence = g_primes[slot].used ? g_primes[slot].gpu_fence : 0u;
+    spinlock_unlock(&g_lock);
+    if (fence != 0u && fence > gpu_fence_done(render_gpu_backend())) return 0u;
+    return events & 0x5u; /* POLLIN | POLLOUT */
+}
+
+static bool sync_fence_signaled(uint64_t fence)
+{
+    return fence == 0u || fence <= gpu_fence_done(render_gpu_backend());
+}
+
+/* Make a sync_file fd for `fence` (a global fd number, or -errno). Must not
+ * be called with g_lock held: installing an fd takes the file table lock. */
+int32_t drm_sync_file_create(uint64_t fence)
+{
+    ensure_init();
+    int32_t slot = -1;
+    spinlock_lock(&g_lock);
+    for (int32_t i = 0; i < DRM_MAX_SYNC; i++) {
+        if (!g_syncs[i].used) {
+            g_syncs[i].used = 1u;
+            g_syncs[i].fence = fence;
+            slot = i;
+            break;
+        }
+    }
+    spinlock_unlock(&g_lock);
+    if (slot < 0) return -24; /* EMFILE */
+    int32_t fd = devfs_sync_fd(slot);
+    if (fd < 0) {
+        spinlock_lock(&g_lock);
+        g_syncs[slot].used = 0u;
+        spinlock_unlock(&g_lock);
+    }
+    return fd;
+}
+
+/* The fence behind a sync_file descriptor (global fd), or -1 if `fd` is not
+ * one. */
+static int drm_sync_fence_of_fd(int32_t fd, uint64_t *out_fence)
+{
+    vfs_file_t vf;
+    if (syscall_file_get_file_info(fd, &vf, NULL) != 0) return -1;
+    int32_t slot = devfs_sync_slot(&vf);
+    if (slot < 0 || slot >= DRM_MAX_SYNC) return -1;
+    spinlock_lock(&g_lock);
+    int ok = g_syncs[slot].used ? 0 : -1;
+    if (ok == 0) *out_fence = g_syncs[slot].fence;
+    spinlock_unlock(&g_lock);
+    return ok;
+}
+
+void drm_sync_file_close(int32_t slot)
+{
+    if (slot < 0 || slot >= DRM_MAX_SYNC) return;
+    spinlock_lock(&g_lock);
+    g_syncs[slot].used = 0u;
+    g_syncs[slot].fence = 0u;
+    spinlock_unlock(&g_lock);
+}
+
+uint32_t drm_sync_file_poll(int32_t slot, uint32_t events)
+{
+    if (slot < 0 || slot >= DRM_MAX_SYNC) return 0u;
+    spinlock_lock(&g_lock);
+    uint64_t fence = g_syncs[slot].used ? g_syncs[slot].fence : 0u;
+    spinlock_unlock(&g_lock);
+    return sync_fence_signaled(fence) ? (events & 0x1u) : 0u; /* POLLIN */
+}
+
+#define SYNC_IOC_TYPE       0x3Eu /* '>' */
+#define SYNC_IOC_MERGE_NR   3u
+#define SYNC_IOC_FILE_INFO_NR 4u
+
+struct sync_merge_data {
+    char     name[32];
+    int32_t  fd2;
+    int32_t  fence;
+    uint32_t flags;
+    uint32_t pad;
+};
+struct sync_fence_info {
+    char     obj_name[32];
+    char     driver_name[32];
+    int32_t  status;
+    uint32_t flags;
+    uint64_t timestamp_ns;
+};
+struct sync_file_info {
+    char     name[32];
+    int32_t  status;
+    uint32_t flags;
+    uint32_t num_fences;
+    uint32_t pad;
+    uint64_t sync_fence_info;
+};
+_Static_assert(sizeof(struct sync_merge_data) == 48u, "sync_merge_data ABI");
+_Static_assert(sizeof(struct sync_fence_info) == 80u, "sync_fence_info ABI");
+_Static_assert(sizeof(struct sync_file_info) == 56u, "sync_file_info ABI");
+
+int64_t drm_sync_file_ioctl(int32_t slot, uint64_t request, uint64_t arg)
+{
+    ensure_init();
+    void *uarg = (void *)(uintptr_t)arg;
+    if (slot < 0 || slot >= DRM_MAX_SYNC || IOC_TYPE(request) != SYNC_IOC_TYPE) {
+        return E_NOTTY;
+    }
+    spinlock_lock(&g_lock);
+    int used = g_syncs[slot].used;
+    uint64_t fence = g_syncs[slot].fence;
+    spinlock_unlock(&g_lock);
+    if (!used) return E_INVAL;
+
+    switch (IOC_NR(request)) {
+    case SYNC_IOC_MERGE_NR: {
+        /* fd2 arrives as a global descriptor (the Linux ABI layer rewrote
+         * it); the new descriptor goes back the same way. */
+        struct sync_merge_data m;
+        if (!uarg || copy_from_user(&m, uarg, sizeof(m)) != 0u) return E_FAULT;
+        if (m.flags != 0u || m.pad != 0u) return E_INVAL;
+        uint64_t other = 0u;
+        if (drm_sync_fence_of_fd(m.fd2, &other) < 0) return E_INVAL;
+        int32_t fd = drm_sync_file_create(other > fence ? other : fence);
+        if (fd < 0) return fd;
+        m.fence = fd;
+        return copy_to_user(uarg, &m, sizeof(m)) == 0u ? 0 : E_FAULT;
+    }
+    case SYNC_IOC_FILE_INFO_NR: {
+        struct sync_file_info info;
+        if (!uarg || copy_from_user(&info, uarg, sizeof(info)) != 0u) return E_FAULT;
+        if (info.flags != 0u) return E_INVAL;
+        int32_t status = sync_fence_signaled(fence) ? 1 : 0;
+        if (info.num_fences != 0u && info.sync_fence_info != 0u) {
+            struct sync_fence_info fi;
+            memset(&fi, 0, sizeof(fi));
+            static const char obj[] = "virtio_gpu";
+            static const char drv[] = "virtio_gpu";
+            memcpy(fi.obj_name, obj, sizeof(obj));
+            memcpy(fi.driver_name, drv, sizeof(drv));
+            fi.status = status;
+            fi.timestamp_ns = status ? timer_monotonic_ns() : 0u;
+            if (copy_to_user((void *)(uintptr_t)info.sync_fence_info, &fi,
+                             sizeof(fi)) != 0u) {
+                return E_FAULT;
+            }
+        }
+        memset(info.name, 0, sizeof(info.name));
+        static const char nm[] = "virtio_gpu";
+        memcpy(info.name, nm, sizeof(nm));
+        info.status = status;
+        info.num_fences = 1u;
+        return copy_to_user(uarg, &info, sizeof(info)) == 0u ? 0 : E_FAULT;
+    }
+    default:
+        return E_NOTTY;
+    }
 }
 
 uint32_t drm_prime_size(int32_t slot)

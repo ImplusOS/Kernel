@@ -1,4 +1,5 @@
 #include "Core/sound/ALSA.h"
+#include "Core/drm/DRM_Kms.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -705,6 +706,117 @@ static int64_t lx_prime_publish(uint64_t arg)
     return 0;
 }
 
+/* ---- fence descriptors carried inside ioctl arguments --------------------
+ *
+ * The same gap as PRIME, for sync_files (GPU fence fds):
+ *   DRM_IOCTL_VIRTGPU_EXECBUFFER  fence_fd (offset 28): in-fence when
+ *                                 FENCE_FD_IN, out-fence when FENCE_FD_OUT
+ *   SYNC_IOC_MERGE                fd2 in (offset 32), fence out (offset 36)
+ *   DMA_BUF_IOCTL_EXPORT_SYNC_FILE fd out (offset 4)
+ *   DMA_BUF_IOCTL_IMPORT_SYNC_FILE fd in (offset 4)
+ * Inputs are rewritten to global numbers for the call and restored after;
+ * outputs are published into the caller's table like PRIME exports. Every
+ * one is created O_CLOEXEC, as Linux's are. */
+#define LX_VIRTGPU_EXECBUF_NR    0x42u
+#define LX_EXECBUF_FLAGS_OFF     0u
+#define LX_EXECBUF_FENCE_OFF     28u
+#define LX_EXECBUF_FENCE_FD_IN   0x01u
+#define LX_EXECBUF_FENCE_FD_OUT  0x02u
+#define LX_SYNC_IOC_TYPE         0x3Eu /* '>' */
+#define LX_SYNC_MERGE_NR         3u
+#define LX_SYNC_MERGE_FD2_OFF    32u
+#define LX_SYNC_MERGE_FENCE_OFF  36u
+#define LX_DMABUF_TYPE           0x62u /* 'b' */
+#define LX_DMABUF_EXPORT_SYNC_NR 2u
+#define LX_DMABUF_IMPORT_SYNC_NR 3u
+#define LX_DMABUF_SYNC_FD_OFF    4u
+
+static int lx_ioctl_is(uint64_t request, uint32_t type, uint32_t nr)
+{
+    return (uint32_t)(request & 0xffu) == nr &&
+           (uint32_t)((request >> 8) & 0xffu) == type;
+}
+
+/* Rewrite the caller's fd at `off` to its global number. */
+static int64_t lx_ioctl_fd_in(uint64_t arg, uint32_t off, uint32_t *saved)
+{
+    uint32_t given;
+    if (lx_prime_get(arg, off, &given) < 0) return LINUX_EFAULT;
+    int32_t g = lxfd_get((int32_t)given);
+    if (g < 0) return LINUX_EBADF;
+    *saved = given;
+    return lx_prime_set(arg, off, (uint32_t)g) < 0 ? LINUX_EFAULT : 0;
+}
+
+/* Publish the global fd the call wrote at `off` into the caller's table. */
+static int64_t lx_ioctl_fd_out(uint64_t arg, uint32_t off)
+{
+    uint32_t gfd;
+    if (lx_prime_get(arg, off, &gfd) < 0) return LINUX_EFAULT;
+    if ((int32_t)gfd < 0) return 0;
+    int32_t u = lxfd_install((int32_t)gfd, 1, 0);
+    if (u < 0) {
+        (void)linux_close_global((int32_t)gfd);
+        return (u == -24) ? (-24LL) : LINUX_EBADF;
+    }
+    if (lx_prime_set(arg, off, (uint32_t)u) < 0) {
+        int32_t back = -1;
+        if (lxfd_remove(u, &back) == 1 && back >= 0) {
+            (void)linux_close_global(back);
+        }
+        return LINUX_EFAULT;
+    }
+    return 0;
+}
+
+/* The fence-fd ioctls above, around the actual call. */
+static int64_t lx_ioctl_fence_fds(int32_t fd, uint64_t request, uint64_t arg,
+                                  int *handled)
+{
+    *handled = 1;
+    uint32_t saved = 0u;
+    int64_t rc;
+    if (lx_ioctl_is(request, LX_DRM_IOCTL_BASE, LX_VIRTGPU_EXECBUF_NR)) {
+        uint32_t flags = 0u;
+        if (lx_prime_get(arg, LX_EXECBUF_FLAGS_OFF, &flags) < 0) {
+            return LINUX_EFAULT;
+        }
+        int in = (flags & LX_EXECBUF_FENCE_FD_IN) != 0u;
+        int out = (flags & LX_EXECBUF_FENCE_FD_OUT) != 0u;
+        if (!in && !out) { *handled = 0; return 0; }
+        if (in) {
+            rc = lx_ioctl_fd_in(arg, LX_EXECBUF_FENCE_OFF, &saved);
+            if (rc < 0) return rc;
+        }
+        rc = syscall_file_ioctl(fd, request, arg);
+        if (rc == 0 && out) return lx_ioctl_fd_out(arg, LX_EXECBUF_FENCE_OFF);
+        if (in) (void)lx_prime_set(arg, LX_EXECBUF_FENCE_OFF, saved);
+        return rc;
+    }
+    if (lx_ioctl_is(request, LX_SYNC_IOC_TYPE, LX_SYNC_MERGE_NR)) {
+        rc = lx_ioctl_fd_in(arg, LX_SYNC_MERGE_FD2_OFF, &saved);
+        if (rc < 0) return rc;
+        rc = syscall_file_ioctl(fd, request, arg);
+        (void)lx_prime_set(arg, LX_SYNC_MERGE_FD2_OFF, saved);
+        if (rc == 0) return lx_ioctl_fd_out(arg, LX_SYNC_MERGE_FENCE_OFF);
+        return rc;
+    }
+    if (lx_ioctl_is(request, LX_DMABUF_TYPE, LX_DMABUF_EXPORT_SYNC_NR)) {
+        rc = syscall_file_ioctl(fd, request, arg);
+        if (rc == 0) return lx_ioctl_fd_out(arg, LX_DMABUF_SYNC_FD_OFF);
+        return rc;
+    }
+    if (lx_ioctl_is(request, LX_DMABUF_TYPE, LX_DMABUF_IMPORT_SYNC_NR)) {
+        rc = lx_ioctl_fd_in(arg, LX_DMABUF_SYNC_FD_OFF, &saved);
+        if (rc < 0) return rc;
+        rc = syscall_file_ioctl(fd, request, arg);
+        (void)lx_prime_set(arg, LX_DMABUF_SYNC_FD_OFF, saved);
+        return rc;
+    }
+    *handled = 0;
+    return 0;
+}
+
 int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
 {
     /* A pseudo-terminal answers the terminal ioctls for real -- termios, the
@@ -738,6 +850,9 @@ int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
     /* Character devices (DRM/KMS, evdev) handle their own arg validation and
      * some requests legitimately pass arg == 0 (DRM_IOCTL_SET_MASTER etc.). */
     if (syscall_file_is_chardev(fd)) {
+        int fence_handled = 0;
+        int64_t fence_rc = lx_ioctl_fence_fds(fd, request, arg, &fence_handled);
+        if (fence_handled) return fence_rc;
         /* PRIME's descriptor travels inside `arg`; bridge it across the
          * private/global numbering gap both ways. See lx_prime_publish(). */
         uint32_t prime_ufd = 0u;
@@ -1445,6 +1560,7 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_S_IFCHR  0x2000u
 #define LINUX_S_IFREG  0x8000u
 #define LINUX_S_IFIFO  0x1000u
+#define LINUX_S_IFSOCK 0xC000u
 
 #define LINUX_AF_UNIX       1u
 #define LINUX_AF_INET       2u
@@ -1515,6 +1631,56 @@ static void linux_syscall_restart(uint64_t saved_rsp, uint64_t num)
     (void)saved_rsp;
     (void)num;
 #endif
+}
+
+/* poll(2)/select(2)/epoll_wait(2) and their p- variants never resume after
+ * a signal handler on Linux -- with or without SA_RESTART they return EINTR,
+ * and event loops depend on it: the X server's SIGTERM handler only sets a
+ * flag, and the server looks at it when epoll_wait() comes back. Here a wait
+ * with nothing ready is not a sleep inside the syscall but a park and a
+ * re-execution (linux_syscall_restart()), so a handler that ran while the
+ * task was parked returned straight into the same wait, and Xorg sat on a
+ * SIGTERM until the next client happened to connect.
+ *
+ * So remember, per task, that its frame is rewound for such a wait; if a
+ * handler is pushed onto that frame before the task runs again,
+ * process_push_signal_frame_locked() asks linux_signal_interrupts_wait() and
+ * turns the pending re-execution into an EINTR return instead. */
+/* The rewound wait, per task: its syscall number and the user RIP the frame
+ * was rewound to. Both must still match the frame a handler is pushed onto
+ * -- a bare per-slot flag outlived the task that set it (a killed task's
+ * slot is reused by the next process), and rewrote the registers of an
+ * unrelated program that merely took a signal. */
+static uint16_t g_lx_wait_num[OS_CONFIG_PROCESS_MAX_COUNT];
+static uint64_t g_lx_wait_rip[OS_CONFIG_PROCESS_MAX_COUNT];
+
+static int lx_is_signal_interruptible_wait(uint64_t num)
+{
+    switch (num) {
+    case LINUX_SYS_POLL: case LINUX_SYS_PPOLL:
+    case LINUX_SYS_SELECT: case LINUX_SYS_PSELECT6:
+    case LINUX_SYS_EPOLL_WAIT: case LINUX_SYS_EPOLL_PWAIT:
+    case LINUX_SYS_EPOLL_PWAIT2:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int linux_signal_interrupts_wait(int32_t tid, uint64_t frame_num,
+                                 uint64_t frame_rip);
+int linux_signal_interrupts_wait(int32_t tid, uint64_t frame_num,
+                                 uint64_t frame_rip)
+{
+    if (tid < 0 || tid >= (int32_t)OS_CONFIG_PROCESS_MAX_COUNT ||
+        g_lx_wait_num[tid] == 0u) {
+        return 0;
+    }
+    int match = frame_num == (uint64_t)g_lx_wait_num[tid] &&
+                frame_rip == g_lx_wait_rip[tid];
+    g_lx_wait_num[tid] = 0u;
+    g_lx_wait_rip[tid] = 0u;
+    return match;
 }
 
 static int64_t linux_copy_cstring(char *out, uint64_t capacity,
@@ -1931,10 +2097,18 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                     (mapped_phys & ~(0x200000ULL - 1u)) |
                     (page & (0x200000ULL - 1u));
             }
+            /* Under the low identity map only the reserved shadow windows
+             * are on offer. Claiming any free identity frame used to be
+             * allowed too, and Wine walks 0x10000..0x68000000 reserving
+             * everything it can as PROT_NONE: each "reservation" was
+             * committed eagerly, one free low frame at a time, until the
+             * machine had ~26 MB left and the fork for wineserver failed.
+             * Answering EEXIST is what Wine expects for an occupied range;
+             * it then keeps its memory in the ordinary mmap arena. */
             int identity_mapping_available =
                 (pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT &&
                 mapped_phys == page &&
-                pmm_page_is_allocated(page) == 0;
+                paging_is_user_shadow_window(page);
 #if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
             if (page == 0x7FFE0000ULL) {
                 serial_write_string("[wine-map] shared-page precheck pte=");
@@ -2022,6 +2196,37 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
      * maps the same object (the compositor, after SCM_RIGHTS). The generic
      * file path below only makes a one-time snapshot copy, which is useless
      * for shared memory. offset is expected to be 0 for a pool mmap. */
+    /* MAP_SHARED | MAP_FIXED of a memfd or a shareable tmpfs file: the
+     * shared pages themselves, at the caller's address. Both paths below
+     * pick their own address, so a fixed request used to fall through to
+     * the private-snapshot copy. wineserver publishes its session state
+     * (desktop, thread input, window positions) in such a file and every
+     * Wine client maps it MAP_FIXED into a reserved view; with a private
+     * copy the client never saw an update, re-requested the object from the
+     * server in a loop, and explorer's desktop thread spun there forever
+     * instead of answering messages. */
+    if ((flags & LINUX_MAP_SHARED) != 0u && (flags & LINUX_MAP_FIXED) != 0u &&
+        (offset & (PAGE_SIZE - 1u)) == 0u && (addr & (PAGE_SIZE - 1u)) == 0u &&
+        addr != 0u) {
+        int32_t fixed_handle = syscall_memfd_shm_handle((int32_t)fd);
+        if (fixed_handle < 0 &&
+            syscall_file_is_shareable((int32_t)fd)) {
+            fixed_handle = syscall_file_share_pages((int32_t)fd, offset + length);
+        }
+        if (fixed_handle > 0) {
+            (void)shared_memory_set_public(fixed_handle);
+            int32_t self = process_get_current_pid();
+            if (self >= 0) {
+                linux_mshared_flush_range(self, addr, addr + length, 1);
+                filemap_unregister_range(self, addr, length);
+            }
+            (void)shared_memory_unmap_range((void *)(uintptr_t)addr, length);
+            if (shared_memory_map_fixed(fixed_handle, addr, offset, length) != NULL) {
+                return (int64_t)addr;
+            }
+        }
+    }
+
     {
         int32_t shm_handle = syscall_memfd_shm_handle((int32_t)fd);
         if (shm_handle >= 0) {
@@ -3255,12 +3460,157 @@ static int64_t linux_apply_root(char *path, uint64_t capacity)
     return 0;
 }
 
+/* Symbolic links. Only the writable tmpfs trees (/tmp, /run, /var,
+ * /dev/shm) can hold them, and tmpfs keys its nodes by full path, so a path
+ * that runs *through* a link names nothing there. Wine builds its drive
+ * letters out of links -- $WINEPREFIX/dosdevices/c: -> ../drive_c and
+ * z: -> / -- and reaches every file of the prefix through them
+ * ("Cannot set the dir to C:\windows", "could not load kernel32.dll").
+ * Rewrite such a path to the link's target: every intermediate component
+ * always, the last one when the call follows links (open without
+ * O_NOFOLLOW, stat, chdir, access). Paths outside those trees are left
+ * alone, so nothing else pays for the lookups. */
+#define LINUX_ELOOP_RC (-40LL)
+#define LINUX_O_NOFOLLOW 0x20000u
+
+static int linux_path_may_hold_links(const char *p)
+{
+    static const char *const roots[] = { "/tmp", "/run", "/var", "/dev/shm" };
+    for (uint32_t i = 0u; i < sizeof(roots) / sizeof(roots[0]); ++i) {
+        uint64_t n = strlen(roots[i]);
+        if (strncmp(p, roots[i], n) == 0 && (p[n] == '/' || p[n] == '\0')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int64_t linux_follow_links(char *path, uint64_t cap, int follow_last)
+{
+    if (path[0] != '/') {
+        return 0;
+    }
+    for (uint32_t hops = 0u; hops < 40u; ++hops) {
+        if (!linux_path_may_hold_links(path)) {
+            return 0;
+        }
+        uint64_t len = strlen(path);
+        uint64_t i = 1u;
+        int replaced = 0;
+        while (i < len) {
+            uint64_t end = i;
+            while (end < len && path[end] != '/') {
+                ++end;
+            }
+            if (end >= len && !follow_last) {
+                break;
+            }
+            char save = path[end];
+            path[end] = '\0';
+            char target[256];
+            int32_t n = linux_path_may_hold_links(path)
+                ? vfs_readlink(path, target, (uint32_t)sizeof(target) - 1u)
+                : -1;
+            path[end] = save;
+            if (n > 0) {
+                target[n] = '\0';
+                char out[512];
+                uint64_t o = 0u;
+                if (target[0] != '/') {
+                    /* Relative: against the directory holding the link. */
+                    uint64_t parent = i - 1u; /* the '/' before the link */
+                    memcpy(out, path, parent + 1u);
+                    o = parent + 1u;
+                }
+                uint64_t tl = (uint64_t)n;
+                uint64_t rest = len - end;
+                if (o + tl + rest + 1u > sizeof(out)) {
+                    return LINUX_ENAMETOOLONG;
+                }
+                memcpy(out + o, target, tl);
+                o += tl;
+                memcpy(out + o, path + end, rest);
+                o += rest;
+                out[o] = '\0';
+                vfs_canonicalize_path(out);
+                uint64_t ol = strlen(out);
+                if (ol + 1u > cap) {
+                    return LINUX_ENAMETOOLONG;
+                }
+                memcpy(path, out, ol + 1u);
+                replaced = 1;
+                break;
+            }
+            i = end + 1u;
+        }
+        if (!replaced) {
+            return 0;
+        }
+    }
+    return LINUX_ELOOP_RC;
+}
+
+/* After a relative path was joined onto the cwd or a dirfd (both real kernel
+ * paths, already under any chroot), fold it and keep ".." from climbing out
+ * of the chroot: a result outside the root is clamped to the root. */
+static int64_t linux_finish_joined_path(char *path, uint64_t capacity)
+{
+    vfs_canonicalize_path(path);
+    char root[256];
+    int root_len = process_get_current_root(root, sizeof(root));
+    if (root_len <= 1 || root[0] == '\0') {
+        return 0;
+    }
+    while (root_len > 1 && root[root_len - 1] == '/') {
+        root[--root_len] = '\0';
+    }
+    uint64_t rl = (uint64_t)root_len;
+    if (strncmp(path, root, rl) == 0 && (path[rl] == '\0' || path[rl] == '/')) {
+        return 0;
+    }
+    if (rl + 1u > capacity) {
+        return LINUX_ENAMETOOLONG;
+    }
+    memcpy(path, root, rl + 1u);
+    return 0;
+}
+
+/* Whether `dir` (a real kernel path) is at or below the caller's chroot.
+ * True when no chroot is in force. */
+static int linux_path_under_root(const char *dir)
+{
+    char root[256];
+    int root_len = process_get_current_root(root, sizeof(root));
+    if (root_len <= 1 || root[0] == '\0') {
+        return 1;
+    }
+    while (root_len > 1 && root[root_len - 1] == '/') {
+        root[--root_len] = '\0';
+    }
+    size_t rl = (size_t)root_len;
+    return strncmp(dir, root, rl) == 0 && (dir[rl] == '\0' || dir[rl] == '/');
+}
+
+static int64_t linux_resolve_at_raw(uint64_t dirfd, char *path,
+                                    uint64_t capacity);
+
 static int64_t linux_resolve_at(uint64_t dirfd, char *path, uint64_t capacity)
 {
+    int64_t rc = linux_resolve_at_raw(dirfd, path, capacity);
+    if (rc < 0) {
+        return rc;
+    }
+    return linux_follow_links(path, capacity, 0);
+}
+
+static int64_t linux_resolve_at_raw(uint64_t dirfd, char *path,
+                                    uint64_t capacity)
+{
     if (path[0] == '/') {
+        vfs_canonicalize_path(path);
         return linux_apply_root(path, capacity);
     }
-    if ((int64_t)dirfd == LINUX_AT_FDCWD) {
+    if ((int32_t)dirfd == LINUX_AT_FDCWD) {
         return linux_resolve_path(path, capacity);
     }
     char dir[256];
@@ -3286,12 +3636,36 @@ static int64_t linux_resolve_at(uint64_t dirfd, char *path, uint64_t capacity)
     memmove(path + dir_len + 1u, path, path_len + 1u);
     memcpy(path, dir, dir_len);
     path[dir_len] = '/';
-    return 0;
+    /* A directory opened before a chroot keeps naming the place it was
+     * opened on: Linux applies the root only to absolute lookups and to
+     * ".." walking up out of it, never to a walk that starts outside it.
+     * Chromium depends on exactly that. Its zygote opens /proc, has a
+     * CLONE_FS helper chroot it into the (empty) /proc/<helper>/fdinfo, and
+     * then reads openat(proc_fd, "self/fd/") -- which the clamp below
+     * turned into the helper's fdinfo directory, gone with the helper:
+     * "proc_util.cc:80 Check failed: 0 <= proc_self_fd", and no browser. */
+    if (!linux_path_under_root(dir)) {
+        vfs_canonicalize_path(path);
+        return 0;
+    }
+    return linux_finish_joined_path(path, capacity);
 }
+
+static int64_t linux_resolve_path_raw(char *path, uint64_t capacity);
 
 static int64_t linux_resolve_path(char *path, uint64_t capacity)
 {
+    int64_t rc = linux_resolve_path_raw(path, capacity);
+    if (rc < 0) {
+        return rc;
+    }
+    return linux_follow_links(path, capacity, 0);
+}
+
+static int64_t linux_resolve_path_raw(char *path, uint64_t capacity)
+{
     if (path[0] == '/') {
+        vfs_canonicalize_path(path);
         return linux_apply_root(path, capacity);
     }
     char cwd[256];
@@ -3311,7 +3685,7 @@ static int64_t linux_resolve_path(char *path, uint64_t capacity)
         }
         memmove(path + 1u, path, path_len + 1u);
         path[0] = '/';
-        return 0;
+        return linux_finish_joined_path(path, capacity);
     }
     if (cwd_len + path_len + 2u > capacity) {
         return LINUX_ENAMETOOLONG;
@@ -3319,12 +3693,14 @@ static int64_t linux_resolve_path(char *path, uint64_t capacity)
     memmove(path + cwd_len + 1u, path, path_len + 1u);
     memcpy(path, cwd, cwd_len);
     path[cwd_len] = '/';
-    return 0;
+    return linux_finish_joined_path(path, capacity);
 }
 
-static int64_t linux_open_resolved(char *path, uint64_t flags);
+static int64_t linux_open_resolved(char *path, uint64_t flags, uint64_t mode);
+static void linux_apply_create_mode(const char *path, uint64_t mode);
 
-static int64_t linux_open_path(uint64_t path_ptr, uint64_t flags)
+static int64_t linux_open_path(uint64_t path_ptr, uint64_t flags,
+                               uint64_t mode)
 {
     char path[256];
     int64_t rc = linux_copy_cstring(path, sizeof(path),
@@ -3336,14 +3712,21 @@ static int64_t linux_open_path(uint64_t path_ptr, uint64_t flags)
     if (rc < 0) {
         return rc;
     }
-    return linux_open_resolved(path, flags);
+    return linux_open_resolved(path, flags, mode);
 }
 
 /* open(2)/openat(2) on a path the caller has already made absolute. Split out
  * so openat() can resolve against a real dirfd first. */
-static int64_t linux_open_resolved(char *path, uint64_t flags)
+static int64_t linux_open_resolved(char *path, uint64_t flags, uint64_t mode)
 {
     int64_t result;
+    if ((flags & LINUX_O_NOFOLLOW) == 0u) {
+        /* Callers hand in 256-byte buffers. */
+        int64_t frc = linux_follow_links(path, 256u, 1);
+        if (frc < 0) {
+            return frc;
+        }
+    }
     if ((flags & LINUX_O_DIRECTORY) != 0u) {
         result = (int64_t)syscall_file_register_dir(path);
     } else {
@@ -3364,6 +3747,17 @@ static int64_t linux_open_resolved(char *path, uint64_t flags)
             /* Create it, then open it with the caller's flags: the access mode
              * open() reports back has to be the one that was asked for. */
             result = (int64_t)syscall_file_creat_ex(path, flags);
+            if (result >= 0) {
+                /* The mode open(O_CREAT) was given, applied to the new node
+                 * like mkdir() does. Wine's Debian build keeps the name of
+                 * its server directory in $WINEPREFIX/wineserver, created
+                 * 0400, and wineserver deletes and recreates that file when
+                 * stat() reports any other mode -- the client and the server
+                 * then each picked their own directory and never met. */
+                /* umask(2) reports the conventional 022 (no per-process
+                 * mask is stored), so apply it here as Linux would. */
+                linux_apply_create_mode(path, mode & ~(uint64_t)022u);
+            }
         } else if (result == LINUX_ENOENT && (flags & 3u) == 0u) {
             /* open(dir, O_RDONLY) without O_DIRECTORY is valid on Linux, and
              * the file table has no entry for a directory, so it came back
@@ -3474,6 +3868,25 @@ static void linux_stat_fill_common(linux_stat64_t *st, uint64_t size)
     linux_stat_fill_common_ino(st, size, 0u);
 }
 
+/* Directories have no filesystem-provided identity here, and they all used
+ * to report st_ino 1 -- the same (st_dev, st_ino) for every directory.
+ * Programs compare that pair to decide whether two paths are the same
+ * directory: Wine maps a Unix path to a drive letter by finding the
+ * dosdevices link whose target has the path's identity, so with every
+ * directory equal, its own module directory /usr/lib/x86_64-linux-gnu/wine
+ * became "C:\" and no builtin DLL (kernel32.dll first) could be found.
+ * Derive a stable number from the resolved path instead (FNV-1a), kept out
+ * of the range file identities use. */
+static uint64_t linux_dir_ino(const char *path)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (const char *p = path; *p != '\0'; ++p) {
+        h ^= (uint8_t)*p;
+        h *= 0x100000001b3ULL;
+    }
+    return (h | (1ULL << 62)) & ~(1ULL << 63);
+}
+
 /* Fill *st for a path. Returns 0 or a negative LINUX_E* code. Shared by
  * stat/lstat/newfstatat and statx, which used to carry two copies that had
  * drifted apart -- statx reported a fixed 0755 for every directory and never
@@ -3516,6 +3929,18 @@ static int64_t linux_fill_stat_for_path(const char *path, linux_stat64_t *st)
 {
     memset(st, 0, sizeof(*st));
 
+    /* Reached with the link itself only from lstat()/AT_SYMLINK_NOFOLLOW:
+     * every following caller has already replaced it by its target. */
+    if (linux_path_may_hold_links(path)) {
+        char target[256];
+        int32_t n = vfs_readlink(path, target, (uint32_t)sizeof(target));
+        if (n > 0) {
+            linux_stat_fill_common(st, (uint64_t)n);
+            st->st_mode = 0xA000u | 0x1FFu; /* S_IFLNK | 0777 */
+            return 0;
+        }
+    }
+
     vfs_file_t vf;
     if (vfs_find_file(path, &vf)) {
         linux_stat_fill_common_ino(st, vf.size, vf.internal_id);
@@ -3549,10 +3974,18 @@ static int64_t linux_fill_stat_for_path(const char *path, linux_stat64_t *st)
      * answers this with "no such path". See TMPFS_DIR_HANDLE_MAX. */
     int32_t dir_handle = vfs_opendir(path);
     if (dir_handle < 0) {
+        /* A bound AF_UNIX socket is a filesystem node on Linux (S_IFSOCK).
+         * wineserver's clients lstat() it before connecting and give up on
+         * ENOENT ("the wine server failed to run"). */
+        if (unix_socket_path_bound(path)) {
+            linux_stat_fill_common(st, 0);
+            st->st_mode = LINUX_S_IFSOCK | 0x1EDu; /* srwxr-xr-x */
+            return 0;
+        }
         return LINUX_ENOENT;
     }
     (void)vfs_closedir(dir_handle);
-    linux_stat_fill_common(st, 0);
+    linux_stat_fill_common_ino(st, 0, linux_dir_ino(path));
     /* The stored mode matters: mkdtemp() makes its directory 0700 and
        Chromium's ProcessSingleton CHECK()s that stat() says 0700 --
        reporting a fixed 0755 aborted the browser. */
@@ -3607,6 +4040,17 @@ static int64_t linux_fill_stat_for_fd(int32_t fd, linux_stat64_t *st)
 {
     memset(st, 0, sizeof(*st));
 
+    /* An AF_UNIX endpoint is S_IFSOCK. fstat() of one used to be EBADF, and
+     * wineserver fstat()s every descriptor a client hands it: winex11 passes
+     * its X connection that way, and with the EBADF Wine had no display
+     * ("x11drv: Can't allocate handle for display fd"). Each endpoint gets
+     * its own inode -- wineserver caches fd objects by (st_dev, st_ino). */
+    if (unix_socket_exists(fd)) {
+        linux_stat_fill_common_ino(st, 0, 0x534F434B00000000ULL + (uint64_t)(uint32_t)fd);
+        st->st_mode = LINUX_S_IFSOCK | 0x1FFu;
+        return 0;
+    }
+
     vfs_file_t vf;
     uint32_t writable = 0;
     if (syscall_file_get_file_info(fd, &vf, &writable) == 0) {
@@ -3627,7 +4071,12 @@ static int64_t linux_fill_stat_for_fd(int32_t fd, linux_stat64_t *st)
         return 0;
     }
     if (syscall_file_is_dir(fd)) {
-        linux_stat_fill_common(st, 0);
+        char dpath[256];
+        uint64_t dino = 0u;
+        if (syscall_file_get_dir_path(fd, dpath, sizeof(dpath)) == 0) {
+            dino = linux_dir_ino(dpath);
+        }
+        linux_stat_fill_common_ino(st, 0, dino);
         st->st_mode = LINUX_S_IFDIR | 0x1EDu; /* drwxr-xr-x */
         st->st_blksize = 4096;
         return 0;
@@ -4003,6 +4452,9 @@ static int64_t linux_chdir(uint64_t path_ptr)
         return rc;
     }
     rc = linux_resolve_path(path, sizeof(path));
+    if (rc == 0) {
+        rc = linux_follow_links(path, sizeof(path), 1);
+    }
     if (rc < 0) {
         return rc;
     }
@@ -4200,6 +4652,34 @@ static int64_t linux_socket_create(uint64_t domain, uint64_t type,
     return (int64_t)fd;
 }
 
+/* A pathname AF_UNIX address names a file relative to the cwd, exactly like
+ * open() does. The socket table matches names as strings, so a relative name
+ * has to be made absolute first or bind("socket") and connect("socket") only
+ * meet when both sides happen to use the same spelling -- and stat() cannot
+ * find the node. wineserver binds "socket" inside its server directory and
+ * the client lstat()s and connects to it from there. Abstract names ('@...')
+ * and names that would no longer fit are left as they are. */
+static void linux_absolutize_unix_path(char *path, uint64_t cap)
+{
+    if (path[0] == '/' || path[0] == '@' || path[0] == '\0') {
+        return;
+    }
+    char full[256];
+    uint64_t len = strlen(path);
+    if (len + 1u > sizeof(full)) {
+        return;
+    }
+    memcpy(full, path, len + 1u);
+    if (linux_resolve_path(full, sizeof(full)) < 0) {
+        return;
+    }
+    uint64_t flen = strlen(full);
+    if (flen + 1u > cap) {
+        return;
+    }
+    memcpy(path, full, flen + 1u);
+}
+
 static int64_t linux_socket_bind(uint64_t fd, uint64_t addr_ptr,
                                  uint64_t addr_len)
 {
@@ -4212,6 +4692,7 @@ static int64_t linux_socket_bind(uint64_t fd, uint64_t addr_ptr,
         char path[110];
         rc = linux_copy_sockaddr_un(addr_ptr, addr_len, path, sizeof(path));
         if (rc < 0) return rc;
+        linux_absolutize_unix_path(path, sizeof(path));
         rc = unix_socket_bind((int32_t)fd, path);
         return rc < 0 ? LINUX_EINVAL : rc;
     }
@@ -4237,6 +4718,7 @@ static int64_t linux_socket_connect(uint64_t fd, uint64_t addr_ptr,
         char path[110];
         rc = linux_copy_sockaddr_un(addr_ptr, addr_len, path, sizeof(path));
         if (rc < 0) return rc;
+        linux_absolutize_unix_path(path, sizeof(path));
         rc = unix_socket_connect((int32_t)fd, path);
         return rc < 0 ? LINUX_ENOENT : rc;
     }
@@ -5501,12 +5983,14 @@ static int64_t linux_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
 static int64_t linux_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode,
                                uint64_t flags)
 {
-    (void)flags;
     char path[256];
     int64_t rc = linux_copy_cstring(path, sizeof(path),
                                     (const char *)(uintptr_t)path_ptr);
     if (rc < 0) return rc;
     rc = linux_resolve_at(dirfd, path, sizeof(path));
+    if (rc == 0 && (flags & LINUX_AT_SYMLINK_NOFOLLOW) == 0u) {
+        rc = linux_follow_links(path, sizeof(path), 1);
+    }
     if (rc < 0) return rc;
     return syscall_access(path, (int32_t)mode);
 }
@@ -6067,8 +6551,11 @@ static void linux_unix_block_retry(uint64_t generation, int32_t fd,
             unix_socket_trace_note("rx-NB", fd);
             return;
         }
-    } else if (syscall_file_is_pipe(fd)) {
-        /* A blocking read()/write() on a pipe must never come back EAGAIN:
+    } else if (syscall_file_is_pipe(fd) || syscall_file_is_pty(fd)) {
+        /* (A pty read parks and reports EAGAIN the same way; see
+         * pty_read().)
+         *
+         * A blocking read()/write() on a pipe must never come back EAGAIN:
          * syscall_pipe_read() waits inside the kernel but gives up after
          * PIPE_READ_WAIT_MAX_MS and reports EAGAIN even for a blocking fd,
          * and a reader that legitimately waits forever then sees an error
@@ -6082,6 +6569,24 @@ static void linux_unix_block_retry(uint64_t generation, int32_t fd,
         if (flags < 0 || ((uint32_t)flags & LINUX_O_NONBLOCK) != 0u) {
             return;
         }
+        /* syscall_pipe_read()/write() have already parked this task, with a
+         * generation taken under the pipe lock. Parking a second time here
+         * first dropped that registration, and when any notify anywhere had
+         * bumped the global generation since syscall entry (Xorg and timers
+         * do so constantly) the second park declined -- leaving the task
+         * asleep on the first park's 20 ms deadline with no registration
+         * for the writer to wake. Every wineserver round trip (a request
+         * written to one pipe, the reply read from another) cost up to
+         * 20 ms that way, and building a Wine prefix took over 20 minutes.
+         * Just restart; the existing park stands. */
+        if (should_switch != NULL) {
+            *should_switch = 1;
+        }
+        if (restart_out != NULL) {
+            *restart_out = 1;
+            *result = 0;
+        }
+        return;
     } else {
         return;
     }
@@ -6456,7 +6961,8 @@ static int64_t linux_openat2(uint64_t dirfd, uint64_t path_ptr,
     if (rc < 0) {
         return rc;
     }
-    return linux_open_resolved(path, how.flags & ~(uint64_t)LX_CLOEXEC_FLAG);
+    return linux_open_resolved(path, how.flags & ~(uint64_t)LX_CLOEXEC_FLAG,
+                               how.mode);
 }
 
 /* Rewrite one descriptor argument; EBADF if it names nothing. */
@@ -6688,8 +7194,12 @@ static int lx_fd_pre(uint64_t num, uint64_t *a, int64_t *res, int32_t *cloexec)
             return 0;
 
         /* ---- pids, in the caller's namespace ---- */
+        case LINUX_SYS_SETPGID:
+            lx_pid_in(&a[0]);
+            lx_pid_in(&a[1]);
+            return 0;
         case LINUX_SYS_KILL: case LINUX_SYS_TKILL: case LINUX_SYS_WAIT4:
-        case LINUX_SYS_GETPGID: case LINUX_SYS_SETPGID: case LINUX_SYS_GETSID:
+        case LINUX_SYS_GETPGID: case LINUX_SYS_GETSID:
         case LINUX_SYS_PRLIMIT64: case LINUX_SYS_SCHED_GETAFFINITY:
         case LINUX_SYS_SCHED_SETAFFINITY:
             lx_pid_in(&a[0]);
@@ -6777,6 +7287,8 @@ static int64_t lx_fd_post(uint64_t num, const uint64_t *orig, int64_t result,
         case LINUX_SYS_GETPID: case LINUX_SYS_GETTID:
         case LINUX_SYS_SET_TID_ADDRESS: case LINUX_SYS_WAIT4:
         case LINUX_SYS_CLONE: case LINUX_SYS_FORK: case LINUX_SYS_VFORK:
+        case LINUX_SYS_GETPGID: case LINUX_SYS_GETPGRP: case LINUX_SYS_GETSID:
+        case LINUX_SYS_SETSID:
             return result > 0 ? (int64_t)process_pid_as_seen_by_current((int32_t)result)
                               : result;
         case LINUX_SYS_GETPPID:
@@ -6813,7 +7325,14 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     int request_restart = 0;
 
     flight_rec(FR_TAG_SYSCALL, num, (uint64_t)(uint32_t)process_get_current_pid());
+    process_run_pending_teardowns();
     linux_syscall_heartbeat(num, arg1, saved_rsp);
+    /* Back in a syscall: whatever rewound frame there was has been run. */
+    const int32_t lx_tid = process_get_current_tid();
+    if (lx_tid >= 0 && lx_tid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+        g_lx_wait_num[lx_tid] = 0u;
+        g_lx_wait_rip[lx_tid] = 0u;
+    }
 #if LINUX_SYSCALL_PROFILE
     linux_syscall_profile(num);
 #endif
@@ -6894,7 +7413,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         }
 
         case LINUX_SYS_OPEN:
-            result = linux_open_path(arg1, arg2);
+            result = linux_open_path(arg1, arg2, arg3);
             break;
 
         case LINUX_SYS_CLOSE:
@@ -6925,6 +7444,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             rc = linux_resolve_path(path, sizeof(path));
+            if (rc == 0 && num == LINUX_SYS_STAT) {
+                rc = linux_follow_links(path, sizeof(path), 1);
+            }
             if (rc < 0) {
                 result = rc;
                 break;
@@ -6961,6 +7483,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             rc = linux_resolve_at(arg1, path, sizeof(path));
+            if (rc == 0 && (arg4 & LINUX_AT_SYMLINK_NOFOLLOW) == 0u) {
+                rc = linux_follow_links(path, sizeof(path), 1);
+            }
             if (rc < 0) {
                 result = rc;
                 break;
@@ -7053,8 +7578,23 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             result = process_signal_rt_sigreturn(saved_rsp);
             break;
 
-        case LINUX_SYS_IOCTL:
+        case LINUX_SYS_IOCTL: {
+            /* Read before the ioctl checks its condition, so an event that
+             * lands in between stops the park below (poll_wait_park). */
+            uint64_t ioctl_wait_gen = poll_wait_generation();
             result = syscall_ioctl_ex((int32_t)arg1, arg2, arg3);
+            if (result == DRM_WOULD_BLOCK) {
+                /* A GPU fence or a vblank that has not happened yet: park
+                 * until drm_timer_tick() notifies (or 2 ms pass), then run
+                 * the ioctl again. Both waits re-derive their target from
+                 * the (already rewritten) arguments, so a restart is exact. */
+                if (poll_wait_park(ioctl_wait_gen, 2u)) {
+                    request_switch = 1;
+                }
+                request_restart = 1;
+                result = 0;
+                break;
+            }
             if (result == ALSA_WOULD_BLOCK) {
                 /* A sound device with no room (WRITEI) or still draining:
                  * EAGAIN for a non-blocking descriptor, otherwise wait a
@@ -7072,6 +7612,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 }
             }
             break;
+        }
 
         case LINUX_SYS_READV:
             result = syscall_readv((int32_t)arg1, arg2, (int32_t)arg3);
@@ -7090,6 +7631,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             rc = linux_resolve_path(path, sizeof(path));
+            if (rc == 0) {
+                rc = linux_follow_links(path, sizeof(path), 1);
+            }
             if (rc < 0) {
                 result = rc;
                 break;
@@ -7279,8 +7823,21 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         }
 
         case LINUX_SYS_KILL:
-            result = (int64_t)process_signal_deliver_group((int32_t)arg1,
-                                                           (int32_t)arg2);
+            /* pid <= 0 names a process group (0: the caller's) or, for -1,
+             * the caller's session. xterm hangs up its shell with
+             * kill(-pgid, SIGHUP) when its window is closed. */
+            if ((int32_t)arg1 <= 0) {
+                int32_t target = (int32_t)arg1;
+                if (target < -1) {
+                    target = -process_pid_from_current_view(-target);
+                }
+                result = (int64_t)process_signal_deliver_pgrp(target,
+                                                              (int32_t)arg2);
+                if (result < 0) result = -3; /* ESRCH */
+            } else {
+                result = (int64_t)process_signal_deliver_group((int32_t)arg1,
+                                                               (int32_t)arg2);
+            }
             if (result == 0 &&
                 ((int32_t)arg1 == process_get_current_pid() ||
                  (int32_t)arg1 == 0 || (int32_t)arg1 == -1) &&
@@ -7438,6 +7995,9 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                 break;
             }
             result = (int64_t)syscall_file_creat(path);
+            if (result >= 0) {
+                linux_apply_create_mode(path, arg2 & ~(uint64_t)022u);
+            }
             break;
         }
 
@@ -7721,7 +8281,7 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             if (rc < 0) { result = rc; break; }
             rc = linux_resolve_at(arg1, oa_path, sizeof(oa_path));
             if (rc < 0) { result = rc; break; }
-            result = linux_open_resolved(oa_path, arg3);
+            result = linux_open_resolved(oa_path, arg3, arg4);
             break;
         }
 
@@ -8179,19 +8739,23 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_GETPGID:
+            result = (int64_t)process_get_pgid((int32_t)arg1);
+            if (result < 0) result = -3; /* ESRCH */
+            break;
         case LINUX_SYS_GETPGRP:
+            result = (int64_t)process_get_pgid(0);
+            break;
         case LINUX_SYS_GETSID:
-            /* No process-group/session tracking: model every process as
-             * its own group and session leader. */
-            result = (int64_t)process_get_current_pid();
+            result = (int64_t)process_get_sid((int32_t)arg1);
+            if (result < 0) result = -3;
             break;
 
         case LINUX_SYS_SETPGID:
-            result = 0;
+            result = (int64_t)process_set_pgid((int32_t)arg1, (int32_t)arg2);
             break;
 
         case LINUX_SYS_SETSID:
-            result = (int64_t)process_get_current_pid();
+            result = (int64_t)process_setsid();
             break;
 
         case LINUX_SYS_UMASK:
@@ -8641,6 +9205,14 @@ lx_fd_finished:
 
     if (request_restart) {
         linux_syscall_restart(saved_rsp, num);
+#if defined(__x86_64__)
+        if (lx_is_signal_interruptible_wait(num) && lx_tid >= 0 &&
+            lx_tid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
+            g_lx_wait_num[lx_tid] = (uint16_t)num;
+            g_lx_wait_rip[lx_tid] =
+                ((const uint64_t *)(uintptr_t)saved_rsp)[SYSCALL_FRAME_RCX];
+        }
+#endif
     } else {
         linux_syscall_result(saved_rsp, result);
     }

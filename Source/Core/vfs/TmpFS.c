@@ -7,6 +7,7 @@
 #include "Core/memory/SharedMemory.h"
 #include "Debug/serial/Serial.h"
 #include "kernel/config.h"
+#include "MemoryManagement/Memory_Main.h"
 
 /* One table serves all four mounts below, so it has to hold everything at
  * once: Xorg's sockets and compiled keymaps, the fontconfig cache, the login
@@ -188,20 +189,65 @@ static bool tmpfs_vfs_find_file(const char *path, vfs_file_t *out_file)
 /* Forward declaration for tmpfs_vfs_get_mode() */
 static bool tmpfs_is_dir_locked(const char *path);
 
+/* File contents. Small files live on the kernel heap; anything from
+ * TMPFS_PAGE_BACKED_MIN up comes straight from the page allocator. The heap
+ * is a fixed carve-out sized at boot (at most 1 GiB), while a Wine prefix
+ * alone copies ~700 MB of DLLs into C:\windows\system32 -- with every byte
+ * of it on the heap the kernel ran out of heap halfway through wineboot and
+ * every later allocation, its own included, failed. */
+#define TMPFS_PAGE_BACKED_MIN (64u * 1024u)
+
+static uint8_t *tmpfs_buf_alloc(uint32_t capacity)
+{
+    if (capacity >= TMPFS_PAGE_BACKED_MIN) {
+        return (uint8_t *)alloc_contiguous_pages(capacity / 4096u, 1u);
+    }
+    return (uint8_t *)malloc(capacity);
+}
+
+static void tmpfs_buf_free(uint8_t *data, uint32_t capacity)
+{
+    if (data == NULL) {
+        return;
+    }
+    if (capacity >= TMPFS_PAGE_BACKED_MIN) {
+        free_contiguous_pages(data, capacity / 4096u);
+    } else {
+        free(data);
+    }
+}
+
 static bool tmpfs_ensure_capacity_locked(tmpfs_slot_t *slot, uint32_t required)
 {
     if (required <= slot->capacity) {
         return true;
     }
     uint32_t new_capacity = slot->capacity == 0u ? 4096u : slot->capacity;
-    while (new_capacity < required) {
+    while (new_capacity < required && new_capacity < (1u << 20)) {
         new_capacity *= 2u;
     }
-    uint8_t *resized = (uint8_t *)realloc(slot->data, new_capacity);
+    if (new_capacity < required) {
+        /* Past 1 MiB grow by a quarter, in whole MiB steps: doubling a
+         * 20 MB DLL to 32 MB wastes more than the file. */
+        uint64_t want = (uint64_t)required + (uint64_t)required / 4u;
+        want = (want + (1u << 20) - 1u) & ~(uint64_t)((1u << 20) - 1u);
+        if (want > 0xFFFFF000ULL) {
+            want = 0xFFFFF000ULL;
+        }
+        new_capacity = (uint32_t)want;
+        if (new_capacity < required) {
+            return false;
+        }
+    }
+    uint8_t *resized = tmpfs_buf_alloc(new_capacity);
     if (resized == NULL) {
         return false;
     }
+    if (slot->data != NULL && slot->capacity != 0u) {
+        memcpy(resized, slot->data, slot->capacity);
+    }
     memset(resized + slot->capacity, 0, new_capacity - slot->capacity);
+    tmpfs_buf_free(slot->data, slot->capacity);
     slot->data = resized;
     slot->capacity = new_capacity;
     return true;
@@ -641,7 +687,7 @@ static int32_t tmpfs_vfs_closedir(int32_t handle)
 static void tmpfs_free_slot_locked(tmpfs_slot_t *slot)
 {
     if (slot->data != NULL) {
-        free(slot->data);
+        tmpfs_buf_free(slot->data, slot->capacity);
     }
     if (slot->shm_handle > 0) {
         (void)shared_memory_release(slot->shm_handle);
@@ -768,7 +814,7 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
         (void)shared_memory_copy_in(handle, 0u, slot->data, slot->size);
     }
     if (slot->data != NULL) {
-        free(slot->data);
+        tmpfs_buf_free(slot->data, slot->capacity);
     }
     slot->data = NULL;
     slot->capacity = 0u;

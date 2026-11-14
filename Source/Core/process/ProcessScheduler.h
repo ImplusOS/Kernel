@@ -176,6 +176,14 @@ typedef struct __attribute__((aligned(16))) {
     char     exe_path[256];
     char     launch_argument[512];
     int32_t parent_pid;
+    /* POSIX process group and session (the leader's pid). A spawned program
+     * starts both of its own; fork() inherits them; setpgid()/setsid()
+     * change them. kill(0 / -pgid) reaches every process in a group. */
+    int32_t pgid;
+    int32_t sid;
+    /* Killed by a signal; process_run_pending_teardowns() still has to
+     * close what it held. Not reapable until it has. */
+    uint8_t teardown_pending;
     int32_t memory_owner_pid;
     int32_t exit_status;
     /* Termination cause for POSIX wait-status encoding (wait4/waitid in the

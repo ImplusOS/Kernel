@@ -43,6 +43,24 @@ int64_t drm_kms_mmap(int32_t slot, uint64_t offset, uint64_t length,
 
 void    drm_kms_close(void);
 
+/* Returned by drm_kms_ioctl()/drm_render_ioctl() when the call has to wait
+ * (DRM_VIRTGPU_WAIT on a busy buffer, WAIT_VBLANK for a future vblank). The
+ * kernel cannot sleep inside a syscall, so the Linux ABI layer parks the
+ * thread on the poll-wait generation and runs the same ioctl again;
+ * drm_timer_tick() calls poll_wait_notify() when a fence retires or a vblank
+ * a waiter asked for has passed. Never returned to userspace. (-513 is
+ * Linux's ERESTARTNOINTR; ALSA's would-block code is -512.) */
+#define DRM_WOULD_BLOCK (-513)
+
+/* Called from the timer interrupt (CPU 0). Lock-free: wakes parked pollers
+ * when a GPU fence retires or a pending vblank event / wait comes due. */
+void drm_timer_tick(void);
+
+/* High-resolution timer client (Core/timer): the earliest pending vblank
+ * deadline, and its servicing from the timer interrupt. Lock-free. */
+uint64_t drm_hires_next_due_ns(void);
+void     drm_hires_service(uint64_t now_ns);
+
 /* ---- renderD128 (render-only) ----------------------------------------- */
 /* Separate namespace: GEM buffers, VirtIO virgl resources, exec/transfer,
  * and PRIME descriptors. Rejects modeset ioctls. Unsupported blob, syncobj,
@@ -89,6 +107,18 @@ int64_t  drm_prime_mmap(int32_t slot, uint64_t offset, uint64_t length,
                         uint64_t prot, uint64_t flags);
 void     drm_prime_close(int32_t slot);
 uint32_t drm_prime_size(int32_t slot);
+/* poll(2) on a dma-buf: POLLIN/POLLOUT once its implicit fence retired. */
+uint32_t drm_prime_poll(int32_t slot, uint32_t events);
+
+/* ---- sync_file descriptors ----------------------------------------------
+ * A pathless fd that signals (POLLIN) when one GPU fence retires: what
+ * EXECBUFFER(FENCE_FD_OUT) and DMA_BUF_IOCTL_EXPORT_SYNC_FILE return.
+ * drm_sync_file_create() returns a global fd or -errno and must not be
+ * called with DRM's lock held. ioctl: SYNC_IOC_MERGE, SYNC_IOC_FILE_INFO. */
+int32_t  drm_sync_file_create(uint64_t fence);
+int64_t  drm_sync_file_ioctl(int32_t slot, uint64_t request, uint64_t arg);
+uint32_t drm_sync_file_poll(int32_t slot, uint32_t events);
+void     drm_sync_file_close(int32_t slot);
 
 /* ---- Scanout redirection ("mirror") -------------------------------------
  *

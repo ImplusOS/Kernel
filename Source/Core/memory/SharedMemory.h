@@ -11,6 +11,12 @@ void *shared_memory_map(int32_t handle);
  * semantics -- see the note on shared_memory_map_ex(). */
 void *shared_memory_map_new(int32_t handle);
 int32_t shared_memory_unmap(int32_t handle, void *address);
+
+/* mmap(MAP_SHARED | MAP_FIXED): map `length` bytes of the object starting at
+ * byte `offset` (page aligned) at the fixed user `address`, replacing
+ * whatever the range held. Returns `address`, or NULL. */
+void *shared_memory_map_fixed(int32_t handle, uint64_t address,
+                              uint64_t offset, uint64_t length);
 int32_t shared_memory_close(int32_t handle);
 
 /* Release whatever shared-memory mapping the calling address space holds at

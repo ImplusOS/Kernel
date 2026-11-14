@@ -4,6 +4,7 @@
 
 #include "kernel/config.h"
 #include "Core/process/ProcessManager.h"
+#include "Core/process/ProcessScheduler.h"
 #include "Core/syscall/Poll_Wait.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/syscall/Syscall_File.h"
@@ -785,6 +786,20 @@ int64_t pty_read(int32_t index, int is_master, uint8_t *user_buffer,
          * timeslice per millisecond in every shell sitting at a prompt. The
          * back-off is only a ceiling -- pty_write() cuts it short the moment
          * a byte arrives, so keystroke latency does not grow with idle time. */
+        /* A Linux task waits by being parked once and re-running the
+         * syscall: poll_wait_park() only marks the task blocked -- the sleep
+         * itself happens on the way out of the syscall -- so looping here
+         * never slept at all. It spun the CPU with interrupts masked for as
+         * long as the terminal stayed quiet, which is all of a shell's life
+         * at its prompt: one idle shell cost a whole CPU, and a second
+         * xterm on a two-CPU machine stopped the clock and froze the system.
+         * Same cure as syscall_pipe_read(): park (pty_write()'s
+         * poll_wait_notify() cuts it short) and report EAGAIN, which
+         * linux_unix_block_retry() turns into a restart for a blocking fd. */
+        if (process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+            (void)poll_wait_park(generation, 20u);
+            return PTY_ERR_AGAIN;
+        }
         (void)poll_wait_park(generation, idle_iterations < 64u ? 1u : 10u);
         if (idle_iterations < 64u) {
             idle_iterations += 1u;

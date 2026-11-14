@@ -37,6 +37,15 @@ const driver_display_t *driver_select_pick_display_driver(void) {
         if (drv->set_framebuffer) {
             drv->set_framebuffer(&g_boot_framebuffer);
         }
+        /* A driver that is already up (initialised by the module loader or by
+         * the DRM render backend) is picked as-is. Running init() again would
+         * reset a live device -- for VirtIO GPU that drops the scanout and
+         * every in-flight command, which froze the screen whenever the boot
+         * framebuffer could not be claimed by the generic GOP driver (OVMF's
+         * virtio-gpu GOP is BltOnly, e.g. "-vga none -device virtio-gpu-gl-pci"). */
+        if (drv->is_ready != NULL && drv->is_ready()) {
+            return drv;
+        }
         if (!drv->probe || drv->probe()) {
             if (drv->init()) {
                 return drv;

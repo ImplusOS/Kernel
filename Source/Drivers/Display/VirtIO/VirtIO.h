@@ -59,3 +59,27 @@ bool virtio_gpu_transfer_3d_ex(uint32_t context_id, uint32_t resource_id,
                                uint32_t depth, uint64_t offset,
                                uint32_t level, uint32_t stride,
                                uint32_t layer_stride);
+
+/* Fenced submission: queue and return the fence id (0 = not queued) without
+ * waiting for the host. virtio_gpu_fence_completed() reports the largest id
+ * at or below which every fence has retired. */
+uint64_t virtio_gpu_submit_3d_async(uint32_t context_id, const void *blob,
+                                    uint32_t blob_size);
+uint64_t virtio_gpu_transfer_3d_async(uint32_t context_id,
+                                      uint32_t resource_id, bool to_host,
+                                      uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t depth, uint64_t offset,
+                                      uint32_t level, uint32_t stride,
+                                      uint32_t layer_stride);
+uint64_t virtio_gpu_fence_completed(void);
+/* Called (possibly from an interrupt) when the retired fence advances. */
+void virtio_gpu_set_fence_callback(void (*callback)(void));
+
+/* GPU-composited scanout: put a desktop-sized 3D resource on every monitor
+ * (0 restores the driver's own framebuffer resources), and flush a desktop
+ * rectangle of it. */
+bool virtio_gpu_scanout_set(uint32_t resource_id, uint32_t width,
+                            uint32_t height);
+bool virtio_gpu_scanout_flush(uint32_t resource_id, int32_t x, int32_t y,
+                              uint32_t width, uint32_t height);

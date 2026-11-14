@@ -348,6 +348,28 @@ static int keyboard_queue_pop(driver_keyboard_event_t *event_out)
     return 1;
 }
 
+/*
+ * Decode the movement bytes of a standard 3-byte PS/2 mouse packet.
+ * The deltas are 9-bit two's complement: the low 8 bits come in bytes 1/2 and
+ * the sign bits in byte 0 (bit 4 = X, bit 5 = Y). PS/2 reports Y as positive
+ * when the mouse moves *up*, whereas driver_mouse_event_t (like USB HID boot
+ * reports) uses screen orientation, positive = down -- so Y is negated here.
+ */
+static void ps2_mouse_decode_deltas(uint8_t b0, uint8_t b1, uint8_t b2,
+                                    int16_t *dx_out, int16_t *dy_out)
+{
+    int16_t dx = (int16_t)b1;
+    int16_t dy = (int16_t)b2;
+    if ((b0 & 0x10u) != 0u) {
+        dx = (int16_t)(dx - 256);
+    }
+    if ((b0 & 0x20u) != 0u) {
+        dy = (int16_t)(dy - 256);
+    }
+    *dx_out = dx;
+    *dy_out = (int16_t)-dy;
+}
+
 static void mouse_queue_push(const driver_mouse_event_t *event)
 {
     if (event == NULL) {
@@ -488,8 +510,9 @@ static void handle_mouse_byte(uint8_t value)
         return;
     }
 
-    int16_t dx = (int16_t)(int8_t)b1;
-    int16_t dy = (int16_t)(int8_t)b2;
+    int16_t dx = 0;
+    int16_t dy = 0;
+    ps2_mouse_decode_deltas(b0, b1, b2, &dx, &dy);
     uint8_t buttons = (uint8_t)(b0 & 0x07u);
 
     if (dx == 0 && dy == 0 && buttons == g_last_mouse_buttons) {
@@ -757,8 +780,9 @@ void ps2_input_poll(void)
                 continue;
             }
 
-            int16_t dx = (int16_t)(int8_t)b1;
-            int16_t dy = (int16_t)(int8_t)b2;
+            int16_t dx = 0;
+            int16_t dy = 0;
+            ps2_mouse_decode_deltas(b0, b1, b2, &dx, &dy);
             uint8_t buttons = (uint8_t)(b0 & 0x07u);
 
             if (dx != 0 || dy != 0 || buttons != g_last_mouse_buttons) {
