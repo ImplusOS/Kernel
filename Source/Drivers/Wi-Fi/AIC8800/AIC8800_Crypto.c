@@ -426,14 +426,14 @@ bool aic_aes128_kw_unwrap(const uint8_t kek[16],
 {
     static const uint8_t iv[8] = { 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };
     uint8_t a[8];
-    uint8_t r[8 * 8]; /* up to 8 64-bit blocks: 64 bytes of key material */
+    uint8_t r[AIC_AES_KW_MAX_BLOCKS * 8u];
     uint32_t n;
 
     if (wrapped_len < 24u || (wrapped_len % 8u) != 0u) {
         return false;
     }
     n = (wrapped_len / 8u) - 1u;
-    if (n > 8u) {
+    if (n > AIC_AES_KW_MAX_BLOCKS) {
         return false;
     }
     if ((n * 8u) > out_cap) {
@@ -452,7 +452,9 @@ bool aic_aes128_kw_unwrap(const uint8_t kek[16],
 
     for (uint32_t j = 6u; j > 0u; --j) {
         for (uint32_t i = n; i > 0u; --i) {
-            uint32_t t = j * n + i;
+            /* RFC 3394 2.2.2: t = n*j + i for j = 5..0 (the loop variable
+             * runs 6..1 to stay unsigned). */
+            uint32_t t = (j - 1u) * n + i;
             uint8_t block_in[16];
             uint8_t block_out[16];
 
@@ -516,6 +518,12 @@ void aic_random_bytes(uint8_t *out, uint32_t len)
         uint64_t ticks = (g_aic_api->timer_ticks != NULL) ? g_aic_api->timer_ticks() : 0u;
         uint32_t hz = (g_aic_api->timer_hz != NULL) ? g_aic_api->timer_hz() : 0u;
         g_aic_rng_state ^= (ticks * 0x9E3779B97F4A7C15u) ^ (uint64_t)hz;
+        if (g_aic_api->timer.monotonic_ns != NULL) {
+            /* Nanosecond jitter between calls is the best entropy a driver
+             * module can reach; mix it in on every request. */
+            g_aic_rng_state ^= g_aic_api->timer.monotonic_ns() *
+                               0x94D049BB133111EBu;
+        }
     }
     g_aic_rng_state ^= (uint64_t)(++calls) * 0xBF58476D1CE4E5B9u;
 

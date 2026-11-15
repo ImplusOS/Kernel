@@ -6,6 +6,7 @@
 
 #include "Network/ipv4.h"
 #include "Network/udp/UDP.h"
+#include "Network/ethernet/Ethernet.h"
 #include "Network/network_utils.h"
 #include "Debug/serial/Serial.h"
 #include "Core/timer/Timer.h"
@@ -125,6 +126,10 @@ static void dhcp_on_udp(uint32_t src_ip, uint16_t src_port,
         req->op = 1;
         req->htype = 1;
         req->hlen = 6;
+        /* chaddr identifies the client to the server: a real DHCP server
+         * (a home router) keys the lease on it, and some will not answer a
+         * client whose hardware address is all zeros. */
+        ethernet_get_local_mac(req->chaddr);
         req->xid = net_htonl(g_dhcp_xid);
         req->flags = net_htons(0x8000u);
         req->magic_cookie = net_htonl(DHCP_MAGIC_COOKIE);
@@ -164,6 +169,7 @@ bool dhcp_discover(void)
     req->op = 1;
     req->htype = 1;
     req->hlen = 6;
+    ethernet_get_local_mac(req->chaddr); /* see the REQUEST in dhcp_on_udp */
     req->xid = net_htonl(g_dhcp_xid);
     req->flags = net_htons(0x8000u);
     req->magic_cookie = net_htonl(DHCP_MAGIC_COOKIE);

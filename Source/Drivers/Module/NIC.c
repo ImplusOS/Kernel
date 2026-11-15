@@ -106,10 +106,17 @@ bool nic_send_frame(const uint8_t *frame, uint16_t frame_len)
 
 void nic_poll(void)
 {
-    if (g_active_driver == NULL || g_active_driver->poll == NULL) {
-        return;
+    if (g_active_driver != NULL && g_active_driver->poll != NULL) {
+        g_active_driver->poll();
     }
-    g_active_driver->poll();
+    /* A wireless module that is not the data-path NIC (a wired controller
+     * won nic_init(), or the adapter was plugged in after it ran) still
+     * needs its poll: that is what loads its firmware and brings the
+     * station up, so the Wi-Fi panel finds it ready. */
+    const driver_nic_t *wifi = nic_wifi_driver();
+    if (wifi != NULL && wifi != g_active_driver && wifi->poll != NULL) {
+        wifi->poll();
+    }
 }
 
 void nic_set_rx_callback(nic_rx_callback_t cb)

@@ -9,7 +9,7 @@ a browser GPU process can use the device.
 | Backend | Display acceleration | 3D rendering |
 | --- | --- | --- |
 | VirtIO-GPU | Damage-rectangle 2D scanout and framebuffer transfer | virgl control protocol plus a Linux VirtIO-GPU DRM render-node path for Mesa's virgl Gallium winsys |
-| Intel Gen9 / Gen9.5 | BCS blitter acceleration for validated framebuffer copies, with CPU fallback | Not implemented; this is not an i915-compatible 3D driver |
+| Intel Gen9 / Gen9.5 | BCS blitter present (execlists submission, legacy-ring fallback), self-tested, hang reset, CPU fallback | Not implemented; this is not an i915-compatible 3D driver |
 
 ## VirtIO-GPU / Mesa virgl connection
 
@@ -199,9 +199,12 @@ DRI3 clients reach the render node independently.
 
 ## Intel Gen9 / Gen9.5
 
-The Intel display module remains deliberately conservative. It only enables
-its blitter after bounded ring, fence, GGTT, and scratch-memory self-tests. A
-failure leaves the CPU framebuffer-copy path active. Its current acceleration
+The Intel display module submits to the blitter (BCS) through execlists, as
+i915 does on Gen9, with the legacy ring buffer as a fallback. It only enables
+the blitter after store/fill/copy self-tests on its own memory; a failure or
+a hang (engine reset, three strikes) leaves the CPU framebuffer-copy path
+active. See `Docs/Architecture/IntelGen9.md`; `make -C Tools/IntelGen9Sim
+test` runs the driver against a host-side GPU model. Its current acceleration
 is a 2D presentation optimization; it does not implement the Intel 3D render
 command streamer, i915 GEM execution ABI, or an OpenGL driver.
 

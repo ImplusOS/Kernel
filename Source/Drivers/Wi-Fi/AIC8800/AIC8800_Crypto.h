@@ -51,6 +51,10 @@ void aic_aes128_decrypt(const aic_aes128_ctx_t *ctx, const uint8_t in[16], uint8
 /* NIST SP 800-38F AES key unwrap ("AES-KW", RFC 3394). Accepts a
  * `wrapped_len` that is a multiple of 8 and >= 24. Returns false when
  * the integrity check fails (wrong KEK / corrupted data). */
+/* Message 3's key data: RSN IE + GTK KDE + (PMF-capable APs) IGTK KDE and
+ * padding -- 256 bytes is plenty. */
+#define AIC_AES_KW_MAX_BLOCKS 32u
+
 bool aic_aes128_kw_unwrap(const uint8_t kek[16],
                           const uint8_t *wrapped, uint32_t wrapped_len,
                           uint8_t *out, uint32_t out_cap, uint32_t *out_len);

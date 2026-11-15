@@ -35,6 +35,23 @@ typedef enum {
     AIC_WPA_FAILED,
 } aic_wpa_state_t;
 
+/* Group cipher suite selectors this supplicant can live with (pairwise is
+ * always CCMP, the AKM always PSK). */
+#define AIC_RSN_GROUP_NONE  0u
+#define AIC_RSN_GROUP_CCMP  4u /* 00-0F-AC:4 */
+#define AIC_RSN_GROUP_TKIP  2u /* 00-0F-AC:2 */
+
+/* Look at an AP's RSN element (id byte first). Returns true when this
+ * supplicant can join it -- pairwise CCMP offered, PSK among the AKMs, no
+ * mandatory management frame protection -- and stores the AP's group
+ * cipher (AIC_RSN_GROUP_*) in *group_out. */
+bool aic_wpa_rsn_usable(const uint8_t *rsn_ie, uint32_t ie_len,
+                        uint8_t *group_out);
+
+/* Choose the group cipher for the next association (before aic_connect()
+ * builds the request with aic_wpa_rsn_ie()). */
+void aic_wpa_set_group_cipher(uint8_t group);
+
 /* Arm the supplicant for a new connection.
  *   psk      -- WPA2 passphrase, 8..63 characters (NUL-terminated)
  *   ssid/len -- the SSID (PMK salt)
@@ -50,8 +67,9 @@ aic_wpa_state_t aic_wpa_state(void);
 /* Consume one received 802.3 frame. Returns true when it was EAPOL. */
 bool aic_wpa_recv(const uint8_t *eth_frame, uint16_t frame_len);
 
-/* Periodic work: EAPOL-Start retry, deferred MM_KEY_ADD installs,
- * handshake timeout. Call outside the RX dispatch. */
+/* Periodic work: EAPOL-Start retry, deferred MM_KEY_ADD installs (also
+ * after a PTK or group-key rekey), handshake timeout. Call outside the RX
+ * dispatch. */
 void aic_wpa_tick(void);
 
 /* The RSN IE this driver puts in the association request, and the exact

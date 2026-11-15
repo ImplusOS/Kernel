@@ -1,182 +1,41 @@
 /*
- * IntelGen9.c - display driver for Intel 9th generation ("Gen9.5") integrated
- * graphics (Coffee Lake and its Whiskey Lake / Comet Lake siblings).
+ * IntelGen9.c - display driver for Intel Gen9 / Gen9.5 integrated graphics
+ * (Skylake, Kaby Lake, Amber Lake, Coffee Lake, Whiskey Lake, Comet Lake,
+ * Apollo Lake, Gemini Lake): module entry, device matching, and the
+ * driver_display_t implementation.
  *
- * WHAT THIS DOES
+ * WHAT IT DOES
  *
- * The firmware has already programmed a display pipeline and handed the
- * kernel a linear framebuffer (the same one ImplusOS_Generic_Display_Driver
- * presents through), so this driver does NOT modeset: it never touches a
- * pipe, plane, PLL or port register. All it takes from the hardware is the
- * blitter engine (BCS), which it uses to move the window manager's composed
- * frame into the scanout buffer. Everything the GPU cannot be trusted to do
- * - and everything on a machine that is not one of the parts in
- * g_ig9_devices[] - stays exactly as it is on the generic driver: CPU
- * copies, same double-buffer protocol, same framebuffer.
+ * The firmware (UEFI GOP) has already lit a pipe and left a linear 32-bpp
+ * framebuffer on it. This driver keeps that mode - it never touches a PLL,
+ * port, transcoder or plane register - and takes over everything else:
  *
- * WHY IT IS BUILT THIS WAY
+ *   - It reads the display engine's state (which pipe/plane scans out the
+ *     framebuffer, its tiling/format/stride, which DDI port and protocol the
+ *     transcoder drives, the real refresh rate measured off the pipe's
+ *     frame counter) and reports it through the monitor/mode queries.
+ *   - The window manager composes into a driver-owned back buffer; each
+ *     present is copied into scanout by the GPU blitter (BCS) as one
+ *     XY_SRC_COPY_BLT per damaged rectangle, submitted through execlists
+ *     (IG9_Engine.c). If the engine cannot be brought up, fails its
+ *     self-tests or hangs, the same rectangles are copied by the CPU
+ *     through a write-combining mapping, exactly like the generic driver.
  *
- * Nothing here can be exercised in the environment this OS is developed in
- * (QEMU has no Intel GPU), so the code assumes any single register or
- * command encoding below might be wrong:
- *
- *   - Only known Gen9.5 device ids are ever touched.
- *   - Every wait on the hardware is deadline-bounded, and the one register
- *     write that could plausibly wedge a machine if it were wrong
- *     (forcewake) is checked against its acknowledge register before
- *     anything else is issued.
- *   - Acceleration is staged behind self-tests that run on memory this
- *     driver owns and can read back:
- *       stage 0 (always)   two MI_NOOPs and a MI_USER_INTERRUPT are queued
- *                          and the ring's HEAD is watched to advance past
- *                          them: forcewake, ring registers and the doorbell.
- *       stage 1            a scratch page is mapped into the GGTT, an
- *                          XY_COLOR_BLT fills it, a MI_STORE_DWORD_IMM fence
- *                          lands in it, and the CPU compares the result.
- *                          Nothing outside our own scratch is written.
- *       stage 2            an XY_SRC_COPY_BLT copies a CPU-written pattern
- *                          from a second scratch page into the first: the
- *                          exact direction present_rects() needs.
- *     Present acceleration additionally needs the scanout framebuffer's
- *     graphics address. That address is read out of the display plane's
- *     surface register when that is possible (each candidate is validated
- *     against the GGTT entry it names), and only otherwise looked up by
- *     scanning the GGTT for the framebuffer's physical address. A failure
- *     at any point logs over serial and leaves the CPU path in place.
- *   - A present whose fence does not confirm within its deadline falls back
- *     to a CPU copy of the same rectangles *and* disables GPU use for the
- *     rest of the boot, so a wedged engine costs one frame, not a session.
- *
- * WHAT IS VERIFIED
- *
- *   - Compiles for x86_64 and arm64 driver-module builds.
- *   - On machines without an allowlisted Intel GPU (QEMU included) probe()
- *     returns false before any MMIO access, so the generic driver stays
- *     selected - verified by booting the live image with this module staged.
- *   - MMIO/ring/command encodings follow the Gen9 programming model as used
- *     by i915's blitter paths and the Intel DDX's 2D blit sequences:
- *     BCS ring registers at 0x22000 + 0x30/0x34/0x38/0x3C, XY_COLOR_BLT and
- *     XY_SRC_COPY_BLT with the BR13 dword, MI_STORE_DWORD_IMM GEN4 fences.
- *     *Not* verified on real silicon; see Docs/Architecture/IntelGen9.md.
+ * Source layout: IG9_Regs.h (registers/encodings), IG9_Uncore.c (MMIO,
+ * forcewake, PCI power), IG9_Ggtt.c (GGTT), IG9_Engine.c (BCS), this file.
+ * Design notes and the bring-up log to expect on hardware:
+ * Docs/Architecture/IntelGen9.md.
  */
-
-#include <stdint.h>
-#include <stddef.h>
-#include <stdbool.h>
 
 #ifdef IMPLUS_DRIVER_MODULE
 
-#include "Drivers/Module/DriverBinary.h"
-
-#if defined(__GNUC__)
-#define IG9_UNUSED __attribute__((unused))
-#else
-#define IG9_UNUSED
-#endif
+#include "IG9_Private.h"
 
 /* ------------------------------------------------------------------ *
- * 0. Driver-module glue
+ * 1. Supported devices (i915 i915_pciids.h: SKL, KBL, AML, CFL, WHL, CML,
+ *    BXT/APL, GLK)
  * ------------------------------------------------------------------ */
 
-static const driver_binary_t *g_api = NULL;
-
-static void *ig9_memset(void *dst, int value, size_t n)
-{
-    uint8_t *p = (uint8_t *)dst;
-    for (size_t i = 0; i < n; ++i) {
-        p[i] = (uint8_t)value;
-    }
-    return dst;
-}
-
-#define api_malloc(size)              g_api->malloc((size))
-#define api_free(ptr)                 g_api->free((ptr))
-#define api_dma_alloc(size, phys_out) g_api->dma_alloc((size), (phys_out))
-#define api_dma_free(ptr, size)       g_api->dma_free((ptr), (size))
-#define api_virt_to_phys(ptr)         g_api->virt_to_phys((ptr))
-#define api_map_mmio(phys, size)      g_api->hw.map_mmio_range((phys), (size))
-#define api_memset                    ig9_memset
-
-static void ig9_log(const char *str)
-{
-    if (g_api != NULL && g_api->serial_write_string != NULL) {
-        g_api->serial_write_string(str);
-    }
-}
-
-static void ig9_log_hex(uint32_t value)
-{
-    if (g_api != NULL && g_api->serial_write_uint32 != NULL) {
-        g_api->serial_write_uint32(value);
-    }
-}
-
-static void ig9_msleep(uint32_t ms)
-{
-    if (g_api != NULL && g_api->timer_msleep != NULL) {
-        g_api->timer_msleep(ms);
-    }
-}
-
-static void ig9_cache_flush(const void *base, uint64_t bytes)
-{
-#if defined(__x86_64__)
-    const uint8_t *p = (const uint8_t *)base;
-    for (uint64_t offset = 0; offset < bytes; offset += 64u) {
-        __asm__ __volatile__("clflush (%0)" : : "r"((const void *)(p + offset))
-                             : "memory");
-    }
-    __asm__ __volatile__("mfence" ::: "memory");
-#else
-    (void)base;
-    (void)bytes;
-#endif
-}
-
-/* Cache-flush without serialization barrier for row-by-row batch operations. */
-static void ig9_cache_flush_lines(const void *base, uint64_t bytes)
-{
-#if defined(__x86_64__)
-    const uint8_t *p = (const uint8_t *)base;
-    for (uint64_t offset = 0; offset < bytes; offset += 64u) {
-        __asm__ __volatile__("clflush (%0)" : : "r"((const void *)(p + offset))
-                             : "memory");
-    }
-#else
-    (void)base;
-    (void)bytes;
-#endif
-}
-
-/* ------------------------------------------------------------------ *
- * 1. Devices this driver will touch
- * ------------------------------------------------------------------ */
-
-typedef enum {
-    IG9_GEN_SKYLAKE,
-    IG9_GEN_KABYLAKE,
-    IG9_GEN_COFFEELAKE,
-    IG9_GEN_COMETLAKE,
-    IG9_GEN_AMBERLAKE,
-    IG9_GEN_BROXTON,
-    IG9_GEN_GEMINILAKE,
-} ig9_gen_t;
-
-typedef struct {
-    uint16_t device_id;
-    const char *name;
-    ig9_gen_t gen;
-} ig9_device_t;
-
-/*
- * Complete Intel Gen9 / Gen9.5 integrated graphics device database.
- * Verified against Intel Programmer's Reference Manuals (PRM) Volume 12
- * (Device IDs) and open-source Linux i915 driver tables:
- *   - Skylake (SKL, Gen9 GT1/GT2/GT3/GT4)
- *   - Kaby Lake (KBL, Gen9.5 GT1/GT2/GT3/GT4) & Amber Lake (AML)
- *   - Coffee Lake / Whiskey Lake / Comet Lake (CFL/WHL/CML, Gen9.5 GT1/GT2/GT3)
- *   - Broxton / Apollo Lake & Gemini Lake (BXT/APL/GLK, Gen9 low power)
- */
 static const ig9_device_t g_ig9_devices[] = {
     /* --- Skylake (Gen9) --- */
     { 0x1902u, "HD Graphics 510 (Skylake GT1 Desktop)",      IG9_GEN_SKYLAKE },
@@ -217,1287 +76,160 @@ static const ig9_device_t g_ig9_devices[] = {
     { 0x5926u, "Iris Plus Graphics 640 (Kaby Lake GT3)",     IG9_GEN_KABYLAKE },
     { 0x5927u, "Iris Plus Graphics 650 (Kaby Lake GT3)",     IG9_GEN_KABYLAKE },
     { 0x593Bu, "Iris Pro Graphics (Kaby Lake GT4 Mobile)",   IG9_GEN_KABYLAKE },
-    { 0x87C0u, "UHD Graphics 617 (Amber Lake Y)",             IG9_GEN_AMBERLAKE },
-    { 0x87CAu, "UHD Graphics (Amber Lake Y)",                 IG9_GEN_AMBERLAKE },
+    { 0x87C0u, "UHD Graphics 617 (Amber Lake Y)",            IG9_GEN_AMBERLAKE },
+    { 0x87CAu, "UHD Graphics (Amber Lake Y)",                IG9_GEN_AMBERLAKE },
 
     /* --- Coffee Lake & Whiskey Lake (Gen9.5) --- */
-    { 0x3E90u, "UHD Graphics 610 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E91u, "UHD Graphics 630 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E92u, "UHD Graphics 630 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E93u, "UHD Graphics 610 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E94u, "UHD Graphics 620 (Coffee Lake Mobile)",       IG9_GEN_COFFEELAKE },
-    { 0x3E96u, "UHD Graphics 630 (Coffee Lake Server)",       IG9_GEN_COFFEELAKE },
-    { 0x3E98u, "UHD Graphics 630 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E99u, "UHD Graphics 610 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3E9Au, "UHD Graphics P630 (Coffee Lake WS)",          IG9_GEN_COFFEELAKE },
-    { 0x3E9Bu, "UHD Graphics 630 (Coffee Lake-H)",            IG9_GEN_COFFEELAKE },
-    { 0x3E9Cu, "UHD Graphics 615 (Coffee Lake Y)",            IG9_GEN_COFFEELAKE },
-    { 0x3EA0u, "UHD Graphics 620 (Whiskey Lake)",             IG9_GEN_COFFEELAKE },
-    { 0x3EA1u, "UHD Graphics 620 (Whiskey Lake U)",           IG9_GEN_COFFEELAKE },
-    { 0x3EA2u, "UHD Graphics 620 (Whiskey Lake U)",           IG9_GEN_COFFEELAKE },
-    { 0x3EA3u, "UHD Graphics 620 (Whiskey Lake U)",           IG9_GEN_COFFEELAKE },
-    { 0x3EA4u, "UHD Graphics 620 (Whiskey Lake U)",           IG9_GEN_COFFEELAKE },
-    { 0x3EA5u, "UHD Graphics 655 (Coffee Lake)",              IG9_GEN_COFFEELAKE },
-    { 0x3EA6u, "Iris Plus Graphics 655 (Coffee Lake)",        IG9_GEN_COFFEELAKE },
-    { 0x3EA7u, "Iris Plus Graphics 655 (Coffee Lake)",        IG9_GEN_COFFEELAKE },
-    { 0x3EA8u, "Iris Plus Graphics 655 (Coffee Lake)",        IG9_GEN_COFFEELAKE },
+    { 0x3E90u, "UHD Graphics 610 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E91u, "UHD Graphics 630 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E92u, "UHD Graphics 630 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E93u, "UHD Graphics 610 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E94u, "UHD Graphics 620 (Coffee Lake Mobile)",      IG9_GEN_COFFEELAKE },
+    { 0x3E96u, "UHD Graphics 630 (Coffee Lake Server)",      IG9_GEN_COFFEELAKE },
+    { 0x3E98u, "UHD Graphics 630 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E99u, "UHD Graphics 610 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3E9Au, "UHD Graphics P630 (Coffee Lake WS)",         IG9_GEN_COFFEELAKE },
+    { 0x3E9Bu, "UHD Graphics 630 (Coffee Lake-H)",           IG9_GEN_COFFEELAKE },
+    { 0x3E9Cu, "UHD Graphics 615 (Coffee Lake Y)",           IG9_GEN_COFFEELAKE },
+    { 0x3EA0u, "UHD Graphics 620 (Whiskey Lake)",            IG9_GEN_COFFEELAKE },
+    { 0x3EA1u, "UHD Graphics 620 (Whiskey Lake U)",          IG9_GEN_COFFEELAKE },
+    { 0x3EA2u, "UHD Graphics 620 (Whiskey Lake U)",          IG9_GEN_COFFEELAKE },
+    { 0x3EA3u, "UHD Graphics 620 (Whiskey Lake U)",          IG9_GEN_COFFEELAKE },
+    { 0x3EA4u, "UHD Graphics 620 (Whiskey Lake U)",          IG9_GEN_COFFEELAKE },
+    { 0x3EA5u, "UHD Graphics 655 (Coffee Lake)",             IG9_GEN_COFFEELAKE },
+    { 0x3EA6u, "Iris Plus Graphics 655 (Coffee Lake)",       IG9_GEN_COFFEELAKE },
+    { 0x3EA7u, "Iris Plus Graphics 655 (Coffee Lake)",       IG9_GEN_COFFEELAKE },
+    { 0x3EA8u, "Iris Plus Graphics 655 (Coffee Lake)",       IG9_GEN_COFFEELAKE },
 
     /* --- Comet Lake (Gen9.5) --- */
-    { 0x9B21u, "UHD Graphics 610 (Comet Lake Mobile)",        IG9_GEN_COMETLAKE },
-    { 0x9B41u, "UHD Graphics 620 (Comet Lake Mobile)",        IG9_GEN_COMETLAKE },
-    { 0x9BA0u, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BA2u, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BA4u, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BA5u, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BA8u, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BAAu, "UHD Graphics 630 (Comet Lake Desktop)",       IG9_GEN_COMETLAKE },
-    { 0x9BC0u, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BC2u, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BC4u, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BC5u, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BC8u, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BCAu, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
-    { 0x9BCCu, "UHD Graphics 630 (Comet Lake)",               IG9_GEN_COMETLAKE },
+    { 0x9B21u, "UHD Graphics 610 (Comet Lake Mobile)",       IG9_GEN_COMETLAKE },
+    { 0x9B41u, "UHD Graphics 620 (Comet Lake Mobile)",       IG9_GEN_COMETLAKE },
+    { 0x9BA0u, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BA2u, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BA4u, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BA5u, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BA8u, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BAAu, "UHD Graphics 630 (Comet Lake Desktop)",      IG9_GEN_COMETLAKE },
+    { 0x9BC0u, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BC2u, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BC4u, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BC5u, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BC8u, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BCAu, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
+    { 0x9BCCu, "UHD Graphics 630 (Comet Lake)",              IG9_GEN_COMETLAKE },
 
     /* --- Broxton / Apollo Lake & Gemini Lake (Gen9 LP) --- */
-    { 0x1A84u, "HD Graphics (Broxton)",                       IG9_GEN_BROXTON },
-    { 0x1A85u, "HD Graphics (Broxton)",                       IG9_GEN_BROXTON },
-    { 0x5A84u, "HD Graphics 505 (Apollo Lake)",               IG9_GEN_BROXTON },
-    { 0x5A85u, "HD Graphics 500 (Apollo Lake)",               IG9_GEN_BROXTON },
-    { 0x3184u, "UHD Graphics 605 (Gemini Lake)",              IG9_GEN_GEMINILAKE },
-    { 0x3185u, "UHD Graphics 600 (Gemini Lake)",              IG9_GEN_GEMINILAKE },
+    { 0x1A84u, "HD Graphics (Broxton)",                      IG9_GEN_BROXTON },
+    { 0x1A85u, "HD Graphics (Broxton)",                      IG9_GEN_BROXTON },
+    { 0x5A84u, "HD Graphics 505 (Apollo Lake)",              IG9_GEN_BROXTON },
+    { 0x5A85u, "HD Graphics 500 (Apollo Lake)",              IG9_GEN_BROXTON },
+    { 0x3184u, "UHD Graphics 605 (Gemini Lake)",             IG9_GEN_GEMINILAKE },
+    { 0x3185u, "UHD Graphics 600 (Gemini Lake)",             IG9_GEN_GEMINILAKE },
 };
 
 #define IG9_DEVICE_COUNT (sizeof(g_ig9_devices) / sizeof(g_ig9_devices[0]))
 
-#define IG9_PCI_VENDOR_INTEL  0x8086u
-#define IG9_PCI_CLASS_DISPLAY 0x03u
+static bool g_probe_attempted = false;
 
-typedef struct {
-    uint8_t   bus;
-    uint8_t   device;
-    uint8_t   function;
-    uint16_t  device_id;
-    const char *name;
-    ig9_gen_t gen;
-} ig9_match_t;
-
-static ig9_match_t g_match;
-static int g_have_match = 0;
-static int g_probe_attempted = 0;
-
-/* ------------------------------------------------------------------ *
- * 2. MMIO register map (Gen9)
- * ------------------------------------------------------------------ */
-
-/* BAR0 (GTTMMADR) is 16 MiB on Gen8+: a 4 MiB register window followed by
- * the GGTT at +8 MiB. The whole BAR is mapped so both are reachable. */
-#define IG9_MMIO_MAP_BYTES       (16u * 1024u * 1024u)
-#define IG9_PAGE_BYTES           4096u
-
-/* GT forcewake: the GT power well must be awake before engine registers in
- * the 0x2xxxx block can be written. The acknowledge register reports the
- * same bit back once the well is up.
- * On Intel Gen9, writes use a 16-bit write mask in bits [31:16].
- * Broxton/Gemini Lake use FORCEWAKE_BXT at 0x0D88. */
-#define IG9_FORCEWAKE_MT         0xA188u
-#define IG9_FORCEWAKE_MT_ACK     0x130044u
-#define IG9_FORCEWAKE_BXT        0x0D88u
-#define IG9_FORCEWAKE_BLITTER    0x9A78u
-#define IG9_FORCEWAKE_BLT_ACK    0x130048u
-#define IG9_FORCEWAKE_KERNEL_BIT 0x1u
-
-/* Graphics Device Reset register (Gen6+ / Gen9): bit 1 triggers BCS soft reset. */
-#define IG9_GEN6_GDRST           0x941Cu
-#define IG9_GEN6_GDRST_BLT       (1u << 1)
-
-/* Blitter (BCS) ring, Gen9. TAIL/HEAD/START/CTL sit at +0x30/+0x34/+0x38/
- * +0x3C; HEAD and TAIL also carry wrap counts above their address field. */
-#define IG9_BLT_RING_BASE        0x22000u
-#define IG9_RING_TAIL            (IG9_BLT_RING_BASE + 0x30u)
-#define IG9_RING_HEAD            (IG9_BLT_RING_BASE + 0x34u)
-#define IG9_RING_START           (IG9_BLT_RING_BASE + 0x38u)
-#define IG9_RING_CTL             (IG9_BLT_RING_BASE + 0x3Cu)
-/* Gen7+ ring address-space selector. Firmware may leave BCS executing in a
- * PPGTT context; this driver owns only GGTT mappings, so every BCS command
- * must explicitly run with that selector disabled. */
-#define IG9_RING_MODE            (IG9_BLT_RING_BASE + 0x29Cu)
-#define IG9_RING_MODE_GFX_PPGTT  (1u << 9)
-#define IG9_RING_CTL_VALID       (1u << 0)
-#define IG9_RING_CTL_SIZE_SHIFT  12u
-#define IG9_RING_HEAD_ADDR_MASK  0x001FFFFCu
-
-/* GGTT: the GTTMMADR BAR is 16 MiB; the register window occupies its first
- * 4 MiB and Gen8+ places the GTT of 8-byte PTEs (4 KiB pages) at offset
- * 8 MiB, covering up to 4 GiB of graphics address space. */
-#define IG9_GGTT_OFFSET      (8u * 1024u * 1024u)
-#define IG9_GGTT_PTE_BYTES   8u
-#define IG9_GGTT_MAX_ENTRIES ((8u * 1024u * 1024u) / IG9_GGTT_PTE_BYTES)
-
-/* Bits [38:12] of a PTE hold the physical page address on Gen9; everything
- * else (present, read/write, cache/pat bits) is left exactly as found in
- * the firmware's own entries. */
-#define IG9_GGTT_PTE_ADDR_MASK ((uint64_t)0x7FFFFFF000ull)
-
-/* How large the firmware actually made the GTT is reported by the host
- * bridge in GMCH_CTRL bits [7:6] (PCI config offset 0x50, Gen8+ layout:
- * a value N >= 1 means 2^N MiB of page table). */
-#define IG9_PCI_GMCH_CTRL    0x50u
-#define IG9_GMCH_GGMS_SHIFT  6u
-#define IG9_GMCH_GGMS_MASK   0x3u
-#define IG9_PCI_CLASS_HOST_BRIDGE 0x06u
-#define IG9_PCI_SUBCLASS_HOST_BRIDGE 0x00u
-
-/* Display plane control registers (bit 31 is plane enable). */
-#define IG9_PLANE_CTL_1_A        0x70180u
-#define IG9_PLANE_CTL_1_B        0x71180u
-#define IG9_PLANE_CTL_1_C        0x72180u
-#define IG9_PLANE_CTL_ENABLE     (1u << 31)
-
-/* Display plane surface registers (pipe A/B/C, primary, sprite, and cursor).
- * The firmware leaves the scanout buffer's graphics address in one of
- * these; the address is in bits [31:12]. */
-#define IG9_PLANE_SURF_1_A       0x7019Cu
-#define IG9_PLANE_SURF_1_B       0x7119Cu
-#define IG9_PLANE_SURF_1_C       0x7219Cu
-#define IG9_PLANE_SURF_2_A       0x7029Cu
-#define IG9_PLANE_SURF_2_B       0x7129Cu
-#define IG9_PLANE_SURF_2_C       0x7229Cu
-#define IG9_PLANE_SURF_3_A       0x7039Cu
-#define IG9_PLANE_SURF_3_B       0x7139Cu
-#define IG9_PLANE_SURF_3_C       0x7239Cu
-#define IG9_PLANE_SURF_4_A       0x7049Cu
-#define IG9_PLANE_SURF_4_B       0x7149Cu
-#define IG9_PLANE_SURF_4_C       0x7249Cu
-#define IG9_CUR_SURF_A           0x7009Cu
-#define IG9_CUR_SURF_B           0x7109Cu
-#define IG9_CUR_SURF_C           0x7209Cu
-#define IG9_PLANE_SURF_ADDR_MASK 0xFFFFF000u
-
-/* Our own GGTT pages come from the top of the table, which the firmware does
- * not use; each candidate entry is required to read back as empty before it
- * is written, and the window is placed inside the table size the firmware
- * programmed (see ig9_ggtt_detect_size()). */
-/* 16K entries reserve a 64 MiB GPU virtual window for scanout, ring and scratch. */
-#define IG9_GGTT_PRIVATE_ENTRIES 16384u
-
-static volatile uint8_t *g_mmio = NULL;
-/* A forcewake request is a shared domain resource.  Keep the request asserted
- * until the last user releases it; a boolean lets one subsystem accidentally
- * power the domain down while another still owns MMIO access. */
-static uint32_t g_forcewake_refs = 0u;
-static uint32_t g_forcewake_reg = IG9_FORCEWAKE_MT;
-
-static uint32_t ig9_mmio_read32(uint32_t offset)
+static void ig9_pci_find_device(void)
 {
-    if (g_mmio == NULL) {
-        return 0u;
-    }
-    return *(volatile uint32_t *)(g_mmio + offset);
-}
-
-static void ig9_mmio_write32(uint32_t offset, uint32_t value)
-{
-    if (g_mmio == NULL) {
+    const driver_binary_t *api = g_ig9_api;
+    if (api == NULL || api->pci.get_device_count == NULL ||
+        api->pci.get_device == NULL) {
+        ig9_log("[IntelGen9] probe: no PCI client\n");
         return;
     }
-    *(volatile uint32_t *)(g_mmio + offset) = value;
-}
 
-static uint64_t ig9_ggtt_read_pte(uint32_t index)
-{
-    uint32_t lo = ig9_mmio_read32(IG9_GGTT_OFFSET + index * IG9_GGTT_PTE_BYTES);
-    uint32_t hi = ig9_mmio_read32(IG9_GGTT_OFFSET + index * IG9_GGTT_PTE_BYTES + 4u);
-    return (uint64_t)lo | ((uint64_t)hi << 32);
-}
-
-static void ig9_ggtt_write_pte(uint32_t index, uint64_t value)
-{
-    ig9_mmio_write32(IG9_GGTT_OFFSET + index * IG9_GGTT_PTE_BYTES,
-                     (uint32_t)(value & 0xFFFFFFFFu));
-    ig9_mmio_write32(IG9_GGTT_OFFSET + index * IG9_GGTT_PTE_BYTES + 4u,
-                     (uint32_t)(value >> 32));
-}
-
-/* Gen8+ GGTT invalidation, matching the GFX_FLSH_CNTL_GEN6 path in i915. */
-#define IG9_GFX_FLSH_CNTL_GEN6 0x101008u
-#define IG9_GFX_FLSH_CNTL_EN   (1u << 0)
-
-static void ig9_ggtt_invalidate(void)
-{
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    ig9_mmio_write32(IG9_GFX_FLSH_CNTL_GEN6, IG9_GFX_FLSH_CNTL_EN);
-    (void)ig9_mmio_read32(IG9_GFX_FLSH_CNTL_GEN6);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-}
-
-/* PTE template: the flags of an entry the firmware installed and is
- * currently scanning out of, so this driver never has to guess at Gen9's
- * present/cache bit layout. */
-static uint64_t g_ggtt_template = 0;
-static int g_ggtt_template_ready = 0;
-static uint32_t g_ggtt_entries = 0u;
-static uint32_t g_ggtt_private_first = 0u;
-static uint32_t g_ggtt_private_bitmap[
-    (IG9_GGTT_PRIVATE_ENTRIES + 31u) / 32u];
-#define IG9_GGTT_MAX_MAPPINGS 128u
-typedef struct {
-    uint8_t used;
-    uint32_t slot_first;
-    uint32_t slot_count;
-    uint32_t first_entry;
-    uint32_t pages;
-    const void *virt;
-} ig9_ggtt_mapping_t;
-
-static ig9_ggtt_mapping_t g_ggtt_mappings[IG9_GGTT_MAX_MAPPINGS];
-static volatile uint32_t g_ggtt_allocator_lock = 0u;
-static int g_ggtt_size_ready = 0;
-
-static void ig9_ggtt_lock(void)
-{
-    while (__atomic_exchange_n(&g_ggtt_allocator_lock, 1u,
-                               __ATOMIC_ACQUIRE) != 0u) {
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    }
-}
-
-static void ig9_ggtt_unlock(void)
-{
-    __atomic_store_n(&g_ggtt_allocator_lock, 0u, __ATOMIC_RELEASE);
-}
-
-static bool ig9_ggtt_slot_used(uint32_t slot)
-{
-    return (g_ggtt_private_bitmap[slot / 32u] &
-            (1u << (slot % 32u))) != 0u;
-}
-
-static void ig9_ggtt_mark_slots(uint32_t first, uint32_t count)
-{
-    for (uint32_t i = 0u; i < count; ++i) {
-        uint32_t slot = first + i;
-        g_ggtt_private_bitmap[slot / 32u] |= 1u << (slot % 32u);
-    }
-}
-
-static void ig9_ggtt_clear_slots(uint32_t first, uint32_t count)
-{
-    for (uint32_t i = 0u; i < count; ++i) {
-        uint32_t slot = first + i;
-        g_ggtt_private_bitmap[slot / 32u] &=
-            ~(1u << (slot % 32u));
-    }
-}
-
-/*
- * GMCH_CTRL.GGMS reports the size of the GTT page-table allocation. Never
- * assume the maximum BAR layout when the field cannot be read: a guessed
- * table size can make a PTE access walk beyond the implemented GGTT aperture.
- */
-static IG9_UNUSED bool ig9_ggtt_detect_size(void)
-{
-    if (g_api->pci.read_config == NULL ||
-        g_api->pci.get_device_count == NULL ||
-        g_api->pci.get_device == NULL) {
-        return false;
-    }
-
-    /* GGC/GMCH_CTRL belongs to the Intel host bridge (normally 00:00.0),
-     * not the display function (normally 00:02.0). Reading offset 0x50 from
-     * the GPU returns unrelated config data and makes a valid GGTT look
-     * disabled or impossibly small. */
-    uint8_t host_bus = 0u;
-    uint8_t host_device = 0u;
-    uint8_t host_function = 0u;
-    bool host_found = false;
-    uint32_t device_count = g_api->pci.get_device_count();
-    for (uint32_t i = 0u; i < device_count; ++i) {
-        driver_pci_device_t device;
-        if (!g_api->pci.get_device(i, &device) ||
-            device.vendor_id != IG9_PCI_VENDOR_INTEL ||
-            device.class_code != IG9_PCI_CLASS_HOST_BRIDGE ||
-            device.subclass != IG9_PCI_SUBCLASS_HOST_BRIDGE) {
+    uint32_t count = api->pci.get_device_count();
+    for (uint32_t i = 0; i < count; ++i) {
+        driver_pci_device_t dev;
+        if (!api->pci.get_device(i, &dev) ||
+            dev.vendor_id != IG9_PCI_VENDOR_INTEL) {
             continue;
         }
-        host_bus = device.bus;
-        host_device = device.device;
-        host_function = device.function;
-        host_found = true;
-        break;
-    }
-    if (!host_found) {
-        ig9_log("[IntelGen9] ggtt: Intel host bridge not found\n");
-        return false;
-    }
-
-    uint32_t gmch = g_api->pci.read_config(host_bus, host_device,
-                                           host_function, IG9_PCI_GMCH_CTRL);
-    uint32_t ggms = (gmch >> IG9_GMCH_GGMS_SHIFT) & IG9_GMCH_GGMS_MASK;
-    if (ggms < 1u || ggms > 3u) {
-        ig9_log("[IntelGen9] ggtt: invalid GMCH_CTRL.GGMS\n");
-        return false;
-    }
-
-    uint32_t entries = ((1u << ggms) * 1024u * 1024u) /
-                       IG9_GGTT_PTE_BYTES;
-    if (entries > IG9_GGTT_MAX_ENTRIES ||
-        entries < IG9_GGTT_PRIVATE_ENTRIES * 2u) {
-        ig9_log("[IntelGen9] ggtt: reported table is too small\n");
-        return false;
-    }
-
-    g_ggtt_entries = entries;
-    g_ggtt_private_first = entries - IG9_GGTT_PRIVATE_ENTRIES;
-    for (uint32_t i = 0u;
-         i < (IG9_GGTT_PRIVATE_ENTRIES + 31u) / 32u; ++i) {
-        g_ggtt_private_bitmap[i] = 0u;
-    }
-    g_ggtt_size_ready = 1;
-
-    ig9_log("[IntelGen9] ggtt entries 0x");
-    ig9_log_hex(g_ggtt_entries);
-    ig9_log("\n");
-    return true;
-}
-
-/*
- * Read-only search for the entry mapping `phys`. This is how the scanout
- * framebuffer - whose graphics address we are never told - becomes something
- * the blitter can be pointed at. The first match is also kept as the PTE
- * template used below.
- */
-static IG9_UNUSED bool ig9_ggtt_find_mapping(uint64_t phys, uint32_t *entry_out)
-{
-    uint64_t want = phys & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-
-    /* Firmware is free to place scanout above the first 64 MiB. The GGTT
-     * aperture is bounded by the value just read from the host bridge, so
-     * scanning the complete implemented table is safe and deterministic. */
-    for (uint32_t i = 0; i < g_ggtt_entries; ++i) {
-        uint64_t pte = ig9_ggtt_read_pte(i);
-        if ((pte & 0x1u) == 0u) {
-            continue;
-        }
-        if ((pte & IG9_GGTT_PTE_ADDR_MASK) == want) {
-            if (entry_out != NULL) {
-                *entry_out = i;
+        /* The allowlist decides, not the class code: firmware has been
+         * seen to enumerate the iGPU as 0x038000 instead of 0x030000. */
+        for (uint32_t d = 0; d < IG9_DEVICE_COUNT; ++d) {
+            if (g_ig9_devices[d].device_id != dev.device_id) {
+                continue;
             }
-            return true;
+            g_ig9_match.bus = dev.bus;
+            g_ig9_match.device = dev.device;
+            g_ig9_match.function = dev.function;
+            g_ig9_match.revision = dev.revision;
+            g_ig9_match.device_id = dev.device_id;
+            g_ig9_match.name = g_ig9_devices[d].name;
+            g_ig9_match.gen = g_ig9_devices[d].gen;
+            g_ig9_match.has_llc = g_ig9_devices[d].gen != IG9_GEN_BROXTON &&
+                                  g_ig9_devices[d].gen != IG9_GEN_GEMINILAKE;
+            g_ig9_have_match = true;
+            ig9_log("[IntelGen9] found ");
+            ig9_log(g_ig9_devices[d].name);
+            ig9_log(" id 0x");
+            ig9_log_hex(dev.device_id);
+            ig9_log(" rev 0x");
+            ig9_log_hex(dev.revision);
+            ig9_log("\n");
+            return;
+        }
+        if (dev.class_code == IG9_PCI_CLASS_DISPLAY) {
+            ig9_log("[IntelGen9] display device id 0x");
+            ig9_log_hex(dev.device_id);
+            ig9_log(" class 0x");
+            ig9_log_hex(((uint32_t)dev.class_code << 16) |
+                        ((uint32_t)dev.subclass << 8) | (uint32_t)dev.prog_if);
+            ig9_log(" not in the allowlist\n");
         }
     }
-    return false;
+    ig9_log("[IntelGen9] probe: no supported GPU\n");
 }
 
-/* The firmware's scanout entry is normally found by the physical-address
- * search above.  Some UEFI GOP implementations, however, hand the kernel a
- * framebuffer address that is an alias of the graphics address used by the
- * plane.  In that case the exact search quite correctly refuses the alias,
- * but we can still use the firmware's PTE attributes for a new mapping. */
-static bool ig9_ggtt_find_template(void)
-{
-    if (g_ggtt_size_ready == 0) {
-        return false;
-    }
-    for (uint32_t i = 0u; i < g_ggtt_entries; ++i) {
-        uint64_t pte = ig9_ggtt_read_pte(i);
-        if ((pte & 0x1u) != 0u) {
-            g_ggtt_template = pte;
-            g_ggtt_template_ready = 1;
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Point consecutive private GGTT entries at the pages of `virt`..`virt+bytes`
- * (one entry per page, in order). Walking pages instead of assuming one
- * contiguous physical span means this works for any allocation the kernel
- * hands out - the back buffer, the ring, scratch - whether or not it is
- * physically contiguous; the only requirement is a page-aligned start.
- * Each allocation is isolated by an unmapped guard page on both sides. PTEs
- * are read back exactly; a mismatch rolls the range back before returning.
- *
- * `physical_base` is an optional authoritative DMA address. When it is
- * supplied, it must be used instead of translating `virt` again: DMA
- * allocators may return a device-visible address that is not the result of
- * the generic kernel virtual-to-physical helper (for example because of a
- * DMA aperture or an allocator-specific offset).
- */
-static bool ig9_ggtt_map_pages(const void *virt, uint64_t physical_base,
-                               uint64_t bytes, uint32_t *ggtt_offset_out)
-{
-    if (g_ggtt_size_ready == 0 || g_ggtt_template_ready == 0 ||
-        (virt == NULL && physical_base == 0u) || ggtt_offset_out == NULL ||
-        bytes == 0u ||
-        bytes > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
-        return false;
-    }
-    if (virt != NULL &&
-        ((uintptr_t)virt & (uintptr_t)(IG9_PAGE_BYTES - 1u)) != 0u) {
-        return false;
-    }
-    if (virt == NULL &&
-        (physical_base & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u) {
-        return false;
-    }
-
-    uint64_t pages64 = (bytes + IG9_PAGE_BYTES - 1u) / IG9_PAGE_BYTES;
-    /* A guard page on each side stops surface/command prefetches from reaching
-     * a neighbouring allocation in the private GGTT window. */
-    if (pages64 == 0u ||
-        pages64 > (uint64_t)IG9_GGTT_PRIVATE_ENTRIES - 2u) {
-        return false;
-    }
-    uint32_t pages = (uint32_t)pages64;
-    uint32_t slots_needed = pages + 2u;
-
-    ig9_ggtt_lock();
-
-    uint32_t slot_first = UINT32_MAX;
-    for (uint32_t candidate = 0u;
-         candidate + slots_needed <= IG9_GGTT_PRIVATE_ENTRIES;
-         ++candidate) {
-        bool available = true;
-        for (uint32_t j = 0u; j < slots_needed; ++j) {
-            uint32_t slot = candidate + j;
-            uint32_t entry = g_ggtt_private_first + slot;
-            if (ig9_ggtt_slot_used(slot) ||
-                ig9_ggtt_read_pte(entry) != 0u) {
-                available = false;
-                candidate += j;
-                break;
-            }
-        }
-        if (available) {
-            slot_first = candidate;
-            break;
-        }
-    }
-    if (slot_first == UINT32_MAX) {
-        ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: private window exhausted\n");
-        return false;
-    }
-
-    uint32_t mapping_slot = UINT32_MAX;
-    for (uint32_t i = 0u; i < IG9_GGTT_MAX_MAPPINGS; ++i) {
-        if (g_ggtt_mappings[i].used == 0u) {
-            mapping_slot = i;
-            break;
-        }
-    }
-    if (mapping_slot == UINT32_MAX) {
-        ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: mapping table exhausted\n");
-        return false;
-    }
-
-    /* Validate every DMA address before the first hardware page-table write.
-     * A translation failure therefore cannot leave a partially mapped range. */
-    for (uint32_t i = 0u; i < pages; ++i) {
-        const uint8_t *page = (virt == NULL) ? NULL :
-                              (const uint8_t *)virt +
-                              (uint64_t)i * IG9_PAGE_BYTES;
-        uint64_t page_phys = (physical_base != 0u)
-                                 ? physical_base + (uint64_t)i * IG9_PAGE_BYTES
-                                 : (virt == NULL)
-                                       ? 0u
-                                       : api_virt_to_phys((void *)(uintptr_t)page);
-        if (page_phys == 0u ||
-            (page_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u ||
-            (page_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
-            ig9_ggtt_unlock();
-            ig9_log("[IntelGen9] ggtt: unmappable page\n");
-            return false;
-        }
-    }
-
-    uint32_t first_entry = g_ggtt_private_first + slot_first + 1u;
-    for (uint32_t i = 0u; i < pages; ++i) {
-        const uint8_t *page = (virt == NULL) ? NULL :
-                              (const uint8_t *)virt +
-                              (uint64_t)i * IG9_PAGE_BYTES;
-        uint64_t page_phys = (physical_base != 0u)
-                                 ? physical_base + (uint64_t)i * IG9_PAGE_BYTES
-                                 : (virt == NULL)
-                                       ? 0u
-                                       : api_virt_to_phys((void *)(uintptr_t)page);
-        uint64_t pte = (g_ggtt_template & ~IG9_GGTT_PTE_ADDR_MASK) |
-                       (page_phys & IG9_GGTT_PTE_ADDR_MASK);
-        ig9_ggtt_write_pte(first_entry + i, pte);
-    }
-    ig9_ggtt_invalidate();
-
-    bool verified = true;
-    for (uint32_t i = 0u; i < pages; ++i) {
-        const uint8_t *page = (virt == NULL) ? NULL :
-                              (const uint8_t *)virt +
-                              (uint64_t)i * IG9_PAGE_BYTES;
-        uint64_t page_phys = (physical_base != 0u)
-                                 ? physical_base + (uint64_t)i * IG9_PAGE_BYTES
-                                 : (virt == NULL)
-                                       ? 0u
-                                       : api_virt_to_phys((void *)(uintptr_t)page);
-        uint64_t expected = (g_ggtt_template & ~IG9_GGTT_PTE_ADDR_MASK) |
-                            (page_phys & IG9_GGTT_PTE_ADDR_MASK);
-        if (ig9_ggtt_read_pte(first_entry + i) != expected) {
-            verified = false;
-            break;
-        }
-    }
-
-    if (!verified) {
-        for (uint32_t i = 0u; i < pages; ++i) {
-            ig9_ggtt_write_pte(first_entry + i, 0u);
-        }
-        ig9_ggtt_invalidate();
-
-        bool rollback_ok = true;
-        for (uint32_t i = 0u; i < pages; ++i) {
-            if (ig9_ggtt_read_pte(first_entry + i) != 0u) {
-                rollback_ok = false;
-                break;
-            }
-        }
-        if (!rollback_ok) {
-            /* Do not let another allocation reuse an entry whose hardware
-             * state could not be proven clear. This reservation is permanent
-             * for this boot; it is safer than aliasing a live DMA mapping. */
-            ig9_ggtt_mark_slots(slot_first, slots_needed);
-        }
-        ig9_ggtt_unlock();
-        ig9_log(rollback_ok ?
-                "[IntelGen9] ggtt: PTE readback mismatch; rolled back\n" :
-                "[IntelGen9] ggtt: rollback unverified; range quarantined\n");
-        return false;
-    }
-
-    ig9_ggtt_mark_slots(slot_first, slots_needed);
-    g_ggtt_mappings[mapping_slot].used = 1u;
-    g_ggtt_mappings[mapping_slot].slot_first = slot_first;
-    g_ggtt_mappings[mapping_slot].slot_count = slots_needed;
-    g_ggtt_mappings[mapping_slot].first_entry = first_entry;
-    g_ggtt_mappings[mapping_slot].pages = pages;
-    g_ggtt_mappings[mapping_slot].virt = virt;
-    *ggtt_offset_out = first_entry * IG9_PAGE_BYTES;
-    ig9_ggtt_unlock();
-    return true;
-}
-
-/*
- * Remove a mapping only after the caller has proved that no engine can still
- * reference it. The GPU-VA range remains reserved unless every cleared PTE
- * reads back as zero; a failed clear therefore cannot be recycled to another
- * allocation.
- */
-static bool ig9_ggtt_unmap_pages(const void *virt, uint32_t ggtt_offset)
-{
-    if (g_ggtt_size_ready == 0 ||
-        (ggtt_offset & (IG9_PAGE_BYTES - 1u)) != 0u) {
-        return false;
-    }
-
-    ig9_ggtt_lock();
-    uint32_t mapping_slot = UINT32_MAX;
-    for (uint32_t i = 0u; i < IG9_GGTT_MAX_MAPPINGS; ++i) {
-        const ig9_ggtt_mapping_t *mapping = &g_ggtt_mappings[i];
-        if (mapping->used != 0u && mapping->virt == virt &&
-            mapping->first_entry * IG9_PAGE_BYTES == ggtt_offset) {
-            mapping_slot = i;
-            break;
-        }
-    }
-    if (mapping_slot == UINT32_MAX) {
-        ig9_ggtt_unlock();
-        return false;
-    }
-
-    ig9_ggtt_mapping_t *mapping = &g_ggtt_mappings[mapping_slot];
-    for (uint32_t i = 0u; i < mapping->pages; ++i) {
-        ig9_ggtt_write_pte(mapping->first_entry + i, 0u);
-    }
-    ig9_ggtt_invalidate();
-
-    bool cleared = true;
-    for (uint32_t i = 0u; i < mapping->pages; ++i) {
-        if (ig9_ggtt_read_pte(mapping->first_entry + i) != 0u) {
-            cleared = false;
-            break;
-        }
-    }
-    if (!cleared) {
-        ig9_ggtt_unlock();
-        ig9_log("[IntelGen9] ggtt: PTE clear failed; range retained\n");
-        return false;
-    }
-
-    ig9_ggtt_clear_slots(mapping->slot_first, mapping->slot_count);
-    mapping->used = 0u;
-    mapping->slot_first = 0u;
-    mapping->slot_count = 0u;
-    mapping->first_entry = 0u;
-    mapping->pages = 0u;
-    mapping->virt = NULL;
-    ig9_ggtt_unlock();
-    return true;
-}
 /* ------------------------------------------------------------------ *
- * 3. Ring, commands, fences
+ * 2. Display state
  * ------------------------------------------------------------------ */
 
-#define IG9_RING_BYTES    (64u * 1024u)
-/* Eight 8-dword copies plus a 4-dword fence fit in one present batch. */
-#define IG9_MAX_BATCH_DW  128u
-
-/* Command encodings, kept together so they can be checked against the Gen9
- * PRM without reading the logic around them. */
-#define IG9_MI_NOOP                  (0x00u << 23)
-#define IG9_MI_USER_INTERRUPT        (0x02u << 23)
-/* MI_STORE_DWORD_IMM, GEN4+ format: four dwords (header, address low,
- * address high, data) with the address interpreted as a GGTT address. */
-#define IG9_MI_STORE_DWORD_IMM_GEN4        ((0x20u << 23) | 2u)
-#define IG9_MI_USE_GGTT                    (1u << 22)
-#define IG9_MI_FLUSH_DW                    ((0x26u << 23) | 1u)
-#define IG9_MI_FLUSH_DW_STORE_DWORD        (1u << 14)
-#define IG9_MI_FLUSH_DW_USE_GGTT           (1u << 2)
-
-#define IG9_XY_COLOR_BLT_CMD         ((2u << 29) | (0x50u << 22))
-#define IG9_XY_SRC_COPY_BLT_CMD      ((2u << 29) | (0x53u << 22))
-#define IG9_BLT_WRITE_ALPHA          (1u << 21)
-#define IG9_BLT_WRITE_RGB            (1u << 20)
-#define IG9_BLT_DEPTH_32             (3u << 24)  /* 8888 destination */
-#define IG9_BLT_ROP_SRC_COPY         0xCCu
-#define IG9_BLT_ROP_PAT_COPY         0xF0u
-/* The 2D blit commands state "total dwords - 2" in bits [7:0]. */
-#define IG9_BLT_DW_LEN(dwords)       ((dwords) - 2u)
+#define IG9_BPP 4u
 
 typedef struct {
-    volatile uint32_t *base;   /* CPU view of the ring */
-    uint32_t ggtt_offset;      /* its graphics address */
-    uint32_t size_bytes;
-    uint32_t tail_bytes;       /* where the next command goes (8-byte aligned) */
-    uint32_t seqno;
-    int ready;
-} ig9_ring_t;
-
-static ig9_ring_t g_ring;
-
-/* RING_MODE uses the usual Intel masked-write layout: bits [31:16] select
- * which low-half bits are updated. XY BLT commands do not carry an explicit
- * GGTT/PPGTT selector, unlike MI_STORE_DWORD_IMM, so leaving this enabled
- * makes their addresses resolve through firmware-owned page tables. */
-static bool ig9_ring_select_ggtt(void)
-{
-    ig9_mmio_write32(IG9_RING_MODE, IG9_RING_MODE_GFX_PPGTT << 16);
-    return (ig9_mmio_read32(IG9_RING_MODE) & IG9_RING_MODE_GFX_PPGTT) == 0u;
-}
-
-/* Scratch page: GGTT-mapped, holds the fence dword and the blitter's own
- * self-test surface. */
-static uint8_t *g_scratch_virt = NULL;
-static uint64_t g_scratch_phys = 0u;
-static uint32_t g_scratch_ggtt = 0;
-static int g_scratch_ready = 0;
-
-static uint8_t *g_copy_src_virt = NULL;
-static uint32_t g_copy_src_ggtt = 0;
-static int g_copy_src_ready = 0;
-
-static int g_accel_ok = 0;
-
-#define IG9_FORCEWAKE_TIMEOUT_MS  50u
-#define IG9_RING_DRAIN_TIMEOUT_MS 50u
-#define IG9_FENCE_TIMEOUT_MS      50u
-/* MI_FLUSH_DW post-sync writes a QWord, so the fence occupies the final
- * aligned QWord rather than only the final dword of the scratch page. */
-#define IG9_FENCE_DWORD_OFFSET    (IG9_PAGE_BYTES - (2u * sizeof(uint32_t)))
-#define IG9_MAX_RECTS_PER_BATCH   8u
-
-static volatile uint32_t *ig9_fence_slot(void)
-{
-    if (g_scratch_virt == NULL) {
-        return NULL;
-    }
-    return (volatile uint32_t *)(void *)(g_scratch_virt + IG9_FENCE_DWORD_OFFSET);
-}
-
-/*
- * Free space between the engine (HEAD) and the next command (TAIL). HEAD is
- * masked to its address field (its wrap count lives above it) and one 8-byte
- * slot is always left unused, which is what makes HEAD == TAIL mean "empty".
- * The mask arithmetic works because the ring size is a power of two.
- */
-static uint32_t ig9_ring_free_dwords(void)
-{
-    uint32_t head = ig9_mmio_read32(IG9_RING_HEAD) & IG9_RING_HEAD_ADDR_MASK;
-    uint32_t tail = g_ring.tail_bytes;
-    uint32_t size = g_ring.size_bytes;
-
-    if (size == 0u) {
-        return 0u;
-    }
-    return ((tail - head - 8u) & (size - 1u)) / 4u;
-}
-
-/*
- * Copy a prepared batch into the ring and ring the doorbell. Batches are
- * padded to 8 bytes because that is the alignment the engine reads its
- * buffer at. Returns false without touching the hardware when there is not
- * enough room; callers drain first rather than blocking in here.
- */
-static bool ig9_ring_submit(const uint32_t *cmds, uint32_t dwords)
-{
-    if (g_ring.ready == 0 || cmds == NULL || dwords == 0u) {
-        return false;
-    }
-
-    uint32_t padded = (dwords + 1u) & ~1u;
-    if (padded + 4u > ig9_ring_free_dwords()) {
-        return false;
-    }
-
-    uint32_t start = g_ring.tail_bytes;
-    for (uint32_t i = 0; i < padded; ++i) {
-        uint32_t offset = g_ring.tail_bytes / 4u;
-        g_ring.base[offset] = (i < dwords) ? cmds[i] : IG9_MI_NOOP;
-        g_ring.tail_bytes += 4u;
-        if (g_ring.tail_bytes >= g_ring.size_bytes) {
-            g_ring.tail_bytes = 0u;
-        }
-    }
-
-    /* The engine reads memory, not the CPU's caches: write the batch back
-     * before the doorbell rings, then order the tail store after it. */
-    const uint8_t *ring_bytes = (const uint8_t *)(const void *)g_ring.base;
-    uint32_t written = padded * 4u;
-    if (start + written <= g_ring.size_bytes) {
-        ig9_cache_flush(ring_bytes + start, written);
-    } else {
-        ig9_cache_flush(ring_bytes + start, g_ring.size_bytes - start);
-        ig9_cache_flush(ring_bytes, start + written - g_ring.size_bytes);
-    }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-
-    ig9_mmio_write32(IG9_RING_TAIL, g_ring.tail_bytes);
-    /* Posting read: make sure the doorbell write reached the device. */
-    (void)ig9_mmio_read32(IG9_RING_TAIL);
-    return true;
-}
-
-static bool ig9_ring_drain(uint32_t timeout_ms)
-{
-    for (uint32_t waited = 0; waited <= timeout_ms; ++waited) {
-        if ((ig9_mmio_read32(IG9_RING_HEAD) & IG9_RING_HEAD_ADDR_MASK) ==
-            g_ring.tail_bytes) {
-            return true;
-        }
-        ig9_msleep(1u);
-    }
-    return false;
-}
-
-/* Append a cache flush and fence: the engine flushes BLT/render writes and
- * performs a post-sync Store DWord before storing an incrementing seqno into
- * the scratch page. The explicit post-sync form is required by the Gen9 BCS;
- * a three-DWord MI_FLUSH_DW without it can remain stuck in the flush command.
- * The engines execute in order, so a landed fence means the work queued ahead
- * of it has executed and its system-memory writes are visible to the CPU.
- * On Gen9, MI_STORE_DWORD_IMM_GEN4 stores the sequence number to the
- * GGTT-mapped fence slot after the preceding blit commands. */
-static bool ig9_emit_fence(uint32_t *batch, uint32_t *dw_inout)
-{
-    if (g_scratch_ready == 0 || batch == NULL || dw_inout == NULL) {
-        return false;
-    }
-    uint32_t dw = *dw_inout;
-    uint32_t seqno = g_ring.seqno + 1u;
-    if (seqno == 0u) {
-        seqno = 1u;
-    }
-    g_ring.seqno = seqno;
-
-    /* Prevent an old value from satisfying a wait after 32-bit wraparound. */
-    volatile uint32_t *slot = ig9_fence_slot();
-    if (slot == NULL) {
-        return false;
-    }
-    __atomic_store_n(slot, ~seqno, __ATOMIC_RELEASE);
-    ig9_cache_flush((const void *)slot, sizeof(uint32_t));
-
-    /* XY_COLOR_BLT and XY_SRC_COPY_BLT can leave writes in the BLT/render
-     * cache. Use the four-dword post-sync form: Gen9 BCS can otherwise stop
-     * while executing a three-dword MI_FLUSH_DW with no post-sync operation. */
-    batch[dw++] = (IG9_MI_FLUSH_DW + 1u) |
-                  IG9_MI_FLUSH_DW_STORE_DWORD;
-    batch[dw++] = (g_scratch_ggtt + IG9_FENCE_DWORD_OFFSET) |
-                  IG9_MI_FLUSH_DW_USE_GGTT;
-    batch[dw++] = 0u;   /* address high dword */
-    batch[dw++] = 0u;   /* post-sync value */
-    batch[dw++] = 0u;
-    batch[dw++] = IG9_MI_STORE_DWORD_IMM_GEN4 | IG9_MI_USE_GGTT;
-    batch[dw++] = g_scratch_ggtt + IG9_FENCE_DWORD_OFFSET;
-    batch[dw++] = 0u;   /* address high dword */
-    batch[dw++] = seqno;
-    *dw_inout = dw;
-    return true;
-}
-
-/* Reset the Blitter Command Streamer (BCS) via GDRST on hang/timeout */
-static bool ig9_reset_bcs(void)
-{
-    if (g_mmio == NULL) {
-        return false;
-    }
-    /* GEN6_GDRST: bit 1 requests blitter engine soft reset */
-    ig9_mmio_write32(IG9_GEN6_GDRST, IG9_GEN6_GDRST_BLT);
-    for (uint32_t i = 0u; i <= 50u; ++i) {
-        if ((ig9_mmio_read32(IG9_GEN6_GDRST) & IG9_GEN6_GDRST_BLT) == 0u) {
-            /* Reset complete; re-initialize BCS ring registers */
-            ig9_mmio_write32(IG9_RING_CTL, 0u);
-            ig9_mmio_write32(IG9_RING_HEAD, 0u);
-            ig9_mmio_write32(IG9_RING_TAIL, 0u);
-            ig9_mmio_write32(IG9_RING_START, g_ring.ggtt_offset);
-            if (!ig9_ring_select_ggtt()) {
-                ig9_log("[IntelGen9] BCS reset: could not select GGTT\n");
-                return false;
-            }
-            ig9_mmio_write32(IG9_RING_CTL,
-                             (((IG9_RING_BYTES / IG9_PAGE_BYTES) - 1u) <<
-                              IG9_RING_CTL_SIZE_SHIFT) | IG9_RING_CTL_VALID);
-            g_ring.tail_bytes = 0u;
-            ig9_log("[IntelGen9] BCS reset completed, ring re-armed\n");
-            return true;
-        }
-        ig9_msleep(1u);
-    }
-    ig9_log("[IntelGen9] BCS reset timed out\n");
-    return false;
-}
-
-static bool ig9_wait_fence(uint32_t seqno, uint32_t timeout_ms)
-{
-    if (g_scratch_ready == 0) {
-        return false;
-    }
-    volatile uint32_t *slot = ig9_fence_slot();
-    for (uint32_t waited = 0; waited <= timeout_ms; ++waited) {
-        /* Drop the CPU's cached copy so the engine's store is visible. */
-        ig9_cache_flush((const void *)slot, sizeof(uint32_t));
-        if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == seqno) {
-            return true;
-        }
-        ig9_msleep(1u);
-    }
-
-    /* Some Gen9 firmware configurations execute the BCS stream and advance
-     * HEAD correctly but do not make a GGTT MI_STORE value visible through
-     * the CPU mapping in the short fence window. HEAD == TAIL is still a
-     * valid completion barrier for this single-owner ring: all commands
-     * preceding TAIL have been consumed. The self-tests verify the actual
-     * destination bytes, so this cannot silently bless a dead BLT. */
-    if (ig9_ring_drain(timeout_ms)) {
-        ig9_log("[IntelGen9] fence value not visible; ring drained\n");
-        return true;
-    }
-
-    /* Attempt hardware engine recovery via BCS reset */
-    ig9_log("[IntelGen9] wait_fence: timeout, attempting BCS reset\n");
-    (void)ig9_reset_bcs();
-    return false;
-}
-
-static void ig9_log_bcs_state(const char *prefix)
-{
-    ig9_log(prefix);
-    ig9_log(" head 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_RING_HEAD));
-    ig9_log(" tail 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_RING_TAIL));
-    ig9_log(" acthd 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_BLT_RING_BASE + 0x74u));
-    ig9_log(" ipeir 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_BLT_RING_BASE + 0x64u));
-    ig9_log(" ipehr 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_BLT_RING_BASE + 0x68u));
-    ig9_log(" instdone 0x");
-    ig9_log_hex(ig9_mmio_read32(IG9_BLT_RING_BASE + 0x6Cu));
-    ig9_log("\n");
-}
-
-/* ------------------------------------------------------------------ *
- * 4. Blitter commands
- * ------------------------------------------------------------------ */
-
-/* XY_COLOR_BLT: six dwords (command, BR13 with destination pitch, rect
- * top-left, rect bottom-right, destination graphics address, colour). */
-static uint32_t ig9_emit_fill(uint32_t *batch, uint32_t dst_ggtt,
-                              uint32_t dst_pitch, int32_t x, int32_t y,
-                              uint32_t w, uint32_t h, uint32_t color)
-{
-    uint32_t dw = 0u;
-
-    batch[dw++] = IG9_XY_COLOR_BLT_CMD | IG9_BLT_DW_LEN(6u) |
-                  IG9_BLT_WRITE_ALPHA | IG9_BLT_WRITE_RGB;
-    batch[dw++] = IG9_BLT_DEPTH_32 |
-                  ((uint32_t)IG9_BLT_ROP_PAT_COPY << 16) |
-                  (dst_pitch & 0xFFFFu);
-    batch[dw++] = ((uint32_t)y << 16) | ((uint32_t)x & 0xFFFFu);
-    batch[dw++] = ((uint32_t)(y + (int32_t)h) << 16) |
-                  ((uint32_t)(x + (int32_t)w) & 0xFFFFu);
-    batch[dw++] = dst_ggtt;
-    batch[dw++] = color;
-    return dw;
-}
-
-/* XY_SRC_COPY_BLT: eight dwords (command, BR13 with destination pitch,
- * destination rect, destination address, source position, source pitch,
- * source address). The destination rectangle's size sets the copy size;
- * clipping is the caller's job. */
-static uint32_t ig9_emit_copy(uint32_t *batch,
-                              uint32_t dst_ggtt, uint32_t dst_pitch,
-                              uint32_t src_ggtt, uint32_t src_pitch,
-                              int32_t x, int32_t y, uint32_t w, uint32_t h)
-{
-    uint32_t dw = 0u;
-
-    batch[dw++] = IG9_XY_SRC_COPY_BLT_CMD | IG9_BLT_DW_LEN(8u) |
-                  IG9_BLT_WRITE_ALPHA | IG9_BLT_WRITE_RGB;
-    batch[dw++] = IG9_BLT_DEPTH_32 |
-                  ((uint32_t)IG9_BLT_ROP_SRC_COPY << 16) |
-                  (dst_pitch & 0xFFFFu);
-    batch[dw++] = ((uint32_t)y << 16) | ((uint32_t)x & 0xFFFFu);
-    batch[dw++] = ((uint32_t)(y + (int32_t)h) << 16) |
-                  ((uint32_t)(x + (int32_t)w) & 0xFFFFu);
-    batch[dw++] = dst_ggtt;
-    batch[dw++] = ((uint32_t)y << 16) | ((uint32_t)x & 0xFFFFu);
-    batch[dw++] = src_pitch & 0xFFFFu;
-    batch[dw++] = src_ggtt;
-    return dw;
-}
-
-/* ------------------------------------------------------------------ *
- * 5. Bring-up: forcewake, ring, self-tests
- * ------------------------------------------------------------------ */
-
-static IG9_UNUSED bool ig9_forcewake(void)
-{
-    if (g_forcewake_refs != 0u) {
-        ++g_forcewake_refs;
-        return true;
-    }
-
-    /* Intel Gen9 masked register write: high 16 bits are the write mask */
-    uint32_t req = (IG9_FORCEWAKE_KERNEL_BIT << 16) | IG9_FORCEWAKE_KERNEL_BIT;
-    uint32_t fw_reg = IG9_FORCEWAKE_MT;
-    uint32_t ack_reg = IG9_FORCEWAKE_MT_ACK;
-
-    if (g_have_match != 0 &&
-        (g_match.gen == IG9_GEN_BROXTON || g_match.gen == IG9_GEN_GEMINILAKE)) {
-        fw_reg = IG9_FORCEWAKE_BXT;
-    }
-
-    ig9_mmio_write32(fw_reg, req);
-    /* Also request blitter-domain forcewake if register exists */
-    ig9_mmio_write32(IG9_FORCEWAKE_BLITTER, req);
-
-    for (uint32_t waited = 0; waited <= IG9_FORCEWAKE_TIMEOUT_MS; ++waited) {
-        if ((ig9_mmio_read32(ack_reg) & IG9_FORCEWAKE_KERNEL_BIT) != 0u) {
-            /* Re-assert so driver holds the reference */
-            ig9_mmio_write32(fw_reg, req);
-            g_forcewake_reg = fw_reg;
-            g_forcewake_refs = 1u;
-            return true;
-        }
-        ig9_msleep(1u);
-    }
-
-    /* Fallback: try standard A188 if BXT was selected or vice-versa */
-    if (fw_reg == IG9_FORCEWAKE_BXT) {
-        fw_reg = IG9_FORCEWAKE_MT;
-        ig9_mmio_write32(fw_reg, req);
-        for (uint32_t waited = 0; waited <= IG9_FORCEWAKE_TIMEOUT_MS; ++waited) {
-            if ((ig9_mmio_read32(ack_reg) & IG9_FORCEWAKE_KERNEL_BIT) != 0u) {
-                ig9_mmio_write32(fw_reg, req);
-                g_forcewake_reg = fw_reg;
-                g_forcewake_refs = 1u;
-                return true;
-            }
-            ig9_msleep(1u);
-        }
-    }
-
-    /* Nothing else is touched if acknowledge never comes: clean up and report failure */
-    ig9_mmio_write32(fw_reg, (IG9_FORCEWAKE_KERNEL_BIT << 16) | 0u);
-    ig9_mmio_write32(IG9_FORCEWAKE_BLITTER, (IG9_FORCEWAKE_KERNEL_BIT << 16) | 0u);
-    return false;
-}
-
-static IG9_UNUSED void ig9_forcewake_release(void)
-{
-    if (g_forcewake_refs != 0u) {
-        --g_forcewake_refs;
-    }
-    if (g_forcewake_refs == 0u) {
-        uint32_t clr = (IG9_FORCEWAKE_KERNEL_BIT << 16) | 0u;
-        ig9_mmio_write32(g_forcewake_reg, clr);
-        ig9_mmio_write32(IG9_FORCEWAKE_BLITTER, clr);
-        /* Keep the selected domain explicit for the next acquire. */
-        g_forcewake_reg = IG9_FORCEWAKE_MT;
-    }
-}
-
-static IG9_UNUSED bool ig9_ring_init(void)
-{
-    uint64_t ring_phys = 0;
-    uint8_t *ring = (uint8_t *)api_dma_alloc(IG9_RING_BYTES, &ring_phys);
-    if (ring == NULL || ring_phys == 0u) {
-        ig9_log("[IntelGen9] ring: dma_alloc failed\n");
-        return false;
-    }
-    api_memset(ring, 0, IG9_RING_BYTES);
-
-    if ((ring_phys & (uint64_t)(IG9_PAGE_BYTES - 1u)) != 0u) {
-        ig9_log("[IntelGen9] ring: not page aligned\n");
-        api_dma_free(ring, IG9_RING_BYTES);
-        return false;
-    }
-
-    if (!ig9_ggtt_map_pages(ring, ring_phys, IG9_RING_BYTES,
-                            &g_ring.ggtt_offset)) {
-        ig9_log("[IntelGen9] ring: no GGTT mapping\n");
-        api_dma_free(ring, IG9_RING_BYTES);
-        return false;
-    }
-
-    g_ring.base = (volatile uint32_t *)(void *)ring;
-    g_ring.size_bytes = IG9_RING_BYTES;
-    g_ring.tail_bytes = 0u;
-    g_ring.seqno = 0u;
-
-    ig9_log("[IntelGen9] ring: ggtt 0x");
-    ig9_log_hex(g_ring.ggtt_offset);
-    ig9_log("\n");
-
-    ig9_mmio_write32(IG9_RING_CTL, 0u);
-    ig9_mmio_write32(IG9_RING_HEAD, 0u);
-    ig9_mmio_write32(IG9_RING_TAIL, 0u);
-    ig9_mmio_write32(IG9_RING_START, g_ring.ggtt_offset);
-    if (!ig9_ring_select_ggtt()) {
-        ig9_log("[IntelGen9] ring: could not select GGTT\n");
-        (void)ig9_ggtt_unmap_pages(ring, g_ring.ggtt_offset);
-        api_dma_free(ring, IG9_RING_BYTES);
-        g_ring.base = NULL;
-        g_ring.size_bytes = 0u;
-        g_ring.ggtt_offset = 0u;
-        return false;
-    }
-    ig9_log("[IntelGen9] ring: GGTT address space selected\n");
-    /* Size is expressed in pages-minus-one at bit 12, with the valid bit. */
-    ig9_mmio_write32(IG9_RING_CTL,
-                     (((IG9_RING_BYTES / IG9_PAGE_BYTES) - 1u) <<
-                      IG9_RING_CTL_SIZE_SHIFT) | IG9_RING_CTL_VALID);
-
-    g_ring.ready = 1;
-    return true;
-}
-
-/* Stage 0: does the ring move at all? */
-static IG9_UNUSED bool ig9_selftest_ring(void)
-{
-    uint32_t batch[4];
-    uint32_t dw = 0u;
-
-    batch[dw++] = IG9_MI_NOOP;
-    batch[dw++] = IG9_MI_NOOP;
-    batch[dw++] = IG9_MI_USER_INTERRUPT;
-
-    if (!ig9_ring_submit(batch, dw)) {
-        ig9_log("[IntelGen9] selftest: submit failed\n");
-        return false;
-    }
-    if (!ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS)) {
-        ig9_log("[IntelGen9] selftest: ring did not drain\n");
-        return false;
-    }
-    return true;
-}
-
-/* Verify the GGTT destination path independently of XY_COLOR_BLT. */
-static IG9_UNUSED bool ig9_selftest_store(void)
-{
-    uint32_t batch[IG9_MAX_BATCH_DW];
-    uint32_t dw = 0u;
-    const uint32_t marker = 0x13579BDFu;
-    volatile uint32_t *word = (volatile uint32_t *)(void *)g_scratch_virt;
-
-    *word = 0u;
-    ig9_cache_flush(g_scratch_virt, sizeof(uint32_t));
-
-    batch[dw++] = IG9_MI_STORE_DWORD_IMM_GEN4 | IG9_MI_USE_GGTT;
-    batch[dw++] = g_scratch_ggtt;
-    batch[dw++] = 0u;
-    batch[dw++] = marker;
-
-    if (!ig9_emit_fence(batch, &dw) || !ig9_ring_submit(batch, dw) ||
-        !ig9_wait_fence(g_ring.seqno, IG9_FENCE_TIMEOUT_MS)) {
-        ig9_log("[IntelGen9] selftest: GGTT store wait failed\n");
-        ig9_log_bcs_state("[IntelGen9] BCS:");
-        return false;
-    }
-
-    ig9_cache_flush(g_scratch_virt, sizeof(uint32_t));
-    if (*word != marker) {
-        ig9_log("[IntelGen9] selftest: GGTT store wrong value ");
-        ig9_log_hex((uint32_t)*word);
-        ig9_log(" expected ");
-        ig9_log_hex(marker);
-        ig9_log("\n");
-        ig9_log_bcs_state("[IntelGen9] BCS:");
-        return false;
-    }
-    return true;
-}
-
-/* Stage 1: can the blitter write memory this driver owns? */
-static IG9_UNUSED bool ig9_selftest_fill(void)
-{
-    uint32_t batch[IG9_MAX_BATCH_DW];
-    uint32_t dw = 0u;
-    const uint32_t pattern = 0xA5C3E1FFu;
-    uint32_t seqno;
-
-    ig9_log("[IntelGen9] selftest: scratch ggtt 0x");
-    ig9_log_hex(g_scratch_ggtt);
-    ig9_log(" pte 0x");
-    ig9_log_hex((uint32_t)ig9_ggtt_read_pte(g_scratch_ggtt /
-                                            IG9_PAGE_BYTES));
-    ig9_log(" phys 0x");
-    ig9_log_hex((uint32_t)g_scratch_phys);
-    ig9_log("\n");
-
-    dw += ig9_emit_fill(batch, g_scratch_ggtt, 256u, 0, 0, 32u, 8u, pattern);
-    if (!ig9_emit_fence(batch, &dw)) {
-        return false;
-    }
-    seqno = g_ring.seqno;
-
-    volatile uint32_t *words = (volatile uint32_t *)(void *)g_scratch_virt;
-    for (uint32_t i = 0; i < 64u; ++i) {
-        words[i] = 0u;
-    }
-    ig9_cache_flush(g_scratch_virt, 256u);
-
-    if (!ig9_ring_submit(batch, dw)) {
-        ig9_log("[IntelGen9] selftest: fill submit failed\n");
-        return false;
-    }
-    if (!ig9_wait_fence(seqno, IG9_FENCE_TIMEOUT_MS)) {
-        ig9_log("[IntelGen9] selftest: fill fence timeout\n");
-        ig9_log_bcs_state("[IntelGen9] BCS:");
-        return false;
-    }
-
-    ig9_cache_flush(g_scratch_virt, 256u);
-    for (uint32_t i = 0; i < 5u; ++i) {
-        if (words[i] != pattern) {
-            ig9_log("[IntelGen9] selftest: fill wrong at ");
-            ig9_log_hex(i);
-            ig9_log(" value ");
-            ig9_log_hex((uint32_t)words[i]);
-            ig9_log(" expected ");
-            ig9_log_hex(pattern);
-            ig9_log("\n");
-            ig9_log_bcs_state("[IntelGen9] BCS:");
-            return false;
-        }
-    }
-    return true;
-}
-
-/* Stage 2: the copy direction present_rects() needs - source in system
- * memory written by the CPU, destination in GGTT-mapped memory. */
-static IG9_UNUSED bool ig9_selftest_copy(void)
-{
-    uint32_t batch[IG9_MAX_BATCH_DW];
-    uint32_t dw = 0u;
-    uint32_t seqno;
-
-    if (g_copy_src_ready == 0 || g_scratch_ready == 0) {
-        return false;
-    }
-
-    volatile uint32_t *src = (volatile uint32_t *)(void *)g_copy_src_virt;
-    for (uint32_t i = 0; i < 64u; ++i) {
-        src[i] = 0x11223344u + i;
-    }
-    ig9_cache_flush(g_copy_src_virt, 256u);
-
-    volatile uint32_t *dst = (volatile uint32_t *)(void *)g_scratch_virt;
-    for (uint32_t i = 0; i < 64u; ++i) {
-        dst[i] = 0u;
-    }
-    ig9_cache_flush(g_scratch_virt, 256u);
-
-    dw += ig9_emit_copy(batch, g_scratch_ggtt, 256u, g_copy_src_ggtt, 256u,
-                        0, 0, 64u, 1u);
-    if (!ig9_emit_fence(batch, &dw)) {
-        return false;
-    }
-    seqno = g_ring.seqno;
-
-    if (!ig9_ring_submit(batch, dw)) {
-        ig9_log("[IntelGen9] selftest: copy submit failed\n");
-        return false;
-    }
-    if (!ig9_wait_fence(seqno, IG9_FENCE_TIMEOUT_MS)) {
-        ig9_log("[IntelGen9] selftest: copy fence timeout\n");
-        return false;
-    }
-
-    ig9_cache_flush(g_scratch_virt, 256u);
-    for (uint32_t i = 0; i < 64u; ++i) {
-        if (dst[i] != 0x11223344u + i) {
-            ig9_log("[IntelGen9] selftest: copy wrong at ");
-            ig9_log_hex(i);
-            ig9_log(" value ");
-            ig9_log_hex((uint32_t)dst[i]);
-            ig9_log(" expected ");
-            ig9_log_hex(0x11223344u + i);
-            ig9_log("\n");
-            ig9_log_bcs_state("[IntelGen9] BCS:");
-            return false;
-        }
-    }
-    return true;
-}
-
-/* ------------------------------------------------------------------ *
- * 6. Display surface (same protocol as the generic driver)
- * ------------------------------------------------------------------ */
-
-#define IG9_BYTES_PER_PIXEL 4u
-
-typedef struct {
+    /* boot framebuffer */
     uint32_t width;
     uint32_t height;
-    uint32_t pixels_per_scan_line;
+    uint32_t stride_px;
     uint64_t size_bytes;
-    uint64_t phys_base;
-    volatile uint8_t *mapped;
-    uint32_t ggtt_offset;   /* graphics address of the first mapped page */
-    int ggtt_found;
+    uint64_t phys;
+    volatile uint8_t *cpu;          /* WC (or UC) CPU mapping of scanout */
+
+    /* driver-owned back buffer the WM draws into */
+    uint32_t *back;
+    void *back_raw;
+    uint64_t back_bytes;
+    uint32_t back_ggtt;
+    bool back_mapped;
+
+    /* scanout as seen by the GPU */
+    uint32_t fb_ggtt;
+    bool fb_ggtt_ok;
 } ig9_fb_t;
 
+typedef struct {
+    bool found;
+    uint32_t pipe;
+    uint32_t plane;
+    uint32_t plane_ctl;
+    uint32_t pipe_w;
+    uint32_t pipe_h;
+    uint32_t output_type;
+    char output_name[16];
+    uint32_t refresh_millihz;
+} ig9_scanout_t;
+
 static ig9_fb_t g_fb;
-static uint32_t *g_back_buffer = NULL;
-static uint8_t *g_back_buffer_raw = NULL;
-static uint64_t g_back_buffer_bytes = 0;
-static uint32_t g_back_ggtt = 0;
-static int g_back_ggtt_ready = 0;
-static int g_ready = 0;
+static ig9_scanout_t g_scanout;
+static bool g_ready = false;         /* a framebuffer is set up */
+static bool g_initialized = false;   /* probe() matched and init() ran */
+static bool g_hw_attempted = false;
 static uint32_t g_generation = 1u;
+static ig9_spinlock_t g_present_lock;
 
 static void ig9_copy_string(char *dst, uint32_t dst_size, const char *src)
 {
@@ -1514,328 +246,474 @@ static void ig9_copy_string(char *dst, uint32_t dst_size, const char *src)
     dst[i] = '\0';
 }
 
-static bool ig9_fb_set(const driver_boot_framebuffer_t *framebuffer)
-{
-    uint32_t old_generation = g_generation;
-    g_ready = 0;
-    /* Preserve g_back_ggtt_ready until the old mapping has been drained and
-     * unmapped below; clearing it here would orphan a live GPU mapping. */
-    ++g_generation;
+/* ------------------------------------------------------------------ *
+ * 3. Reading the firmware's display configuration (read-only)
+ * ------------------------------------------------------------------ */
 
-    if (g_back_buffer != NULL) {
-        bool release_back_buffer = true;
-        if (g_back_ggtt_ready != 0) {
-            /* A CPU free is legal only after the BCS has stopped reading the
-             * old pages and the corresponding GGTT PTEs are visibly cleared. */
-            if (g_ring.ready != 0 &&
-                (!ig9_ring_drain(IG9_RING_DRAIN_TIMEOUT_MS) ||
-                 g_scratch_ready == 0 ||
-                 (g_ring.seqno != 0u &&
-                  !ig9_wait_fence(g_ring.seqno, IG9_FENCE_TIMEOUT_MS)))) {
-                /* HEAD == TAIL only proves fetch progress. The fence is the
-                 * completion proof that every earlier BLT has stopped
-                 * reading the old buffer pages. */
-                release_back_buffer = false;
-                g_accel_ok = 0;
-                ig9_log("[IntelGen9] fb: old back buffer retained (engine busy)\n");
-                /* Do not discard the only safe reference to memory which the
-                 * GPU may still touch.  The caller can retry after the engine
-                 * drains; the old framebuffer remains the active one. */
-                g_generation = old_generation;
-                g_ready = 1;
-                return false;
-            } else if (!ig9_ggtt_unmap_pages(g_back_buffer, g_back_ggtt)) {
-                release_back_buffer = false;
-                g_accel_ok = 0;
-                ig9_log("[IntelGen9] fb: old back buffer retained (GGTT unmap failed)\n");
-                g_generation = old_generation;
-                g_ready = 1;
+static uint32_t ig9_planes_per_pipe(void)
+{
+    /* SKL/KBL/CFL: 2 sprite + 1 primary universal planes per pipe;
+     * BXT/GLK: 3 + 1. */
+    return (g_ig9_match.gen == IG9_GEN_BROXTON ||
+            g_ig9_match.gen == IG9_GEN_GEMINILAKE) ? 4u : 3u;
+}
+
+/* Which transcoder feeds `pipe`, and what kind of port does it drive? */
+static void ig9_detect_output(uint32_t pipe)
+{
+    static const char ports[] = "ABCDE";
+    uint32_t ctl = 0u;
+    bool edp = false;
+
+    uint32_t edp_ctl = ig9_read32(IG9_TRANS_DDI_FUNC_CTL_EDP);
+    if ((edp_ctl & IG9_TRANS_DDI_ENABLE) != 0u) {
+        uint32_t in = (edp_ctl >> IG9_TRANS_DDI_EDP_INPUT_SHIFT) &
+                      IG9_TRANS_DDI_EDP_INPUT_MASK;
+        uint32_t edp_pipe = (in == 5u) ? 1u : (in == 6u) ? 2u : 0u;
+        if (edp_pipe == pipe) {
+            ctl = edp_ctl;
+            edp = true;
+        }
+    }
+    if (!edp) {
+        ctl = ig9_read32(IG9_TRANS_DDI_FUNC_CTL(pipe));
+    }
+
+    g_scanout.output_type = DISPLAY_OUTPUT_UNKNOWN;
+    ig9_copy_string(g_scanout.output_name, sizeof(g_scanout.output_name),
+                    "pipe");
+    if ((ctl & IG9_TRANS_DDI_ENABLE) == 0u) {
+        return;
+    }
+
+    uint32_t port = (ctl >> IG9_TRANS_DDI_PORT_SHIFT) & IG9_TRANS_DDI_PORT_MASK;
+    uint32_t mode = (ctl >> IG9_TRANS_DDI_MODE_SHIFT) & IG9_TRANS_DDI_MODE_MASK;
+    const char *proto;
+    if (edp) {
+        proto = "eDP-";
+        g_scanout.output_type = DISPLAY_OUTPUT_DISPLAYPORT;
+    } else if (mode == IG9_TRANS_DDI_MODE_HDMI) {
+        proto = "HDMI-";
+        g_scanout.output_type = DISPLAY_OUTPUT_HDMI;
+    } else if (mode == IG9_TRANS_DDI_MODE_DVI) {
+        proto = "DVI-";
+        g_scanout.output_type = DISPLAY_OUTPUT_HDMI;
+    } else if (mode == IG9_TRANS_DDI_MODE_DP_SST ||
+               mode == IG9_TRANS_DDI_MODE_DP_MST) {
+        proto = "DP-";
+        g_scanout.output_type = DISPLAY_OUTPUT_DISPLAYPORT;
+    } else {
+        proto = "DDI-";
+    }
+
+    char name[16];
+    uint32_t n = 0u;
+    for (const char *p = proto; *p != '\0' && n < sizeof(name) - 2u; ++p) {
+        name[n++] = *p;
+    }
+    name[n++] = (port < 5u) ? ports[port] : '?';
+    name[n] = '\0';
+    ig9_copy_string(g_scanout.output_name, sizeof(g_scanout.output_name), name);
+}
+
+/* Measure the refresh rate off the pipe's hardware frame counter. */
+static uint32_t ig9_measure_refresh(uint32_t pipe)
+{
+    static const uint32_t common[] = {
+        23976u, 24000u, 25000u, 29970u, 30000u, 48000u, 50000u, 59940u,
+        60000u, 72000u, 75000u, 85000u, 90000u, 100000u, 119880u, 120000u,
+        144000u, 165000u, 240000u,
+    };
+    const uint32_t frames = 6u;
+    uint64_t start = ig9_now_ns();
+    if (start == 0u) {
+        return 0u;
+    }
+
+    uint32_t reg = IG9_PIPE_FRMCOUNT(pipe);
+    uint32_t c0 = ig9_read32(reg);
+    uint64_t t0 = 0u;
+    uint32_t cs = c0;
+    /* Busy-poll: a 1 ms sleep granule would cost ~1% accuracy. Bounded to
+     * ~0.4 s even if the counter is frozen. */
+    for (;;) {
+        uint64_t now = ig9_now_ns();
+        cs = ig9_read32(reg);
+        if (cs != c0) {
+            t0 = now;
+            break;
+        }
+        if (now - start > 60000000u) {
+            return 0u;
+        }
+    }
+    uint64_t t1 = 0u;
+    for (;;) {
+        uint64_t now = ig9_now_ns();
+        uint32_t c = ig9_read32(reg);
+        if (c - cs >= frames) {
+            t1 = now;
+            break;
+        }
+        if (now - start > 400000000u) {
+            return 0u;
+        }
+    }
+    if (t1 <= t0) {
+        return 0u;
+    }
+    uint64_t mhz = ((uint64_t)frames * 1000000000000ull) / (t1 - t0);
+    if (mhz < 20000u || mhz > 400000u) {
+        return 0u;
+    }
+    /* Snap to the nearest standard rate within 0.5 %. */
+    uint64_t best = mhz;
+    uint64_t best_diff = UINT64_MAX;
+    for (uint32_t i = 0; i < sizeof(common) / sizeof(common[0]); ++i) {
+        uint64_t c = common[i];
+        uint64_t diff = (mhz > c) ? mhz - c : c - mhz;
+        if (diff * 200u <= c && diff < best_diff) {
+            best = c;
+            best_diff = diff;
+        }
+    }
+    return (uint32_t)best;
+}
+
+/*
+ * Find the enabled universal plane whose surface is the framebuffer, and
+ * check that what it scans out is what this driver will be blitting:
+ * linear, XRGB8888, same stride.
+ */
+static bool ig9_match_plane(uint32_t fb_ggtt, uint32_t pitch)
+{
+    g_scanout.found = false;
+    for (uint32_t pipe = 0; pipe < IG9_PIPE_COUNT; ++pipe) {
+        if ((ig9_read32(IG9_PIPECONF(pipe)) & IG9_PIPECONF_ENABLE) == 0u) {
+            continue;
+        }
+        for (uint32_t plane = 1u; plane <= ig9_planes_per_pipe(); ++plane) {
+            uint32_t ctl = ig9_read32(IG9_PLANE_CTL(pipe, plane));
+            if ((ctl & IG9_PLANE_CTL_ENABLE) == 0u) {
+                continue;
+            }
+            uint32_t surf = ig9_read32(IG9_PLANE_SURF(pipe, plane)) &
+                            IG9_PLANE_SURF_ADDR_MASK;
+            uint32_t off = ig9_read32(IG9_PLANE_OFFSET(pipe, plane));
+            uint32_t stride = (ig9_read32(IG9_PLANE_STRIDE(pipe, plane)) &
+                               0x3FFu) * 64u;
+            uint64_t start = (uint64_t)surf +
+                             (uint64_t)(off >> 16) * stride +
+                             (uint64_t)(off & 0xFFFFu) * IG9_BPP;
+            if (start != fb_ggtt) {
+                continue;
+            }
+
+            uint32_t src = ig9_read32(IG9_PIPESRC(pipe));
+            g_scanout.found = true;
+            g_scanout.pipe = pipe;
+            g_scanout.plane = plane;
+            g_scanout.plane_ctl = ctl;
+            g_scanout.pipe_w = (src >> 16) + 1u;
+            g_scanout.pipe_h = (src & 0xFFFFu) + 1u;
+
+            ig9_log("[IntelGen9] scanout: pipe ");
+            ig9_log_dec(pipe);
+            ig9_log(" plane ");
+            ig9_log_dec(plane);
+            ig9_log(" ctl 0x");
+            ig9_log_hex(ctl);
+            ig9_log(" stride ");
+            ig9_log_dec(stride);
+            ig9_log(" pipe-src ");
+            ig9_log_dec(g_scanout.pipe_w);
+            ig9_log("x");
+            ig9_log_dec(g_scanout.pipe_h);
+            ig9_log("\n");
+
+            if ((ctl & IG9_PLANE_CTL_TILED_MASK) != IG9_PLANE_CTL_TILED_LINEAR) {
+                ig9_log("[IntelGen9] scanout: plane is tiled; blitter disabled\n");
                 return false;
             }
+            if ((ctl & IG9_PLANE_CTL_FORMAT_MASK) != IG9_PLANE_CTL_FORMAT_XRGB8888) {
+                ig9_log("[IntelGen9] scanout: plane is not 8888; blitter disabled\n");
+                return false;
+            }
+            if (stride != pitch) {
+                ig9_log("[IntelGen9] scanout: plane stride differs from GOP pitch; blitter disabled\n");
+                return false;
+            }
+            return true;
         }
-
-        if (release_back_buffer) {
-            api_free(g_back_buffer_raw);
-        }
-        /* On any uncertain hardware state we intentionally leak the pages
-         * rather than allow the GPU to DMA into memory that PMM has reused. */
-        g_back_buffer = NULL;
-        g_back_buffer_raw = NULL;
-        g_back_buffer_bytes = 0u;
-        g_back_ggtt = 0u;
-        g_back_ggtt_ready = 0;
     }
-    api_memset(&g_fb, 0, sizeof(g_fb));
-
-    if (framebuffer == NULL || framebuffer->addr == NULL ||
-        framebuffer->width == 0u || framebuffer->height == 0u ||
-        framebuffer->pixels_per_scan_line < framebuffer->width) {
-        return false;
-    }
-
-    uint32_t bpp = framebuffer->bytes_per_pixel;
-    if (bpp == 0u) {
-        bpp = IG9_BYTES_PER_PIXEL;
-    }
-    if (bpp != IG9_BYTES_PER_PIXEL) {
-        return false;
-    }
-
-    uint64_t stride = (uint64_t)framebuffer->pixels_per_scan_line;
-    uint64_t rows = (uint64_t)framebuffer->height;
-    if (rows != 0u && stride > UINT64_MAX / rows) {
-        return false;
-    }
-    uint64_t pixel_count = stride * rows;
-    if (pixel_count > UINT64_MAX / (uint64_t)bpp) {
-        return false;
-    }
-    uint64_t required = pixel_count * (uint64_t)bpp;
-    if (required == 0u || required > (uint64_t)SIZE_MAX ||
-        (framebuffer->size_bytes != 0u &&
-         required > (uint64_t)framebuffer->size_bytes)) {
-        return false;
-    }
-
-    uint64_t phys = (uint64_t)(uintptr_t)framebuffer->addr;
-    volatile uint8_t *mapped =
-        (volatile uint8_t *)api_map_mmio(phys, (size_t)required);
-    if (mapped == NULL) {
-        ig9_log("[IntelGen9] fb: map failed\n");
-        return false;
-    }
-
-    uint64_t buffer_size = required;
-    if (buffer_size > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
-        return false;
-    }
-    uint64_t buffer_map_size =
-        (buffer_size + IG9_PAGE_BYTES - 1u) &
-        ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-    if (buffer_map_size > UINT64_MAX - IG9_PAGE_BYTES ||
-        buffer_map_size + IG9_PAGE_BYTES > (uint64_t)SIZE_MAX) {
-        return false;
-    }
-
-    /* The allocation includes the page-rounded GPU mapping size plus the
-     * maximum alignment slop. Every page installed in the GGTT is therefore
-     * backed by memory owned by this allocation. */
-    uint8_t *buffer_raw =
-        (uint8_t *)api_malloc(buffer_map_size + IG9_PAGE_BYTES);
-    if (buffer_raw == NULL) {
-        return false;
-    }
-    uint32_t *buffer = (uint32_t *)(void *)
-        (((uintptr_t)buffer_raw + (IG9_PAGE_BYTES - 1u)) &
-         ~(uintptr_t)(IG9_PAGE_BYTES - 1u));
-    api_memset(buffer, 0, (size_t)buffer_size);
-    g_back_buffer_raw = buffer_raw;
-
-    g_fb.width = framebuffer->width;
-    g_fb.height = framebuffer->height;
-    g_fb.pixels_per_scan_line = framebuffer->pixels_per_scan_line;
-    g_fb.size_bytes = required;
-    g_fb.phys_base = phys;
-    g_fb.mapped = mapped;
-
-    /* The graphics address of the framebuffer is only discoverable once the
-     * MMIO window is mapped; ig9_hw_bringup() does that and fills in
-     * g_fb.ggtt_offset/ggtt_found. */
-
-    g_back_buffer = buffer;
-    g_back_buffer_bytes = buffer_size;
-    g_ready = 1;
-    return true;
+    ig9_log("[IntelGen9] scanout: no enabled plane scans out the GOP framebuffer\n");
+    return true;   /* not fatal: the fence check below still guards tiling */
 }
 
-static void ig9_hw_bringup(void);
-
-/*
- * BAR0 reads on a function parked in D3 can hang the bus on real hardware,
- * so before the first MMIO touch: turn on memory decoding and bus mastering,
- * and if the function has a power-management capability and is not in D0,
- * ask it to wake up. Both are no-ops on the firmware setups this project
- * normally sees; this runs only for a device that already matched the
- * display allowlist, and a failure here just leaves the CPU path.
- */
-static IG9_UNUSED bool ig9_pci_prepare(void)
+/* A fence register over the framebuffer would mean the CPU sees a detiled
+ * view of a tiled surface; a blit into it would then be garbage. */
+static bool ig9_fb_fenced(uint32_t ggtt, uint64_t bytes)
 {
-    uint8_t bus = g_match.bus;
-    uint8_t dev = g_match.device;
-    uint8_t fn = g_match.function;
-
-    if (g_api->pci.read_config == NULL || g_api->pci.write_config == NULL) {
-        return false;
-    }
-
-    uint32_t command = g_api->pci.read_config(bus, dev, fn, 0x04u);
-    if ((command & 0x6u) != 0x6u) {
-        g_api->pci.write_config(bus, dev, fn, 0x04u, command | 0x6u);
-    }
-
-    if (g_api->pci.find_capability == NULL) {
-        return true;
-    }
-    int32_t pm_cap = g_api->pci.find_capability(bus, dev, fn, 0x01u);
-    if (pm_cap < 0) {
-        return true; /* no PM capability: nothing that can be in D3 */
-    }
-    uint16_t pmcsr_offset = (uint16_t)((uint32_t)pm_cap + 4u);
-
-    uint32_t pmcsr = g_api->pci.read_config(bus, dev, fn, pmcsr_offset);
-    if ((pmcsr & 0x3u) != 0u) {
-        g_api->pci.write_config(bus, dev, fn, pmcsr_offset, pmcsr & ~0x3u);
-        ig9_msleep(10u); /* a wake from D3 takes a moment on real silicon */
-        pmcsr = g_api->pci.read_config(bus, dev, fn, pmcsr_offset);
-        if ((pmcsr & 0x3u) != 0u) {
-            ig9_log("[IntelGen9] bringup: device will not enter D0\n");
-            return false;
-        }
-    }
-    return true;
-}
-
-static void ig9_pci_find_device(void);
-
-/*
- * Find the scanout framebuffer's graphics address in the display plane's
- * surface register. A candidate is only accepted when the GGTT entry it
- * names is present and points at a page inside the framebuffer's own
- * physical range, so a misread register can never become a blit target.
- * The first accepted entry also teaches ig9_ggtt_map_pages() the PTE flags
- * the firmware itself uses.
- */
-/*
- * A single matching first page is not sufficient: XY_SRC_COPY_BLT treats
- * the framebuffer as one linear surface. Verify that every GPU virtual page
- * in that surface maps to the corresponding consecutive physical page.
- */
-static bool ig9_fb_validate_ggtt_span(uint32_t ggtt_base)
-{
-    if ((ggtt_base & (IG9_PAGE_BYTES - 1u)) != 0u ||
-        g_fb.phys_base == 0u || g_fb.size_bytes == 0u) {
-        return false;
-    }
-
-    uint64_t first_page =
-        g_fb.phys_base & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-    uint64_t page_offset = g_fb.phys_base - first_page;
-    if (g_fb.size_bytes > UINT64_MAX - page_offset) {
-        return false;
-    }
-    uint64_t span_bytes = page_offset + g_fb.size_bytes;
-    if (span_bytes > UINT64_MAX - (IG9_PAGE_BYTES - 1u)) {
-        return false;
-    }
-    uint64_t pages64 =
-        (span_bytes + IG9_PAGE_BYTES - 1u) / IG9_PAGE_BYTES;
-    uint32_t first_entry = ggtt_base / IG9_PAGE_BYTES;
-    if (pages64 == 0u || pages64 > g_ggtt_entries ||
-        first_entry > g_ggtt_entries - (uint32_t)pages64 ||
-        (pages64 > 1u &&
-         first_page > UINT64_MAX - ((pages64 - 1u) * IG9_PAGE_BYTES))) {
-        return false;
-    }
-
-    uint64_t template_pte = 0u;
-    for (uint32_t i = 0u; i < (uint32_t)pages64; ++i) {
-        uint64_t expected_phys =
-            first_page + (uint64_t)i * IG9_PAGE_BYTES;
-        if ((expected_phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
-            return false;
-        }
-
-        uint64_t pte = ig9_ggtt_read_pte(first_entry + i);
-        if ((pte & 0x1u) == 0u ||
-            (pte & IG9_GGTT_PTE_ADDR_MASK) != expected_phys) {
-            return false;
-        }
-        if (i == 0u) {
-            template_pte = pte;
-        }
-    }
-
-    if (g_ggtt_template_ready == 0) {
-        g_ggtt_template = template_pte;
-        g_ggtt_template_ready = 1;
-    }
-    return true;
-}
-
-static IG9_UNUSED bool ig9_fb_find_via_plane(void)
-{
-    static const uint32_t surf_regs[] = {
-        IG9_PLANE_SURF_1_A, IG9_PLANE_SURF_1_B, IG9_PLANE_SURF_1_C,
-        IG9_PLANE_SURF_2_A, IG9_PLANE_SURF_2_B, IG9_PLANE_SURF_2_C,
-        IG9_PLANE_SURF_3_A, IG9_PLANE_SURF_3_B, IG9_PLANE_SURF_3_C,
-        IG9_PLANE_SURF_4_A, IG9_PLANE_SURF_4_B, IG9_PLANE_SURF_4_C,
-        IG9_CUR_SURF_A, IG9_CUR_SURF_B, IG9_CUR_SURF_C,
-    };
-
-    if (g_fb.mapped == NULL || g_fb.phys_base == 0u || g_fb.size_bytes == 0u) {
-        return false;
-    }
-
-    uint64_t first_page = g_fb.phys_base & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-    uint64_t page_offset = g_fb.phys_base - first_page;
-
-    for (uint32_t i = 0u; i < sizeof(surf_regs) / sizeof(surf_regs[0]); ++i) {
-        uint32_t value = ig9_mmio_read32(surf_regs[i]);
-        uint32_t ggtt = value & IG9_PLANE_SURF_ADDR_MASK;
-        if (ggtt == 0u) {
+    uint64_t lo_addr = ggtt;
+    uint64_t hi_addr = (uint64_t)ggtt + bytes;
+    for (uint32_t i = 0; i < IG9_FENCE_COUNT; ++i) {
+        uint32_t lo = ig9_read32(IG9_FENCE_REG_GEN6_LO(i));
+        if ((lo & IG9_FENCE_VALID) == 0u) {
             continue;
         }
-
-        uint64_t pte = ig9_ggtt_read_pte(ggtt / IG9_PAGE_BYTES);
-        if ((pte & 0x1u) == 0u ||
-            (pte & IG9_GGTT_PTE_ADDR_MASK) != first_page ||
-            !ig9_fb_validate_ggtt_span(ggtt)) {
-            continue;
+        uint32_t hi = ig9_read32(IG9_FENCE_REG_GEN6_HI(i));
+        uint64_t start = lo & 0xFFFFF000u;
+        uint64_t end = (uint64_t)(hi & 0xFFFFF000u) + IG9_PAGE_BYTES;
+        if (start < hi_addr && lo_addr < end) {
+            ig9_log_val("scanout: framebuffer covered by fence", i);
+            return true;
         }
-
-        g_fb.ggtt_offset = ggtt + (uint32_t)page_offset;
-        g_fb.ggtt_found = 1;
-        ig9_log("[IntelGen9] fb: plane 0x");
-        ig9_log_hex(surf_regs[i]);
-        ig9_log(" -> ggtt 0x");
-        ig9_log_hex(ggtt);
-        ig9_log("\n");
-        return true;
     }
     return false;
 }
 
-static bool ig9_probe(void)
+/*
+ * Where is the framebuffer in the GPU's address space?
+ *
+ * UEFI GOP on Intel hands out the CPU aperture address (BAR2/GMADR) of the
+ * buffer it pinned in the GGTT, so for that case the answer is plain
+ * arithmetic: aperture offset == GGTT offset. A framebuffer given by its
+ * physical (stolen-memory) address is looked up in the GGTT instead.
+ */
+static bool ig9_fb_locate(void)
 {
-    if (g_have_match == 0 && g_probe_attempted == 0) {
-        /* driver_module_init() runs before any module is activated, so the
-         * PCI client is not attached yet at that point; probe() runs once
-         * the bus driver is live. The device list is static, so search the
-         * first time only. */
-        g_probe_attempted = 1;
-        ig9_pci_find_device();
-    }
-    return g_have_match != 0;
-}
+    g_fb.fb_ggtt_ok = false;
+    uint64_t phys = g_fb.phys;
+    uint64_t bytes = g_fb.size_bytes;
+    uint32_t pitch = g_fb.stride_px * IG9_BPP;
+    uint32_t ggtt = 0u;
 
-/* The display manager calls set_framebuffer() on every candidate driver
- * before probe()/init(), so the hardware bring-up (which needs the
- * framebuffer's physical address to find its GGTT mapping) runs here, on
- * the first init(), once the framebuffer is known. The return value stays
- * "is the framebuffer ready": a bring-up that fails only means the CPU
- * present path is used, not that the driver cannot drive the display. */
-static bool ig9_init(void)
-{
-    if (g_ready == 0) {
+    if (g_ig9_bars.gmadr_size != 0u && phys >= g_ig9_bars.gmadr_phys &&
+        phys - g_ig9_bars.gmadr_phys + bytes <= g_ig9_bars.gmadr_size) {
+        ggtt = (uint32_t)(phys - g_ig9_bars.gmadr_phys);
+        if (!ig9_ggtt_range_present(ggtt, bytes)) {
+            ig9_log("[IntelGen9] scanout: aperture range not fully mapped\n");
+            return false;
+        }
+        ig9_log_val("scanout: GOP framebuffer via aperture, ggtt", ggtt);
+    } else {
+        uint32_t index = 0u;
+        if (!ig9_ggtt_find_phys(phys, &index)) {
+            ig9_log("[IntelGen9] scanout: framebuffer is neither in the aperture nor in the GGTT\n");
+            return false;
+        }
+        ggtt = index * IG9_PAGE_BYTES + (uint32_t)(phys & (IG9_PAGE_BYTES - 1u));
+        if (!ig9_ggtt_range_maps(ggtt, phys, bytes)) {
+            ig9_log("[IntelGen9] scanout: framebuffer not linearly mapped in the GGTT\n");
+            return false;
+        }
+        ig9_log_val("scanout: framebuffer found in GGTT at", ggtt);
+    }
+
+    ig9_log_val("scanout: first PTE (low)",
+                (uint32_t)ig9_ggtt_read_pte(ggtt / IG9_PAGE_BYTES));
+
+    if ((ggtt & 63u) != 0u) {
+        ig9_log("[IntelGen9] scanout: framebuffer not 64-byte aligned\n");
         return false;
     }
-    ig9_hw_bringup();
+    if (pitch > IG9_BLT_MAX_PITCH || g_fb.width > IG9_BLT_MAX_COORD ||
+        g_fb.height > IG9_BLT_MAX_COORD) {
+        ig9_log("[IntelGen9] scanout: beyond blitter limits\n");
+        return false;
+    }
+    if (!ig9_match_plane(ggtt, pitch) || ig9_fb_fenced(ggtt, bytes)) {
+        return false;
+    }
+
+    g_fb.fb_ggtt = ggtt;
+    g_fb.fb_ggtt_ok = true;
     return true;
 }
 
+static bool ig9_back_buffer_map(void)
+{
+    if (g_fb.back_mapped) {
+        return true;
+    }
+    if (g_fb.back == NULL) {
+        return false;
+    }
+    if (!ig9_ggtt_map(g_fb.back, 0u, g_fb.back_bytes, &g_fb.back_ggtt)) {
+        ig9_log("[IntelGen9] back buffer: GGTT map failed\n");
+        return false;
+    }
+    g_fb.back_mapped = true;
+    return true;
+}
+
+static void ig9_hw_bringup(void)
+{
+    if (!g_ig9_have_match || g_hw_attempted) {
+        return;
+    }
+    g_hw_attempted = true;
+
+    if (!ig9_uncore_init() || !ig9_ggtt_init()) {
+        ig9_log("[IntelGen9] bringup: CPU present path only\n");
+        return;
+    }
+    if (!ig9_forcewake_get(IG9_FW_GT)) {
+        ig9_log("[IntelGen9] bringup: no GT forcewake, CPU present path only\n");
+        return;
+    }
+
+    bool fb_ok = ig9_fb_locate();
+    if (g_scanout.found) {
+        ig9_detect_output(g_scanout.pipe);
+        g_scanout.refresh_millihz = ig9_measure_refresh(g_scanout.pipe);
+        ig9_log("[IntelGen9] output ");
+        ig9_log(g_scanout.output_name);
+        ig9_log(" refresh ");
+        ig9_log_dec(g_scanout.refresh_millihz);
+        ig9_log(" mHz\n");
+    }
+
+    if (fb_ok && ig9_engine_init() && ig9_back_buffer_map()) {
+        ig9_log("[IntelGen9] blitter present enabled (");
+        ig9_log(ig9_engine_mode_name());
+        ig9_log(")\n");
+    } else {
+        ig9_log("[IntelGen9] bringup: CPU present path only\n");
+    }
+    ig9_forcewake_put(IG9_FW_GT);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. driver_display_t
+ * ------------------------------------------------------------------ */
+
+static void ig9_back_buffer_release(void)
+{
+    if (g_fb.back == NULL) {
+        return;
+    }
+    bool can_free = true;
+    if (g_fb.back_mapped) {
+        /* Presents are synchronous and serialized by g_present_lock, so
+         * the engine cannot be reading these pages now. */
+        can_free = ig9_ggtt_unmap(g_fb.back_ggtt);
+    }
+    if (can_free) {
+        g_ig9_api->free(g_fb.back_raw);
+    }
+    g_fb.back = NULL;
+    g_fb.back_raw = NULL;
+    g_fb.back_bytes = 0u;
+    g_fb.back_mapped = false;
+    g_fb.back_ggtt = 0u;
+}
+
+static bool ig9_fb_set(const driver_boot_framebuffer_t *fb)
+{
+    bool ok = false;
+    ig9_spin_lock(&g_present_lock);
+    g_ready = false;
+    ++g_generation;
+    ig9_back_buffer_release();
+    ig9_memset(&g_fb, 0, sizeof(g_fb));
+
+    if (fb == NULL || fb->addr == NULL || fb->width == 0u || fb->height == 0u ||
+        fb->pixels_per_scan_line < fb->width ||
+        (fb->bytes_per_pixel != 0u && fb->bytes_per_pixel != IG9_BPP)) {
+        goto out;
+    }
+
+    uint64_t pitch = (uint64_t)fb->pixels_per_scan_line * IG9_BPP;
+    uint64_t bytes = pitch * fb->height;
+    if (bytes == 0u || bytes > 0x40000000ull ||
+        (fb->size_bytes != 0u && bytes > fb->size_bytes)) {
+        goto out;
+    }
+
+    uint64_t phys = (uint64_t)(uintptr_t)fb->addr;
+    void *cpu = NULL;
+    if (g_ig9_api->hw.map_mmio_wc_range != NULL) {
+        cpu = g_ig9_api->hw.map_mmio_wc_range(phys, (size_t)bytes);
+    }
+    if (cpu == NULL) {
+        cpu = g_ig9_api->hw.map_mmio_range(phys, (size_t)bytes);
+    }
+    if (cpu == NULL) {
+        ig9_log("[IntelGen9] fb: map failed\n");
+        goto out;
+    }
+
+    uint64_t map_bytes = (bytes + IG9_PAGE_BYTES - 1u) &
+                         ~(uint64_t)(IG9_PAGE_BYTES - 1u);
+    void *raw = g_ig9_api->malloc(map_bytes + IG9_PAGE_BYTES);
+    if (raw == NULL) {
+        ig9_log("[IntelGen9] fb: back buffer allocation failed\n");
+        goto out;
+    }
+    uint32_t *back = (uint32_t *)(void *)
+        (((uintptr_t)raw + IG9_PAGE_BYTES - 1u) &
+         ~(uintptr_t)(IG9_PAGE_BYTES - 1u));
+    ig9_memset(back, 0, (size_t)map_bytes);
+
+    g_fb.width = fb->width;
+    g_fb.height = fb->height;
+    g_fb.stride_px = fb->pixels_per_scan_line;
+    g_fb.size_bytes = bytes;
+    g_fb.phys = phys;
+    g_fb.cpu = (volatile uint8_t *)cpu;
+    g_fb.back = back;
+    g_fb.back_raw = raw;
+    g_fb.back_bytes = map_bytes;
+
+    if (g_hw_attempted && ig9_uncore_ready()) {
+        /* A new framebuffer after bring-up: re-validate it for the GPU. */
+        if (ig9_forcewake_get(IG9_FW_GT)) {
+            if (ig9_fb_locate() && ig9_engine_ready()) {
+                (void)ig9_back_buffer_map();
+            }
+            ig9_forcewake_put(IG9_FW_GT);
+        }
+    }
+    g_ready = true;
+    ok = true;
+
+out:
+    ig9_spin_unlock(&g_present_lock);
+    return ok;
+}
+
+static bool ig9_probe(void)
+{
+    if (!g_ig9_have_match && !g_probe_attempted) {
+        /* driver_module_init() runs before the PCI client is attached;
+         * search the (static) device list the first time probe() runs. */
+        g_probe_attempted = true;
+        ig9_pci_find_device();
+    }
+    return g_ig9_have_match;
+}
+
+/* The display manager calls set_framebuffer() before probe()/init(), so the
+ * hardware bring-up (which needs the framebuffer's address) runs here. A
+ * failed bring-up only means the CPU present path is used. */
+static bool ig9_init(void)
+{
+    if (!g_ready || !ig9_probe()) {
+        return false;
+    }
+    ig9_hw_bringup();
+    g_initialized = true;
+    return true;
+}
+
+/* The display selector adopts any driver whose is_ready() is true right
+ * after set_framebuffer(), without calling probe(); so "ready" must mean
+ * "this machine has a supported GPU and init() ran", not merely "a
+ * framebuffer was handed over". */
 static bool ig9_is_ready(void)
 {
-    return g_ready != 0;
+    return g_ready && g_initialized;
 }
 
 static uint32_t ig9_width(void)
@@ -1863,128 +741,114 @@ static uint32_t ig9_monitor_count(void)
     return g_ready ? 1u : 0u;
 }
 
-static bool ig9_get_topology(display_topology_t *out_topology)
+static uint32_t ig9_refresh(void)
 {
-    if (g_ready == 0 || out_topology == NULL) {
+    return g_scanout.refresh_millihz != 0u ? g_scanout.refresh_millihz : 60000u;
+}
+
+static bool ig9_get_topology(display_topology_t *out)
+{
+    if (!g_ready || out == NULL) {
         return false;
     }
-    api_memset(out_topology, 0, sizeof(*out_topology));
-    out_topology->generation = g_generation;
-    out_topology->monitor_count = 1u;
-    out_topology->primary_monitor = 0u;
-    out_topology->width = g_fb.width;
-    out_topology->height = g_fb.height;
+    ig9_memset(out, 0, sizeof(*out));
+    out->generation = g_generation;
+    out->monitor_count = 1u;
+    out->primary_monitor = 0u;
+    out->width = g_fb.width;
+    out->height = g_fb.height;
     return true;
 }
 
-static bool ig9_get_monitor_info(uint32_t monitor_index,
-                                 display_monitor_info_t *out_info)
+static bool ig9_get_monitor_info(uint32_t index, display_monitor_info_t *out)
 {
-    if (g_ready == 0 || out_info == NULL || monitor_index != 0u) {
+    if (!g_ready || out == NULL || index != 0u) {
         return false;
     }
-    api_memset(out_info, 0, sizeof(*out_info));
-    out_info->index = 0u;
-    out_info->flags = DISPLAY_MONITOR_FLAG_CONNECTED |
-                      DISPLAY_MONITOR_FLAG_PRIMARY |
-                      DISPLAY_MONITOR_FLAG_SYNTHETIC_MODE;
-    out_info->output_type = DISPLAY_OUTPUT_FRAMEBUFFER;
-    out_info->width = g_fb.width;
-    out_info->height = g_fb.height;
-    out_info->refresh_millihz = 60000u;
-    out_info->mode_count = 1u;
-    out_info->generation = g_generation;
-    ig9_copy_string(out_info->name, sizeof(out_info->name),
-                    (g_have_match != 0 && g_match.name != NULL) ?
-                        g_match.name : "Intel Gen9.5 Graphics");
-    ig9_copy_string(out_info->output_name, sizeof(out_info->output_name),
-                    "framebuffer0");
+    ig9_memset(out, 0, sizeof(*out));
+    out->index = 0u;
+    out->flags = DISPLAY_MONITOR_FLAG_CONNECTED | DISPLAY_MONITOR_FLAG_PRIMARY;
+    if (!g_scanout.found || g_scanout.refresh_millihz == 0u) {
+        out->flags |= DISPLAY_MONITOR_FLAG_SYNTHETIC_MODE;
+    }
+    out->output_type = g_scanout.found ? g_scanout.output_type
+                                       : DISPLAY_OUTPUT_FRAMEBUFFER;
+    out->width = g_fb.width;
+    out->height = g_fb.height;
+    out->refresh_millihz = ig9_refresh();
+    out->current_mode = 0u;
+    out->mode_count = 1u;
+    out->generation = g_generation;
+    ig9_copy_string(out->name, sizeof(out->name),
+                    g_ig9_have_match ? g_ig9_match.name : "Intel Gen9 Graphics");
+    ig9_copy_string(out->output_name, sizeof(out->output_name),
+                    g_scanout.found ? g_scanout.output_name : "framebuffer0");
     return true;
 }
 
-static bool ig9_get_mode_info(uint32_t monitor_index, uint32_t mode_index,
-                              display_mode_info_t *out_info)
+static bool ig9_get_mode_info(uint32_t monitor, uint32_t mode,
+                              display_mode_info_t *out)
 {
-    if (g_ready == 0 || out_info == NULL || monitor_index != 0u ||
-        mode_index != 0u) {
+    if (!g_ready || out == NULL || monitor != 0u || mode != 0u) {
         return false;
     }
-    api_memset(out_info, 0, sizeof(*out_info));
-    out_info->flags = DISPLAY_MODE_FLAG_CURRENT |
-                      DISPLAY_MODE_FLAG_PREFERRED |
-                      DISPLAY_MODE_FLAG_SYNTHETIC;
-    out_info->width = g_fb.width;
-    out_info->height = g_fb.height;
-    out_info->stride = g_fb.pixels_per_scan_line;
-    out_info->bits_per_pixel = 32u;
-    out_info->refresh_millihz = 60000u;
-    ig9_copy_string(out_info->name, sizeof(out_info->name), "Current");
+    ig9_memset(out, 0, sizeof(*out));
+    out->flags = DISPLAY_MODE_FLAG_CURRENT | DISPLAY_MODE_FLAG_PREFERRED;
+    if (!g_scanout.found || g_scanout.refresh_millihz == 0u) {
+        out->flags |= DISPLAY_MODE_FLAG_SYNTHETIC;
+    }
+    out->width = g_fb.width;
+    out->height = g_fb.height;
+    out->stride = g_fb.stride_px;
+    out->bits_per_pixel = 32u;
+    out->refresh_millihz = ig9_refresh();
+    ig9_copy_string(out->name, sizeof(out->name), "Current");
     return true;
 }
 
-/* Deliberately no modesetting: the firmware's mode is the mode, and this
- * driver must not risk the only working display configuration. */
-static bool ig9_set_mode(uint32_t monitor_index, uint32_t mode_index)
+/* Modesetting (DPLL, DDI buffer, link training) is deliberately not done:
+ * the firmware's mode is kept. */
+static bool ig9_set_mode(uint32_t monitor, uint32_t mode)
 {
-    (void)monitor_index;
-    (void)mode_index;
+    (void)monitor;
+    (void)mode;
     return false;
 }
 
 static void ig9_draw_pixel(uint32_t x, uint32_t y, uint32_t color)
 {
-    if (g_ready == 0 || g_back_buffer == NULL) {
+    if (!g_ready || g_fb.back == NULL || x >= g_fb.width || y >= g_fb.height) {
         return;
     }
-    if (x >= g_fb.width || y >= g_fb.height) {
-        return;
-    }
-    uint64_t index = (uint64_t)y * g_fb.pixels_per_scan_line + x;
-    if (index < g_back_buffer_bytes / sizeof(uint32_t)) {
-        g_back_buffer[index] = color;
-    }
+    g_fb.back[(uint64_t)y * g_fb.stride_px + x] = color;
 }
 
 static void ig9_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                           uint32_t color)
 {
-    if (g_ready == 0 || g_back_buffer == NULL || w == 0u || h == 0u) {
+    if (!g_ready || g_fb.back == NULL || w == 0u || h == 0u ||
+        x >= g_fb.width || y >= g_fb.height) {
         return;
     }
-    if (x >= g_fb.width || y >= g_fb.height) {
-        return;
-    }
-    uint64_t x_end = (uint64_t)x + w;
-    uint64_t y_end = (uint64_t)y + h;
-    if (x_end > g_fb.width)  { x_end = g_fb.width; }
-    if (y_end > g_fb.height) { y_end = g_fb.height; }
-
-    for (uint32_t py = y; py < (uint32_t)y_end; ++py) {
-        uint64_t row = (uint64_t)py * g_fb.pixels_per_scan_line;
-        for (uint64_t idx = row + x; idx < row + x_end; ++idx) {
-            if (idx >= g_back_buffer_bytes / sizeof(uint32_t)) {
-                break;
-            }
-            g_back_buffer[idx] = color;
+    uint32_t x_end = (w > g_fb.width - x) ? g_fb.width : x + w;
+    uint32_t y_end = (h > g_fb.height - y) ? g_fb.height : y + h;
+    for (uint32_t py = y; py < y_end; ++py) {
+        uint32_t *row = g_fb.back + (uint64_t)py * g_fb.stride_px;
+        for (uint32_t px = x; px < x_end; ++px) {
+            row[px] = color;
         }
     }
 }
 
-static bool ig9_clip_rect(const display_rect_t *in, uint32_t *x, uint32_t *y,
-                          uint32_t *w, uint32_t *h)
+static bool ig9_clip(const display_rect_t *in, ig9_blit_rect_t *out)
 {
-    if (in == NULL || in->w == 0u || in->h == 0u ||
-        g_fb.width == 0u || g_fb.height == 0u) {
+    if (in->w == 0u || in->h == 0u) {
         return false;
     }
     int64_t x0 = in->x;
     int64_t y0 = in->y;
     int64_t x1 = x0 + (int64_t)in->w;
     int64_t y1 = y0 + (int64_t)in->h;
-    if (x1 <= 0 || y1 <= 0 || x0 >= (int64_t)g_fb.width ||
-        y0 >= (int64_t)g_fb.height) {
-        return false;
-    }
     if (x0 < 0) { x0 = 0; }
     if (y0 < 0) { y0 = 0; }
     if (x1 > (int64_t)g_fb.width)  { x1 = (int64_t)g_fb.width; }
@@ -1992,179 +856,108 @@ static bool ig9_clip_rect(const display_rect_t *in, uint32_t *x, uint32_t *y,
     if (x1 <= x0 || y1 <= y0) {
         return false;
     }
-    *x = (uint32_t)x0;
-    *y = (uint32_t)y0;
-    *w = (uint32_t)(x1 - x0);
-    *h = (uint32_t)(y1 - y0);
+    out->x = (uint16_t)x0;
+    out->y = (uint16_t)y0;
+    out->w = (uint16_t)(x1 - x0);
+    out->h = (uint16_t)(y1 - y0);
     return true;
 }
 
-static void ig9_cpu_present_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static void ig9_cpu_copy(const ig9_blit_rect_t *r)
 {
-    if (g_fb.mapped == NULL || g_back_buffer == NULL || w == 0u || h == 0u) {
-        return;
-    }
-
-    uint64_t pitch = (uint64_t)g_fb.pixels_per_scan_line * sizeof(uint32_t);
-    const uint8_t *src_base = (const uint8_t *)g_back_buffer;
-
-    for (uint32_t row = 0; row < h; ++row) {
-        const uint8_t *src = src_base + (uint64_t)(y + row) * pitch +
-                             (uint64_t)x * sizeof(uint32_t);
-        volatile uint8_t *dst = g_fb.mapped + (uint64_t)(y + row) * pitch +
-                                (uint64_t)x * sizeof(uint32_t);
-        for (uint32_t col = 0; col < w * sizeof(uint32_t); ++col) {
-            dst[col] = src[col];
-        }
+    uint64_t pitch = (uint64_t)g_fb.stride_px * IG9_BPP;
+    for (uint32_t row = 0; row < r->h; ++row) {
+        uint64_t off = (uint64_t)(r->y + row) * pitch + (uint64_t)r->x * IG9_BPP;
+        ig9_memcpy((void *)(uintptr_t)(g_fb.cpu + off),
+                   (const uint8_t *)g_fb.back + off, (size_t)r->w * IG9_BPP);
     }
 }
 
-/* Hand the back buffer's pages to the engine, once, the first time a
- * present wants them. */
-static bool ig9_back_buffer_map(void)
+static bool ig9_gpu_usable(void)
 {
-    if (g_back_ggtt_ready != 0) {
-        return true;
-    }
-    if (g_back_buffer == NULL) {
-        return false;
-    }
-
-    uint64_t bytes64 = (g_back_buffer_bytes + IG9_PAGE_BYTES - 1u) &
-                       ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-    if (bytes64 == 0u || bytes64 > 0xFFFFFFFFu) {
-        return false;
-    }
-    /* ig9_ggtt_map_pages() handles a non-contiguous buffer page by page, so
-     * all that is required here is that the buffer starts on a page. */
-    if (!ig9_ggtt_map_pages((const void *)g_back_buffer, 0u, bytes64,
-                            &g_back_ggtt)) {
-        return false;
-    }
-    g_back_ggtt_ready = 1;
-    return true;
+    return g_fb.fb_ggtt_ok && g_fb.back_mapped && ig9_engine_ready();
 }
 
-/*
- * Accelerated present: up to IG9_MAX_RECTS_PER_BATCH rectangles per batch,
- * each with the source rows flushed first (the engine reads physical
- * memory, not the CPU's caches), then one fence for the whole batch. A
- * fence that does not confirm in time disables GPU use for the rest of the
- * boot; the caller then CPU-copies the same rectangles, which is idempotent.
- */
-static bool ig9_gpu_present_rects(const display_rect_t *rects, uint32_t count)
+#define IG9_PRESENT_CHUNK 64u
+
+static void ig9_present_chunk(const ig9_blit_rect_t *rects, uint32_t n)
 {
-    uint32_t batch[IG9_MAX_BATCH_DW];
-    uint32_t dw = 0u;
-    uint32_t seqno = 0u;
-    uint32_t batched_rects = 0u;
-    int submitted = 0;
-
-    if (g_accel_ok == 0 || g_fb.ggtt_found == 0 ||
-        !ig9_back_buffer_map()) {
-        return false;
-    }
-
-    uint32_t dst_pitch = g_fb.pixels_per_scan_line * sizeof(uint32_t);
-    uint32_t src_pitch = g_fb.pixels_per_scan_line * sizeof(uint32_t);
-
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t x = 0u;
-        uint32_t y = 0u;
-        uint32_t w = 0u;
-        uint32_t h = 0u;
-        if (!ig9_clip_rect(&rects[i], &x, &y, &w, &h)) {
-            continue;
-        }
-
-        if (batched_rects == IG9_MAX_RECTS_PER_BATCH) {
-            if (!ig9_emit_fence(batch, &dw) || !ig9_ring_submit(batch, dw)) {
-                return false;
+    if (ig9_gpu_usable()) {
+        uint64_t pitch = (uint64_t)g_fb.stride_px * IG9_BPP;
+        /* The blitter reads memory, not the CPU caches. */
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t row = 0; row < rects[i].h; ++row) {
+                uint64_t off = (uint64_t)(rects[i].y + row) * pitch +
+                               (uint64_t)rects[i].x * IG9_BPP;
+                ig9_clflush_range((const uint8_t *)g_fb.back + off,
+                                  (uint64_t)rects[i].w * IG9_BPP);
             }
-            seqno = g_ring.seqno;
-            submitted = 1;
-            dw = 0u;
-            batched_rects = 0u;
         }
-
-        for (uint32_t row = 0; row < h; ++row) {
-            ig9_cache_flush_lines((const uint8_t *)g_back_buffer +
-                                  ((uint64_t)(y + row) * src_pitch +
-                                   (uint64_t)x * sizeof(uint32_t)),
-                                  (uint64_t)w * sizeof(uint32_t));
+        ig9_surface_t dst = { g_fb.fb_ggtt, (uint32_t)pitch };
+        ig9_surface_t src = { g_fb.back_ggtt, (uint32_t)pitch };
+        if (ig9_engine_copy_rects(&dst, &src, rects, n)) {
+            return;
         }
-
-        dw += ig9_emit_copy(batch,
-                            g_fb.ggtt_offset,
-                            dst_pitch,
-                            g_back_ggtt,
-                            src_pitch, (int32_t)x, (int32_t)y, w, h);
-        ++batched_rects;
+        ig9_log("[IntelGen9] present: GPU copy failed, CPU fallback\n");
     }
-
-    if (batched_rects != 0u) {
-        if (!ig9_emit_fence(batch, &dw) || !ig9_ring_submit(batch, dw)) {
-            return false;
-        }
-        seqno = g_ring.seqno;
-        submitted = 1;
+    for (uint32_t i = 0; i < n; ++i) {
+        ig9_cpu_copy(&rects[i]);
     }
-
-    if (submitted == 0) {
-        return true;    /* nothing to present */
-    }
-    if (!ig9_wait_fence(seqno, IG9_FENCE_TIMEOUT_MS)) {
-        ig9_log("[IntelGen9] present: fence timeout, GPU disabled\n");
-        g_accel_ok = 0;
-        return false;
-    }
-    return true;
-}
-
-static void ig9_present_rects(const display_rect_t *rects, uint32_t count);
-
-static void ig9_present(void)
-{
-    if (g_ready == 0) {
-        return;
-    }
-    display_rect_t full = { 0, 0, g_fb.width, g_fb.height };
-    ig9_present_rects(&full, 1u);
 }
 
 static void ig9_present_rects(const display_rect_t *rects, uint32_t count)
 {
-    if (g_ready == 0 || g_back_buffer == NULL) {
-        return;
-    }
+    display_rect_t full;
     if (rects == NULL || count == 0u) {
-        display_rect_t full = { 0, 0, g_fb.width, g_fb.height };
-        ig9_present_rects(&full, 1u);
-        return;
+        full.x = 0;
+        full.y = 0;
+        full.w = g_fb.width;
+        full.h = g_fb.height;
+        rects = &full;
+        count = 1u;
     }
 
-    if (ig9_gpu_present_rects(rects, count)) {
+    ig9_spin_lock(&g_present_lock);
+    if (!g_ready || g_fb.back == NULL || g_fb.cpu == NULL) {
+        ig9_spin_unlock(&g_present_lock);
         return;
     }
-
+    ig9_blit_rect_t chunk[IG9_PRESENT_CHUNK];
+    uint32_t n = 0u;
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t x = 0u;
-        uint32_t y = 0u;
-        uint32_t w = 0u;
-        uint32_t h = 0u;
-        if (ig9_clip_rect(&rects[i], &x, &y, &w, &h)) {
-            ig9_cpu_present_rect(x, y, w, h);
+        if (!ig9_clip(&rects[i], &chunk[n])) {
+            continue;
+        }
+        if (++n == IG9_PRESENT_CHUNK) {
+            ig9_present_chunk(chunk, n);
+            n = 0u;
         }
     }
+    if (n != 0u) {
+        ig9_present_chunk(chunk, n);
+    }
+    ig9_spin_unlock(&g_present_lock);
+}
+
+static void ig9_present(void)
+{
+    ig9_present_rects(NULL, 0u);
 }
 
 static void *ig9_get_framebuffer(void)
 {
-    return g_back_buffer;
+    return g_fb.back;
+}
+
+static void ig9_shutdown(void)
+{
+    ig9_spin_lock(&g_present_lock);
+    ig9_engine_shutdown();
+    ig9_spin_unlock(&g_present_lock);
 }
 
 static const driver_display_t g_ig9_display = {
-    .name = "Intel Gen9.5 Graphics",
+    .name = "Intel Gen9 Graphics",
     .probe = ig9_probe,
     .init = ig9_init,
     .is_ready = ig9_is_ready,
@@ -2186,244 +979,8 @@ static const driver_display_t g_ig9_display = {
 };
 
 /* ------------------------------------------------------------------ *
- * 7. Hardware bring-up and module entry
+ * 5. Module entry
  * ------------------------------------------------------------------ */
-
-static void ig9_hw_bringup(void)
-{
-    if (g_have_match == 0 || g_mmio != NULL) {
-        return;
-    }
-
-    driver_pci_bar_t bar;
-    api_memset(&bar, 0, sizeof(bar));
-    if (g_api->pci.get_bar == NULL ||
-        !g_api->pci.get_bar(g_match.bus, g_match.device, g_match.function,
-                            0u, &bar) ||
-        bar.address == 0u || bar.is_io != 0u ||
-        bar.size < IG9_MMIO_MAP_BYTES) {
-        ig9_log("[IntelGen9] bringup: BAR0 unusable\n");
-        return;
-    }
-    ig9_log("[IntelGen9] bringup: BAR0 0x");
-    ig9_log_hex((uint32_t)bar.address);
-    ig9_log(" size 0x");
-    ig9_log_hex((uint32_t)bar.size);
-    ig9_log("\n");
-
-    if (g_api->pci.enable_bus_master != NULL) {
-        (void)g_api->pci.enable_bus_master(g_match.bus, g_match.device,
-                                           g_match.function);
-    }
-    if (!ig9_pci_prepare()) {
-        ig9_log("[IntelGen9] bringup: PCI prepare failed\n");
-        return;
-    }
-
-    volatile uint8_t *mmio =
-        (volatile uint8_t *)api_map_mmio(bar.address, IG9_MMIO_MAP_BYTES);
-    if (mmio == NULL) {
-        ig9_log("[IntelGen9] bringup: MMIO map failed\n");
-        return;
-    }
-    g_mmio = mmio;
-    ig9_log("[IntelGen9] bringup: MMIO mapped\n");
-
-    if (!ig9_ggtt_detect_size()) {
-        ig9_log("[IntelGen9] bringup: GGTT size unavailable, CPU path only\n");
-        return;
-    }
-
-    /* The PTE template comes from the firmware's own mapping of the
-     * framebuffer: whatever is found there is known to be a working entry.
-     * The plane register is authoritative; the table scan is kept for the
-     * case where the plane register cannot be read. */
-    if (!ig9_fb_find_via_plane()) {
-        uint32_t fb_entry = 0u;
-        if (g_fb.phys_base != 0u &&
-            ig9_ggtt_find_mapping(g_fb.phys_base, &fb_entry) &&
-            ig9_fb_validate_ggtt_span(fb_entry * IG9_PAGE_BYTES)) {
-            uint64_t page_offset =
-                g_fb.phys_base & (uint64_t)(IG9_PAGE_BYTES - 1u);
-            g_fb.ggtt_offset = fb_entry * IG9_PAGE_BYTES +
-                               (uint32_t)page_offset;
-            g_fb.ggtt_found = 1;
-            ig9_log("[IntelGen9] fb: ggtt entry 0x");
-            ig9_log_hex(fb_entry);
-            ig9_log("\n");
-        } else {
-            ig9_log("[IntelGen9] bringup: framebuffer not in GGTT\n");
-
-            /* Do not make acceleration depend on the firmware preserving a
-             * discoverable alias for the GOP framebuffer.  The display
-             * engine and the CPU can legally name the same RAM through
-             * different address spaces.  Re-use a valid firmware PTE as the
-             * attribute template and install our own private GGTT mapping to
-             * the framebuffer's physical pages. */
-            if (ig9_ggtt_find_template()) {
-                uint64_t first_page =
-                    g_fb.phys_base & ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-                uint64_t page_offset = g_fb.phys_base - first_page;
-                if (g_fb.size_bytes <= UINT64_MAX - page_offset) {
-                    uint64_t span = page_offset + g_fb.size_bytes;
-                    uint64_t map_bytes =
-                        (span + IG9_PAGE_BYTES - 1u) &
-                        ~(uint64_t)(IG9_PAGE_BYTES - 1u);
-                    uint32_t private_ggtt = 0u;
-                    if (map_bytes != 0u &&
-                        ig9_ggtt_map_pages(NULL, first_page, map_bytes,
-                                           &private_ggtt)) {
-                        g_fb.ggtt_offset = private_ggtt +
-                                           (uint32_t)page_offset;
-                        g_fb.ggtt_found = 1;
-                        ig9_log("[IntelGen9] fb: private GGTT remap 0x");
-                        ig9_log_hex(private_ggtt);
-                        ig9_log("\n");
-                    }
-                }
-            }
-        }
-    }
-
-    if (g_fb.ggtt_found == 0) {
-        ig9_log("[IntelGen9] bringup: no framebuffer address, CPU path only\n");
-        return;
-    }
-
-    /* Gen9 XY_SRC_COPY_BLT encodes a positive pitch in 15 bits and rectangle
-     * coordinates in 16 bits. Outside those limits keep the display on the
-     * CPU path rather than truncating a surface descriptor. */
-    uint64_t blt_pitch =
-        (uint64_t)g_fb.pixels_per_scan_line * IG9_BYTES_PER_PIXEL;
-    if (blt_pitch > 0x7FFFu || g_fb.width > 0xFFFFu ||
-        g_fb.height > 0xFFFFu) {
-        ig9_log("[IntelGen9] bringup: framebuffer exceeds BLT limits; CPU path only\n");
-        return;
-    }
-
-    if (!ig9_forcewake()) {
-        ig9_log("[IntelGen9] bringup: no forcewake ack, CPU path only\n");
-        return;
-    }
-    if (!ig9_ring_init()) {
-        ig9_log("[IntelGen9] bringup: ring setup failed\n");
-        ig9_forcewake_release();
-        return;
-    }
-    if (!ig9_selftest_ring()) {
-        ig9_log("[IntelGen9] bringup: ring selftest failed\n");
-        ig9_forcewake_release();
-        return;
-    }
-    ig9_log("[IntelGen9] ring alive\n");
-
-    uint64_t scratch_phys = 0;
-    uint8_t *scratch = (uint8_t *)api_dma_alloc(IG9_PAGE_BYTES, &scratch_phys);
-    if (scratch == NULL || scratch_phys == 0u) {
-        ig9_log("[IntelGen9] bringup: scratch alloc failed\n");
-        return;
-    }
-    api_memset(scratch, 0, IG9_PAGE_BYTES);
-    if (!ig9_ggtt_map_pages(scratch, scratch_phys, IG9_PAGE_BYTES,
-                            &g_scratch_ggtt)) {
-        ig9_log("[IntelGen9] bringup: scratch GGTT map failed\n");
-        api_dma_free(scratch, IG9_PAGE_BYTES);
-        return;
-    }
-    g_scratch_virt = scratch;
-    g_scratch_phys = scratch_phys;
-    g_scratch_ready = 1;
-
-    uint64_t src_phys = 0;
-    uint8_t *src = (uint8_t *)api_dma_alloc(IG9_PAGE_BYTES, &src_phys);
-    if (src != NULL && src_phys != 0u) {
-        api_memset(src, 0, IG9_PAGE_BYTES);
-        if (ig9_ggtt_map_pages(src, src_phys, IG9_PAGE_BYTES,
-                               &g_copy_src_ggtt)) {
-            g_copy_src_virt = src;
-            g_copy_src_ready = 1;
-        }
-    }
-
-    if (!ig9_selftest_store()) {
-        ig9_log("[IntelGen9] bringup: GGTT store selftest failed\n");
-        return;
-    }
-    /* XY_COLOR_BLT is diagnostic only: present_rects() uses XY_SRC_COPY_BLT.
-     * A failed colour-fill test must not hide a passing test of the actual
-     * source-copy path, provided it ran solely against our isolated scratch
-     * page and its fence completed. */
-    bool fill_ok = ig9_selftest_fill();
-    if (!fill_ok) {
-        ig9_log("[IntelGen9] bringup: fill selftest failed; testing source copy\n");
-    }
-    if (!ig9_selftest_copy()) {
-        ig9_log("[IntelGen9] bringup: copy selftest failed\n");
-        return;
-    }
-
-    g_accel_ok = 1;
-    ig9_log(fill_ok ?
-            "[IntelGen9] blitter verified, accelerated present enabled\n" :
-            "[IntelGen9] source copy verified; accelerated present enabled\n");
-}
-
-static void ig9_pci_find_device(void)
-{
-    if (g_api == NULL || g_api->pci.get_device_count == NULL ||
-        g_api->pci.get_device == NULL) {
-        ig9_log("[IntelGen9] probe: no PCI client\n");
-        return;
-    }
-
-    uint32_t count = g_api->pci.get_device_count();
-    if (count == 0u) {
-        ig9_log("[IntelGen9] probe: PCI device list empty\n");
-        return;
-    }
-
-    for (uint32_t i = 0; i < count; ++i) {
-        driver_pci_device_t dev;
-        if (!g_api->pci.get_device(i, &dev)) {
-            continue;
-        }
-        if (dev.vendor_id != IG9_PCI_VENDOR_INTEL) {
-            continue;
-        }
-        /* The allowlist decides, not the class code: firmware has been seen
-         * to enumerate the integrated GPU as 0x038000 ("other display
-         * controller") instead of the usual 0x030000. */
-        for (uint32_t d = 0; d < IG9_DEVICE_COUNT; ++d) {
-            if (g_ig9_devices[d].device_id != dev.device_id) {
-                continue;
-            }
-            g_match.bus = dev.bus;
-            g_match.device = dev.device;
-            g_match.function = dev.function;
-            g_match.device_id = dev.device_id;
-            g_match.name = g_ig9_devices[d].name;
-            g_match.gen = g_ig9_devices[d].gen;
-            g_have_match = 1;
-            ig9_log("[IntelGen9] found ");
-            ig9_log(g_ig9_devices[d].name);
-            ig9_log(" id 0x");
-            ig9_log_hex(dev.device_id);
-            ig9_log("\n");
-            return;
-        }
-        if (dev.class_code == IG9_PCI_CLASS_DISPLAY) {
-            ig9_log("[IntelGen9] display device id 0x");
-            ig9_log_hex(dev.device_id);
-            ig9_log(" class 0x");
-            ig9_log_hex(((uint32_t)dev.class_code << 16) |
-                        ((uint32_t)dev.subclass << 8) |
-                        (uint32_t)dev.prog_if);
-            ig9_log(" not in the allowlist\n");
-        }
-    }
-
-    ig9_log("[IntelGen9] probe: no supported GPU\n");
-}
 
 const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
 {
@@ -2431,18 +988,13 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
         .magic = DRIVER_DESCRIPTOR_MAGIC,
         .version = DRIVER_DESCRIPTOR_VERSION,
         .kind = DEVICE_TYPE_DISPLAY,
-        /* Ahead of the generic framebuffer driver (90) in load order: on a
-         * machine this driver supports, probe() answers true and its display
-         * api is selected; everywhere else probe() is false before any
-         * hardware is touched and the generic driver is picked exactly as
-         * before. */
+        /* Ahead of the generic framebuffer driver (90): on a supported
+         * machine probe() answers true; everywhere else it answers false
+         * before any MMIO and the generic driver is picked as before. */
         .load_priority = 60u,
-        /* Same reason the storage and network drivers take this dependency:
-         * the device search needs the PCI client attached, and this module
-         * has to be activated after it. */
         .deps = { "PCI_Driver.ELF", NULL },
         .driver_api = &g_ig9_display,
-        .shutdown = NULL,
+        .shutdown = ig9_shutdown,
     };
 
     if (api == NULL || api->malloc == NULL || api->free == NULL ||
@@ -2452,22 +1004,9 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
         return NULL;
     }
 
-    g_api = api;
-    /* This runs during the prepare pass, before any module is activated and
-     * therefore before the PCI client can answer; the search itself is
-     * deferred to probe(). The log stays unconditional so a staged module
-     * that never matches is still visible on the serial console. */
+    g_ig9_api = api;
     ig9_log("[IntelGen9] module init\n");
-
     return &descriptor;
 }
-
-#undef api_malloc
-#undef api_free
-#undef api_dma_alloc
-#undef api_dma_free
-#undef api_virt_to_phys
-#undef api_map_mmio
-#undef api_memset
 
 #endif /* IMPLUS_DRIVER_MODULE */

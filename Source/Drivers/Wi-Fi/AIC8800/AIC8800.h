@@ -67,7 +67,13 @@
 /* Firmware download pace: at most this many 1 KiB DBG_MEM_BLOCK_WRITE
  * chunks per poll() call, so a ~300 KiB image never blocks the syscall
  * path for more than a few milliseconds at a time. */
-#define AIC_FW_CHUNKS_PER_STEP  16u
+/* How long a user action (scan/connect/disconnect) and a scan-results read
+ * wait for the driver lock held by another CPU. */
+/* Spacing of the bring-up steps driven from the network poll. */
+#define AIC_BRING_POLL_MS         10u
+#define AIC_USER_LOCK_WAIT_MS     3000u
+#define AIC_RESULTS_LOCK_WAIT_MS  200u
+#define AIC_FW_CHUNKS_PER_STEP  64u
 
 /* At most this many (addr,value) patch-table writes per poll() call. */
 #define AIC_FW_WRITES_PER_STEP  64u
@@ -78,7 +84,16 @@
 
 /* Command/response engine */
 #define AIC_CMD_BUF_MAX         2048u
-#define AIC_RX_BUF_MAX          2048u
+/* One bulk IN transfer: the vendor's AICWF_USB_AGGR_MAX_PKT_SIZE. The
+ * firmware stage aggregates up to ten packets into one transfer (see
+ * AIC8800_Protocol.h), so a smaller landing buffer would split packets
+ * across transfers on every busy burst. Anything that still spills past it
+ * (a single oversized A-MSDU) is stitched together by the RX carry buffer. */
+#define AIC_RX_BUF_MAX          20480u
+/* The carry buffer: one packet that started near the end of a full
+ * transfer and continues in the next one. The largest single packet the
+ * firmware produces is an A-MSDU of 7935 bytes plus its RX descriptor. */
+#define AIC_RX_CARRY_MAX        8192u
 #define AIC_USB_XFER_TIMEOUT_MS 100u
 #define AIC_CMD_TIMEOUT_MS      2000u /* vendor RWNX_80211_CMD_TIMEOUT_MS */
 
@@ -96,7 +111,7 @@
  * messages. Matches the window the window manager's Wi-Fi panel uses
  * (WIFI_SCAN_WINDOW_MS). */
 #define AIC_SCAN_WINDOW_MS      3000u
-#define AIC_MAX_SCAN_RESULTS    24u
+#define AIC_MAX_SCAN_RESULTS    32u
 
 /* Connection: how long to wait for SM_CONNECT_IND after SM_CONNECT_REQ
  * was accepted, and the EAPOL-Start retry period once associated. */
@@ -107,6 +122,14 @@
  * yet, and this must not cost anything on such boots). */
 #define AIC_RETRY_INTERVAL_MS   2000u
 #define AIC_MAX_ATTEMPTS        6u
+
+/* A firmware-stage unit this boot did not load firmware into (a warm
+ * reboot, or another OS ran it) is rebooted back into its ROM loader first,
+ * exactly like the vendor's aic_load_fw does (rwnx_send_reboot). If it does
+ * not re-enumerate within this window the driver falls back to bringing up
+ * whatever firmware is running. */
+#define AIC_REBOOT_DELAY_MS     2000u /* the vendor's DBG_START_APP_REQ delay */
+#define AIC_REBOOT_WAIT_MS      8000u
 
 /* ---- state ---- */
 
@@ -131,14 +154,20 @@ typedef enum {
     AIC_FW_FAILED,
 } aic_fw_phase_t;
 
+/* The vendor's order (rwnx_cfg80211_init() then rwnx_open()). */
 typedef enum {
     AIC_BRING_IDLE = 0,
-    AIC_BRING_RF,        /* MM_SET_TXPWR_IDX_LVL, MM_SET_RF_CALIB */
-    AIC_BRING_MAC_ADDR,  /* MM_GET_MAC_ADDR (logged only) */
-    AIC_BRING_RESET,     /* MM_RESET */
-    AIC_BRING_VERSION,   /* MM_VERSION */
-    AIC_BRING_START,     /* MM_START */
-    AIC_BRING_ADD_IF,    /* MM_ADD_IF -> vif index, station ready */
+    AIC_BRING_REBOOT_WAIT, /* sent the ROM reboot, waiting for 8d80 */
+    AIC_BRING_STACK_START, /* MM_SET_STACK_START -> 5 GHz support */
+    AIC_BRING_RF,          /* MM_SET_TXPWR_IDX_LVL, MM_SET_RF_CALIB */
+    AIC_BRING_MAC_ADDR,    /* MM_GET_MAC_ADDR (logged only) */
+    AIC_BRING_RESET,       /* MM_RESET */
+    AIC_BRING_VERSION,     /* MM_VERSION */
+    AIC_BRING_ME_CONFIG,   /* ME_CONFIG: HT capabilities, lifetime, PS */
+    AIC_BRING_CHAN_CONFIG, /* ME_CHAN_CONFIG: the channels we may use */
+    AIC_BRING_START,       /* MM_START */
+    AIC_BRING_COEX,        /* MM_SET_COEX (CONFIG_COEX in the vendor build) */
+    AIC_BRING_ADD_IF,      /* MM_ADD_IF -> vif index, station ready */
     AIC_BRING_DONE,
     AIC_BRING_FAILED,
 } aic_bring_phase_t;
@@ -167,9 +196,21 @@ typedef struct {
     bool     present;
     bool     pending;    /* an async transfer is posted right now */
     bool     use_async;  /* DMA buffer + async API available */
-    uint8_t *dma;
+    /* A sync bulk transfer has been issued on this endpoint, so the xHCI
+     * driver created its transfer ring as a *bulk* endpoint. The async API
+     * creates a missing ring as an *interrupt* endpoint, so it must never
+     * be the first thing to touch a pipe. */
+    bool     ring_ready;
+    uint8_t *dma;        /* 20 KiB window inside dma_base */
     uint64_t dma_phys;
+    uint8_t *dma_base;   /* what dma_alloc returned (for dma_free) */
+    uint32_t dma_base_size;
     uint8_t *sync_buf;   /* fallback landing buffer (owned by AIC8800.c) */
+    /* Cross-transfer reassembly: the head of a packet that did not fit in
+     * the previous transfer, and how many bytes the whole packet has. */
+    uint8_t *carry;      /* AIC_RX_CARRY_MAX bytes (owned by AIC8800.c) */
+    uint32_t carry_len;
+    uint32_t carry_need;
 } aic_rx_pipe_t;
 
 typedef struct {
@@ -275,8 +316,11 @@ typedef struct {
     const char *bring_last_error; /* literal passed to bring_fail() */
     uint32_t bring_attempts;
     uint64_t bring_last_attempt; /* ticks at the last attempt (for retry pacing) */
+    uint64_t reboot_ticks;      /* when the ROM reboot was requested */
+    uint64_t last_bring_poll;   /* last bring-up step run from the network poll */
     uint8_t  vif_idx;
     uint8_t  mac[AIC_MAC_ADDR_LEN];
+    bool     band_5g;  /* MM_SET_STACK_START_CFM.is_5g_support */
     bool     ready; /* MM_ADD_IF_CFM came back */
 
     /* ---- scan ---- */
@@ -284,6 +328,9 @@ typedef struct {
     uint64_t scan_deadline;
     driver_wifi_scan_result_t scan_results[AIC_MAX_SCAN_RESULTS];
     uint16_t scan_freq[AIC_MAX_SCAN_RESULTS]; /* parallel: MHz of each result */
+    /* parallel: what the AP's RSN element allows (AIC_RSN_* in AIC8800_Wpa.h) */
+    uint8_t  scan_rsn_group[AIC_MAX_SCAN_RESULTS];
+    uint8_t  scan_rsn_ok[AIC_MAX_SCAN_RESULTS];
     uint32_t scan_result_count;
 
     /* ---- connection ---- */
@@ -295,6 +342,8 @@ typedef struct {
     uint16_t center_freq;
     bool     wpa_enabled;  /* a PSK was supplied: run the 4-way handshake */
     bool     connect_open; /* target is an open network */
+    bool     port_opened;  /* ME_SET_CONTROL_PORT_REQ(open) acknowledged */
+    uint8_t  port_attempts;
     uint64_t connect_deadline;
 
     /* ---- data path ---- */
@@ -388,6 +437,14 @@ static inline uint32_t aic_strnlen(const char *s, uint32_t max)
     return n;
 }
 
+/* Driver-wide entry lock. Every kernel entry point (the Wi-Fi syscalls,
+ * the network poll, send_frame) may run on any CPU, and the command engine
+ * and RX pump are not re-entrant, so each entry takes this first; one that
+ * finds it held simply skips its work this time (the next poll or syscall
+ * will do it). */
+bool aic_lock_try(void);
+void aic_unlock(void);
+
 /* One bounded bulk transfer over the device's bulk pipe. */
 bool aic_usb_bulk(uint8_t endpoint, uint16_t mps, uint8_t pid,
                   void *data, uint32_t length);
@@ -423,6 +480,14 @@ void aic_tick(void);
 
 /* ---- AIC8800_Fw.c: loader stage ---- */
 
+/* True once this boot has started firmware it downloaded itself: a
+ * firmware-stage unit seen while this is still false is running firmware
+ * of unknown provenance and gets rebooted into its ROM first. Survives
+ * the probe()-time state reset (it is not part of g_aic). */
+bool aic_fw_loaded_this_boot(void);
+/* DBG_START_APP_REQ(REBOOT) on the current command pipe. */
+bool aic_fw_send_reboot(void);
+
 void aic_fw_reset(void);
 /* One paced step of the firmware download: a single DBG round-trip, or a
  * bounded run of 1 KiB block writes. The stage's phase carries the
@@ -444,6 +509,8 @@ void aic_disconnect(void);
 bool aic_mm_key_add(uint8_t key_idx, uint8_t sta_idx, const uint8_t *key,
                     uint8_t key_len, uint8_t cipher_suite, bool pairwise);
 void aic_mm_disconnect(void);
+/* SCANU_START_CFM: the firmware finished the sweep. */
+void aic_handle_scan_done(void);
 
 /* RX-side handlers (called from the dispatch in AIC8800.c). */
 void aic_handle_scan_result(const uint8_t *payload, uint16_t len);
@@ -454,9 +521,10 @@ void aic_handle_disconnect_ind(const uint8_t *payload, uint16_t len);
 
 /* Transmit a complete 802.3 frame (14-byte Ethernet header included). */
 bool aic_tx_eth(const uint8_t *frame, uint16_t frame_len);
-/* Handle one RX USB packet whose payload begins with a 56-byte hw_rxhdr
- * followed by an 802.11 MPDU. */
-void aic_rx_data_packet(const uint8_t *usb_packet, uint16_t usb_len);
+/* Handle one RX DATA packet: `usb_len` bytes starting at its 4-byte USB
+ * header, the RX descriptor overlaying the first 56 and the 802.11 MPDU at
+ * AIC_RX_HWHRD_LEN. */
+void aic_rx_data_packet(const uint8_t *usb_packet, uint32_t usb_len);
 
 /* ---- AIC8800_Wpa.c: WPA2-PSK supplicant (see AIC8800_Wpa.h) ---- */
 

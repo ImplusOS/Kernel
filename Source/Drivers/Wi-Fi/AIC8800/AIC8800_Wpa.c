@@ -50,6 +50,13 @@
 #define AIC_WPA_MAX_FRAME              384u
 #define AIC_WPA_GTK_MAX                32u
 
+/* MM_KEY_ADD cipher_suite values (enum mac_cipher_suite). */
+#define AIC_MAC_CIPHER_TKIP            1u
+#define AIC_MAC_CIPHER_CCMP            2u
+
+/* RSN capabilities: management frame protection required / capable. */
+#define AIC_RSN_CAP_MFPR               0x0040u
+
 /* How long the whole 4-way handshake may take before the connection is
  * declared failed. Without this a silent AP (or one whose message 1 never
  * arrives) would leave the panel spinning on "Connecting..." forever,
@@ -77,6 +84,7 @@ typedef struct {
 
     uint8_t  rsn_ie[22];
     uint32_t rsn_ie_len;
+    bool     replay_valid; /* `replay` holds the last accepted counter */
 
     uint64_t start_ticks;
     bool     eapol_start_sent;
@@ -95,13 +103,18 @@ typedef struct {
 
 static aic_wpa_t g_wpa;
 
-/* WPA2-PSK/CCMP RSN IE: version 1, group CCMP, one pairwise CCMP, one
- * PSK AKM, no RSN capabilities. Used both in the association request
- * (SM_CONNECT_REQ's ie_buf) and in message 2/4. */
-static const uint8_t aic_rsn_ie_ccmp_psk[22] = {
+/* The group cipher of the next association. Lives outside g_wpa because
+ * aic_connect() chooses it before aic_wpa_start() resets the rest. */
+static uint8_t g_wpa_group = AIC_RSN_GROUP_CCMP;
+
+/* WPA2-PSK RSN IE: version 1, the AP's group cipher, one pairwise CCMP,
+ * one PSK AKM, no RSN capabilities. Used both in the association request
+ * (SM_CONNECT_REQ's ie_buf) and in message 2/4 -- the two must be the same
+ * bytes, which is why it is built once per connection. */
+static uint8_t g_rsn_ie[22] = {
     0x30u, 0x14u,
     0x01u, 0x00u,                    /* version 1 */
-    0x00u, 0x0fu, 0xacu, 0x04u,      /* group cipher: CCMP */
+    0x00u, 0x0fu, 0xacu, 0x04u,      /* group cipher (patched below) */
     0x01u, 0x00u,                    /* pairwise count: 1 */
     0x00u, 0x0fu, 0xacu, 0x04u,      /* pairwise cipher: CCMP */
     0x01u, 0x00u,                    /* AKM count: 1 */
@@ -190,8 +203,10 @@ static void wpa_prf(const uint8_t *key, uint32_t key_len, const char *label,
         uint8_t h[20];
         uint32_t take;
 
-        ++counter;
+        /* The counter byte starts at 0 (IEEE 802.11i H.3 test vectors,
+         * wpa_supplicant's sha1_prf()). */
         msg[msg_len] = counter;
+        ++counter;
         aic_hmac_sha1(key, key_len, msg, msg_len + 1u, h);
 
         take = out_len - done;
@@ -316,6 +331,18 @@ static bool wpa_send_eapol_start(void)
 
 /* ---- message handlers ---- */
 
+/* Replay counters are 64-bit big-endian; a new message must carry a larger
+ * one than the last message this supplicant accepted. */
+static bool wpa_replay_newer(const uint8_t *candidate, const uint8_t *last)
+{
+    for (uint32_t i = 0u; i < WPA_REPLAY_LEN; ++i) {
+        if (candidate[i] != last[i]) {
+            return candidate[i] > last[i];
+        }
+    }
+    return false;
+}
+
 static void wpa_handle_m1(const uint8_t *key, uint16_t body_len)
 {
     uint16_t key_info;
@@ -328,13 +355,24 @@ static void wpa_handle_m1(const uint8_t *key, uint16_t body_len)
      * WAIT_M3: the AP resends it when it did not see our message 2, and
      * the right answer is to rebuild and resend message 2 (with the same
      * SNonce and whatever ANonce the AP just handed us). */
-    if (g_wpa.state != AIC_WPA_WAIT_M1 && g_wpa.state != AIC_WPA_WAIT_M3) {
+    if (g_wpa.state != AIC_WPA_WAIT_M1 && g_wpa.state != AIC_WPA_WAIT_M3 &&
+        g_wpa.state != AIC_WPA_DONE) {
         return;
     }
     if (body_len < KEY_DATA_OFF) {
         return;
     }
     key_info = wpa_get_be16(key + KEY_INFO_OFF);
+    if (g_wpa.state == AIC_WPA_DONE) {
+        /* A PTK rekey: a fresh 4-way handshake on the live link. It needs a
+         * fresh SNonce; the keys stay installed until the new ones are. */
+        if (g_wpa.replay_valid &&
+            !wpa_replay_newer(key + REPLAY_OFF, g_wpa.replay)) {
+            return;
+        }
+        aic_random_bytes(g_wpa.snonce, WPA_NONCE_LEN);
+        g_wpa.start_ticks = aic_now_ticks();
+    }
 
     /* Message 1: pairwise, ACK, no MIC, not an install, no error. */
     if ((key_info & WPA_KEY_INFO_KEY_TYPE) == 0u ||
@@ -425,14 +463,41 @@ static bool wpa_key_data_has_gtk_kde(const uint8_t *ies, uint32_t len)
     return wpa_parse_gtk_kde(ies, len, gtk, &gtk_len, &idx);
 }
 
+/* GTK as MM_KEY_ADD wants it. For TKIP the KDE carries TK | Tx-MIC |
+ * Rx-MIC from the authenticator's point of view; the station swaps the two
+ * Michael keys (wpa_supplicant_install_gtk()). */
+static void wpa_stage_gtk(const uint8_t *gtk, uint32_t gtk_len, uint8_t idx)
+{
+    if (g_wpa_group == AIC_RSN_GROUP_TKIP && gtk_len == 32u) {
+        wpa_memcpy(g_wpa.gtk, gtk, 16u);
+        wpa_memcpy(g_wpa.gtk + 16u, gtk + 24u, 8u);
+        wpa_memcpy(g_wpa.gtk + 24u, gtk + 16u, 8u);
+    } else {
+        wpa_memcpy(g_wpa.gtk, gtk, gtk_len);
+    }
+    g_wpa.gtk_len = gtk_len;
+    g_wpa.gtk_idx = idx;
+    g_wpa.install_gtk = true;
+}
+
+static bool wpa_verify_mic(uint8_t *key, uint8_t *eapol, uint16_t eapol_len)
+{
+    uint8_t saved_mic[WPA_MIC_LEN];
+    uint8_t calc_mic[20];
+
+    wpa_memcpy(saved_mic, key + MIC_OFF, WPA_MIC_LEN);
+    wpa_memset(key + MIC_OFF, 0u, WPA_MIC_LEN);
+    aic_hmac_sha1(g_wpa.ptk, 16u, eapol, eapol_len, calc_mic);
+    wpa_memcpy(key + MIC_OFF, saved_mic, WPA_MIC_LEN);
+    return wpa_equal(calc_mic, saved_mic, WPA_MIC_LEN);
+}
+
 static void wpa_handle_m3(uint8_t *key, uint16_t body_len,
                           uint8_t *eapol, uint16_t eapol_len)
 {
     uint16_t key_info;
     uint16_t key_length;
     uint16_t kd_len;
-    uint8_t saved_mic[WPA_MIC_LEN];
-    uint8_t calc_mic[20];
     uint8_t body[KEY_DATA_OFF];
 
     if (g_wpa.state != AIC_WPA_WAIT_M3) {
@@ -465,21 +530,20 @@ static void wpa_handle_m3(uint8_t *key, uint16_t body_len,
 
     /* Verify the key MIC over the whole EAPOL frame. The frame lives in
      * the RX scratch buffer, which is ours to modify. */
-    wpa_memcpy(saved_mic, key + MIC_OFF, WPA_MIC_LEN);
-    wpa_memset(key + MIC_OFF, 0u, WPA_MIC_LEN);
-    aic_hmac_sha1(g_wpa.ptk, 16u, eapol, eapol_len, calc_mic);
-    wpa_memcpy(key + MIC_OFF, saved_mic, WPA_MIC_LEN);
-    if (!wpa_equal(calc_mic, saved_mic, WPA_MIC_LEN)) {
+    if (!wpa_verify_mic(key, eapol, eapol_len)) {
         /* Wrong KCK: the PSK is wrong. Report as a failure rather than
          * silently retrying -- the AP will keep retransmitting M1. */
+        aic_log("[AIC8800] message 3 MIC mismatch: wrong passphrase?\n");
         g_wpa.state = AIC_WPA_FAILED;
         return;
     }
+    wpa_memcpy(g_wpa.replay, key + REPLAY_OFF, WPA_REPLAY_LEN);
+    g_wpa.replay_valid = true;
 
     /* Key data: wrapped with the KEK when the encrypted-key-data bit is
      * set (the normal WPA2 case -- unwrap it and pull the GTK out). */
     if ((key_info & WPA_KEY_INFO_ENCR_KEY_DATA) != 0u) {
-        uint8_t unwrapped[64];
+        uint8_t unwrapped[AIC_AES_KW_MAX_BLOCKS * 8u];
         uint32_t unwrapped_len = 0u;
         uint8_t gtk[AIC_WPA_GTK_MAX];
         uint32_t gtk_len = 0u;
@@ -492,11 +556,9 @@ static void wpa_handle_m3(uint8_t *key, uint16_t body_len,
             return;
         }
         if (wpa_parse_gtk_kde(unwrapped, unwrapped_len, gtk, &gtk_len, &idx)) {
-            wpa_memcpy(g_wpa.gtk, gtk, gtk_len);
-            g_wpa.gtk_len = gtk_len;
-            g_wpa.gtk_idx = idx;
-            g_wpa.install_gtk = true;
+            wpa_stage_gtk(gtk, gtk_len, idx);
         }
+        wpa_memset(unwrapped, 0u, sizeof(unwrapped));
     } else if (wpa_key_data_has_gtk_kde(key + KEY_DATA_OFF, kd_len)) {
         /* 802.11i forbids the GTK in unencrypted key data. */
         g_wpa.state = AIC_WPA_FAILED;
@@ -529,12 +591,154 @@ static void wpa_handle_m3(uint8_t *key, uint16_t body_len,
     g_wpa.state = AIC_WPA_DONE;
 }
 
+/* Group Key Handshake, message 1 of 2 (IEEE 802.11-2016 12.7.7): the AP
+ * hands out a new GTK, wrapped with the KEK. Answering it matters: an AP
+ * whose group rekey goes unanswered deauthenticates the station. */
+static void wpa_handle_group_m1(uint8_t *key, uint16_t body_len,
+                                uint8_t *eapol, uint16_t eapol_len)
+{
+    uint16_t key_info;
+    uint16_t kd_len;
+    uint8_t unwrapped[AIC_AES_KW_MAX_BLOCKS * 8u];
+    uint32_t unwrapped_len = 0u;
+    uint8_t gtk[AIC_WPA_GTK_MAX];
+    uint32_t gtk_len = 0u;
+    uint8_t idx = 0u;
+    uint8_t body[KEY_DATA_OFF];
+
+    if (g_wpa.state != AIC_WPA_DONE || !g_wpa.ptk_valid ||
+        body_len < KEY_DATA_OFF) {
+        return;
+    }
+    key_info = wpa_get_be16(key + KEY_INFO_OFF);
+    if ((key_info & WPA_KEY_INFO_MIC) == 0u ||
+        (key_info & WPA_KEY_INFO_ACK) == 0u ||
+        (key_info & WPA_KEY_INFO_ENCR_KEY_DATA) == 0u) {
+        return;
+    }
+    if (g_wpa.replay_valid &&
+        !wpa_replay_newer(key + REPLAY_OFF, g_wpa.replay)) {
+        return; /* a replay of an older message */
+    }
+    kd_len = wpa_get_be16(key + KEY_DATA_LEN_OFF);
+    if ((uint32_t)KEY_DATA_OFF + kd_len > body_len || kd_len < 16u) {
+        return;
+    }
+    if (!wpa_verify_mic(key, eapol, eapol_len)) {
+        return;
+    }
+    if (!aic_aes128_kw_unwrap(g_wpa.ptk + 16u, key + KEY_DATA_OFF, kd_len,
+                              unwrapped, sizeof(unwrapped), &unwrapped_len) ||
+        !wpa_parse_gtk_kde(unwrapped, unwrapped_len, gtk, &gtk_len, &idx)) {
+        wpa_memset(unwrapped, 0u, sizeof(unwrapped));
+        return;
+    }
+    wpa_memset(unwrapped, 0u, sizeof(unwrapped));
+    wpa_memcpy(g_wpa.replay, key + REPLAY_OFF, WPA_REPLAY_LEN);
+    g_wpa.replay_valid = true;
+
+    /* Message 2 of 2: MIC | SECURE, the same replay counter, no key data
+     * (wpa_supplicant_send_2_of_2() for RSN). */
+    wpa_memset(body, 0u, sizeof(body));
+    body[0] = EAPOL_KEY_TYPE_RSN;
+    wpa_put_be16(body + KEY_INFO_OFF,
+                 (uint16_t)(WPA_KEY_INFO_TYPE_HMAC_SHA1_AES |
+                            WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE));
+    wpa_memcpy(body + REPLAY_OFF, key + REPLAY_OFF, WPA_REPLAY_LEN);
+    if (!wpa_send_eapol_key(body, KEY_DATA_OFF, true)) {
+        return; /* the AP retransmits message 1 */
+    }
+    wpa_stage_gtk(gtk, gtk_len, idx);
+    g_wpa.install_attempts = 0u;
+    aic_log("[AIC8800] group key rekeyed\n");
+}
+
 /* ---- public interface ---- */
 
 const uint8_t *aic_wpa_rsn_ie(uint32_t *out_len)
 {
-    *out_len = sizeof(aic_rsn_ie_ccmp_psk);
-    return aic_rsn_ie_ccmp_psk;
+    g_rsn_ie[7] = (g_wpa_group == AIC_RSN_GROUP_TKIP) ? AIC_RSN_GROUP_TKIP
+                                                      : AIC_RSN_GROUP_CCMP;
+    *out_len = sizeof(g_rsn_ie);
+    return g_rsn_ie;
+}
+
+void aic_wpa_set_group_cipher(uint8_t group)
+{
+    g_wpa_group = (group == AIC_RSN_GROUP_TKIP) ? AIC_RSN_GROUP_TKIP
+                                                : AIC_RSN_GROUP_CCMP;
+}
+
+/* A cipher/AKM selector list entry is 4 bytes: OUI 00-0F-AC + type. */
+static bool rsn_suite_is(const uint8_t *s, uint8_t type)
+{
+    return s[0] == 0x00u && s[1] == 0x0Fu && s[2] == 0xACu && s[3] == type;
+}
+
+bool aic_wpa_rsn_usable(const uint8_t *ie, uint32_t ie_len, uint8_t *group_out)
+{
+    uint32_t pos;
+    uint32_t end;
+    uint16_t count;
+    bool ccmp = false;
+    bool psk = false;
+    uint8_t group;
+
+    if (ie == NULL || ie_len < 2u || ie[0] != 0x30u) {
+        return false;
+    }
+    end = 2u + (uint32_t)ie[1];
+    if (end > ie_len || end < 8u) {
+        return false;
+    }
+    if (ie[2] != 0x01u || ie[3] != 0x00u) {
+        return false; /* RSN version 1 only */
+    }
+    /* Group cipher. */
+    if (rsn_suite_is(ie + 4u, AIC_RSN_GROUP_CCMP)) {
+        group = AIC_RSN_GROUP_CCMP;
+    } else if (rsn_suite_is(ie + 4u, AIC_RSN_GROUP_TKIP)) {
+        group = AIC_RSN_GROUP_TKIP;
+    } else {
+        return false;
+    }
+    pos = 8u;
+    /* Pairwise ciphers (absent = CCMP by default). */
+    if (pos + 2u > end) {
+        ccmp = true;
+        psk = true; /* absent AKM list defaults to 802.1X, but be lenient */
+    } else {
+        count = (uint16_t)(ie[pos] | (ie[pos + 1u] << 8));
+        pos += 2u;
+        for (uint16_t i = 0u; i < count; ++i, pos += 4u) {
+            if (pos + 4u > end) {
+                return false;
+            }
+            ccmp = ccmp || rsn_suite_is(ie + pos, 4u);
+        }
+        /* AKM suites. */
+        if (pos + 2u <= end) {
+            count = (uint16_t)(ie[pos] | (ie[pos + 1u] << 8));
+            pos += 2u;
+            for (uint16_t i = 0u; i < count; ++i, pos += 4u) {
+                if (pos + 4u > end) {
+                    return false;
+                }
+                psk = psk || rsn_suite_is(ie + pos, 2u);
+            }
+            /* RSN capabilities: refuse mandatory MFP (no BIP here). */
+            if (pos + 2u <= end) {
+                uint16_t caps = (uint16_t)(ie[pos] | (ie[pos + 1u] << 8));
+                if ((caps & AIC_RSN_CAP_MFPR) != 0u) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (group_out != NULL) {
+        *group_out = group;
+    }
+    return ccmp && psk;
 }
 
 bool aic_wpa_start(const char *psk, const uint8_t *ssid, uint32_t ssid_len,
@@ -557,8 +761,12 @@ bool aic_wpa_start(const char *psk, const uint8_t *ssid, uint32_t ssid_len,
 
     wpa_memcpy(g_wpa.bssid, bssid, 6u);
     wpa_memcpy(g_wpa.own_mac, own_mac, 6u);
-    wpa_memcpy(g_wpa.rsn_ie, aic_rsn_ie_ccmp_psk, sizeof(aic_rsn_ie_ccmp_psk));
-    g_wpa.rsn_ie_len = sizeof(aic_rsn_ie_ccmp_psk);
+    {
+        uint32_t ie_len = 0u;
+        const uint8_t *ie = aic_wpa_rsn_ie(&ie_len);
+        wpa_memcpy(g_wpa.rsn_ie, ie, ie_len);
+        g_wpa.rsn_ie_len = ie_len;
+    }
 
     /* PMK = PBKDF2(HMAC-SHA1, passphrase, SSID, 4096, 256 bits) */
     aic_pbkdf2_sha1((const uint8_t *)psk, psk_len, ssid, ssid_len,
@@ -630,13 +838,19 @@ bool aic_wpa_recv(const uint8_t *eth_frame, uint16_t frame_len)
         return true;
     }
 
-    /* Message 1 carries no MIC, message 3 does -- that is the whole
-     * dispatch (the state machine inside each handler rejects frames
-     * that do not belong to the current step). */
-    if ((wpa_get_be16(key + KEY_INFO_OFF) & WPA_KEY_INFO_MIC) == 0u) {
-        wpa_handle_m1(key, body_len);
-    } else {
-        wpa_handle_m3((uint8_t *)key, body_len, (uint8_t *)eapol, eapol_len);
+    /* Pairwise: message 1 carries no MIC, message 3 does. Group: the group
+     * key handshake. The handlers reject frames that do not belong to the
+     * current step. */
+    {
+        uint16_t ki = wpa_get_be16(key + KEY_INFO_OFF);
+        if ((ki & WPA_KEY_INFO_KEY_TYPE) == 0u) {
+            wpa_handle_group_m1((uint8_t *)key, body_len, (uint8_t *)eapol,
+                                eapol_len);
+        } else if ((ki & WPA_KEY_INFO_MIC) == 0u) {
+            wpa_handle_m1(key, body_len);
+        } else {
+            wpa_handle_m3((uint8_t *)key, body_len, (uint8_t *)eapol, eapol_len);
+        }
     }
     return true;
 }
@@ -685,7 +899,8 @@ void aic_wpa_tick(void)
             /* Pairwise key: key index 0, CCMP, held by the AP's station
              * entry (the firmware assigns hw_key_idx itself). */
             if (aic_mm_key_add(0u, g_aic.ap_idx != 0xFFu ? g_aic.ap_idx : 0u,
-                               g_wpa.ptk + 32u, 16u, 2u, true)) {
+                               g_wpa.ptk + 32u, 16u, AIC_MAC_CIPHER_CCMP,
+                               true)) {
                 g_wpa.install_ptk = false;
             } else {
                 ++g_wpa.install_attempts;
@@ -694,7 +909,11 @@ void aic_wpa_tick(void)
         if (!g_wpa.install_ptk && g_wpa.install_gtk) {
             /* Group key: default key index, not tied to a station. */
             if (aic_mm_key_add(g_wpa.gtk_idx, 0xFFu, g_wpa.gtk,
-                               (uint8_t)g_wpa.gtk_len, 2u, false)) {
+                               (uint8_t)g_wpa.gtk_len,
+                               (g_wpa_group == AIC_RSN_GROUP_TKIP)
+                                   ? AIC_MAC_CIPHER_TKIP
+                                   : AIC_MAC_CIPHER_CCMP,
+                               false)) {
                 g_wpa.install_gtk = false;
                 wpa_memset(g_wpa.gtk, 0u, sizeof(g_wpa.gtk));
                 g_wpa.gtk_len = 0u;

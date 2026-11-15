@@ -269,7 +269,16 @@ int64_t unix_socket_create(int32_t type) {
         }
     }
     free(buf);
-    return -24;
+    /* Say so once: from the caller's side a full table and an empty heap
+     * both used to read as "socketpair: Cannot allocate memory". */
+    static int s_full_reported;
+    if (!s_full_reported) {
+        s_full_reported = 1;
+        serial_write_string("[usock] endpoint table full (UNIX_SOCK_MAX=");
+        serial_write_uint64((uint64_t)UNIX_SOCK_MAX);
+        serial_write_string(")\n");
+    }
+    return -23; /* ENFILE: the system-wide table is full */
 }
 
 /* Ascending walk of a process's AF_UNIX endpoints, in the same "-1 to start,
@@ -391,6 +400,11 @@ static void usock_trace2(const char *tag, int32_t a, int64_t b)
     serial_write_char('\n');
 }
 
+/* Bytes queued in a ring. */
+static uint32_t usock_ring_used(const unix_sock_t *s) {
+    return (s->buf_head + UNIX_SOCK_BUF_SIZE - s->buf_tail) % UNIX_SOCK_BUF_SIZE;
+}
+
 int64_t unix_socket_accept(int32_t fd) {
     unix_sock_t *s = usock_get(fd);
     if (!s || !s->listening) return -22;
@@ -408,16 +422,36 @@ int64_t unix_socket_accept(int32_t fd) {
                  * any pending SCM_RIGHTS handles and message records, onto
                  * the accepted socket. */
                 spinlock_lock(&s->lock);
-                /* The moved bytes and descriptors keep their coordinates. */
-                ns->in_pos = s->in_pos;
-                ns->out_pos = s->out_pos;
+                /* The moved bytes and descriptors keep their coordinates
+                 * (usock_passed.at is a listener in_pos), so the new
+                 * endpoint's window has to be exactly the bytes it takes
+                 * over: it starts where the listener's oldest unread byte
+                 * is. The listener never reads, so its own out_pos does not
+                 * say where that is -- it stays put while in_pos counts
+                 * every byte any client ever wrote before being accepted.
+                 * Copying both as they were left a connection accepted
+                 * after another client's early write with out_pos behind
+                 * in_pos by that client's bytes, and usock_dequeue() then
+                 * held back every descriptor sent on it for that many bytes:
+                 * an X server got the fd for DRI3 FenceFromFD /
+                 * PixmapFromBuffer only after the request that needed it
+                 * (BadValue, then BadAlloc for every later request), Mesa's
+                 * error path closed fd 0, and Chromium's GPU process died
+                 * on its FD-ownership check -- three times, and Chromium
+                 * fell back to software compositing. */
+                uint32_t start = s->in_pos - usock_ring_used(s);
+                uint32_t moved = 0;
+                ns->out_pos = start;
                 while (s->buf_tail != s->buf_head) {
                     uint32_t nx = (ns->buf_head + 1) % UNIX_SOCK_BUF_SIZE;
                     if (nx == ns->buf_tail) break;
                     ns->buf[ns->buf_head] = s->buf[s->buf_tail];
                     ns->buf_head = nx;
                     s->buf_tail = (s->buf_tail + 1) % UNIX_SOCK_BUF_SIZE;
+                    ++moved;
                 }
+                ns->in_pos = start + moved;
+                s->out_pos = start + moved;
                 while (s->fds_tail != s->fds_head) {
                     uint32_t nx = (ns->fds_head + 1) % UNIX_SOCK_FD_MAX;
                     if (nx == ns->fds_tail) break;
@@ -490,11 +524,6 @@ int64_t unix_socket_connect(int32_t fd, const char *path) {
     return -111;
 }
 
-/* Bytes queued in a ring. */
-static uint32_t usock_ring_used(const unix_sock_t *s) {
-    return (s->buf_head + UNIX_SOCK_BUF_SIZE - s->buf_tail) % UNIX_SOCK_BUF_SIZE;
-}
-
 /*
  * Append one send to the peer's queues: `len` bytes of `data` plus `nobjs`
  * descriptors. A boundary-preserving socket takes the whole message or
@@ -524,6 +553,20 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
             spinlock_unlock(&peer->lock);
             return -11; /* EAGAIN: caller keeps its descriptors and retries */
         }
+    } else if ((len > 0u && space == 0u) ||
+               (nobjs > fd_space && fd_space < UNIX_SOCK_FD_MAX - 1u)) {
+        /* Stream with no room: take nothing -- neither bytes nor
+         * descriptors -- exactly as Linux does for an EAGAIN. Queuing the
+         * descriptors and then reporting EAGAIN made the sender (Mojo's
+         * channel writer) retry the same sendmsg() with the same fds, so
+         * every retry queued another copy. Each copy holds a reference the
+         * receiver never closes: leaked AF_UNIX endpoints and shared-memory
+         * regions until the table and RAM ran out and socketpair() failed
+         * with ENOMEM. The caller releases what it captured. (An oversized
+         * batch into an empty fd queue still goes through below, minus the
+         * excess; waiting could never make room for it.) */
+        spinlock_unlock(&peer->lock);
+        return -11;
     }
     for (uint32_t i = 0; i < nobjs; ++i) {
         if (i < fd_space) {
@@ -830,14 +873,24 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
         int64_t r = usock_enqueue(s, (const uint8_t *)(uintptr_t)iov[i].base,
                                   iov[i].len, first ? objs : NULL,
                                   first ? nobjs : 0u);
+        if (r < 0) {
+            /* -11 took nothing, descriptors included; the other errors
+             * released them inside usock_enqueue(). */
+            if (first && r == -11) {
+                for (uint32_t k = 0; k < nobjs; ++k) usock_release_passed(objs[k]);
+            }
+            return total > 0 ? total : r;
+        }
         first = 0;
-        if (r < 0) return total > 0 ? total : r;
         total += r;
         if ((uint64_t)r < iov[i].len) break; /* ring full: partial */
     }
     if (first && nobjs != 0u) {
         /* Descriptors with no payload at all. */
         int64_t r = usock_enqueue(s, NULL, 0, objs, nobjs);
+        if (r == -11) {
+            for (uint32_t k = 0; k < nobjs; ++k) usock_release_passed(objs[k]);
+        }
         if (r < 0) return r;
     }
     return total;
@@ -965,6 +1018,12 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
                 }
                 int32_t u = g_usock_install ? g_usock_install(g) : g;
                 if (u < 0) {
+                    /* No number for it in the receiver's table: give back
+                     * the reference usock_adopt() just took, or the
+                     * endpoint outlives every descriptor that names it. */
+                    if (objs[i].kind == USOCK_PASS_UNIX) {
+                        (void)unix_socket_close(g);
+                    }
                     continue;
                 }
                 out[written++] = u;

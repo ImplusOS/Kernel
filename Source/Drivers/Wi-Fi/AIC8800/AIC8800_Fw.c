@@ -56,6 +56,11 @@
 #define AIC_CHIP_ID_H_MASK          0xC0u
 #define AIC_CHIP_ID_H(chip_id)      (((chip_id) & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK)
 
+/* Where the adid/patch images go on U02/U03 when the patch table's INF
+ * block does not say (aicfw_download_fw_8800d80()'s defaults). */
+#define AIC_FW_RAM_ADID_BASE_U02    0x00201940u
+#define AIC_FW_RAM_PATCH_BASE_U02   0x0020B43Cu
+
 #define AIC_PATCH_CONFIG_OFS        0x0198u /* fmacfw image: patch base */
 #define AIC_PATCH_STR_OFS           0x01A0u /* fmacfw image: patch descriptor */
 #define AIC_PATCH_BUFF_OFS          0x01A4u /* fmacfw image: alternate buffer */
@@ -100,7 +105,8 @@
 #define AICBT_LPM_ENABLE            0u
 #define AICBT_TXPWR_LVL_D80         0x00006F2Fu
 
-#define AIC_HOST_START_APP_AUTO     1u
+/* Set when this boot started firmware it downloaded (see AIC8800.h). */
+static bool g_fw_loaded_this_boot;
 
 /* The vendor compares sizeof(AICBT_PT_TAG) - 1 bytes of the 16-byte tag
  * field ("AICBT_PT_TAG" is 12 characters). */
@@ -640,7 +646,7 @@ static bool fw_sys_config(void)
 static bool fw_patch_config(void)
 {
     static const uint32_t pair_table[AIC_PATCH_PAIR_COUNT][2] = {
-        { 0x00B4u, 0xF3010000u }, /* front-end config: 2.4 GHz only */
+        { 0x00B4u, 0xF3010000u }, /* front-end config (vendor default, no USE_5G) */
         { 0x0170u, 0x0001000Au }, /* RX aggregation counter */
         { 0x0188u, 0x00000001u }, /* user_ext_flags: PWROFST cover calib */
     };
@@ -696,6 +702,25 @@ static bool fw_patch_config(void)
     return true;
 }
 
+bool aic_fw_loaded_this_boot(void)
+{
+    return g_fw_loaded_this_boot;
+}
+
+/* rwnx_send_reboot(): DBG_START_APP_REQ with the REBOOT type, whose
+ * bootaddr is the delay before the chip resets. Fire and forget -- the
+ * chip drops off the bus instead of answering. The firmware stage accepts
+ * TASK_DBG on its message pipe, which is the vendor's use_msg_ep path. */
+bool aic_fw_send_reboot(void)
+{
+    aic_dbg_start_app_req_t req;
+
+    req.bootaddr = AIC_REBOOT_DELAY_MS;
+    req.boottype = AIC_HOST_START_APP_REBOOT;
+    return aic_cmd_nowait(AIC_DBG_START_APP_REQ, (uint16_t)AIC_TASK_DBG,
+                          &req, (uint16_t)sizeof(req));
+}
+
 static bool fw_start_app(void)
 {
     aic_dbg_start_app_req_t req;
@@ -714,8 +739,8 @@ static void fw_ladder_reset(void)
 {
     fw_pt_free();
     fw_upload_abort();
-    g_aic.addr_adid = 0u;
-    g_aic.addr_patch = 0u;
+    g_aic.addr_adid = AIC_FW_RAM_ADID_BASE_U02;
+    g_aic.addr_patch = AIC_FW_RAM_PATCH_BASE_U02;
     g_aic.ext_patch_nb = 0u;
     g_aic.ext_patch_index = 0u;
     g_aic.fw_version = 0u;
@@ -781,6 +806,12 @@ void aic_fw_step(void)
         }
         g_aic.fw_last_attempt = aic_now_ticks();
         fw_ladder_reset();
+        /* Printed before the first USB command, so a log that ends here
+         * points at that command (no reply from the loader), and a log that
+         * ends at the probe line means nothing is driving the driver. */
+        aic_log("[AIC8800] firmware download: starting (attempt ");
+        aic_log_hex32(g_aic.fw_attempts + 1u);
+        aic_log("), reading the chip id\n");
     }
 
     switch (g_aic.fw_phase) {
@@ -873,8 +904,9 @@ void aic_fw_step(void)
             fw_fail("start app");
             return;
         }
-        aic_log("[AIC8800] firmware running; waiting for the device to "
-                "come back with its firmware product id (8d83)\n");
+        aic_log("[AIC8800] firmware started; waiting for the adapter to "
+                "re-enumerate with its firmware product id (8d81)\n");
+        g_fw_loaded_this_boot = true;
         g_aic.fw_done = true;
         g_aic.fw_phase = AIC_FW_DONE;
         break;

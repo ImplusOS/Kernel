@@ -20,3 +20,10 @@
 # goes through.
 usb:vid=A69C=AIC8800_Driver.ELF
 usb:vid=368B=AIC8800_Driver.ELF
+# Branded AIC8800D80 units re-enumerate under their own vendor id once the
+# firmware runs (a warm reboot can leave them there). pid-filtered, so other
+# TP-Link/Tenda USB devices never load this module.
+usb:vid=2357,pid=014E=AIC8800_Driver.ELF
+usb:vid=2357,pid=014B=AIC8800_Driver.ELF
+usb:vid=2604,pid=001F=AIC8800_Driver.ELF
+usb:vid=2604,pid=0020=AIC8800_Driver.ELF

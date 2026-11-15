@@ -19,10 +19,12 @@ The files staged into the boot image automatically by the top-level
 - `fmacfw_8800d80_u02.bin` — the full-mac firmware, loaded at 0x00120000.
 - `fmacfw_8800d80_h_u02.bin` — the variant for "H" chip revisions
   (`(chip_id & 0xC0) == 0xC0`); the driver picks between the two itself.
-  This image came from the same vendor release as the other H-capable D80
-  blobs (`shenmintao/aic8800d80`, `fw/aic8800D80/`); the non-H files in
-  this directory are from an older D80/U02 snapshot. A board that reports
-  as H is best served by replacing the whole set with one vendor release.
+
+All six files are one coherent vendor release (`shenmintao/aic8800d80`,
+`fw/aic8800D80/`). They must stay a set: the patch table records the
+addresses inside the ROM patch it belongs to, and the full-MAC image
+expects that patch. (An earlier snapshot of this directory mixed an older
+patch/patch-table/fmac triple with the newer H image.)
 - `fw_patch_8800d80_u02.bin` — the ROM patch.
 - `fw_patch_8800d80_u02_ext0.bin` — the external patch image the patch
   table's INF block points at (`ext0` is the id the D80 table lists; the

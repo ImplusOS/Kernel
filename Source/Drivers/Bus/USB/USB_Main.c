@@ -1048,6 +1048,19 @@ static bool usb_hc_port_connected(usb_hc_type_t hc, uint32_t port)
     return false;
 }
 
+/* A device that drops off the bus and comes back between two hotplug polls
+ * (one second apart) looks continuously connected. AIC8800 adapters do
+ * exactly that when their firmware starts: the ROM loader disconnects and
+ * the firmware re-enumerates with another product id within a few hundred
+ * milliseconds. The controller latches the change, so ask it. */
+static bool usb_hc_port_connect_changed(usb_hc_type_t hc, uint32_t port)
+{
+    if (hc == USB_HC_XHCI) {
+        return xhci_port_take_connect_change(port);
+    }
+    return false;
+}
+
 static bool usb_hc_reset_port(usb_hc_type_t hc, uint32_t port)
 {
     if (hc == USB_HC_XHCI) {
@@ -1509,6 +1522,14 @@ static bool usb_poll_hc_hotplug(usb_hc_type_t hc)
             usb_disconnect_root_device(state);
             changed = true;
             continue;
+        }
+
+        if (state->connected && usb_hc_port_connect_changed(hc, port)) {
+            /* Gone and back already: drop the old device, then enumerate
+             * the new one below like any fresh connection. */
+            usb_disconnect_root_device(state);
+            state->enum_failures = 0u;
+            changed = true;
         }
 
         if (!connected) {

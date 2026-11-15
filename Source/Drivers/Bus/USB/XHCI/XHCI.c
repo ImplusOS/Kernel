@@ -85,6 +85,24 @@ typedef struct {
 
 #define XHCI_MAX_EP_PER_SLOT 32
 static xhci_xfer_ring_t g_xfer[XHCI_MAX_SLOTS][XHCI_MAX_EP_PER_SLOT];
+/* Whether endpoint DCI `ep` of the device currently in a slot has been through
+ * Configure Endpoint. Transfer rings outlive the device (they are reused by
+ * whatever device gets the slot next), so a ring existing says nothing about
+ * the controller's endpoint state: a device that re-enumerates into the slot
+ * its previous identity used -- the AIC8800 does exactly that when its
+ * firmware starts -- would otherwise ring doorbells on endpoints the
+ * controller has disabled, and its transfers would never run. */
+static uint8_t g_ep_configured[XHCI_MAX_SLOTS][XHCI_MAX_EP_PER_SLOT];
+
+static void xhci_forget_slot_endpoints(uint8_t slot_idx)
+{
+    if (slot_idx >= XHCI_MAX_SLOTS) {
+        return;
+    }
+    for (uint8_t ep = 0u; ep < XHCI_MAX_EP_PER_SLOT; ++ep) {
+        g_ep_configured[slot_idx][ep] = 0u;
+    }
+}
 
 static void    *g_dev_ctx[XHCI_MAX_SLOTS];
 static uint64_t g_dev_ctx_phys[XHCI_MAX_SLOTS];
@@ -890,6 +908,21 @@ bool xhci_port_connected(uint32_t port) {
     return (g_op->ports[port].portsc & XHCI_PORTSC_CCS) != 0;
 }
 
+bool xhci_port_take_connect_change(uint32_t port) {
+    if (!g_op) return false;
+    if (!xhci_port_valid(port)) return false;
+
+    uint32_t portsc = g_op->ports[port].portsc;
+    if ((portsc & XHCI_PORTSC_CSC) == 0u) {
+        return false;
+    }
+    /* Write CSC back as 1 to clear it; keep the preserved RW bits and write
+     * 0 to every other RW1C bit and to PED (writing 1 there disables). */
+    g_op->ports[port].portsc = (portsc & 0x0E000200u) | XHCI_PORTSC_CSC;
+    hal_cpu_memory_barrier();
+    return true;
+}
+
 bool xhci_port_valid(uint32_t port) {
     if (!g_op) return false;
     uint32_t maxp = max_ports();
@@ -1225,6 +1258,7 @@ void xhci_disable_slot(uint8_t addr)
     if (slot_id == 0 || slot_id > XHCI_MAX_SLOTS) return;
 
     xhci_disable_slot_command(slot_id);
+    xhci_forget_slot_endpoints((uint8_t)(slot_id - 1u));
 
     g_addr_from_slot[slot_id] = 0;
     g_slot_map[addr] = 0;
@@ -1258,6 +1292,7 @@ static bool xhci_address_device(uint8_t port, uint8_t speed, uint8_t dev_addr)
     }
 
     g_slot_map[0] = slot_id;
+    xhci_forget_slot_endpoints(si);
 
     if (!g_dev_ctx[si]) {
         g_dev_ctx[si] = xhci_dma_alloc(4096u, 4096u, &g_dev_ctx_phys[si]);
@@ -1530,6 +1565,11 @@ static bool xhci_configure_ep(uint8_t addr, uint8_t ep_addr, uint8_t ep_type,
 
     if (!g_xfer[si][ep_idx].ring) {
         if (!init_xfer_ring(si, ep_idx)) return false;
+    } else {
+        /* A ring left by an earlier configuration: start it over, since the
+         * endpoint context below points the controller at its first TRB
+         * with cycle state 1. */
+        xhci_reset_xfer_ring(si, ep_idx);
     }
     if (!g_inp_ctx[si]) return false;
 
@@ -1573,7 +1613,9 @@ static bool xhci_configure_ep(uint8_t addr, uint8_t ep_addr, uint8_t ep_type,
     cmd.control   = (12u << 10) | ((uint32_t)slot_id << 24);
 
     uint32_t cc = 0;
-    return xhci_issue_command(&cmd, slot_id, &cc);
+    bool ok = xhci_issue_command(&cmd, slot_id, &cc);
+    g_ep_configured[si][ep_idx] = ok ? 1u : 0u;
+    return ok;
 }
 
 bool xhci_submit_control(uint8_t addr, uint8_t endpoint,
@@ -1743,11 +1785,16 @@ bool xhci_submit_bulk_timeout(uint8_t addr, uint8_t endpoint,
         return false;
     }
 
-    if (!g_xfer[si][ep_idx].ring) {
+    if (!g_ep_configured[si][ep_idx] || !g_xfer[si][ep_idx].ring) {
         uint16_t mps = max_packet_size ? max_packet_size : 512u;
         if (!xhci_configure_ep(addr,
                                (uint8_t)(endpoint | (dir_in ? 0x80u : 0)),
                                2, mps, 0)) {
+            xhci_debug_string("[XHCI] configure bulk ep ");
+            xhci_debug_u32((uint32_t)(endpoint | (dir_in ? 0x80u : 0)));
+            xhci_debug_string(" of addr ");
+            xhci_debug_u32(addr);
+            xhci_debug_string(" failed\n");
             return false;
         }
     }
@@ -1797,6 +1844,18 @@ bool xhci_submit_bulk_timeout(uint8_t addr, uint8_t endpoint,
             uint8_t *dst = (uint8_t *)dma_buf;
             for (uint32_t i = 0; i < length; i++) dst[i] = src[i];
         }
+    } else {
+        /* The whole `length` is copied back to the caller below, but a short
+         * transfer only writes its own bytes. Without this the tail would be
+         * whatever the shared bounce buffer last held -- typically the
+         * previous OUT transfer -- and a caller that finds the end of the
+         * data by its zero terminator (AIC8800's aggregated RX) would parse
+         * that stale tail as more packets. */
+        uint8_t *dst = (uint8_t *)dma_buf;
+        if (g_api && g_api->memset)
+            g_api->memset(dma_buf, 0, length);
+        else
+            for (uint32_t i = 0; i < length; i++) dst[i] = 0u;
     }
 
     uint64_t rflags;
@@ -1891,7 +1950,7 @@ bool xhci_submit_interrupt_in(uint8_t addr, uint8_t ep_num,
     if (ep_idx == 0 || ep_idx >= XHCI_MAX_EP_PER_SLOT) return false;
     if (dma_phys == 0u || length == 0u) return false;
 
-    if (!g_xfer[si][ep_idx].ring) {
+    if (!g_ep_configured[si][ep_idx] || !g_xfer[si][ep_idx].ring) {
         xhci_configure_ep(addr, ep_num | 0x80u, 3, max_packet_size, 6);
     }
 

@@ -4611,7 +4611,9 @@ static int64_t linux_socketpair(uint64_t domain, uint64_t type,
      * Chromium's zygote protocol depends on reading one request per call. */
     int64_t rc = unix_socket_pair_typed((int32_t)base_type, fds);
     if (rc < 0) {
-        return LINUX_ENOMEM;
+        /* ENFILE (endpoint table full) is reported as itself, so a failure
+         * says which limit was hit; anything else is an allocation failure. */
+        return rc == -23 ? rc : LINUX_ENOMEM;
     }
     if (copy_to_user_trusted((void *)(uintptr_t)fds_ptr, fds, sizeof(fds)) != 0u) {
         return LINUX_EFAULT;
@@ -4631,7 +4633,8 @@ static int64_t linux_socket_create(uint64_t domain, uint64_t type,
             return LINUX_EPROTONOSUPPORT;
         }
         int64_t fd = unix_socket_create((int32_t)base_type);
-        return fd < 0 ? LINUX_ENOMEM : fd;
+        if (fd < 0) return fd == -23 ? fd : LINUX_ENOMEM;
+        return fd;
     }
     if (domain != LINUX_AF_INET) {
         return LINUX_EAFNOSUPPORT;

@@ -7648,6 +7648,9 @@ int32_t process_get_full_info(int32_t pid, void *info_out)
     info->pid = pid;
     info->parent_pid = proc->parent_pid;
     info->state = proc->state;
+    /* reserved[0]: scheduling priority (0-3, see process_set_priority) so a
+     * task manager can show what it would be changing. */
+    info->reserved[0] = proc->priority;
     for (int i = 0; i < 64; i++) info->name[i] = proc->name[i];
     info->total_ticks = proc->total_ticks;
     

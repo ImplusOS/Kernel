@@ -183,6 +183,10 @@ bool     xhci_reset_port(uint32_t port);
 void     xhci_delay_ms(uint32_t ms);
 bool     xhci_is_ready(void);
 bool     xhci_port_connected(uint32_t port);
+/* True (once) when the port latched a connect status change since the last
+ * call -- i.e. a device left and/or arrived, possibly so quickly that the
+ * current connect status alone looks unchanged. Clears the latch. */
+bool     xhci_port_take_connect_change(uint32_t port);
 bool     xhci_port_valid(uint32_t port);
 bool     xhci_evaluate_ep0_mps(uint8_t addr, uint16_t new_mps);
 
