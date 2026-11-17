@@ -340,7 +340,7 @@ void process_scheduler_debug_dump_cpus(void)
     serial_write_string("\n");
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
 extern void smp_send_resched_ipi(uint32_t cpu);
 #endif
 
@@ -351,13 +351,19 @@ void process_scheduler_idle_wait(void)
     /* sti; hlt as one sequence: an interrupt (the kick IPI) that becomes
      * pending between the two is taken after the hlt starts, so it wakes it
      * instead of being consumed before the CPU goes to sleep. */
+#if defined(__x86_64__)
     __asm__ volatile("sti; hlt" ::: "memory");
+#elif defined(__aarch64__)
+    /* WFI wakes on a pending IRQ even while PSTATE.I masks it, so waiting
+     * first and unmasking afterwards has the same no-lost-wakeup property. */
+    __asm__ volatile("dsb sy; wfi; msr daifclr, #2" ::: "memory");
+#endif
     __atomic_store_n(&g_cpu_idle[cpu], 0u, __ATOMIC_SEQ_CST);
 }
 
 void process_scheduler_kick_idle_cpu(void)
 {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
     uint32_t me = scheduler_cpu_id();
     uint32_t n = smp_get_cpu_count();
     if (n > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) n = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;
@@ -373,7 +379,7 @@ void process_scheduler_kick_idle_cpu(void)
 
 void process_scheduler_kick_for_rt(const process_t *processes, int32_t capacity)
 {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
     uint32_t me = scheduler_cpu_id();
     uint32_t n = smp_get_cpu_count();
     if (n > (uint32_t)OS_CONFIG_SMP_MAX_CPUS) n = (uint32_t)OS_CONFIG_SMP_MAX_CPUS;

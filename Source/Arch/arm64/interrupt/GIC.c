@@ -1,6 +1,9 @@
 #include "GIC.h"
 #include "interfaces/interrupt_ops.h"
+#include "interfaces/mmio.h"
+#include "kernel/config.h"
 #include "Platform/acpi/ACPI.h"
+#include "smp/SMP_Main.h"
 
 #define GICD_CTLR       0x0000
 #define GICD_TYPER      0x0004
@@ -20,6 +23,12 @@
 #define GICC_IAR        0x000C
 #define GICC_EOIR       0x0010
 
+#define GICD_SGIR       0x0F00
+
+#define GICR_TYPER      0x0008
+#define GICR_TYPER_VLPIS (1ULL << 1)
+#define GICR_TYPER_LAST  (1ULL << 4)
+#define GICR_FRAME_SIZE  0x20000ULL
 #define GICR_WAKER      0x0014
 #define GICR_SGI_BASE   0x10000
 #define GICR_IGROUPR0   (GICR_SGI_BASE + 0x0080)
@@ -51,24 +60,28 @@
 
 static volatile uint32_t *g_gicd;
 static volatile uint32_t *g_gicc;
+/* GICv3 has one redistributor per CPU; g_gicr is the first frame of the
+ * redistributor region and g_gicr_cpu[] the frame each CPU found for itself
+ * (gicv3_find_redistributor). Everything per-CPU -- SGIs and PPIs such as
+ * the generic timer -- goes through the calling CPU's frame. */
 static volatile uint32_t *g_gicr;
+static volatile uint32_t *g_gicr_cpu[OS_CONFIG_SMP_MAX_CPUS];
 static uint8_t g_gic_version;
 static int g_gic_ready;
 
-static inline uint32_t mmio_read32(volatile uint32_t *base, uint64_t off)
+static inline uint32_t gic_read32(volatile uint32_t *base, uint64_t off)
 {
-    return base[off / 4];
+    return mmio_read32((volatile uint8_t *)base + off);
 }
 
-static inline void mmio_write32(volatile uint32_t *base, uint64_t off, uint32_t value)
+static inline void gic_write32(volatile uint32_t *base, uint64_t off, uint32_t value)
 {
-    base[off / 4] = value;
+    mmio_write32((volatile uint8_t *)base + off, value);
 }
 
-static inline void mmio_write64(volatile uint32_t *base, uint64_t off, uint64_t value)
+static inline void gic_write64(volatile uint32_t *base, uint64_t off, uint64_t value)
 {
-    base[off / 4] = (uint32_t)value;
-    base[(off / 4) + 1u] = (uint32_t)(value >> 32);
+    mmio_write64((volatile uint8_t *)base + off, value);
 }
 
 static inline uint64_t read_mpidr_el1(void)
@@ -158,10 +171,20 @@ static inline void gic_barrier(void)
     __asm__ volatile("dsb sy; isb" ::: "memory");
 }
 
+/* This CPU's redistributor frame (GICv3), or NULL before it has one. */
+static volatile uint32_t *gicr_this_cpu(void)
+{
+    uint32_t cpu = smp_get_current_cpu_id();
+    if (cpu < (uint32_t)OS_CONFIG_SMP_MAX_CPUS && g_gicr_cpu[cpu] != 0) {
+        return g_gicr_cpu[cpu];
+    }
+    return (cpu == 0u) ? g_gicr : 0;
+}
+
 static void gicd_wait_rwp(void)
 {
     for (uint32_t i = 0; i < 100000u; ++i) {
-        if ((mmio_read32(g_gicd, GICD_CTLR) & GICD_CTLR_RWP) == 0u) {
+        if ((gic_read32(g_gicd, GICD_CTLR) & GICD_CTLR_RWP) == 0u) {
             break;
         }
     }
@@ -169,7 +192,7 @@ static void gicd_wait_rwp(void)
 
 static uint32_t gicd_irq_count(void)
 {
-    uint32_t typer = mmio_read32(g_gicd, GICD_TYPER);
+    uint32_t typer = gic_read32(g_gicd, GICD_TYPER);
     uint32_t count = ((typer & 0x1Fu) + 1u) * 32u;
     if (count > GIC_MAX_IRQ) {
         count = GIC_MAX_IRQ;
@@ -190,30 +213,30 @@ static void gicd_set_spi_target_v2(uint32_t irq)
 {
     uint64_t off = GICD_ITARGETSR + (uint64_t)(irq & ~3u);
     uint32_t shift = (irq & 3u) * 8u;
-    uint32_t value = mmio_read32(g_gicd, off);
+    uint32_t value = gic_read32(g_gicd, off);
     value &= ~(0xFFu << shift);
     value |=  (0x01u << shift);
-    mmio_write32(g_gicd, off, value);
+    gic_write32(g_gicd, off, value);
 }
 
 static void gicd_route_spi_v3(uint32_t irq)
 {
     if (irq >= 32u) {
-        mmio_write64(g_gicd, GICD_IROUTER + ((uint64_t)irq * 8u),
+        gic_write64(g_gicd, GICD_IROUTER + ((uint64_t)irq * 8u),
                      gicv3_current_affinity());
     }
 }
 
-static void gicv3_configure_ppi_level(uint32_t irq)
+static void gicv3_configure_ppi_level(volatile uint32_t *gicr, uint32_t irq)
 {
-    if (g_gicr == 0 || irq < 16u || irq >= 32u) {
+    if (gicr == 0 || irq < 16u || irq >= 32u) {
         return;
     }
 
     uint32_t shift = (irq - 16u) * 2u;
-    uint32_t value = mmio_read32(g_gicr, GICR_ICFGR1);
+    uint32_t value = gic_read32(gicr, GICR_ICFGR1);
     value &= ~(0x3u << shift);
-    mmio_write32(g_gicr, GICR_ICFGR1, value);
+    gic_write32(gicr, GICR_ICFGR1, value);
 }
 
 static void gicd_configure_ppi_level(uint32_t irq)
@@ -224,68 +247,97 @@ static void gicd_configure_ppi_level(uint32_t irq)
 
     uint64_t off = GICD_ICFGR + ((uint64_t)(irq / 16u) * 4u);
     uint32_t shift = (irq % 16u) * 2u;
-    uint32_t value = mmio_read32(g_gicd, off);
+    uint32_t value = gic_read32(g_gicd, off);
     value &= ~(0x3u << shift);
-    mmio_write32(g_gicd, off, value);
+    gic_write32(g_gicd, off, value);
 }
 
 static void gic_clear_pending_irq(uint32_t irq)
 {
-    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && g_gicr != 0) {
-        mmio_write32(g_gicr, GICR_ICPENDR0, 1u << irq);
+    volatile uint32_t *gicr = gicr_this_cpu();
+    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && gicr != 0) {
+        gic_write32(gicr, GICR_ICPENDR0, 1u << irq);
         return;
     }
 
-    mmio_write32(g_gicd, GICD_ICPENDR + ((irq / 32u) * 4u),
+    gic_write32(g_gicd, GICD_ICPENDR + ((irq / 32u) * 4u),
                  1u << (irq % 32u));
 }
 
 static void gic_clear_active_irq(uint32_t irq)
 {
-    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && g_gicr != 0) {
-        mmio_write32(g_gicr, GICR_ICACTIVER0, 1u << irq);
+    volatile uint32_t *gicr = gicr_this_cpu();
+    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && gicr != 0) {
+        gic_write32(gicr, GICR_ICACTIVER0, 1u << irq);
         return;
     }
 
-    mmio_write32(g_gicd, GICD_ICACTIVER + ((irq / 32u) * 4u),
+    gic_write32(g_gicd, GICD_ICACTIVER + ((irq / 32u) * 4u),
                  1u << (irq % 32u));
 }
 
 static void gicv2_cpu_init(void)
 {
     if (g_gicc) {
-        mmio_write32(g_gicc, GICC_PMR, 0xFFu);
-        mmio_write32(g_gicc, GICC_BPR, 0u);
-        mmio_write32(g_gicc, GICC_CTLR, GICC_CTLR_ENABLE);
+        gic_write32(g_gicc, GICC_PMR, 0xFFu);
+        gic_write32(g_gicc, GICC_BPR, 0u);
+        gic_write32(g_gicc, GICC_CTLR, GICC_CTLR_ENABLE);
     }
 }
 
-static void gicv3_redistributor_init(void)
+/* Walk the redistributor region for the frame whose GICR_TYPER affinity
+ * is this CPU's. Frames are 128 KiB (256 KiB with VLPI support); the last
+ * one has GICR_TYPER.Last set. */
+static volatile uint32_t *gicv3_find_redistributor(void)
 {
     if (g_gicr == 0) {
+        return 0;
+    }
+    uint64_t mpidr = read_mpidr_el1();
+    uint64_t aff = (mpidr & 0xFFFFFFULL) | ((mpidr >> 8) & 0xFF000000ULL);
+    uintptr_t frame = (uintptr_t)g_gicr;
+    for (uint32_t i = 0; i < 256u; ++i) {
+        uint64_t typer = mmio_read64((volatile uint8_t *)frame + GICR_TYPER);
+        if ((typer >> 32) == aff) {
+            return (volatile uint32_t *)frame;
+        }
+        if ((typer & GICR_TYPER_LAST) != 0u) {
+            break;
+        }
+        frame += (uintptr_t)(GICR_FRAME_SIZE *
+                             (((typer & GICR_TYPER_VLPIS) != 0u) ? 2u : 1u));
+    }
+    return 0;
+}
+
+static void gicv3_redistributor_init(volatile uint32_t *gicr)
+{
+    if (gicr == 0) {
         return;
     }
 
-    uint32_t waker = mmio_read32(g_gicr, GICR_WAKER);
+    uint32_t waker = gic_read32(gicr, GICR_WAKER);
     waker &= ~GICR_WAKER_PROCESSOR_SLEEP;
-    mmio_write32(g_gicr, GICR_WAKER, waker);
+    gic_write32(gicr, GICR_WAKER, waker);
 
     for (uint32_t i = 0; i < 100000u; ++i) {
-        if ((mmio_read32(g_gicr, GICR_WAKER) &
+        if ((gic_read32(gicr, GICR_WAKER) &
              GICR_WAKER_CHILDREN_ASLEEP) == 0u) {
             break;
         }
     }
 
-    mmio_write32(g_gicr, GICR_IGROUPR0, 0xFFFFFFFFu);
-    mmio_write32(g_gicr, GICR_ICENABLER0, 0xFFFFFFFFu);
-    mmio_write32(g_gicr, GICR_ICPENDR0, 0xFFFFFFFFu);
-    mmio_write32(g_gicr, GICR_ICACTIVER0, 0xFFFFFFFFu);
-    gicv3_configure_ppi_level(27u);
-    gicv3_configure_ppi_level(30u);
+    gic_write32(gicr, GICR_IGROUPR0, 0xFFFFFFFFu);
+    gic_write32(gicr, GICR_ICENABLER0, 0xFFFFFFFFu);
+    gic_write32(gicr, GICR_ICPENDR0, 0xFFFFFFFFu);
+    gic_write32(gicr, GICR_ICACTIVER0, 0xFFFFFFFFu);
+    gicv3_configure_ppi_level(gicr, 27u);
+    gicv3_configure_ppi_level(gicr, 30u);
     for (uint32_t i = 0; i < 8u; ++i) {
-        mmio_write32(g_gicr, GICR_IPRIORITYR + i * 4u, GIC_PRIORITY_DEFAULT);
+        gic_write32(gicr, GICR_IPRIORITYR + i * 4u, GIC_PRIORITY_DEFAULT);
     }
+    /* The SGIs this kernel sends between CPUs (arm64_gic_send_sgi). */
+    gic_write32(gicr, GICR_ISENABLER0, 0x0000FFFFu);
     gic_barrier();
 }
 
@@ -318,7 +370,7 @@ int arm64_gic_init(uint64_t gicd_base, uint64_t gicr_base, uint64_t gicc_base)
     g_gicr = (volatile uint32_t *)(uintptr_t)gicr_base;
     g_gic_version = (gicr_base != 0) ? GIC_VERSION_3 : GIC_VERSION_2;
 
-    mmio_write32(g_gicd, GICD_CTLR, 0);
+    gic_write32(g_gicd, GICD_CTLR, 0);
     gicd_wait_rwp();
 
     uint32_t irq_count = gicd_irq_count();
@@ -326,25 +378,31 @@ int arm64_gic_init(uint64_t gicd_base, uint64_t gicr_base, uint64_t gicc_base)
     for (uint32_t i = 0; i < group_regs; ++i) {
         uint32_t group = (g_gic_version >= GIC_VERSION_3) ?
                          0xFFFFFFFFu : 0x00000000u;
-        mmio_write32(g_gicd, GICD_IGROUPR + i * 4u, group);
-        mmio_write32(g_gicd, GICD_ICENABLER + i * 4u, 0xFFFFFFFFu);
-        mmio_write32(g_gicd, GICD_ICPENDR + i * 4u, 0xFFFFFFFFu);
-        mmio_write32(g_gicd, GICD_ICACTIVER + i * 4u, 0xFFFFFFFFu);
+        gic_write32(g_gicd, GICD_IGROUPR + i * 4u, group);
+        gic_write32(g_gicd, GICD_ICENABLER + i * 4u, 0xFFFFFFFFu);
+        gic_write32(g_gicd, GICD_ICPENDR + i * 4u, 0xFFFFFFFFu);
+        gic_write32(g_gicd, GICD_ICACTIVER + i * 4u, 0xFFFFFFFFu);
     }
     for (uint32_t i = 0; i < (irq_count / 4u); ++i) {
-        mmio_write32(g_gicd, GICD_IPRIORITYR + i * 4u, GIC_PRIORITY_DEFAULT);
+        gic_write32(g_gicd, GICD_IPRIORITYR + i * 4u, GIC_PRIORITY_DEFAULT);
     }
 
     if (g_gic_version >= GIC_VERSION_3) {
-        gicv3_redistributor_init();
-        mmio_write32(g_gicd, GICD_CTLR,
+        volatile uint32_t *own = gicv3_find_redistributor();
+        if (own == 0) {
+            own = g_gicr;
+        }
+        g_gicr_cpu[0] = own;
+        gicv3_redistributor_init(own);
+        gic_write32(g_gicd, GICD_CTLR,
                      GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1NS);
         gicd_wait_rwp();
         gicv3_cpu_init();
     } else {
         gicd_configure_ppi_level(27u);
         gicd_configure_ppi_level(30u);
-        mmio_write32(g_gicd, GICD_CTLR, GICD_CTLR_ENABLE_GRP0);
+        gic_write32(g_gicd, GICD_ISENABLER, 0x0000FFFFu); /* SGIs, banked */
+        gic_write32(g_gicd, GICD_CTLR, GICD_CTLR_ENABLE_GRP0);
         gicd_wait_rwp();
         gicv2_cpu_init();
     }
@@ -362,7 +420,7 @@ void arm64_gic_eoi(uint32_t irq)
     if (g_gic_version >= GIC_VERSION_3) {
         gicv3_write_eoir1(irq);
     } else if (g_gicc) {
-        mmio_write32(g_gicc, GICC_EOIR, irq);
+        gic_write32(g_gicc, GICC_EOIR, irq);
     }
 }
 
@@ -371,7 +429,7 @@ uint32_t arm64_gic_read_iar(void)
     if (g_gic_version >= GIC_VERSION_3) {
         return (uint32_t)gicv3_read_iar1();
     }
-    if (g_gicc) return mmio_read32(g_gicc, GICC_IAR);
+    if (g_gicc) return gic_read32(g_gicc, GICC_IAR);
     return GIC_SPURIOUS_IRQ;
 }
 
@@ -394,23 +452,87 @@ int arm64_gic_route_irq(uint32_t irq, uint32_t vector)
 void arm64_gic_mask_irq(uint32_t irq)
 {
     if (!g_gic_ready || irq >= GIC_MAX_IRQ) return;
-    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && g_gicr != 0) {
-        mmio_write32(g_gicr, GICR_ICENABLER0, 1u << irq);
+    volatile uint32_t *gicr = gicr_this_cpu();
+    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && gicr != 0) {
+        gic_write32(gicr, GICR_ICENABLER0, 1u << irq);
         return;
     }
-    mmio_write32(g_gicd, GICD_ICENABLER + ((irq / 32u) * 4u),
+    gic_write32(g_gicd, GICD_ICENABLER + ((irq / 32u) * 4u),
                  1u << (irq % 32u));
 }
 
 void arm64_gic_unmask_irq(uint32_t irq)
 {
     if (!g_gic_ready || irq >= GIC_MAX_IRQ) return;
-    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && g_gicr != 0) {
-        mmio_write32(g_gicr, GICR_ISENABLER0, 1u << irq);
+    volatile uint32_t *gicr = gicr_this_cpu();
+    if (g_gic_version >= GIC_VERSION_3 && irq < 32u && gicr != 0) {
+        gic_write32(gicr, GICR_ISENABLER0, 1u << irq);
         return;
     }
-    mmio_write32(g_gicd, GICD_ISENABLER + ((irq / 32u) * 4u),
+    gic_write32(g_gicd, GICD_ISENABLER + ((irq / 32u) * 4u),
                  1u << (irq % 32u));
+}
+
+/* Per-CPU half of arm64_gic_init(), for a secondary CPU coming up: its
+ * redistributor (GICv3) or its banked distributor registers (GICv2), and its
+ * CPU interface. The distributor itself is shared and already enabled. */
+int arm64_gic_init_secondary(void)
+{
+    if (!g_gic_ready) {
+        return -1;
+    }
+    if (g_gic_version >= GIC_VERSION_3) {
+        volatile uint32_t *own = gicv3_find_redistributor();
+        if (own == 0) {
+            return -1;
+        }
+        uint32_t cpu = smp_get_current_cpu_id();
+        if (cpu < (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
+            g_gicr_cpu[cpu] = own;
+        }
+        gicv3_redistributor_init(own);
+        gicv3_cpu_init();
+    } else {
+        /* SGI/PPI enables, priorities and configuration are banked per CPU. */
+        gic_write32(g_gicd, GICD_ICENABLER, 0xFFFFFFFFu);
+        gic_write32(g_gicd, GICD_ICPENDR, 0xFFFFFFFFu);
+        gic_write32(g_gicd, GICD_ICACTIVER, 0xFFFFFFFFu);
+        for (uint32_t i = 0; i < 8u; ++i) {
+            gic_write32(g_gicd, GICD_IPRIORITYR + i * 4u, GIC_PRIORITY_DEFAULT);
+        }
+        gicd_configure_ppi_level(27u);
+        gicd_configure_ppi_level(30u);
+        gic_write32(g_gicd, GICD_ISENABLER, 0x0000FFFFu);
+        gicv2_cpu_init();
+    }
+    gic_barrier();
+    return 0;
+}
+
+/* Raise SGI `sgi` (0-15) on the CPU whose MPIDR is `target_mpidr` (GICv3)
+ * / whose GIC CPU interface number is `target_iface` (GICv2). */
+void arm64_gic_send_sgi(uint64_t target_mpidr, uint32_t target_iface, uint32_t sgi)
+{
+    if (!g_gic_ready || sgi > 15u) {
+        return;
+    }
+    __asm__ volatile("dsb ishst" ::: "memory");
+    if (g_gic_version >= GIC_VERSION_3) {
+        uint64_t aff0 = target_mpidr & 0xFFu;
+        uint64_t aff1 = (target_mpidr >> 8) & 0xFFu;
+        uint64_t aff2 = (target_mpidr >> 16) & 0xFFu;
+        uint64_t aff3 = (target_mpidr >> 32) & 0xFFu;
+        /* TargetList covers Aff0 values 0-15 within the Aff3.Aff2.Aff1
+         * cluster; RS (bits 47:44) selects which group of 16. */
+        uint64_t rs = aff0 >> 4;
+        uint64_t value = (aff3 << 48) | (rs << 44) | (aff2 << 32) |
+                         ((uint64_t)sgi << 24) | (aff1 << 16) |
+                         (1ULL << (aff0 & 0xFu));
+        __asm__ volatile("msr S3_0_C12_C11_5, %0; isb" :: "r"(value) : "memory");
+    } else {
+        gic_write32(g_gicd, GICD_SGIR,
+                     ((1u << (target_iface & 7u)) << 16) | sgi);
+    }
 }
 
 static int arm64_interrupt_configure(const void *firmware_info)

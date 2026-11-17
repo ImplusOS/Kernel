@@ -5669,6 +5669,82 @@ void process_preempt_from_user_irq(uint64_t *isr_regs)
 }
 #endif
 
+#if defined(__aarch64__)
+/* Timer preemption of user code, arm64 flavour of the x86 function above.
+ *
+ * Simpler than x86: an IRQ taken from EL0 already saved the complete user
+ * register file as an arm64_exception_frame_t on this task's kernel stack --
+ * at kernel_stack_top - sizeof(frame), the same place a syscall frame goes,
+ * because SP_EL1 is left at kernel_stack_top when the task enters EL0 (see
+ * arm64_enter_user_from_frame). That frame *is* the task's resumable
+ * context, so all there is to do is record it and switch. */
+void process_preempt_from_user_irq_arm64(arm64_exception_frame_t *frame)
+{
+    if (frame == NULL || !process_table_ready()) {
+        return;
+    }
+    if (!process_scheduler_consume_reschedule()) {
+        return;
+    }
+
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_process_table_lock);
+
+    int32_t cur = current_pid_get();
+    if (!is_valid_pid(cur) ||
+        g_processes[cur].state != PROCESS_STATE_RUNNING ||
+        g_processes[cur].kernel_stack_top == 0u ||
+        scheduler_pid_held_for_fork(g_processes, g_process_capacity, cur)) {
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return;
+    }
+    process_t *current = &g_processes[cur];
+
+    int32_t next_pid = process_scheduler_pick_next(g_processes,
+                                                   g_process_capacity, cur);
+    if (next_pid < 0 || next_pid == cur) {
+        process_scheduler_prepare_run(current);
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        return;
+    }
+
+    uint64_t now_ns = process_perf_now_ns();
+
+    current->saved_rsp = (uint64_t)(uintptr_t)frame;
+    current->saved_user_rsp = frame->sp_el0;
+    current->user_stack_exchanged = 0;
+    process_fpu_save(current->fpu_state);
+    current->fs_base = rdmsr_fs_base();
+
+    process_perf_account_runtime_locked(current, now_ns);
+    current->state = PROCESS_STATE_READY;
+    process_perf_mark_ready_locked(current, now_ns);
+
+    /* Still on cur's kernel stack until enter_user_mode switches: keep other
+     * CPUs off it until then. */
+    process_scheduler_set_leaving_pid(cur);
+
+    current_pid_set(next_pid);
+    process_t *next = &g_processes[next_pid];
+    process_deliver_pending_signals_locked(next);
+    process_perf_prepare_run_locked(next, now_ns, 1);
+    process_scheduler_prepare_run(next);
+
+    uint64_t next_saved_rsp = next->saved_rsp;
+    uint64_t next_user_rsp = next->saved_user_rsp;
+    uint64_t next_cr3 = next->cr3;
+    process_fpu_restore(next->fpu_state);
+    activate_process_context(next);
+    spinlock_unlock(&g_process_table_lock);
+    (void)irq_flags; /* interrupts stay masked until the eret into next */
+
+    const arch_ops_t *ops = arch_ops_get();
+    ops->enter_user_mode(next_saved_rsp, next_user_rsp, next_cr3);
+}
+#endif
+
 int process_run_next_on_current_cpu(void)
 {
     if (!process_table_ready()) {

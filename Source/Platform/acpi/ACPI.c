@@ -157,16 +157,21 @@ static int g_ready = 0;
 
 #include "Platform/io/IO_Main.h"
 
+#if defined(__aarch64__)
+#include "Arch/arm64/smp/PSCI.h"
+#endif
+
 void acpi_reboot(void)
 {
-    
-    outb(0x64, 0xFE);
-    
 #if defined(__aarch64__)
+    /* No keyboard controller or triple fault here: PSCI SYSTEM_RESET. */
+    arm64_psci_system_reset();
     while (1) {
         __asm__ volatile("wfi");
     }
 #else
+    outb(0x64, 0xFE);
+
     __asm__ volatile ("lidt %0; int3" :: "m"((uint16_t[3]){0,0,0}));
 #endif
     while(1);
@@ -190,6 +195,10 @@ void acpi_shutdown(void)
         display->present();
     }
 
+#if defined(__aarch64__)
+    /* Hardware-reduced ACPI on AArch64: S5 goes through PSCI SYSTEM_OFF. */
+    arm64_psci_system_off();
+#else
     if (g_info.has_s5 && g_info.pm1a_cnt_blk != 0) {
         outw((uint16_t)g_info.pm1a_cnt_blk, (uint16_t)(g_info.slp_typ_s5 | (1 << 13)));
     }
@@ -198,6 +207,7 @@ void acpi_shutdown(void)
     outw(0xB004, 0x2000);
     outw(0x604, 0x2000);
     outw(0x4004, 0x3400);
+#endif
     
     while(1);
 }
@@ -256,6 +266,14 @@ static void parse_fadt(const fadt_t *fadt)
     if (fadt == NULL) return;
     
     g_info.pm1a_cnt_blk = fadt->pm1a_cnt_blk;
+
+    /* ARM_BOOT_ARCH (ACPI 5.1+, FADT offset 129): how to reach PSCI. */
+    if (fadt->header.length >= 131u) {
+        const uint8_t *raw = (const uint8_t *)fadt;
+        uint16_t arm_boot_arch = (uint16_t)(raw[129] | ((uint16_t)raw[130] << 8));
+        g_info.psci_compliant = (uint8_t)((arm_boot_arch & 0x1u) != 0u);
+        g_info.psci_use_hvc = (uint8_t)((arm_boot_arch & 0x2u) != 0u);
+    }
     
     const sdt_header_t *dsdt = (const sdt_header_t *)map_mmio_virt(fadt->dsdt);
     dsdt = validate_sdt(dsdt, "DSDT");
@@ -349,6 +367,16 @@ static void parse_madt(const madt_t *madt)
                 break;
             }
             case 11: {
+                if (hdr->length >= offsetof(madt_gicc_t, processor_power_efficiency_class)) {
+                    const madt_gicc_t *gicc = (const madt_gicc_t *)hdr;
+                    if ((gicc->flags & 0x1u) != 0u &&
+                        g_info.cpu_count < ACPI_MAX_CPUS) {
+                        g_info.cpu_mpidr[g_info.cpu_count] = gicc->mpidr;
+                        g_info.cpu_apic_ids[g_info.cpu_count] =
+                            (uint8_t)gicc->cpu_interface_number;
+                        g_info.cpu_count++;
+                    }
+                }
                 if (hdr->length >= offsetof(madt_gicc_t, gicr_base_address) &&
                     g_info.gicc_base == 0) {
                     const madt_gicc_t *gicc = (const madt_gicc_t *)hdr;

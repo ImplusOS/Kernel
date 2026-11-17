@@ -16,7 +16,8 @@ ifeq ($(ARCH),arm64)
 CC := aarch64-elf-gcc
 LD := aarch64-elf-ld
 OBJCOPY := aarch64-elf-objcopy
-DRIVER_ARCH_CFLAGS := -mstrict-align -mno-outline-atomics -DPLATFORM_ARM64
+# -mgeneral-regs-only: as on x86_64, and as for the arm64 kernel proper.
+DRIVER_ARCH_CFLAGS := -mstrict-align -mno-outline-atomics -mgeneral-regs-only -DPLATFORM_ARM64
 endif
 
 DRIVER_BASE_CFLAGS := \

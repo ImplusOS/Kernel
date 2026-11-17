@@ -29,7 +29,12 @@ LD := aarch64-elf-ld
 OBJCOPY := aarch64-elf-objcopy
 NASM := false
 ARCH_DIR := Arch/arm64
-ARCH_CFLAGS := -mstrict-align -mno-outline-atomics -DPLATFORM_ARM64
+# -mgeneral-regs-only for the same reason as x86_64 above: the exception
+# vectors (Arch/arm64/cpu/ExceptionVectors.S) save only the general
+# registers, and the per-process SIMD state is saved later, inside the
+# scheduler. Kernel C code that used q0-q31 for a memcpy would corrupt the
+# interrupted EL0 thread's vector registers.
+ARCH_CFLAGS := -mstrict-align -mno-outline-atomics -mgeneral-regs-only -DPLATFORM_ARM64
 KERNEL_LDSCRIPT := Arch/arm64/linker/linker.ld
 else
 $(error Unsupported ARCH: $(ARCH))

@@ -9,3 +9,5 @@ int arm64_gic_route_irq(uint32_t irq, uint32_t vector);
 void arm64_gic_mask_irq(uint32_t irq);
 void arm64_gic_unmask_irq(uint32_t irq);
 
+int arm64_gic_init_secondary(void);
+void arm64_gic_send_sgi(uint64_t target_mpidr, uint32_t target_iface, uint32_t sgi);

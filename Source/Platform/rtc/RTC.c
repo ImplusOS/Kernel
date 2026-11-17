@@ -14,6 +14,7 @@ static const driver_binary_t *g_api = NULL;
 
 #include "Core/sync/Spinlock.h"
 
+#if !defined(__aarch64__)
 static spinlock_t g_rtc_lock;
 
 #define CMOS_ADDR 0x70
@@ -28,10 +29,53 @@ static uint8_t get_rtc_register(int reg) {
     outb(CMOS_ADDR, (uint8_t)reg);
     return inb(CMOS_DATA);
 }
+#endif
 
 void rtc_init(void) {
 }
 
+#if defined(__aarch64__)
+/* AArch64 has no CMOS behind port 0x70/0x71 (the port-I/O HAL reads 0xFF, so
+ * the update-in-progress wait below never ends). QEMU virt -- like most
+ * AArch64 boards -- has an ARM PrimeCell PL031 instead, whose data register
+ * is a plain count of seconds since the Unix epoch, in UTC. */
+#include "interfaces/mmio.h"
+
+#define PL031_BASE 0x09010000ULL
+#define PL031_DR   0x000u
+
+static void rtc_from_unix_seconds(uint64_t t, rtc_time_t *time)
+{
+    uint64_t days = t / 86400u;
+    uint64_t rem = t % 86400u;
+    time->hour = (uint8_t)(rem / 3600u);
+    time->minute = (uint8_t)((rem % 3600u) / 60u);
+    time->second = (uint8_t)(rem % 60u);
+
+    /* Civil-from-days (H. Hinnant), proleptic Gregorian, UTC. */
+    int64_t z = (int64_t)days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    uint64_t doe = (uint64_t)(z - era * 146097);
+    uint64_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    int64_t y = (int64_t)yoe + era * 400;
+    uint64_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    uint64_t mp = (5u * doy + 2u) / 153u;
+    uint64_t d = doy - (153u * mp + 2u) / 5u + 1u;
+    uint64_t m = mp < 10u ? mp + 3u : mp - 9u;
+    if (m <= 2u) {
+        ++y;
+    }
+    time->day = (uint8_t)d;
+    time->month = (uint8_t)m;
+    time->year = (uint16_t)y;
+}
+
+void rtc_read_time(rtc_time_t *time) {
+    rtc_from_unix_seconds(
+        (uint64_t)mmio_read32((const volatile void *)(uintptr_t)(PL031_BASE + PL031_DR)),
+        time);
+}
+#else
 void rtc_read_time(rtc_time_t *time) {
     /* CMOS is an index/data port pair, so two CPUs reading at once can select
      * a register and read back the one the other selected -- seconds as the
@@ -84,6 +128,7 @@ void rtc_read_time(rtc_time_t *time) {
     time->month  = month;
     time->year   = (uint16_t)(2000 + year);
 }
+#endif
 
 #ifdef IMPLUS_DRIVER_MODULE
 static void rtc_shutdown(void)

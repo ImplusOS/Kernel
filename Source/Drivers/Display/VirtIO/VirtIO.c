@@ -15,6 +15,14 @@
 #include "Drivers/Module/DriverBinary.h"
 #include "Drivers/Module/PCI_Main.h"
 
+#ifndef CPU_RELAX_INSN
+#if defined(__aarch64__)
+#define CPU_RELAX_INSN "yield"
+#else
+#define CPU_RELAX_INSN "pause"
+#endif
+#endif
+
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_GPU_DEVICE_ID 0x1050
 #define VIRTIO_GPU_DEVICE_NAME "VirtIO GPU"
@@ -507,7 +515,7 @@ static uint64_t gpu_lock(void)
     while (__atomic_exchange_n(&g_gpu_lock, 1, __ATOMIC_ACQUIRE) != 0) {
         while (__atomic_load_n(&g_gpu_lock, __ATOMIC_RELAXED) != 0) {
 #ifdef PLATFORM_X86_64
-            __asm__ volatile ("pause" ::: "memory");
+            __asm__ volatile(CPU_RELAX_INSN ::: "memory");
 #else
             __asm__ volatile ("yield" ::: "memory");
 #endif
@@ -987,7 +995,7 @@ static uint32_t vgpu_align64(uint32_t v) { return (v + 63u) & ~63u; }
 
 static inline void vgpu_cpu_relax(void) {
 #ifdef PLATFORM_X86_64
-    __asm__ volatile ("pause" ::: "memory");
+    __asm__ volatile(CPU_RELAX_INSN ::: "memory");
 #else
     __asm__ volatile ("yield" ::: "memory");
 #endif

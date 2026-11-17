@@ -7,6 +7,7 @@
 #include "Arch/arm64/interrupt/GIC.h"
 #include "Arch/arm64/cpu/IDT_Main.h"
 #include "Debug/serial/Serial.h"
+#include "smp/SMP_Main.h"
 
 #define CNT_CTL_ENABLE  (1u << 0)
 #define CNT_CTL_IMASK   (1u << 1)
@@ -305,11 +306,31 @@ static void generic_timer_irq_handler(void)
     }
 
     g_tick_bank->write_tval(g_interval_count);
-    g_ticks++;
+    /* Every CPU's timer lands here; only CPU0 keeps time, as on x86 (see
+     * lapic_timer_handler). The core handler still has per-CPU scheduling
+     * work to do on the others. */
+    if (smp_get_current_cpu_id() == 0u) {
+        g_ticks++;
+    }
 
     if (g_timer_callback != NULL) {
         g_timer_callback();
     }
+}
+
+/* A secondary CPU's own tick: the timer is a per-CPU PPI, so each CPU arms
+ * its own once CPU0 has switched to interrupt-driven ticks
+ * (generic_timer_enable_irq_tick), mirroring lapic_timer_ap_init(). */
+void generic_timer_ap_init(void)
+{
+    while (__atomic_load_n(&g_irq_enabled, __ATOMIC_ACQUIRE) == 0u ||
+           g_tick_bank == NULL) {
+        hal_cpu_pause();
+    }
+    g_tick_bank->write_ctl(CNT_CTL_IMASK);
+    g_tick_bank->write_tval(g_interval_count);
+    arm64_gic_route_irq(g_tick_bank->irq, 0);
+    g_tick_bank->write_ctl(CNT_CTL_ENABLE);
 }
 
 static void generic_timer_enable_irq_tick(void)

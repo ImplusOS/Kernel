@@ -32,6 +32,10 @@
 #define ARM64_TABLE_ENTRIES         512U
 #define ARM64_L1_BLOCK_SIZE         (1ULL << ARM64_L1_SHIFT)
 #define ARM64_L2_BLOCK_SIZE         (1ULL << ARM64_L2_SHIFT)
+/* L1 slots (1 GiB each, under L0[0]) spanned by USER_CODE_BASE ..
+ * USER_STACK_TOP (0x40_0000_0000 .. 0x48_0000_0000). */
+#define ARM64_USER_L1_FIRST         256U
+#define ARM64_USER_L1_LIMIT         288U
 
 typedef struct {
     uint8_t used;
@@ -45,10 +49,26 @@ static uint64_t g_kernel_l1[ARM64_TABLE_ENTRIES] __attribute__((aligned(4096)));
 static uint64_t g_kernel_ttbr = 0;
 static arm64_space_t g_spaces_static[OS_CONFIG_PROCESS_MAX_COUNT];
 static spinlock_t g_space_lock;
+static spinlock_t g_demand_fault_lock;
+/* The translation regime init_paging() switched to, for secondary CPUs to
+ * load verbatim (paging_get_secondary_config). */
+static uint64_t g_mmu_mair;
+static uint64_t g_mmu_tcr;
+static uint64_t g_mmu_sctlr;
 
+/* Every address space is tagged ASID 0 (TCR_EL1.A1 = 0, TTBR0.ASID = 0), so
+ * the TLB cannot tell one process's translations from another's. x86 drops
+ * non-global entries on every CR3 write; do the equivalent here, or the next
+ * process runs through whatever of the previous one's mappings the TLB still
+ * caches. Local flush only: other CPUs keep their own address space. */
 static inline void write_ttbr0(uint64_t value)
 {
-    __asm__ volatile("msr TTBR0_EL1, %0; dsb ish; isb" :: "r"(value) : "memory");
+    __asm__ volatile("dsb ishst\n"
+                     "msr TTBR0_EL1, %0\n"
+                     "isb\n"
+                     "tlbi vmalle1\n"
+                     "dsb nsh\n"
+                     "isb" :: "r"(value) : "memory");
 }
 
 static inline void write_ttbr1(uint64_t value)
@@ -383,9 +403,13 @@ static uint64_t *walk_l3(uint64_t ttbr0, uint64_t va, int create)
     return &l3[l3_index];
 }
 
-static void free_user_tables(uint64_t *l1)
+/* Free the L2/L3 tables under l1[first, limit) and every page they map
+ * that the address space owns (PAGE_EXTERNAL pages belong to someone else).
+ * Callers pass only ranges the process owns outright: the rest of a process
+ * L1 is a copy of the kernel's, and its tables are the kernel's own. */
+static void free_l1_subtree(uint64_t *l1, uint32_t first, uint32_t limit)
 {
-    for (uint32_t i = 0; i < ARM64_TABLE_ENTRIES; ++i) {
+    for (uint32_t i = first; i < limit; ++i) {
         uint64_t l1_desc = l1[i];
         if (!desc_is_table(l1_desc, 1)) {
             continue;
@@ -408,7 +432,22 @@ static void free_user_tables(uint64_t *l1)
             free_page(l3);
         }
         free_page(l2);
+        l1[i] = 0;
     }
+}
+
+extern char _kernel_start[];
+extern char _kernel_end[];
+
+static void dcache_clean_poc_range(uintptr_t start, uintptr_t end)
+{
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t line = (uintptr_t)4u << ((ctr >> 16) & 0xFu);
+    for (uintptr_t p = start & ~(line - 1u); p < end; p += line) {
+        __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
 }
 
 void init_paging(void)
@@ -417,6 +456,7 @@ void init_paging(void)
     memset(g_kernel_l1, 0, sizeof(g_kernel_l1));
     memset(g_spaces_static, 0, sizeof(g_spaces_static));
     spinlock_init(&g_space_lock);
+    spinlock_init(&g_demand_fault_lock);
 
     for (uint64_t i = 0; i < ARM64_TABLE_ENTRIES; ++i) {
         g_kernel_l1[i] = kernel_block_desc(i * ARM64_L1_BLOCK_SIZE, i == 0 ? 1 : 0);
@@ -426,31 +466,95 @@ void init_paging(void)
     g_kernel_ttbr = (uint64_t)(uintptr_t)g_kernel_l0;
 
     /* AttrIdx 0: Device-nGnRnE, 1: Normal WB, 2: Normal non-cacheable. */
-    write_mair(0x0044FF00ULL);
-    write_tcr((16ULL << 0) | (16ULL << 16) |
-              (0ULL << 14) | (2ULL << 30) |
-              (3ULL << 12) | (3ULL << 28) |
-              (1ULL << 8) | (1ULL << 24) |
-              (5ULL << 32));
-    write_ttbr0(g_kernel_ttbr);
-    write_ttbr1(g_kernel_ttbr);
-    __asm__ volatile("dsb ish; tlbi vmalle1; dsb ish; isb" ::: "memory");
-    write_sctlr(read_sctlr() | 1ULL | (1ULL << 2) | (1ULL << 12));
+    const uint64_t mair = 0x0044FF00ULL;
+    const uint64_t tcr = (16ULL << 0) | (16ULL << 16) |
+                         (0ULL << 14) | (2ULL << 30) |
+                         (3ULL << 12) | (3ULL << 28) |
+                         (1ULL << 8) | (1ULL << 24) |
+                         (5ULL << 32);
+    /* M | C | I on, WXN off: the identity map keeps kernel text writable. */
+    const uint64_t sctlr_on = (read_sctlr() | 1ULL | (1ULL << 2) | (1ULL << 12)) &
+                              ~(1ULL << 19);
+    g_mmu_mair = mair;
+    g_mmu_tcr = tcr;
+    g_mmu_sctlr = sctlr_on;
+
+    /* The firmware's tables are still live here, and they index MAIR with
+     * their own attribute layout. Rewriting MAIR/TCR under them turns the
+     * kernel's own text into Device memory (or an unmapped VA range) and the
+     * very next instruction fetch faults -- into a vector table that faults
+     * the same way. So switch with the MMU off, and do the whole sequence in
+     * registers: with SCTLR.M clear every data access is non-cacheable and
+     * would miss dirty lines (the stack included) still sitting in the cache.
+     * The new tables were written through the cache; the walker sees them
+     * because TCR selects inner-shareable write-back walks. */
+    /* With SCTLR.M clear, instruction fetches and the table walk bypass the
+     * caches. The boot manager copied (and relocated) this image through the
+     * D-cache and the tables above were just written through it: push both
+     * to the point of coherency first, or on real hardware (HVF) the CPU
+     * would fetch the switch sequence below from stale RAM. */
+    dcache_clean_poc_range((uintptr_t)_kernel_start, (uintptr_t)_kernel_end);
+
+    __asm__ volatile("dsb ish\n"
+                     "mrs x9, sctlr_el1\n"
+                     "bic x9, x9, #1\n"
+                     "msr sctlr_el1, x9\n"
+                     "isb\n"
+                     "msr mair_el1, %0\n"
+                     "msr tcr_el1, %1\n"
+                     "msr ttbr0_el1, %2\n"
+                     "msr ttbr1_el1, %2\n"
+                     "isb\n"
+                     "tlbi vmalle1\n"
+                     "dsb ish\n"
+                     "isb\n"
+                     "msr sctlr_el1, %3\n"
+                     "isb\n"
+                     "ic iallu\n"
+                     "dsb ish\n"
+                     "isb\n"
+                     :
+                     : "r"(mair), "r"(tcr), "r"(g_kernel_ttbr), "r"(sctlr_on)
+                     : "x9", "memory");
 }
 
-void *map_mmio_virt(uint64_t phys_addr)
+/* Kernel view of MMIO that sits inside the user windows.
+ *
+ * The kernel identity-maps physical memory through TTBR0, and so does every
+ * process address space (a copy of the kernel's L0/L1). That is fine below
+ * 256 GiB, but QEMU virt puts the high PCIe ECAM at 0x40_1000_0000, inside
+ * USER_CODE_BASE..USER_STACK_TOP, and its 64-bit BAR window at 0x80_0000_0000.
+ * Mapping those through the identity map turned the kernel's L1[256] into a
+ * table that every process then copied -- one shared set of L2/L3 tables for
+ * every process's user image, so spawning a program overwrote its parent.
+ *
+ * Instead, MMIO at or above ARM64_HIGH_MMIO_BASE is handed out at its alias
+ * in the upper half: TTBR1 always holds the kernel's own tables (it is never
+ * switched per process) and the same L0 walk, so 0xFFFF_0000_0000_0000 + pa
+ * reaches pa with the kernel's attributes in every address space, and the
+ * user windows of a process stay its own (paging_create_process_space). */
+#define ARM64_HIGH_MMIO_BASE   0x0000004000000000ULL
+#define ARM64_KERNEL_ALIAS     0xFFFF000000000000ULL
+
+static void *map_mmio_with_flags(uint64_t phys_addr, uint64_t flags)
 {
     const uint64_t mmio_window_size = 1024ULL * 1024ULL;
-    const uint64_t high_mmio_base = 0x4000000000ULL;
     uint64_t base = phys_addr & ~(PAGE_SIZE - 1ULL);
-    uint64_t flags = PAGE_RW | PAGE_NX;
-    if (phys_addr >= high_mmio_base) {
+    if (phys_addr >= ARM64_HIGH_MMIO_BASE) {
         flags |= PAGE_PCD;
     }
     if (paging_map_kernel_range(base, mmio_window_size, flags) < 0) {
         return NULL;
     }
+    if (phys_addr >= ARM64_HIGH_MMIO_BASE) {
+        return (void *)(uintptr_t)(ARM64_KERNEL_ALIAS | phys_addr);
+    }
     return (void *)(uintptr_t)phys_addr;
+}
+
+void *map_mmio_virt(uint64_t phys_addr)
+{
+    return map_mmio_with_flags(phys_addr, PAGE_RW | PAGE_NX);
 }
 
 /* AArch64 uses the normal mapping attributes selected by map_mmio_virt() for
@@ -458,17 +562,16 @@ void *map_mmio_virt(uint64_t phys_addr)
  * so the display driver can request the intended scanout policy on every arch. */
 void *map_mmio_wc_virt(uint64_t phys_addr)
 {
-    const uint64_t mmio_window_size = 1024ULL * 1024ULL;
-    const uint64_t high_mmio_base = 0x4000000000ULL;
-    uint64_t base = phys_addr & ~(PAGE_SIZE - 1ULL);
-    uint64_t flags = PAGE_RW | PAGE_NX | PAGE_PWT;
-    if (phys_addr >= high_mmio_base) {
-        flags |= PAGE_PCD;
-    }
-    if (paging_map_kernel_range(base, mmio_window_size, flags) < 0) {
-        return NULL;
-    }
-    return (void *)(uintptr_t)phys_addr;
+    return map_mmio_with_flags(phys_addr, PAGE_RW | PAGE_NX | PAGE_PWT);
+}
+
+void paging_get_secondary_config(uint64_t *ttbr, uint64_t *tcr,
+                                 uint64_t *mair, uint64_t *sctlr)
+{
+    *ttbr = g_kernel_ttbr;
+    *tcr = g_mmu_tcr;
+    *mair = g_mmu_mair;
+    *sctlr = g_mmu_sctlr;
 }
 
 uint64_t paging_get_kernel_cr3(void)
@@ -521,6 +624,13 @@ uint64_t paging_create_process_space(void)
     
     memcpy(space->l0, g_kernel_l0, sizeof(g_kernel_l0));
     memcpy(space->l1, g_kernel_l1, sizeof(g_kernel_l1));
+    /* The user windows below 512 GiB (code, heap, stack) belong to the
+     * process alone: never inherit the kernel's identity entries there --
+     * least of all a kernel table, which would be shared with every other
+     * process. See map_mmio_with_flags(). */
+    for (uint64_t i = ARM64_USER_L1_FIRST; i < ARM64_USER_L1_LIMIT; ++i) {
+        space->l1[i] = 0;
+    }
     space->l0[0] = table_desc((uint64_t)(uintptr_t)space->l1);
     space->ttbr0 = (uint64_t)(uintptr_t)space->l0;
     return space->ttbr0;
@@ -550,10 +660,21 @@ void paging_destroy_process_space(uint64_t address_space)
     }
 
     if (space->l1 != NULL) {
-        free_user_tables(space->l1);
+        free_l1_subtree(space->l1, ARM64_USER_L1_FIRST, ARM64_USER_L1_LIMIT);
         free_page(space->l1);
     }
     if (space->l0 != NULL) {
+        /* L0 slots the process filled itself (the mmap arena, 1..16 TiB):
+         * anything that is not the kernel's entry is private to it. */
+        for (uint32_t i = 1; i < ARM64_TABLE_ENTRIES; ++i) {
+            uint64_t desc = space->l0[i];
+            if (!desc_is_table(desc, 0) || desc == g_kernel_l0[i]) {
+                continue;
+            }
+            uint64_t *l1 = desc_to_table(desc);
+            free_l1_subtree(l1, 0, ARM64_TABLE_ENTRIES);
+            free_page(l1);
+        }
         free_page(space->l0);
     }
 
@@ -876,11 +997,85 @@ int paging_swap_reclaim_one_page(void)
     return 0;
 }
 
+/* Demand-zero fill for an absent page in a user window (the mmap arena is
+ * reserved lazily; see USER_MMAP_BASE in ProcessManager.h). There is no swap
+ * on arm64, so this is the whole of what the x86 handler of the same name
+ * does for a never-touched page. Returns 1 when the page is (now) present,
+ * 0 when the fault is not one this handler services. */
 int paging_handle_swap_fault(uint64_t address_space, uint64_t fault_addr)
 {
-    (void)address_space;
-    (void)fault_addr;
-    return -1;
+    if (address_space == 0) {
+        return 0;
+    }
+    uint64_t va = fault_addr & PAGE_MASK;
+    if (!paging_addr_is_user(va)) {
+        return 0;
+    }
+
+    uint64_t irq_flags = hal_cpu_save_interrupts();
+    spinlock_lock(&g_demand_fault_lock);
+
+    uint64_t *pte = walk_l3(address_space, va, 0);
+    if (pte != NULL && desc_is_valid(*pte)) {
+        /* Another CPU filled it in first: only our TLB entry is stale. */
+        spinlock_unlock(&g_demand_fault_lock);
+        hal_cpu_restore_interrupts(irq_flags);
+        hal_mmu_invalidate_tlb(va);
+        return 1;
+    }
+
+    void *page = alloc_page();
+    if (page == NULL) {
+        spinlock_unlock(&g_demand_fault_lock);
+        hal_cpu_restore_interrupts(irq_flags);
+        return 0;
+    }
+    memset(page, 0, PAGE_SIZE);
+    if (paging_map_user_page(address_space, va, (uint64_t)(uintptr_t)page,
+                             PAGE_RW | PAGE_USER) < 0) {
+        free_page(page);
+        spinlock_unlock(&g_demand_fault_lock);
+        hal_cpu_restore_interrupts(irq_flags);
+        return 0;
+    }
+    spinlock_unlock(&g_demand_fault_lock);
+    hal_cpu_restore_interrupts(irq_flags);
+    return 1;
+}
+
+/* x86 page-fault error-code bits, which the generic fault path speaks. */
+#define PF_ERR_WRITE (1ULL << 1)
+#define PF_ERR_USER  (1ULL << 2)
+#define PF_ERR_INSTR (1ULL << 4)
+
+int paging_access_is_now_permitted(uint64_t address_space, uint64_t vaddr,
+                                   uint64_t error_code)
+{
+    if (address_space == 0) {
+        return 0;
+    }
+    uint64_t *pte = walk_l3(address_space, vaddr & PAGE_MASK, 0);
+    if (pte == NULL || !desc_is_valid(*pte)) {
+        return 0;
+    }
+    uint64_t desc = *pte;
+    uint64_t ap = desc & (3ULL << 6);
+    int el0 = (ap == ARM64_DESC_AP_EL0_RW || ap == ARM64_DESC_AP_EL0_RO);
+    int ro = (ap == ARM64_DESC_AP_EL0_RO || ap == ARM64_DESC_AP_EL1_RO);
+    if ((error_code & PF_ERR_USER) != 0 && !el0) {
+        return 0;
+    }
+    if ((error_code & PF_ERR_WRITE) != 0 && ro) {
+        return 0;
+    }
+    if ((error_code & PF_ERR_INSTR) != 0) {
+        uint64_t xn = ((error_code & PF_ERR_USER) != 0) ? ARM64_DESC_UXN
+                                                         : ARM64_DESC_PXN;
+        if ((desc & xn) != 0) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 void *pmm_alloc_pages(size_t num_pages)
@@ -931,8 +1126,14 @@ uint64_t paging_virt_to_phys(uint64_t address_space, uint64_t virt_addr)
 
     uint64_t *l2 = desc_to_table(l1_desc);
     uint64_t l2_desc = l2[level_index(virt_addr, ARM64_L2_SHIFT)];
-    if (!desc_is_table(l2_desc, 2)) {
+    if (!desc_is_valid(l2_desc)) {
         return 0;
+    }
+    if (!desc_is_table(l2_desc, 2)) {
+        /* 2 MiB block (a split kernel 1 GiB block, see
+         * ensure_l2_table_preserve_block). */
+        return (l2_desc & ARM64_DESC_ADDR_MASK & ~(ARM64_L2_BLOCK_SIZE - 1ULL)) |
+               (virt_addr & (ARM64_L2_BLOCK_SIZE - 1ULL));
     }
 
     uint64_t *l3 = desc_to_table(l2_desc);
@@ -942,6 +1143,91 @@ uint64_t paging_virt_to_phys(uint64_t address_space, uint64_t virt_addr)
     }
 
     return (l3_desc & ARM64_DESC_ADDR_MASK) | (virt_addr & (PAGE_SIZE - 1ULL));
+}
+
+int paging_cow_clone_user_range(uint64_t child_ttbr0, uint64_t parent_ttbr0,
+                                uint64_t start, uint64_t end)
+{
+    (void)child_ttbr0;
+    (void)parent_ttbr0;
+    (void)start;
+    (void)end;
+    return -1;
+}
+
+int paging_handle_cow_fault(uint64_t address_space, uint64_t fault_addr)
+{
+    (void)address_space;
+    (void)fault_addr;
+    return 0;
+}
+
+int paging_user_range_break_cow(uint64_t address_space, uint64_t start, uint64_t len)
+{
+    (void)address_space;
+    (void)start;
+    (void)len;
+    return 0;
+}
+
+int paging_user_range_is_writable(uint64_t address_space, uint64_t start, uint64_t len)
+{
+    if (address_space == 0 || len == 0) {
+        return 1;
+    }
+    uint64_t first = start & PAGE_MASK;
+    uint64_t last = (start + len - 1ULL) & PAGE_MASK;
+    for (uint64_t page = first; ; page += PAGE_SIZE) {
+        uint64_t *pte = walk_l3(address_space, page, 0);
+        if (pte != NULL && desc_is_valid(*pte)) {
+            uint64_t ap = *pte & (3ULL << 6);
+            if (ap == ARM64_DESC_AP_EL0_RO || ap == ARM64_DESC_AP_EL1_RO) {
+                return 0;
+            }
+        }
+        if (page == last) {
+            break;
+        }
+    }
+    return 1;
+}
+
+uint64_t paging_debug_leaf_pte(uint64_t address_space, uint64_t virt_addr)
+{
+    if (address_space == 0) {
+        return 0;
+    }
+    uint64_t *pte = walk_l3(address_space, virt_addr & PAGE_MASK, 0);
+    if (pte == NULL || !desc_is_valid(*pte)) {
+        return 0;
+    }
+    uint64_t desc = *pte;
+    uint64_t ap = desc & (3ULL << 6);
+    uint64_t out = (desc & ARM64_DESC_ADDR_MASK) | PAGE_PRESENT;
+    if (ap == ARM64_DESC_AP_EL0_RW || ap == ARM64_DESC_AP_EL1_RW) {
+        out |= PAGE_RW;
+    }
+    if (ap == ARM64_DESC_AP_EL0_RW || ap == ARM64_DESC_AP_EL0_RO) {
+        out |= PAGE_USER;
+    }
+    if ((desc & ARM64_DESC_UXN) != 0) {
+        out |= PAGE_NX;
+    }
+    if ((desc & ARM64_DESC_EXTERNAL) != 0) {
+        out |= PAGE_EXTERNAL;
+    }
+    return out;
+}
+
+int paging_addr_is_user(uint64_t virt_addr)
+{
+    return (virt_addr >= 0x0000004000000000ULL && virt_addr < 0x0000004800000000ULL) ||
+           (virt_addr >= 0x0000010000000000ULL && virt_addr < 0x0000100000000000ULL);
+}
+
+void paging_invalidate_page(uint64_t vaddr)
+{
+    hal_mmu_invalidate_tlb(vaddr & PAGE_MASK);
 }
 
 static const mmu_ops_t g_arm64_mmu_ops = {

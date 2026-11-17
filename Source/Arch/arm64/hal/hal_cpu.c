@@ -353,6 +353,41 @@ void hal_cpu_restore_fpu(uint8_t *state)
                      : "x9", "x10", "memory");
 }
 
+/* There is no CPUID on AArch64. Callers ask for x86 feature leaves (SSE2,
+ * PAT, ...); report every leaf as empty so they take their generic path. */
+void hal_cpu_get_id(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+    (void)leaf;
+    (void)subleaf;
+    if (eax) *eax = 0;
+    if (ebx) *ebx = 0;
+    if (ecx) *ecx = 0;
+    if (edx) *edx = 0;
+}
+
+/* libgcc's __clear_cache: __builtin___clear_cache() lowers to a call to it on
+ * AArch64, and the kernel links without libgcc. Clean D-cache to PoU, then
+ * invalidate I-cache, line by line using the sizes CTR_EL0 reports. */
+void __clear_cache(void *begin, void *end);
+void __clear_cache(void *begin, void *end)
+{
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t dline = 4u << ((ctr >> 16) & 0xFu);
+    uintptr_t iline = 4u << (ctr & 0xFu);
+    uintptr_t start = (uintptr_t)begin;
+    uintptr_t stop = (uintptr_t)end;
+
+    for (uintptr_t p = start & ~(dline - 1u); p < stop; p += dline) {
+        __asm__ volatile("dc cvau, %0" :: "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t p = start & ~(iline - 1u); p < stop; p += iline) {
+        __asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
 uint64_t hal_cpu_read_gs_base(void)
 {
     uint64_t val;

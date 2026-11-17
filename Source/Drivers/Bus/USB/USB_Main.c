@@ -7,6 +7,14 @@
 #include "HID/USB_HID.h"
 #include "Drivers/Module/DriverBinary.h"
 
+#ifndef CPU_RELAX_INSN
+#if defined(__aarch64__)
+#define CPU_RELAX_INSN "yield"
+#else
+#define CPU_RELAX_INSN "pause"
+#endif
+#endif
+
 const driver_binary_t *g_api = NULL;
 
 /* A lock that sleeps rather than spins, spelled locally because this file is
@@ -1745,7 +1753,7 @@ static void usb_storage_lock(void)
          * demand-paging rates that difference is the whole budget. */
         uint32_t spins = 0u;
         while (g_usb_storage_lock.value != 0u && spins < 200000u) {
-            __asm__ volatile("pause" ::: "memory");
+            __asm__ volatile(CPU_RELAX_INSN ::: "memory");
             ++spins;
         }
         if (g_usb_storage_lock.value != 0u &&
