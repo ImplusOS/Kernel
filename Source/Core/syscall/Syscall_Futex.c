@@ -1,4 +1,3 @@
-#include "Debug/serial/Serial.h"
 #include "Syscall_Main.h"
 #include "Core/memory/SharedMemory.h"
 #include "Core/process/ProcessManager.h"
@@ -939,26 +938,7 @@ int64_t syscall_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                       uint64_t timeout_or_val2, uint64_t uaddr2,
                       uint64_t val3)
 {
-    int64_t rc = syscall_futex_impl(uaddr, op, val, timeout_or_val2, uaddr2,
-                                    val3);
-    /* glibc treats anything but EAGAIN/EINTR/ETIMEDOUT from a futex wait as
-     * "The futex facility returned an unexpected error code." and aborts
-     * the process; report those (rate limited) so the cause can be found. */
-    if (rc < 0 && rc != -11 && rc != -4 && rc != -110) {
-        static volatile uint32_t reported;
-        if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 32u) {
-            serial_write_string("[futex] error rc=");
-            serial_write_uint64((uint64_t)rc);
-            serial_write_string(" op=");
-            serial_write_uint64(op);
-            serial_write_string(" uaddr=");
-            serial_write_uint64(uaddr);
-            serial_write_string(" tid=");
-            serial_write_uint64((uint64_t)(uint32_t)process_get_current_tid());
-            serial_write_string("\n");
-        }
-    }
-    return rc;
+    return syscall_futex_impl(uaddr, op, val, timeout_or_val2, uaddr2, val3);
 }
 
 static int64_t syscall_futex_impl(uint64_t uaddr, uint64_t op, uint64_t val,

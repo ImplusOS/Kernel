@@ -9,7 +9,6 @@
 #include "IPC/UnixSocket.h"
 #include "Syscall_Socket.h"
 #include "interfaces/hal_cpu.h"
-#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -58,10 +57,6 @@
  * readiness event in the system and X11 round trips cost ~16 ms each no
  * matter how fast the machine was.
  */
-
-#ifndef PROCESS_STALL_DUMP
-#define PROCESS_STALL_DUMP 0
-#endif
 
 /*
  * One epoll instance per thread that runs a message loop, and Chromium has
@@ -634,57 +629,6 @@ int32_t syscall_epoll_wait_ex(int32_t epfd, epoll_event_t *events,
     }
     return 0;
 }
-
-#if PROCESS_STALL_DUMP
-/* Every epoll set with its per-fd readiness, for the timer-driven stall dump.
- * "Which fd keeps reporting itself ready" is not answerable from the syscall
- * counts alone, and an fd that is wrongly always-ready turns a well-behaved
- * event loop into a spin that starves everything else on the machine. */
-void epoll_debug_dump(void)
-{
-    /* Static, not automatic: this runs from the timer interrupt, and a
-     * EPOLL_MAX_ENTRIES-wide snapshot is over a kilobyte. On the interrupt
-     * stack that was enough to trip the kernel's own stack canary and panic
-     * with "stack smashing detected" at SMP=4 -- a diagnostic that crashes
-     * the thing it is measuring. Serialised by g_epoll_lock below, and the
-     * dump is single-threaded by construction (CPU 0's timer tick). */
-    static epoll_entry_t snapshot[EPOLL_MAX_ENTRIES];
-
-    for (int i = 0; i < EPOLL_MAX_INSTANCES; ++i) {
-        uint32_t count;
-
-        spinlock_lock(&g_epoll_lock);
-        if (!g_epoll_instances[i].used) {
-            spinlock_unlock(&g_epoll_lock);
-            continue;
-        }
-        count = g_epoll_instances[i].count;
-        memcpy(snapshot, g_epoll_instances[i].entries,
-               count * sizeof(epoll_entry_t));
-        spinlock_unlock(&g_epoll_lock);
-
-        serial_write_string("[epoll] ");
-        serial_write_uint32((uint32_t)(0x4000 + i));
-        serial_write_string(" n=");
-        serial_write_uint32(count);
-        for (uint32_t k = 0; k < count; ++k) {
-            uint32_t requested = snapshot[k].events & (EPOLLIN | EPOLLOUT);
-            if (requested == 0u) {
-                requested = EPOLLIN | EPOLLOUT;
-            }
-            uint32_t ready = epoll_poll_fd(snapshot[k].fd, requested) &
-                             (snapshot[k].events | EPOLLERR | EPOLLHUP);
-            serial_write_string(" ");
-            serial_write_uint32((uint32_t)snapshot[k].fd);
-            serial_write_string("/w");
-            serial_write_uint32(snapshot[k].events);
-            serial_write_string("/r");
-            serial_write_uint32(ready);
-        }
-        serial_write_char('\n');
-    }
-}
-#endif
 
 int32_t syscall_eventfd(uint64_t initval, uint64_t flags)
 {

@@ -7,7 +7,6 @@
 #include "Core/process/ProcessManager.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/usercopy/Usercopy.h"
-#include "Debug/serial/Serial.h"
 
 /* Linux x86_64 errno values (negative returns from the compat layer). */
 #define SHM_EINVAL   (-22)
@@ -154,24 +153,6 @@ static sysv_shm_seg_t *find_shmid_locked(uint64_t shmid, uint32_t *index_out)
     return seg;
 }
 
-static void shm_trace(const char *what, uint64_t a, uint64_t b, uint64_t c)
-{
-    static uint32_t budget = 256u;
-    if (budget == 0u) {
-        return;
-    }
-    --budget;
-    serial_write_string("[sysvshm] ");
-    serial_write_string(what);
-    serial_write_string(" a=");
-    serial_write_uint64(a);
-    serial_write_string(" b=");
-    serial_write_uint64(b);
-    serial_write_string(" c=");
-    serial_write_uint64(c);
-    serial_write_string("\n");
-}
-
 int64_t linux_sysv_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 {
     if (size == 0u || size > 0x7fffffffu) {
@@ -200,7 +181,6 @@ int64_t linux_sysv_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
             }
             int32_t id = make_shmid(i, seg->generation);
             spinlock_unlock(&g_shm_lock);
-            shm_trace("shmget-existing", key, size, (uint64_t)(uint32_t)id);
             return id;
         }
         if ((shmflg & SHM_IPC_CREAT) == 0u) {
@@ -248,7 +228,6 @@ int64_t linux_sysv_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
         seg->cpid = self;
         int32_t id = make_shmid(i, generation);
         spinlock_unlock(&g_shm_lock);
-        shm_trace("shmget-create", key, size, (uint64_t)(uint32_t)id);
         return id;
     }
     spinlock_unlock(&g_shm_lock);
@@ -293,7 +272,6 @@ int64_t linux_sysv_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
     seg->nattch++;
     seg->lpid = self;
     spinlock_unlock(&g_shm_lock);
-    shm_trace("shmat", shmid, (uint64_t)(uintptr_t)p, 0u);
     return (int64_t)(uintptr_t)p;
 }
 
@@ -332,7 +310,6 @@ int64_t linux_sysv_shmdt(uint64_t shmaddr)
         reap_segment_locked(seg);
     }
     spinlock_unlock(&g_shm_lock);
-    shm_trace("shmdt", shmaddr, 0u, 0u);
     return 0;
 }
 
@@ -424,7 +401,6 @@ int64_t linux_sysv_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
             }
             reap_segment_locked(seg);
             spinlock_unlock(&g_shm_lock);
-            shm_trace("shmctl-rmid", shmid, 0u, 0u);
             return 0;
 
         case SHM_SHM_LOCK:

@@ -476,51 +476,6 @@ typedef struct {
     bool fb_shared;
 } virtio_gpu_monitor_t;
 
-#ifdef IMPLUS_DRIVER_MODULE
-static uint32_t g_vlog_budget = 16u;
-
-static void vlog(const char *s) {
-    if (g_vlog_budget != 0u && g_driver_api != NULL &&
-        g_driver_api->serial_write_string != NULL) {
-        g_driver_api->serial_write_string(s);
-    }
-}
-
-static void vlog_num(uint64_t v) {
-    if (g_vlog_budget != 0u && g_driver_api != NULL &&
-        g_driver_api->serial_write_uint32 != NULL) {
-        g_driver_api->serial_write_uint32((uint32_t)v);
-    }
-}
-
-static void vlog_hex(uint64_t v) {
-    static const char digits[] = "0123456789abcdef";
-    char buf[19];
-    if (g_vlog_budget == 0u || g_driver_api == NULL ||
-        g_driver_api->serial_write_string == NULL) {
-        return;
-    }
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (uint32_t i = 0u; i < 16u; ++i) {
-        buf[2u + i] = digits[(v >> (60u - i * 4u)) & 0xFu];
-    }
-    buf[18] = '\0';
-    g_driver_api->serial_write_string(buf);
-}
-
-static void vlog_done(void) {
-    if (g_vlog_budget != 0u) {
-        --g_vlog_budget;
-    }
-}
-#else
-static void vlog(const char *s) { (void)s; }
-static void vlog_num(uint64_t v) { (void)v; }
-static void vlog_hex(uint64_t v) { (void)v; }
-static void vlog_done(void) {}
-#endif
-
 /*
  * The virtio-gpu control queue is one shared ring for every command in this
  * module, and callers arrive from any CPU: the kernel log path calls
@@ -857,18 +812,6 @@ static int virtio_pci_device_init(const virtio_gpu_pci_t *gpu, virtio_pci_transp
         g_gpu_features0 |= VIRTIO_GPU_F_CONTEXT_INIT;
     }
 
-#ifdef IMPLUS_DRIVER_MODULE
-    /* Record what the device actually offered. A 2D-ready VirtIO GPU may
-     * still lack VIRGL when QEMU was started without a GL-capable device. */
-    vlog("[vgpu] features dev0=");
-    vlog_hex(device_features0);
-    vlog(" dev1=");
-    vlog_hex(device_features1);
-    vlog(" negotiated=");
-    vlog_hex(g_gpu_features0);
-    vlog("\n");
-#endif
-
     common_write32(t->common_cfg, 8, 0);
     common_write32(t->common_cfg, 12, g_gpu_features0);
     common_write32(t->common_cfg, 8, 1);
@@ -1032,40 +975,6 @@ static int virtqueue_init_ctrl(virtio_pci_transport_t *t, virtqueue_t *vq, uint1
  * vq->resp_buf, never into the caller's buffer, so a request that completes
  * late cannot corrupt a stack frame that has already been reused.
  */
-/* Failures on the control queue are logged regardless of g_vlog_budget
- * (which only throttles the boot-time trace): with virgl a timed-out or
- * rejected command surfaces in userland as an unexplained GL_OUT_OF_MEMORY,
- * and this line is the only place the cause is visible. Capped so a broken
- * device cannot flood the serial port. */
-static uint32_t g_gpu_fail_log_budget = 64u;
-
-static void gpu_log_failure(const char *what, const void *cmd,
-                            uint32_t cmd_len, uint32_t resp_type) {
-#ifndef IMPLUS_DRIVER_MODULE
-    (void)what; (void)cmd; (void)cmd_len; (void)resp_type;
-    (void)g_gpu_fail_log_budget;
-#else
-    if (g_gpu_fail_log_budget == 0u || g_driver_api == NULL ||
-        g_driver_api->serial_write_string == NULL ||
-        g_driver_api->serial_write_uint32 == NULL) {
-        return;
-    }
-    --g_gpu_fail_log_budget;
-    const uint32_t *words = (const uint32_t *)cmd;
-    g_driver_api->serial_write_string("[vgpu] ");
-    g_driver_api->serial_write_string(what);
-    g_driver_api->serial_write_string(" cmd=");
-    g_driver_api->serial_write_uint32(words[0]);
-    g_driver_api->serial_write_string(" ctx=");
-    g_driver_api->serial_write_uint32(words[4]);
-    g_driver_api->serial_write_string(" arg0=");
-    g_driver_api->serial_write_uint32(cmd_len > 24u ? words[6] : 0u);
-    g_driver_api->serial_write_string(" resp=");
-    g_driver_api->serial_write_uint32(resp_type);
-    g_driver_api->serial_write_string("\n");
-#endif
-}
-
 /* ---- used-ring bookkeeping -------------------------------------------- */
 
 /* Fences are issued from one global, monotonically increasing timeline (no
@@ -1123,9 +1032,6 @@ static int vgpu_ring_alloc(virtqueue_t *vq, uint32_t len, uint32_t *off,
     return 1;
 }
 
-static void gpu_log_failure(const char *what, const void *cmd,
-                            uint32_t cmd_len, uint32_t resp_type);
-
 /* Retire the completed slots at the front of the submission FIFO: release
  * their ring bytes and advance g_gpu_fence_done. Caller holds the lock. */
 static void vgpu_retire_async(virtqueue_t *vq) {
@@ -1166,13 +1072,6 @@ static void vgpu_drain_used(virtqueue_t *vq) {
         if (id < 2u || (id & 1u) != 0u) continue;
         uint32_t slot = (id - 2u) / 2u;
         if (slot >= vq->async_slots || !vq->async[slot].busy) continue;
-        uint32_t resp_type = *(volatile uint32_t *)(vq->async_resp +
-                                                    slot * VGPU_ASYNC_RESP_STRIDE);
-        if (resp_type >= 0x1200u) {
-            gpu_log_failure("ERR(async)",
-                            vq->async_ring + vq->async[slot].ring_off,
-                            vq->async[slot].ring_len, resp_type);
-        }
         vq->async[slot].done = 1u;
     }
     vgpu_retire_async(vq);
@@ -1228,7 +1127,6 @@ static uint64_t virtqueue_submit_async(virtqueue_t *vq, const void *cmd,
      * through earlier fences. */
     VGPU_SPIN_UNTIL(vq, (vq->async_fifo_count < vq->async_slots), ok);
     if (!ok) {
-        gpu_log_failure("ASYNC-FULL", cmd, cmd_len, vq->async_fifo_count);
         return 0u;
     }
     for (uint32_t i = 0u; i < vq->async_slots; ++i) {
@@ -1237,7 +1135,6 @@ static uint64_t virtqueue_submit_async(virtqueue_t *vq, const void *cmd,
     if (slot == VGPU_ASYNC_SLOTS) return 0u;
     VGPU_SPIN_UNTIL(vq, vgpu_ring_alloc(vq, total, &off, &consumed), ok);
     if (!ok) {
-        gpu_log_failure("RING-FULL", cmd, cmd_len, total);
         return 0u;
     }
 
@@ -1292,21 +1189,7 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
         cmd_len == 0u || cmd_len > vq->cmd_cap ||
         vq->cmd_phys == 0u || vq->resp_phys == 0u ||
         resp_len > vq->resp_cap) {
-        if (cmd != NULL && cmd_len >= 28u) {
-            gpu_log_failure("REJECT", cmd, cmd_len, cmd_len);
-        }
         return 0;
-    }
-
-    if (g_vlog_budget != 0u) {
-        vlog("[vgpu] submit t=");
-        vlog_num(*(const uint32_t *)cmd);
-        vlog(" avail=");
-        vlog_num(vq->avail_idx);
-        vlog(" used=");
-        vlog_num(vq->used->idx);
-        vlog("\n");
-        vlog_done();
     }
 
     int ok = 1;
@@ -1315,7 +1198,6 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     if (vq->sync_inflight) {
         VGPU_SPIN_UNTIL(vq, (!vq->sync_inflight), ok);
         if (!ok) {
-            gpu_log_failure("STALE", cmd, cmd_len, 0u);
             return 0;
         }
     }
@@ -1341,17 +1223,10 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
     VGPU_SPIN_UNTIL(vq, (vq->sync_done), ok);
     if (!ok) {
         /* sync_inflight stays set; the next request waits it out. */
-        gpu_log_failure("TIMEOUT", cmd, cmd_len, 0u);
         return 0;
     }
 
     memcpy(resp, vq->resp_buf, resp_len);
-    if (resp_len >= 4u) {
-        uint32_t resp_type = *(const uint32_t *)resp;
-        if (resp_type >= 0x1200u) { /* VIRTIO_GPU_RESP_ERR_* */
-            gpu_log_failure("ERR", cmd, cmd_len, resp_type);
-        }
-    }
     return 1;
 }
 
@@ -2214,20 +2089,6 @@ static bool virtio_gpu_apply_layout(virtio_gpu_monitor_t *monitors,
     g_gpu_origin_x = origin_x;
     g_gpu_origin_y = origin_y;
     g_gpu_monitor_count = monitor_count;
-    vlog("[vgpu] apply layout w=");
-    vlog_num(desktop_width);
-    vlog(" h=");
-    vlog_num(desktop_height);
-    vlog(" fb=");
-    vlog_hex((uint64_t)(uintptr_t)virtual_fb);
-    vlog(" bytes=");
-    vlog_num(virtual_bytes);
-    vlog(" nmon=");
-    vlog_num(monitor_count);
-    vlog(" mon0fb=");
-    vlog_hex((uint64_t)(uintptr_t)(monitor_count != 0u ? monitors[0].fb : NULL));
-    vlog("\n");
-    vlog_done();
     for (uint32_t i = 0u; i < monitor_count; ++i) {
         g_gpu_monitors[i] = monitors[i];
         virtio_gpu_publish_monitor_event(&g_gpu_monitors[i], i, pnp_actions[i]);
@@ -2433,9 +2294,6 @@ static void vgpu_setup_msix(const virtio_gpu_pci_t *gpu)
     }
     g_gpu_msix_vector = vector;
     g_gpu_msix_ok = 1u;
-    if (g_driver_api->serial_write_string != NULL) {
-        g_driver_api->serial_write_string("[vgpu] control-queue MSI-X enabled\n");
-    }
 #else
     (void)gpu;
 #endif
@@ -2450,9 +2308,6 @@ bool virtio_gpu_init(void) {
     virtio_gpu_pci_t gpu;
     virtio_pci_transport_t t;
     virtqueue_t controlq;
-
-    vlog("[vgpu] init enter\n");
-    vlog_done();
 
     g_gpu_ready = 0;
     /* The device is about to be reset, which drops every request still in
@@ -2472,60 +2327,22 @@ bool virtio_gpu_init(void) {
     memset(g_gpu_monitors, 0, sizeof(g_gpu_monitors));
 
     if (!find_virtio_gpu(&gpu)) {
-        vlog("[vgpu] no device\n");
-        vlog_done();
         return false;
     }
-    vlog("[vgpu] find bus=");
-    vlog_num(gpu.bus);
-    vlog(" dev=");
-    vlog_num(gpu.device);
-    vlog(" func=");
-    vlog_num(gpu.func);
-    vlog(" bar4=");
-    vlog_hex(gpu.bar_addr[4]);
-    vlog(" mem4=");
-    vlog_num(gpu.bar_is_mem[4]);
-    vlog("\n");
-    vlog_done();
 
 
     if (!virtio_pci_find_caps(&gpu, &t)) {
-        vlog("[vgpu] no caps\n");
-        vlog_done();
         return false;
     }
-    vlog("[vgpu] caps common=");
-    vlog_hex((uint64_t)(uintptr_t)t.common_cfg);
-    vlog(" notify=");
-    vlog_hex((uint64_t)(uintptr_t)t.notify_base);
-    vlog(" devcfg=");
-    vlog_hex((uint64_t)(uintptr_t)t.device_cfg);
-    vlog("\n");
-    vlog_done();
 
     if (!virtio_pci_device_init(&gpu, &t)) {
-        vlog("[vgpu] device init failed\n");
-        vlog_done();
         return false;
     }
 
     vgpu_setup_msix(&gpu);
     if (!virtqueue_init_ctrl(&t, &controlq, 0)) {
-        vlog("[vgpu] queue init failed\n");
-        vlog_done();
         return false;
     }
-    vlog("[vgpu] queue qsize=");
-    vlog_num(controlq.queue_size);
-    vlog(" ring=");
-    vlog_hex((uint64_t)(uintptr_t)controlq.raw_ring);
-    vlog(" desc=");
-    vlog_hex((uint64_t)(uintptr_t)controlq.desc);
-    vlog(" notify=");
-    vlog_hex((uint64_t)(uintptr_t)controlq.notify_addr);
-    vlog("\n");
-    vlog_done();
 
     uint8_t status = common_read8(t.common_cfg, 20);
     common_write8(t.common_cfg, 20, (uint8_t)(status | VIRTIO_STATUS_DRIVER_OK));
@@ -2550,8 +2367,6 @@ bool virtio_gpu_init(void) {
     }
 
     if (!layout_ok && !virtio_gpu_apply_fallback_layout(1024u, 768u)) {
-        vlog("[vgpu] layout failed\n");
-        vlog_done();
         gpu_dma_free(g_gpu_controlq.cmd_buf, VIRTIO_GPU_CMD_BUF_BYTES);
         gpu_dma_free(g_gpu_controlq.resp_buf, VIRTIO_GPU_RESP_BUF_BYTES);
         gpu_dma_free(g_gpu_controlq.raw_ring, g_gpu_controlq.raw_ring_bytes);
@@ -2561,18 +2376,6 @@ bool virtio_gpu_init(void) {
     }
 
     g_gpu_ready = 1;
-    vlog("[vgpu] ready w=");
-    vlog_num(g_gpu_width);
-    vlog(" h=");
-    vlog_num(g_gpu_height);
-    vlog(" fb=");
-    vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
-    vlog(" bytes=");
-    vlog_num(g_gpu_fb_bytes);
-    vlog(" nmon=");
-    vlog_num(g_gpu_monitor_count);
-    vlog("\n");
-    vlog_done();
     return true;
 }
 
@@ -2642,17 +2445,6 @@ void virtio_gpu_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
 static void virtio_gpu_present_rects_locked(const display_rect_t *rects,
                                             uint32_t count)
 {
-    if (g_vlog_budget != 0u) {
-        vlog("[vgpu] present rects=");
-        vlog_num(count);
-        vlog(" fb=");
-        vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
-        vlog(" nmon=");
-        vlog_num(g_gpu_monitor_count);
-        vlog("\n");
-        vlog_done();
-    }
-
     for (uint32_t r = 0u; r < count; ++r) {
         int64_t x0 = rects[r].x;
         int64_t y0 = rects[r].y;
@@ -2821,12 +2613,6 @@ bool virtio_gpu_scanout_set(uint32_t resource_id, uint32_t width,
         }
     }
     g_gpu_ext_scanout = resource_id;
-    vlog("[vgpu] GPU-composited scanout res=");
-    vlog_num(resource_id);
-    vlog(" nmon=");
-    vlog_num(g_gpu_monitor_count);
-    vlog("\n");
-    vlog_done();
     gpu_unlock(irq);
     return true;
 }
@@ -3153,12 +2939,6 @@ static bool virtio_gpu_poll_config(void) {
     }
     (void)virtio_gpu_config_event_pending();
     bool changed = virtio_gpu_refresh_layout_from_device();
-    if (changed && g_vlog_budget != 0u) {
-        vlog("[vgpu] poll relayout fb=");
-        vlog_hex((uint64_t)(uintptr_t)g_gpu_fb);
-        vlog("\n");
-        vlog_done();
-    }
     return changed;
 }
 

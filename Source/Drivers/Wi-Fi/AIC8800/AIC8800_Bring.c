@@ -171,15 +171,6 @@ static bool ie_has_wpa1(const uint8_t *ies, uint32_t len)
     return false;
 }
 
-static void bring_log_status(const char *what, uint32_t value)
-{
-    aic_log("[AIC8800] ");
-    aic_log(what);
-    aic_log(" = ");
-    aic_log_hex32(value);
-    aic_log("\n");
-}
-
 static void chan_fill(aic_mac_chan_def_t *chan, uint16_t freq)
 {
     chan->freq = freq;
@@ -207,8 +198,6 @@ static bool bring_stack_start(void)
         return false;
     }
     g_aic.band_5g = (cfm.is_5g_support != 0u);
-    aic_log(g_aic.band_5g ? "[AIC8800] stack started (2.4 + 5 GHz)\n"
-                          : "[AIC8800] stack started (2.4 GHz only)\n");
     return true;
 }
 
@@ -275,12 +264,6 @@ static bool bring_read_mac(void)
                  &cfm, (uint16_t)sizeof(cfm), AIC_CMD_TIMEOUT_MS)) {
         return false;
     }
-    aic_log("[AIC8800] efuse mac");
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        aic_log(" ");
-        aic_log_hex32(cfm.mac_addr[i]);
-    }
-    aic_log(" (this station uses its locally administered one)\n");
     return true;
 }
 
@@ -305,9 +288,6 @@ static bool bring_mm_version(void)
         return false;
     }
     /* The first word of the reply is the LMAC version. */
-    aic_log("[AIC8800] lmac version ");
-    aic_log_hex32(aic_rd32(cfm));
-    aic_log("\n");
     return true;
 }
 
@@ -397,11 +377,9 @@ static void bring_mm_coex(void)
     req.enable_periodic_timer = 0u;
     req.coex_timeslot_set = 0u;
     aic_memset(cfm, 0u, sizeof(cfm));
-    if (!aic_cmd(AIC_MM_SET_COEX_REQ, AIC_MM_SET_COEX_CFM,
-                 (uint16_t)AIC_TASK_MM, &req, (uint16_t)sizeof(req),
-                 cfm, (uint16_t)sizeof(cfm), AIC_CMD_TIMEOUT_MS)) {
-        aic_log("[AIC8800] coex config not acknowledged (continuing)\n");
-    }
+    (void)aic_cmd(AIC_MM_SET_COEX_REQ, AIC_MM_SET_COEX_CFM,
+                  (uint16_t)AIC_TASK_MM, &req, (uint16_t)sizeof(req),
+                  cfm, (uint16_t)sizeof(cfm), AIC_CMD_TIMEOUT_MS);
 }
 
 static bool bring_mm_add_if(void)
@@ -421,7 +399,6 @@ static bool bring_mm_add_if(void)
         return false;
     }
     if (cfm.status != 0u) {
-        bring_log_status("MM_ADD_IF status", cfm.status);
         return false;
     }
     g_aic.vif_idx = cfm.inst_nbr;
@@ -431,18 +408,10 @@ static bool bring_mm_add_if(void)
 static void bring_fail(const char *what)
 {
     g_aic.bring_last_error = what;
-    aic_log("[AIC8800] bring-up: ");
-    aic_log(what);
-    aic_log(" failed (attempt ");
-    aic_log_hex32(g_aic.bring_attempts + 1u);
-    aic_log("/");
-    aic_log_hex32(AIC_MAX_ATTEMPTS);
-    aic_log(")\n");
 
     ++g_aic.bring_attempts;
     if (g_aic.bring_attempts >= AIC_MAX_ATTEMPTS) {
         g_aic.bring_phase = AIC_BRING_FAILED;
-        aic_log("[AIC8800] giving up on the station bring-up\n");
     } else {
         g_aic.bring_phase = AIC_BRING_IDLE; /* retry the ladder later */
     }
@@ -482,8 +451,6 @@ void aic_bring_step(void)
              * reboot the chip into its ROM so the loader stage configures a
              * fresh image, as the vendor's aic_load_fw does. */
             if (aic_fw_send_reboot()) {
-                aic_log("[AIC8800] firmware already running from before this "
-                        "boot; rebooting the adapter into its ROM loader\n");
                 g_aic.reboot_ticks = aic_now_ticks();
                 g_aic.bring_phase = AIC_BRING_REBOOT_WAIT;
                 return;
@@ -499,8 +466,6 @@ void aic_bring_step(void)
          * reboot, so bring up whatever is running. */
         if (aic_ms_since(g_aic.reboot_ticks, AIC_REBOOT_WAIT_MS) >=
             AIC_REBOOT_WAIT_MS) {
-            aic_log("[AIC8800] adapter did not come back as its ROM loader; "
-                    "using the running firmware\n");
             g_aic.bring_phase = AIC_BRING_STACK_START;
         }
         break;
@@ -582,9 +547,6 @@ void aic_bring_step(void)
         g_aic.bring_phase = AIC_BRING_DONE;
         g_aic.ready = true;
         g_aic.conn = AIC_CONN_NONE;
-        aic_log("[AIC8800] station ready on vif ");
-        aic_log_hex32((uint32_t)g_aic.vif_idx);
-        aic_log("\n");
         break;
 
     default:
@@ -639,14 +601,12 @@ bool aic_scan_start(void)
 
     /* The vendor waits for SCANU_START_CFM_ADDTIONAL, the firmware's
      * immediate acknowledgement; SCANU_START_CFM follows when the sweep is
-     * over (aic_handle_scan_done()). */
-    if (!aic_cmd(AIC_SCANU_START_REQ, AIC_SCANU_START_CFM_ADDTIONAL,
-                 (uint16_t)AIC_TASK_SCANU, &req, (uint16_t)sizeof(req),
-                 NULL, 0u, AIC_CMD_TIMEOUT_MS)) {
-        /* Older firmware may skip the early acknowledgement: the results
-         * still arrive, and the window below ends the scan either way. */
-        aic_log("[AIC8800] scan start not acknowledged early\n");
-    }
+     * over (aic_handle_scan_done()). Older firmware may skip the early
+     * acknowledgement: the results still arrive, and the window below ends
+     * the scan either way. */
+    (void)aic_cmd(AIC_SCANU_START_REQ, AIC_SCANU_START_CFM_ADDTIONAL,
+                  (uint16_t)AIC_TASK_SCANU, &req, (uint16_t)sizeof(req),
+                  NULL, 0u, AIC_CMD_TIMEOUT_MS);
     return true;
 }
 
@@ -654,9 +614,6 @@ void aic_handle_scan_done(void)
 {
     if (g_aic.scanning) {
         g_aic.scanning = false;
-        aic_log("[AIC8800] scan complete: ");
-        aic_log_hex32(g_aic.scan_result_count);
-        aic_log(" networks\n");
     }
 }
 
@@ -837,19 +794,15 @@ bool aic_connect(const char *ssid, const char *psk)
     if (psk != NULL) {
         psk_len = aic_strnlen(psk, (uint32_t)sizeof(g_aic.psk));
         if (psk_len < 8u || psk_len > 63u) {
-            aic_log("[AIC8800] passphrase must be 8..63 characters\n");
             return false;
         }
     }
 
     index = scan_find_ssid(ssid, ssid_len, psk != NULL);
     if (index < 0) {
-        aic_log("[AIC8800] connect: no scan result for that network\n");
         return false;
     }
     if (psk != NULL && g_aic.scan_rsn_ok[index] == 0u) {
-        aic_log("[AIC8800] connect: the network needs a security mode this "
-                "driver does not do (WPA2-PSK/CCMP only)\n");
         return false;
     }
 
@@ -919,13 +872,9 @@ bool aic_connect(const char *ssid, const char *psk)
                  cfm, (uint16_t)sizeof(cfm), AIC_CONNECT_CFM_TIMEOUT_MS) ||
         cfm[0] != AIC_SM_STATUS_SUCCESS) {
         g_aic.conn = AIC_CONN_FAILED;
-        bring_log_status("connect request rejected, status", cfm[0]);
         return false;
     }
 
-    aic_log("[AIC8800] connecting to ");
-    aic_log(g_aic.ssid);
-    aic_log(psk != NULL ? " (WPA2-PSK)\n" : " (open)\n");
     return true;
 }
 
@@ -1002,7 +951,6 @@ bool aic_mm_key_add(uint8_t key_idx, uint8_t sta_idx, const uint8_t *key,
     }
     aic_memset(&req, 0u, sizeof(req));
     if (cfm.status != 0u) {
-        bring_log_status("MM_KEY_ADD status", cfm.status);
         return false;
     }
     return true;
@@ -1040,7 +988,6 @@ void aic_handle_connect_ind(const uint8_t *payload, uint16_t len)
 
     status = aic_rd16(payload);
     if (status != AIC_SM_STATUS_SUCCESS) {
-        bring_log_status("association refused, status", status);
         g_aic.conn = AIC_CONN_FAILED;
         return;
     }
@@ -1058,10 +1005,8 @@ void aic_handle_connect_ind(const uint8_t *payload, uint16_t len)
             return;
         }
         g_aic.conn = AIC_CONN_4WAY;
-        aic_log("[AIC8800] associated; running the 4-way handshake\n");
     } else {
         g_aic.conn = AIC_CONN_ASSOCIATED;
-        aic_log("[AIC8800] associated (open network); link is up\n");
     }
 }
 
@@ -1075,7 +1020,6 @@ void aic_handle_disconnect_ind(const uint8_t *payload, uint16_t len)
     }
     /* The link went down (the AP dropped us, or the firmware gave up):
      * report a failed connection either way -- is_ready() follows. */
-    bring_log_status("disconnected, reason", aic_rd16(payload));
     aic_wpa_stop();
     g_aic.port_opened = false;
     g_aic.conn = AIC_CONN_FAILED;
@@ -1101,7 +1045,6 @@ void aic_conn_tick(void)
         if (aic_ms_since(g_aic.connect_deadline, AIC_CONNECT_TIMEOUT_MS) >=
             AIC_CONNECT_TIMEOUT_MS) {
             g_aic.conn = AIC_CONN_FAILED;
-            aic_log("[AIC8800] association timed out\n");
             aic_mm_disconnect();
         }
         break;
@@ -1109,7 +1052,6 @@ void aic_conn_tick(void)
     case AIC_CONN_4WAY:
         if (aic_wpa_state() == AIC_WPA_FAILED) {
             g_aic.conn = AIC_CONN_FAILED;
-            aic_log("[AIC8800] 4-way handshake failed\n");
             aic_mm_disconnect();
         } else if (aic_wpa_keys_installed()) {
             /* Keys are in; open the controlled port, after which (and only
@@ -1117,11 +1059,8 @@ void aic_conn_tick(void)
             if (aic_open_control_port()) {
                 g_aic.port_opened = true;
                 g_aic.conn = AIC_CONN_ASSOCIATED;
-                aic_log("[AIC8800] WPA2 keys installed, port open; "
-                        "link is up\n");
             } else if (++g_aic.port_attempts >= AIC_PORT_MAX_ATTEMPTS) {
                 g_aic.conn = AIC_CONN_FAILED;
-                aic_log("[AIC8800] controlled port would not open\n");
                 aic_mm_disconnect();
             }
         }
@@ -1131,7 +1070,6 @@ void aic_conn_tick(void)
         if (g_aic.wpa_enabled && aic_wpa_state() == AIC_WPA_FAILED) {
             /* A rekey failed: the AP will drop us anyway. */
             g_aic.conn = AIC_CONN_FAILED;
-            aic_log("[AIC8800] rekey failed\n");
             aic_mm_disconnect();
         }
         break;

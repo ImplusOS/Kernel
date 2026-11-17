@@ -7,7 +7,6 @@
 #include "Platform/interrupt/LAPIC.h"
 #include "Platform/interrupt/Interrupts.h"
 #include "Arch/x86_64/smp/SMP_Main.h"
-#include "Debug/serial/Serial.h"
 #include "interfaces/hal_cpu.h"
 #include "Platform/timer/HPET.h"
 #include "Core/timer/Timer.h"
@@ -47,13 +46,6 @@ static void pit_set_frequency(uint32_t hz) {
  * many times each physical LAPIC id has entered this handler. A tick counter
  * that runs fast makes every guest CLOCK_MONOTONIC reading, every
  * timer_msleep() and every driver settle delay wrong by the same factor. */
-#ifndef TIMER_TICK_TRACE
-#define TIMER_TICK_TRACE 0
-#endif
-#if TIMER_TICK_TRACE
-#define TIMER_TICK_TRACE_LAPICS 16u
-static volatile uint32_t g_tick_by_lapic[TIMER_TICK_TRACE_LAPICS];
-#endif
 
 /* ---- BSP one-shot mode ----------------------------------------------------
  *
@@ -103,31 +95,6 @@ static void lapic_hires_request(uint64_t due_ns)
 }
 
 static void lapic_timer_handler(void) {
-#if TIMER_TICK_TRACE
-    {
-        uint32_t lid = lapic_is_present() ? lapic_get_id() : 0u;
-        if (lid < TIMER_TICK_TRACE_LAPICS) {
-            uint32_t n = __atomic_add_fetch(&g_tick_by_lapic[lid], 1u,
-                                            __ATOMIC_RELAXED);
-            /* Printed per CPU, outside the BSP guard below, because the
-             * failure being chased is "one CPU's LAPIC timer stops firing"
-             * and a trace that only runs on the BSP cannot tell that apart
-             * from the whole subsystem dying. Lines from different CPUs
-             * interleave; the lid= field is what makes them readable. */
-            if ((n % 4000u) == 0u) {
-                serial_write_string("[tk] lid=");
-                serial_write_uint32(lid);
-                serial_write_string(" n=");
-                serial_write_uint32(n);
-                serial_write_string(" hpet_ms=");
-                serial_write_uint64(hpet_is_available()
-                                        ? (hpet_monotonic_ns() / 1000000ull)
-                                        : 0ull);
-                serial_write_string("\n");
-            }
-        }
-    }
-#endif
     if (smp_get_current_cpu_id() != 0u) {
         /* Not counted in g_ticks (CPU0 keeps time), but the core handler
          * still has per-CPU scheduling work to do on an AP. */
@@ -156,23 +123,6 @@ static void lapic_timer_handler(void) {
         }
     }
     __atomic_fetch_add(&g_ticks, 1u, __ATOMIC_RELAXED);
-#if TIMER_TICK_TRACE
-    if ((g_ticks % 2000u) == 0u) {
-        serial_write_string("[tick] hpet_ms=");
-        serial_write_uint64(hpet_is_available() ? (hpet_monotonic_ns() / 1000000ull)
-                                                : 0ull);
-        serial_write_string(" ticks=");
-        serial_write_uint64(g_ticks);
-        serial_write_string(" hz=");
-        serial_write_uint32(g_timer_hz);
-        serial_write_string(" bylapic=");
-        for (uint32_t i = 0; i < 8u; ++i) {
-            serial_write_uint32(g_tick_by_lapic[i]);
-            serial_write_string(",");
-        }
-        serial_write_string("\n");
-    }
-#endif
     if (g_timer_callback) {
         g_timer_callback();
     }
@@ -331,12 +281,6 @@ static void lapic_switch_to_local(void) {
         initial = elapsed / 10u;
     }
 
-    serial_write_string("[lapic] timer initial=");
-    serial_write_uint32(initial);
-    serial_write_string(" hz=");
-    serial_write_uint32(g_timer_hz);
-    serial_write_string("\n");
-
     g_lapic_timer_initial = initial;
     platform_interrupts_mask_pit();
     if (rate != 0u && smp_get_current_cpu_id() == 0u) {
@@ -348,7 +292,6 @@ static void lapic_switch_to_local(void) {
         g_next_tick_ns = now + g_tick_period_ns;
         __atomic_store_n(&g_bsp_oneshot, 1u, __ATOMIC_RELEASE);
         lapic_bsp_arm(now);
-        serial_write_string("[lapic] BSP one-shot (hires deadlines)\n");
         return;
     }
     (void)lapic_timer_start(VECTOR_TIMER, initial, 1, 16u);

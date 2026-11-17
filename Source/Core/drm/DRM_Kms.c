@@ -19,7 +19,6 @@
 #include "Core/syscall/Syscall_File.h"
 #include "Core/syscall/Poll_Wait.h"
 #include "mmu/Paging_Main.h"
-#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -885,12 +884,6 @@ void drm_kms_init(void)
     if (g_tick_gpu != NULL && g_tick_gpu->gpu_set_fence_callback != NULL) {
         g_tick_gpu->gpu_set_fence_callback(poll_wait_notify);
     }
-    serial_write_string("[drm] published /dev/dri/card0 (226:0) and "
-                        "/dev/dri/renderD128 (226:128)\n");
-    serial_write_string("[drm] render backend: ");
-    serial_write_string(display_get_3d_driver() != NULL
-                            ? "virtio_gpu ready\n"
-                            : "unavailable (Mesa will use software fallback)\n");
     g_inited = 1;
 }
 
@@ -1468,13 +1461,6 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         static const char date[] = "20261101";
         static const char desc[] = "ImplusOS VirtIO-GPU render node";
         const char *name = gpu != NULL ? virtio_name : generic_name;
-        /* This one-line probe is intentionally emitted only on the render
-         * node's VERSION ioctl. It distinguishes a real Mesa/libdrm open of
-         * renderD128 from Xorg's separate card0 KMS/DRI2 software path. */
-        serial_write_string("[drm-render] VERSION driver=");
-        serial_write_string(name);
-        serial_write_string((gpu != NULL && gpu->gpu_submit_3d_async != NULL)
-                                ? " version=0.1\n" : " version=0.0\n");
         uint64_t nl = (uint64_t)strlen(name);
         uint64_t dl = sizeof(date) - 1u;
         uint64_t sl = sizeof(desc) - 1u;
@@ -1644,9 +1630,6 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         switch ((uint32_t)param.param) {
         case VIRTGPU_PARAM_3D_FEATURES:
             value = gpu != NULL ? 1u : 0u;
-            serial_write_string(value != 0u
-                                    ? "[drm-render] 3D_FEATURES=1\n"
-                                    : "[drm-render] 3D_FEATURES=0\n");
             break;
         case VIRTGPU_PARAM_CAPSET_QUERY_FIX:
             value = gpu != NULL ? 1u : 0u;
@@ -2612,7 +2595,6 @@ static void vbl_emit_locked(drm_session_t *s, uint8_t type, uint64_t seq,
 {
     uint32_t next = (s->evq_head + 1u) % DRM_EVQ_MAX;
     if (next == s->evq_tail) {
-        serial_write_string("[drm] event queue full, dropping\n");
         return;
     }
     uint64_t ts = vbl_time_of_locked(s, seq);
@@ -3416,11 +3398,6 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         return prime_fd_to_handle(sess->dumbs, uarg, &sess->next_handle,
                                   &sess->next_map_off);
     default:
-        serial_write_string("[drm] unhandled ioctl nr=");
-        serial_write_uint64(nr);
-        serial_write_string(" type=");
-        serial_write_uint64(IOC_TYPE(request));
-        serial_write_string("\n");
         return E_NOTTY;
     }
 }

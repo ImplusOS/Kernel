@@ -533,7 +533,6 @@ static void wpa_handle_m3(uint8_t *key, uint16_t body_len,
     if (!wpa_verify_mic(key, eapol, eapol_len)) {
         /* Wrong KCK: the PSK is wrong. Report as a failure rather than
          * silently retrying -- the AP will keep retransmitting M1. */
-        aic_log("[AIC8800] message 3 MIC mismatch: wrong passphrase?\n");
         g_wpa.state = AIC_WPA_FAILED;
         return;
     }
@@ -650,7 +649,6 @@ static void wpa_handle_group_m1(uint8_t *key, uint16_t body_len,
     }
     wpa_stage_gtk(gtk, gtk_len, idx);
     g_wpa.install_attempts = 0u;
-    aic_log("[AIC8800] group key rekeyed\n");
 }
 
 /* ---- public interface ---- */
@@ -868,7 +866,6 @@ void aic_wpa_tick(void)
      * answer, and 0 means "no timeout" -- never a spurious failure. */
     if ((g_wpa.state == AIC_WPA_WAIT_M1 || g_wpa.state == AIC_WPA_WAIT_M3) &&
         aic_ms_since(g_wpa.start_ticks, 0u) >= AIC_WPA_HANDSHAKE_TIMEOUT_MS) {
-        aic_log("[AIC8800] 4-way handshake timed out\n");
         g_wpa.state = AIC_WPA_FAILED;
         return;
     }
@@ -891,7 +888,6 @@ void aic_wpa_tick(void)
          * tries the handshake is over and the connection is reported
          * failed rather than stalling every tick. */
         if (g_wpa.install_attempts >= AIC_WPA_INSTALL_MAX_ATTEMPTS) {
-            aic_log("[AIC8800] key install kept failing, giving up\n");
             g_wpa.state = AIC_WPA_FAILED;
             break;
         }

@@ -12,7 +12,6 @@
 #include "MemoryManagement/Memory_Main.h"
 #include "mmu/Paging_Main.h"
 #include "kernel/config.h"
-#include "Debug/serial/Serial.h"
 #include "Core/vfs/VFS.h"
 
 #define PROCFS_BUFFER_CAP 4096u
@@ -516,18 +515,10 @@ static const procfs_static_scalar_t g_procfs_static_scalars[] = {
  * of these and quietly change behaviour on what they find, so "is this file
  * even being read" is the first question worth answering before improving one.
  */
-#ifndef PROCFS_TRACE
-#define PROCFS_TRACE 0
-#endif
 
 static bool procfs_generate(const char *path, char *buf, uint32_t cap,
                             uint32_t *size_out)
 {
-#if PROCFS_TRACE
-    serial_write_string("[procfs] ");
-    serial_write_string(path);
-    serial_write_char('\n');
-#endif
     const char *suffix = NULL;
     int32_t pid = procfs_resolve_pid(path, &suffix);
     if (pid >= 0) {
@@ -836,11 +827,6 @@ static bool procfs_vfs_write_at(vfs_file_t *file, uint32_t offset,
     (void)offset;
     (void)buffer;
     (void)size;
-    serial_write_string("[procfs] write_at offset=");
-    serial_write_uint64(offset);
-    serial_write_string(" size=");
-    serial_write_uint64(size);
-    serial_write_char('\n');
     return true; /* Writes to e.g. /proc/sys/... are accepted and discarded. */
 }
 

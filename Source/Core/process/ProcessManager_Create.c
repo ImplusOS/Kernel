@@ -34,7 +34,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include "Core/drm/DRM_Kms.h"
 #include "Core/tty/Pty.h"
 
@@ -158,9 +157,6 @@ static int32_t g_process_capacity = 0;
 static uint64_t *g_sleep_deadline_ns = NULL;
 static spinlock_t g_process_table_lock;
 static uint32_t g_timeslice_ticks = 6;
-static uint64_t g_cpu_usage_prev_runtime_ns[OS_CONFIG_PROCESS_MAX_COUNT_MAX];
-static uint64_t g_cpu_usage_prev_syscalls[OS_CONFIG_PROCESS_MAX_COUNT_MAX];
-static uint64_t g_cpu_usage_prev_display_bytes[OS_CONFIG_PROCESS_MAX_COUNT_MAX];
 
 static void initialize_fpu_state(uint8_t *fpu_state)
 {
@@ -403,9 +399,8 @@ static uint64_t process_perf_now_ns(void)
 
 /* ---- Foreign (Linux-ABI) program launch log -------------------------------
  *
- * OS_CONFIG_FOREIGN_TRACE is the bring-up firehose and is off in a normal
- * boot, but "which Linux program started, when, and how it ended" is worth
- * having in every boot: it is a handful of lines per program rather than
+ * "Which Linux program started, when, and how it ended" is worth having in
+ * every boot: it is a handful of lines per program rather than
  * thousands, and it is the first thing anyone asks when an app seems slow to
  * come up.
  *
@@ -810,14 +805,7 @@ static void release_process_resources(process_t *proc)
      * leaks a few pages per such exit, which is the cheap side of this trade.
      */
     if (proc->cr3 != 0) {
-        if (threads_still_running) {
-            static uint32_t warned;
-            if (warned < 8u) {
-                ++warned;
-                serial_write_string("[proc] address space kept: threads still "
-                                    "running on other CPUs\n");
-            }
-        } else {
+        if (!threads_still_running) {
             flight_rec(FR_TAG_DESTROY, proc->cr3, (uint64_t)(uint32_t)owner_pid);
             paging_destroy_process_space(proc->cr3);
         }
@@ -1161,16 +1149,6 @@ static int process_push_signal_frame_locked(process_t *proc, int32_t signum)
 {
     if (proc == NULL || signum <= 0 || signum >= PROCESS_SIGNAL_MAX) {
         return -1;
-    }
-
-    if (OS_CONFIG_FOREIGN_TRACE) {
-    serial_write_string("[sig] push pid=");
-    serial_write_uint32((uint32_t)(int32_t)(proc - g_processes));
-    serial_write_string(" sig=");
-    serial_write_uint32((uint32_t)signum);
-    serial_write_string(" handler=");
-    serial_write_uint64(proc->signal_handlers[(uint32_t)signum]);
-    serial_write_char('\n');
     }
 
     uint64_t handler = proc->signal_handlers[(uint32_t)signum];
@@ -3352,18 +3330,6 @@ int32_t process_spawn_user_elf_with_env(const char *path,
     elf_loaded_image_info_t image_info = {0};
 
     if (!elf_loader_load_from_path(proc->cr3, pid, path, &policy, &image_info)) {
-        const char *elf_err = elf_loader_last_error();
-        extern void serial_write_string(const char *str);
-        extern void serial_write_uint64(uint64_t value);
-        serial_write_string("[spawn-fail] pid=");
-        serial_write_uint64((uint64_t)pid);
-        serial_write_string(" path=");
-        serial_write_string(path);
-        serial_write_string(" cr3=0x");
-        serial_write_uint64(proc->cr3);
-        serial_write_string(" elf_err=");
-        serial_write_string(elf_err ? elf_err : "(null)");
-        serial_write_string("\n");
         filemap_release_pid(pid);
         ipc_cleanup_process_queue(pid);
         uint64_t irq_flags = irq_save_disable();
@@ -3454,12 +3420,11 @@ int32_t process_spawn_user_elf_with_env(const char *path,
         static const char linux_envp_ld_path[] =
             "LD_LIBRARY_PATH=" OS_CONFIG_LINUX_RUNTIME_LIB_PATH;
 
-        /* Two interpreter families reach this path (Docs/Others/
-           TODO_glibc_Port.md G3): real glibc /lib64/ld-linux-x86-64.so.2
-           used by external Linux binaries, and the in-tree test ld.so
-           (com.ImplusOS.ldso). Only glibc's loader needs the runtime's
-           library directory, and only the kernel can tell the two apart --
-           a launcher never sees PT_INTERP. */
+        /* Only glibc's loader (/lib64/ld-linux-x86-64.so.2, used by
+           external Linux binaries) needs the runtime's library directory,
+           and only the kernel can tell it apart from any other PT_INTERP --
+           a launcher never sees PT_INTERP (Docs/Others/TODO_glibc_Port.md
+           G3). */
         const char *family_ld_path = NULL;
         {
             const char *ip = image_info.interp_path;
@@ -3571,14 +3536,8 @@ static int process_copy_user_page(uint64_t child_cr3, uint64_t vaddr,
     return ret;
 }
 
-/* Bring-up instrumentation (TODO_Doom_Xorg_MethodA.md M12). Xorg's fork() --
- * its only route to xkbcomp -- was measured taking ~281 s and then failing.
- * Whether that is sheer copy volume (Xorg maps libLLVM at 129 MB, libgallium
- * at 42 MB, ...) or a per-page pathology cannot be told apart from the
- * outside, so report both the elapsed time and the outcome once per fork. */
 static int process_clone_address_space(process_t *child, process_t *parent)
 {
-    const uint64_t clone_start_ns = process_perf_now_ns();
     int clone_rc;
 
     if (parent->abi_mode == PROCESS_ABI_LINUX) {
@@ -3645,22 +3604,6 @@ static int process_clone_address_space(process_t *child, process_t *parent)
     }
 
 done:
-    if (OS_CONFIG_FOREIGN_TRACE) {
-        uint64_t elapsed_ms =
-            (process_perf_now_ns() - clone_start_ns) / 1000000ULL;
-        serial_write_string("[fork] clone_address_space rc=");
-        serial_write_uint64((uint64_t)(int64_t)clone_rc);
-        serial_write_string(" elapsed_ms=");
-        serial_write_uint64(elapsed_ms);
-        /* Kernel heap, not free physical memory -- get_free_memory() walks the
-         * heap free list. Labelled honestly so it is not read as an
-         * out-of-RAM signal (it sits at ~94 MB in steady state). */
-        serial_write_string(" free_heap=");
-        serial_write_uint64(get_free_memory());
-        serial_write_string(" free_pages=");
-        serial_write_uint64(memory_free_pages());
-        serial_write_char('\n');
-    }
     return clone_rc;
 }
 
@@ -4304,9 +4247,6 @@ int32_t process_execve(const char *path, const char *const *argv,
 
     uint64_t new_cr3 = paging_create_process_space();
     if (!new_cr3) {
-        serial_write_string("[execve-fail] paging_create_process_space free_pages=");
-        serial_write_uint64(memory_free_pages());
-        serial_write_char('\n');
         /* Past the point of no return: the old image is gone, so there is
          * nothing to return to. Linux kills the process here rather than
          * failing the call, and returning -1 instead left the caller running
@@ -4331,9 +4271,6 @@ int32_t process_execve(const char *path, const char *const *argv,
     uint64_t thread_reserve =
         (uint64_t)g_process_capacity * PROCESS_THREAD_STACK_REGION_SIZE;
     if (thread_reserve >= (proc->user_heap_limit - proc->user_heap_base)) {
-        serial_write_string("[execve-fail] thread-reserve free_pages=");
-        serial_write_uint64(memory_free_pages());
-        serial_write_char('\n');
         paging_destroy_process_space(new_cr3);
         proc->cr3 = 0;
         /* Past the point of no return: the old image is gone, so there is
@@ -4376,9 +4313,6 @@ int32_t process_execve(const char *path, const char *const *argv,
         paging_map_user_range_alloc(proc->cr3, initial_stack_base,
                                      PROCESS_INITIAL_USER_STACK_SIZE,
                                      PAGE_RW | PAGE_USER) < 0) {
-        serial_write_string("[execve-fail] initial-stack-map free_pages=");
-        serial_write_uint64(memory_free_pages());
-        serial_write_char('\n');
         paging_destroy_process_space(new_cr3);
         proc->cr3 = 0;
         /* Past the point of no return: the old image is gone, so there is
@@ -4413,18 +4347,6 @@ int32_t process_execve(const char *path, const char *const *argv,
     elf_loaded_image_info_t image_info = {0};
     if (!elf_loader_load_from_path(proc->cr3, proc_pid, path_buf,
                                     &elf_policy, &image_info)) {
-        const char *elf_err = elf_loader_last_error();
-        extern void serial_write_string(const char *str);
-        extern void serial_write_uint64(uint64_t value);
-        serial_write_string("[execve-fail] pid=");
-        serial_write_uint64((uint64_t)(proc - g_processes));
-        serial_write_string(" path=");
-        serial_write_string(path_buf);
-        serial_write_string(" cr3=0x");
-        serial_write_uint64(proc->cr3);
-        serial_write_string(" elf_err=");
-        serial_write_string(elf_err ? elf_err : "(null)");
-        serial_write_string("\n");
         filemap_release_pid(proc_pid);
         paging_destroy_process_space(new_cr3);
         proc->cr3 = 0;
@@ -4486,7 +4408,6 @@ int32_t process_execve(const char *path, const char *const *argv,
     if (initialize_elf_user_stack_ex(proc, &image_info, path_buf,
                                       argc, (const char *const *)argv_ptrs,
                                       envc, (const char *const *)envp_ptrs) < 0) {
-        serial_write_string("[execve-fail] user-stack-init\n");
         paging_destroy_process_space(new_cr3);
         proc->cr3 = 0;
         process_exit_current_with_status(127);
@@ -4515,9 +4436,6 @@ int32_t process_execve(const char *path, const char *const *argv,
         proc->state != PROCESS_STATE_RUNNING) {
         spinlock_unlock(&g_process_table_lock);
         irq_restore(irq_flags);
-        serial_write_string("[execve-fail] process state=");
-        serial_write_uint64((uint64_t)proc->state);
-        serial_write_char('\n');
         process_exit_current_with_status(127);
         return -1;
     }
@@ -4546,15 +4464,6 @@ int32_t process_execve(const char *path, const char *const *argv,
     /* Successful exec, not just the failures: X shells out to xkbcomp through
      * /bin/sh, and telling "the shell never ran" apart from "xkbcomp ran and
      * hung" needs the successful hop logged too. */
-    if (OS_CONFIG_FOREIGN_TRACE) {
-    serial_write_string("[execve-ok] pid=");
-    serial_write_uint32((uint32_t)(int32_t)(proc - g_processes));
-    serial_write_string(" path=");
-    serial_write_string(path_buf); /* NOT `path`: that user pointer lives in
-                                    * the address space this exec just tore
-                                    * down. */
-    serial_write_char('\n');
-    }
 
     return 0;
 }
@@ -4797,13 +4706,6 @@ static void process_teardown(int32_t pid_to_exit)
     int32_t exit_status_log = owner->exit_status;
     uint8_t abi_mode_log = (owner->abi_mode == PROCESS_ABI_LINUX) ? 1u : 0u;
 
-    if (OS_CONFIG_FOREIGN_TRACE) {
-        serial_write_string("[exit] pid=");
-        serial_write_uint32((uint32_t)pid_to_exit);
-        serial_write_string(" status=");
-        serial_write_uint32((uint32_t)exit_status_log);
-        serial_write_char('\n');
-    }
     foreign_launch_log_exit(pid_to_exit, exit_status_log, abi_mode_log);
 
     uint32_t closed_fds = 0;
@@ -4899,11 +4801,6 @@ void process_exit_current_signaled(int32_t signum)
 {
     /* TEMPORARY DIAGNOSTIC (revert): which of the several kill paths took a
      * process down, and as whom it is recorded. */
-    serial_write_string("[exit-cause] signaled pid=");
-    serial_write_uint32((uint32_t)current_pid_get());
-    serial_write_string(" signum=");
-    serial_write_uint32((uint32_t)signum);
-    serial_write_char('\n');
 
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
@@ -4926,11 +4823,6 @@ void process_exit_current_with_status(int32_t exit_status)
 {
     /* TEMPORARY DIAGNOSTIC (revert): a process that leaves through exit_group
      * rather than by signal -- the status is its own argument. */
-    serial_write_string("[exit-cause] status pid=");
-    serial_write_uint32((uint32_t)current_pid_get());
-    serial_write_string(" status=");
-    serial_write_uint32((uint32_t)exit_status);
-    serial_write_char('\n');
 
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
@@ -5106,83 +4998,6 @@ static int process_group_has_living_member_locked(int32_t leader_pid)
     }
     return 0;
 }
-
-/*
- * Timer-driven snapshot of every live task: state, and the last Linux syscall
- * it made. Enabled with -DPROCESS_STALL_DUMP=1.
- *
- * The syscall-driven heartbeat in Syscall_LinuxCompat.c cannot report the one
- * situation worth reporting -- every thread blocked, no syscalls at all -- so
- * this is hung off the timer instead. State codes are PROCESS_STATE_*: 1 READY,
- * 2 RUNNING, 3 BLOCKED, 5 ZOMBIE.
- */
-#ifndef PROCESS_STALL_DUMP
-#define PROCESS_STALL_DUMP 0
-#endif
-#if PROCESS_STALL_DUMP
-#ifndef PROCESS_STALL_DUMP_FDS
-#define PROCESS_STALL_DUMP_FDS 0
-#endif
-#ifndef PROCESS_STALL_DUMP_MS
-#define PROCESS_STALL_DUMP_MS 10000u
-#endif
-extern uint32_t linux_heartbeat_last_num(int32_t pid);
-extern uint64_t linux_heartbeat_count(int32_t pid);
-extern uint64_t linux_heartbeat_last_arg(int32_t pid);
-extern uint64_t linux_heartbeat_last_rip(int32_t pid);
-
-void process_stall_dump_tick(void)
-{
-    static uint64_t next_ns;
-    uint64_t now = timer_monotonic_ns();
-    if (next_ns == 0u) {
-        next_ns = now + (uint64_t)PROCESS_STALL_DUMP_MS * 1000000ull;
-        return;
-    }
-    if (now < next_ns) {
-        return;
-    }
-    next_ns = now + (uint64_t)PROCESS_STALL_DUMP_MS * 1000000ull;
-
-    serial_write_string("[stall] free=");
-    serial_write_uint64(memory_free_pages());
-    for (int32_t i = 0; i < g_process_capacity; ++i) {
-        const process_t *p = &g_processes[i];
-        if (p->state == PROCESS_STATE_UNUSED) continue;
-        serial_write_string(" ");
-        serial_write_uint32((uint32_t)i);
-        serial_write_string(":");
-        serial_write_string(p->name);
-        serial_write_string(":s");
-        serial_write_uint32((uint32_t)p->state);
-        serial_write_string(":#");
-        serial_write_uint32(linux_heartbeat_last_num(i));
-        serial_write_string(":a");
-        serial_write_uint64(linux_heartbeat_last_arg(i));
-        serial_write_string(":r");
-        serial_write_uint64(linux_heartbeat_last_rip(i));
-        serial_write_string(":n");
-        serial_write_uint64(linux_heartbeat_count(i));
-    }
-    serial_write_char('\n');
-
-    /* The fd-level dumps below are megabytes of serial traffic emitted from a
-     * timer interrupt, which distorts the very timing being measured. Enable
-     * one at a time with -DPROCESS_STALL_DUMP_FDS=1 when a stall needs them. */
-#if PROCESS_STALL_DUMP_FDS
-    {
-        extern void epoll_debug_dump(void);
-        extern void linux_poll_trace_dump_all(void);
-        extern void unix_socket_debug_dump(void);
-        extern void unix_socket_wire_dump(void);
-        epoll_debug_dump();
-        linux_poll_trace_dump_all();
-        unix_socket_debug_dump();
-        unix_socket_wire_dump();
-    }
-#endif
-}
-#endif
 
 /* Lock-free on purpose. It reads only the running task's own slot and its
  * memory owner, neither of which can be torn down while the task runs (a group
@@ -5562,28 +5377,7 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
         uint64_t return_saved_rsp = current->saved_rsp;
         uint64_t return_user_rsp = current->saved_user_rsp;
         current->state = PROCESS_STATE_RUNNING;
-        if (0) {
-            extern void serial_write_uint64(uint64_t value);
-            extern void serial_write_string(const char *str);
-            if (current->is_thread) {
-                serial_write_string("[SR> pid=");
-                serial_write_uint64((uint64_t)(uint32_t)current_pid_get());
-                serial_write_string(" srs=");
-                serial_write_uint64(return_saved_rsp);
-                serial_write_string(" rcx=");
-                if (return_saved_rsp != 0u) {
-                    serial_write_uint64(((const uint64_t *)(uintptr_t)return_saved_rsp)[13]);
-                } else {
-                    serial_write_uint64(0);
-                }
-                serial_write_string(" ursp=");
-                serial_write_uint64(return_user_rsp);
-                serial_write_string("]\n");
-            }
-        }
-        (void)return_saved_rsp;
-        (void)return_user_rsp;
-        
+
         process_fpu_restore(current->fpu_state);
         activate_process_context(current);
         
@@ -5634,33 +5428,6 @@ uint64_t process_schedule_on_syscall(uint64_t current_saved_rsp,
 
     uint64_t next_saved_rsp = next->saved_rsp;
     uint64_t next_user_rsp = next->saved_user_rsp;
-        if (0) {
-            extern void serial_write_uint64(uint64_t value);
-            extern void serial_write_string(const char *str);
-            if (next->is_thread || g_processes[current_pid_get()].is_thread) {
-            serial_write_string("[SW> pid=");
-            serial_write_uint64((uint64_t)(uint32_t)current_pid_get());
-            serial_write_string(" srs=");
-            serial_write_uint64(next_saved_rsp);
-            serial_write_string(" srs_rcx=");
-            if (next_saved_rsp != 0u) {
-                serial_write_uint64(((const uint64_t *)(uintptr_t)next_saved_rsp)[13]);
-            } else {
-                serial_write_uint64(0);
-            }
-            serial_write_string(" srs_r11=");
-            if (next_saved_rsp != 0u) {
-                serial_write_uint64(((const uint64_t *)(uintptr_t)next_saved_rsp)[14]);
-            } else {
-                serial_write_uint64(0);
-            }
-            serial_write_string(" ursp=");
-            serial_write_uint64(next_user_rsp);
-            serial_write_string("]\n");
-        }
-    }
-    (void)next_saved_rsp;
-    (void)next_user_rsp;
     
     process_fpu_restore(next->fpu_state);
     activate_process_context(next);
@@ -5845,16 +5612,6 @@ void process_preempt_from_user_irq(uint64_t *isr_regs)
     }
 
     uint64_t now_ns = process_perf_now_ns();
-
-    {
-        static volatile uint64_t preempt_count;
-        uint64_t n = __atomic_add_fetch(&preempt_count, 1u, __ATOMIC_RELAXED);
-        if ((n % 20000u) == 0u) {
-            serial_write_string("[sched] user-mode preemptions: ");
-            serial_write_uint64(n);
-            serial_write_string("\n");
-        }
-    }
 
     uint64_t *frame = (uint64_t *)(uintptr_t)
         ((current->kernel_stack_top & ~0xFULL) -
@@ -6789,31 +6546,10 @@ int process_signal_maybe_self_terminate(int32_t signum)
     return 1;
 }
 
-/* Every signal that reaches a foreign (Linux-ABI) process is worth a serial
- * line: X's OsSigHandler reports "Received signal N sent by process 0" for
- * anything with si_code == SI_USER, which hides who actually sent it. */
-static void signal_trace(const char *what, int32_t target, int32_t signum)
-{
-    if (!OS_CONFIG_FOREIGN_TRACE) {
-        (void)what; (void)target; (void)signum;
-        return;
-    }
-    serial_write_string("[sig] ");
-    serial_write_string(what);
-    serial_write_string(" from=");
-    serial_write_uint32((uint32_t)current_pid_get());
-    serial_write_string(" to=");
-    serial_write_uint32((uint32_t)target);
-    serial_write_string(" sig=");
-    serial_write_uint32((uint32_t)signum);
-    serial_write_char('\n');
-}
-
 static int process_signal_blocked_locked(const process_t *proc, int32_t signum);
 
 int process_signal_deliver(int32_t pid, int32_t signum)
 {
-    signal_trace("deliver", pid, signum);
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -7051,7 +6787,6 @@ int process_signal_deliver_session(int32_t sid, int32_t signum)
 
 int process_signal_deliver_group(int32_t pid, int32_t signum)
 {
-    signal_trace("group", pid, signum);
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_process_table_lock);
 
@@ -7769,158 +7504,6 @@ void process_perf_note_display(int32_t pid, uint32_t rect_count, uint64_t bytes)
         __atomic_fetch_add(&proc->display_rects, rect_count, __ATOMIC_RELAXED);
         __atomic_fetch_add(&proc->display_bytes, bytes, __ATOMIC_RELAXED);
     }
-}
-
-
-void process_debug_dump_cpu_usage(const char *reason, uint64_t interval_ns)
-{
-    if (interval_ns == 0u) {
-        interval_ns = 1000000000ULL;
-    }
-
-    uint64_t irq_flags = irq_save_disable();
-    spinlock_lock(&g_process_table_lock);
-
-    uint64_t now_ns = process_perf_now_ns();
-    uint64_t total_delta_ns = 0u;
-    uint64_t total_syscall_delta = 0u;
-    uint64_t total_display_delta = 0u;
-    uint64_t top_delta_ns = 0u;
-    uint64_t top_user_delta_ns = 0u;
-    uint64_t top_user_syscall_delta = 0u;
-    uint64_t top_user_display_delta = 0u;
-    uint64_t top_syscall_count = 0u;
-    uint64_t top_syscall_runtime_delta = 0u;
-    uint64_t user_delta_ns = 0u;
-    uint64_t user_syscall_delta = 0u;
-    int32_t top_pid = -1;
-    int32_t top_user_pid = -1;
-    int32_t top_syscall_pid = -1;
-    char top_name[64];
-    char top_user_name[64];
-    char top_syscall_name[64];
-    top_name[0] = '\0';
-    top_user_name[0] = '\0';
-    top_syscall_name[0] = '\0';
-
-    int32_t capacity = g_process_capacity;
-    if (capacity > OS_CONFIG_PROCESS_MAX_COUNT_MAX) {
-        capacity = OS_CONFIG_PROCESS_MAX_COUNT_MAX;
-    }
-
-    for (int32_t i = 0; i < capacity; ++i) {
-        process_t *proc = &g_processes[i];
-        if (proc->state == PROCESS_STATE_UNUSED ||
-            proc->state == PROCESS_STATE_DEAD) {
-            g_cpu_usage_prev_runtime_ns[i] = 0u;
-            g_cpu_usage_prev_syscalls[i] = 0u;
-            g_cpu_usage_prev_display_bytes[i] = 0u;
-            continue;
-        }
-
-        uint64_t runtime_ns = proc->runtime_ns;
-        if (proc->state == PROCESS_STATE_RUNNING &&
-            proc->last_scheduled_ns != 0u &&
-            now_ns >= proc->last_scheduled_ns) {
-            runtime_ns += now_ns - proc->last_scheduled_ns;
-        }
-
-        uint64_t runtime_delta = 0u;
-        if (runtime_ns >= g_cpu_usage_prev_runtime_ns[i]) {
-            runtime_delta = runtime_ns - g_cpu_usage_prev_runtime_ns[i];
-        }
-        uint64_t syscall_delta = 0u;
-        if (proc->syscalls >= g_cpu_usage_prev_syscalls[i]) {
-            syscall_delta = proc->syscalls - g_cpu_usage_prev_syscalls[i];
-        }
-        uint64_t display_delta = 0u;
-        if (proc->display_bytes >= g_cpu_usage_prev_display_bytes[i]) {
-            display_delta = proc->display_bytes -
-                            g_cpu_usage_prev_display_bytes[i];
-        }
-
-        g_cpu_usage_prev_runtime_ns[i] = runtime_ns;
-        g_cpu_usage_prev_syscalls[i] = proc->syscalls;
-        g_cpu_usage_prev_display_bytes[i] = proc->display_bytes;
-
-        total_delta_ns += runtime_delta;
-        total_syscall_delta += syscall_delta;
-        total_display_delta += display_delta;
-        if (i != 0) {
-            user_delta_ns += runtime_delta;
-            user_syscall_delta += syscall_delta;
-            if (runtime_delta > top_user_delta_ns) {
-                top_user_delta_ns = runtime_delta;
-                top_user_syscall_delta = syscall_delta;
-                top_user_display_delta = display_delta;
-                top_user_pid = i;
-                memcpy(top_user_name, proc->name, sizeof(top_user_name));
-                top_user_name[sizeof(top_user_name) - 1u] = '\0';
-            }
-        }
-        if (runtime_delta > top_delta_ns) {
-            top_delta_ns = runtime_delta;
-            top_pid = i;
-            memcpy(top_name, proc->name, sizeof(top_name));
-            top_name[sizeof(top_name) - 1u] = '\0';
-        }
-        if (syscall_delta > top_syscall_count) {
-            top_syscall_count = syscall_delta;
-            top_syscall_runtime_delta = runtime_delta;
-            top_syscall_pid = i;
-            memcpy(top_syscall_name, proc->name, sizeof(top_syscall_name));
-            top_syscall_name[sizeof(top_syscall_name) - 1u] = '\0';
-        }
-    }
-
-    spinlock_unlock(&g_process_table_lock);
-    irq_restore(irq_flags);
-
-    uint32_t cpu_count = smp_get_cpu_count();
-    if (cpu_count == 0u) {
-        cpu_count = 1u;
-    }
-    uint64_t denominator = interval_ns * (uint64_t)cpu_count;
-    if (denominator == 0u) {
-        denominator = interval_ns;
-    }
-    uint64_t total_cpu_x100 = (total_delta_ns * 10000ULL) / denominator;
-    uint64_t top_cpu_x100 = (top_delta_ns * 10000ULL) / denominator;
-    uint64_t user_cpu_x100 = (user_delta_ns * 10000ULL) / denominator;
-    uint64_t top_user_cpu_x100 =
-        (top_user_delta_ns * 10000ULL) / denominator;
-    uint64_t top_syscall_cpu_x100 =
-        (top_syscall_runtime_delta * 10000ULL) / denominator;
-
-    char line[384];
-    snprintf(line, sizeof(line),
-             "[cpu] reason=%s interval_ms=%llu cpus=%u total=%llu.%02llu%% user=%llu.%02llu%% syscalls=%llu user_syscalls=%llu display_kib=%llu top_pid=%d top=%s top_cpu=%llu.%02llu%% top_user_pid=%d top_user=%s top_user_cpu=%llu.%02llu%% top_user_syscalls=%llu top_user_display_kib=%llu syscall_pid=%d syscall_top=%s syscall_count=%llu syscall_cpu=%llu.%02llu%%\n",
-             reason ? reason : "periodic",
-             (unsigned long long)(interval_ns / 1000000ULL),
-             (unsigned int)cpu_count,
-             (unsigned long long)(total_cpu_x100 / 100ULL),
-             (unsigned long long)(total_cpu_x100 % 100ULL),
-             (unsigned long long)(user_cpu_x100 / 100ULL),
-             (unsigned long long)(user_cpu_x100 % 100ULL),
-             (unsigned long long)total_syscall_delta,
-             (unsigned long long)user_syscall_delta,
-             (unsigned long long)(total_display_delta / 1024ULL),
-             (int)top_pid,
-             top_name,
-             (unsigned long long)(top_cpu_x100 / 100ULL),
-             (unsigned long long)(top_cpu_x100 % 100ULL),
-             (int)top_user_pid,
-             top_user_name,
-             (unsigned long long)(top_user_cpu_x100 / 100ULL),
-             (unsigned long long)(top_user_cpu_x100 % 100ULL),
-             (unsigned long long)top_user_syscall_delta,
-             (unsigned long long)(top_user_display_delta / 1024ULL),
-             (int)top_syscall_pid,
-             top_syscall_name,
-             (unsigned long long)top_syscall_count,
-             (unsigned long long)(top_syscall_cpu_x100 / 100ULL),
-             (unsigned long long)(top_syscall_cpu_x100 % 100ULL));
-    serial_write_string(line);
 }
 
 int32_t process_get_capacity(void)

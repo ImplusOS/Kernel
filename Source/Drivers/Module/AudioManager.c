@@ -1,6 +1,5 @@
 #include "AudioManager.h"
 
-#include "Debug/serial/Serial.h"
 #include "DeviceRegistry.h"
 
 #include <stddef.h>
@@ -39,16 +38,6 @@ bool audio_manager_init(void)
         return true;
     }
     g_audio = audio_manager_select();
-    if (g_audio != NULL) {
-        static bool reported;
-        if (!reported) {
-            reported = true;
-            serial_write_string("[audio] output device: ");
-            serial_write_string(g_audio->name != NULL ? g_audio->name : "?");
-            serial_write_string(g_audio->stream_write != NULL
-                                    ? " (continuous playback)\n" : "\n");
-        }
-    }
     return g_audio != NULL;
 }
 

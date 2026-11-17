@@ -460,13 +460,11 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
                                          userland_elf_magic,
                                          sizeof(userland_elf_magic))) {
             vfs_init();
-            if (all_fs_initialize() &&
-                vfs_set_default_fs_for_file(OS_CONFIG_USERLAND_INIT_PATH,
-                                           64u,
-                                           userland_elf_magic,
-                                           sizeof(userland_elf_magic))) {
-                serial_write_string("[kernel:init] retry FS init: SUCCESS\n");
-            } else {
+            if (!all_fs_initialize() ||
+                !vfs_set_default_fs_for_file(OS_CONFIG_USERLAND_INIT_PATH,
+                                            64u,
+                                            userland_elf_magic,
+                                            sizeof(userland_elf_magic))) {
                 kernel_panic("Userland ELF not found or unreadable.", "kernel_main");
             }
         }

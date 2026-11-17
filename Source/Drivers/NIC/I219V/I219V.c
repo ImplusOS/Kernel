@@ -16,7 +16,6 @@
 #include "MemoryManagement/Memory_Main.h"
 #include "mmu/Paging_Main.h"
 #include "Core/sync/Spinlock.h"
-#include "Debug/serial/Serial.h"
 #endif
 
 #ifdef IMPLUS_DRIVER_MODULE
@@ -32,7 +31,6 @@ static const driver_binary_t *g_api = NULL;
 #define map_mmio_range     g_api->hw.map_mmio_range
 #define pci_read_config    g_api->pci_read_config
 #define pci_write_config   g_api->pci_write_config
-#define serial_write_string g_api->serial_write_string
 #define timer_msleep       g_api->timer.msleep
 
 #define hal_cpu_save_interrupts    g_api->hal.cpu_save_interrupts
@@ -260,9 +258,6 @@ static struct {
 
     uint32_t msix_vectors[3];
     driver_nic_rx_callback_t rx_callback;
-
-    uint32_t poll_count;
-    uint32_t last_gprc;
 } g_i219v;
 
 static inline uint32_t mmio_read32(volatile uint8_t *base, uint32_t reg)
@@ -481,31 +476,25 @@ static void i219v_rx_irq(void *context)
 
 bool i219v_init(void)
 {
-    serial_write_string("[I219V] init: starting...\n");
-
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_i219v.lock);
 
     if (g_i219v.ready != 0) {
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
-        serial_write_string("[I219V] init: already ready, skipping\n");
         return true;
     }
 
     if (!dma_init()) {
-        serial_write_string("[I219V] init: FAILED - dma_init\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
     }
-    serial_write_string("[I219V] init: dma ok\n");
 
     uint8_t bus = 0, dev = 0, func = 0;
     uint64_t bar0_phys = 0;
     uint32_t bar0_size = 0;
     if (!find_i219v(&bus, &dev, &func, &bar0_phys, &bar0_size)) {
-        serial_write_string("[I219V] init: FAILED - no I219V device found\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -514,74 +503,15 @@ bool i219v_init(void)
     g_i219v.bus = bus;
     g_i219v.dev = dev;
     g_i219v.func = func;
-    serial_write_string("[I219V] init: PCI found at ");
-
-    const char *hex_digits = "0123456789abcdef";
-    {
-        char bdf[16];
-        bdf[0] = hex_digits[(bus >> 4) & 0xFu];
-        bdf[1] = hex_digits[bus & 0xFu];
-        bdf[2] = ':';
-        bdf[3] = hex_digits[(dev >> 4) & 0xFu];
-        bdf[4] = hex_digits[dev & 0xFu];
-        bdf[5] = '.';
-        bdf[6] = hex_digits[func & 0xFu];
-        bdf[7] = '\n';
-        bdf[8] = '\0';
-        serial_write_string(bdf);
-    }
 
     volatile uint8_t *mmio = (volatile uint8_t *)map_mmio_range(bar0_phys, (size_t)bar0_size);
     if (mmio == NULL) {
-        serial_write_string("[I219V] init: FAILED - map_mmio_range\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
     }
     g_i219v.mmio = mmio;
-    serial_write_string("[I219V] init: MMIO mapped\n");
 
-    {
-        serial_write_string("[I219V] probe: BAR size=");
-        {
-            char b[11];
-            for (int i = 7; i >= 0; --i) { b[7-i] = hex_digits[(bar0_size >> (i*4)) & 0xFu]; }
-            b[8] = '\n'; b[9] = '\0';
-            serial_write_string(b);
-        }
-        uint32_t probes[] = {0x0200,0x0204,0x020C,0x0210,0x0214,0x0218,
-                             0x0C200,0x0C204,0x0C20C,0x0C210,0x0C214,0x0C218,
-                             0x5400,0x5404};
-        for (int i = 0; i < 14; ++i) {
-            uint32_t v = mmio_read32(mmio, probes[i]);
-            serial_write_string("[I219V] probe: 0x");
-            char b[9];
-            b[0] = hex_digits[(probes[i] >> 28) & 0xFu];
-            b[1] = hex_digits[(probes[i] >> 24) & 0xFu];
-            b[2] = hex_digits[(probes[i] >> 20) & 0xFu];
-            b[3] = hex_digits[(probes[i] >> 16) & 0xFu];
-            b[4] = hex_digits[(probes[i] >> 12) & 0xFu];
-            b[5] = hex_digits[(probes[i] >> 8) & 0xFu];
-            b[6] = hex_digits[(probes[i] >> 4) & 0xFu];
-            b[7] = hex_digits[probes[i] & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-            serial_write_string(" = 0x");
-            b[0] = hex_digits[(v >> 28) & 0xFu];
-            b[1] = hex_digits[(v >> 24) & 0xFu];
-            b[2] = hex_digits[(v >> 20) & 0xFu];
-            b[3] = hex_digits[(v >> 16) & 0xFu];
-            b[4] = hex_digits[(v >> 12) & 0xFu];
-            b[5] = hex_digits[(v >> 8) & 0xFu];
-            b[6] = hex_digits[(v >> 4) & 0xFu];
-            b[7] = hex_digits[v & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-            serial_write_string("\n");
-        }
-    }
-
-    serial_write_string("[I219V] init: resetting device...\n");
     mmio_write32(g_i219v.mmio, REG_CTRL, CTRL_RST);
     timer_msleep(1);
     uint32_t timeout = 100u;
@@ -590,86 +520,27 @@ bool i219v_init(void)
         if (++rst_asserted == 1u) {
             mmio_write32(g_i219v.mmio, REG_RDBAL_S, 0xDEAD0000u);
             mmio_write32(g_i219v.mmio, REG_RDH_S, 0xBEEF0000u);
-            serial_write_string("[I219V] init: wrote test vals during reset\n");
         }
         if (--timeout == 0u) { break; }
         timer_msleep(1);
     }
-    {
-        uint32_t rdb_s = mmio_read32(g_i219v.mmio, REG_RDBAL_S);
-        uint32_t rdh_s = mmio_read32(g_i219v.mmio, REG_RDH_S);
-        serial_write_string("[I219V] init: SPT after reset RDBAL_S=0x");
-        char b[9];
-        b[0] = hex_digits[(rdb_s >> 28) & 0xFu];
-        b[1] = hex_digits[(rdb_s >> 24) & 0xFu];
-        b[2] = hex_digits[(rdb_s >> 20) & 0xFu];
-        b[3] = hex_digits[(rdb_s >> 16) & 0xFu];
-        b[4] = hex_digits[(rdb_s >> 12) & 0xFu];
-        b[5] = hex_digits[(rdb_s >> 8) & 0xFu];
-        b[6] = hex_digits[(rdb_s >> 4) & 0xFu];
-        b[7] = hex_digits[rdb_s & 0xFu];
-        b[8] = '\0';
-        serial_write_string(b);
-        serial_write_string(" RDH_S=0x");
-        b[0] = hex_digits[(rdh_s >> 28) & 0xFu];
-        b[1] = hex_digits[(rdh_s >> 24) & 0xFu];
-        b[2] = hex_digits[(rdh_s >> 20) & 0xFu];
-        b[3] = hex_digits[(rdh_s >> 16) & 0xFu];
-        b[4] = hex_digits[(rdh_s >> 12) & 0xFu];
-        b[5] = hex_digits[(rdh_s >> 8) & 0xFu];
-        b[6] = hex_digits[(rdh_s >> 4) & 0xFu];
-        b[7] = hex_digits[rdh_s & 0xFu];
-        b[8] = '\0';
-        serial_write_string(b);
-        serial_write_string("\n");
-    }
-    if (timeout == 0u) {
-        serial_write_string("[I219V] init: WARN - reset timeout\n");
-    } else {
-        serial_write_string("[I219V] init: reset done\n");
-    }
-
-    serial_write_string("[I219V] init: mask interrupts, clear ICR\n");
     mmio_write32(g_i219v.mmio, REG_IMC, 0xFFFFFFFFu);
     mmio_read32(g_i219v.mmio, REG_ICR);
 
     mmio_write32(g_i219v.mmio, REG_CTRL_EXT,
         mmio_read32(g_i219v.mmio, REG_CTRL_EXT) | CTRL_EXT_DRV_LOAD);
-    serial_write_string("[I219V] init: CTRL_EXT DRV_LOAD set\n");
-
-    serial_write_string("[I219V] init: acquiring SW_FW_SYNC...\n");
     {
         uint32_t swfw = mmio_read32(g_i219v.mmio, REG_SW_FW_SYNC);
-        serial_write_string("[I219V] init: SW_FW_SYNC=0x");
-        char b[9];
-        b[0] = hex_digits[(swfw >> 28) & 0xFu];
-        b[1] = hex_digits[(swfw >> 24) & 0xFu];
-        b[2] = hex_digits[(swfw >> 20) & 0xFu];
-        b[3] = hex_digits[(swfw >> 16) & 0xFu];
-        b[4] = hex_digits[(swfw >> 12) & 0xFu];
-        b[5] = hex_digits[(swfw >> 8) & 0xFu];
-        b[6] = hex_digits[(swfw >> 4) & 0xFu];
-        b[7] = hex_digits[swfw & 0xFu];
-        b[8] = '\0';
-        serial_write_string(b);
         if (swfw & SW_FW_SYNC_FW_MGMT) {
-            serial_write_string(" (FW holds lock)\n");
             uint32_t wait = 1000u;
             while ((mmio_read32(g_i219v.mmio, REG_SW_FW_SYNC) & SW_FW_SYNC_FW_MGMT) != 0u) {
                 if (--wait == 0u) { break; }
                 timer_msleep(1);
             }
-            if (wait == 0u) {
-                serial_write_string("[I219V] init: WARN - FW lock timeout, forcing\n");
-            } else {
-                serial_write_string("[I219V] init: FW released lock\n");
-            }
         }
         mmio_write32(g_i219v.mmio, REG_SW_FW_SYNC, swfw | SW_FW_SYNC_SW_MGMT);
-        serial_write_string("[I219V] init: SW_FW_SYNC acquired\n");
     }
 
-    serial_write_string("[I219V] init: PHY power-on...\n");
     {
         uint32_t ctrl_phy = mmio_read32(g_i219v.mmio, REG_CTRL);
         ctrl_phy |= CTRL_LANPHYPC;
@@ -682,16 +553,6 @@ bool i219v_init(void)
         timer_msleep(5);
     }
     {
-        uint32_t phy_status = mmio_read32(g_i219v.mmio, REG_STATUS);
-        if (phy_status & STATUS_LAN_INIT_DONE) {
-            serial_write_string("[I219V] init: PHY LAN_INIT_DONE OK\n");
-        } else {
-            serial_write_string("[I219V] init: PHY LAN_INIT_DONE not set\n");
-        }
-    }
-
-    serial_write_string("[I219V] init: waiting for PHY reset to clear");
-    {
         uint32_t phyra_wait = 100u;
         while (phyra_wait > 0u) {
             uint32_t s = mmio_read32(g_i219v.mmio, REG_STATUS);
@@ -700,15 +561,8 @@ bool i219v_init(void)
             timer_msleep(1);
             phyra_wait--;
         }
-        if (phyra_wait == 0u) {
-            serial_write_string(" TIMEOUT");
-        } else {
-            serial_write_string(" OK");
-        }
-        serial_write_string("\n");
     }
 
-    serial_write_string("[I219V] init: waiting for auto-negotiation");
     uint32_t link_wait = 3000u;
     int link_up = 0;
     while (link_wait > 0u) {
@@ -717,25 +571,11 @@ bool i219v_init(void)
             link_up = 1;
             break;
         }
-        if ((link_wait & 0x7Fu) == 0u) { serial_write_string("."); }
         timer_msleep(1);
         link_wait--;
     }
-    serial_write_string("\n");
 
-    if (link_up) {
-        uint32_t s = mmio_read32(g_i219v.mmio, REG_STATUS);
-        serial_write_string("[I219V] init: link up");
-        if (s & STATUS_FD) { serial_write_string(" FD"); }
-        switch ((s >> STATUS_SPEED_SHIFT) & 3u) {
-            case 0: serial_write_string(" 10Mbps"); break;
-            case 1: serial_write_string(" 100Mbps"); break;
-            case 2: serial_write_string(" 1000Mbps"); break;
-            default: serial_write_string(" unknown"); break;
-        }
-        serial_write_string("\n");
-    } else {
-        serial_write_string("[I219V] init: link timeout, forcing 1000Mbps FD\n");
+    if (!link_up) {
         uint32_t ctrl = mmio_read32(g_i219v.mmio, REG_CTRL);
         ctrl |= CTRL_SLU | CTRL_FRCSPD | CTRL_FRCFDX | CTRL_FD;
         ctrl &= ~CTRL_SPEED_MASK;
@@ -744,48 +584,17 @@ bool i219v_init(void)
         timer_msleep(100);
     }
 
-    serial_write_string("[I219V] init: MSI-X setup...\n");
     if (g_api->pci.enable_msix(bus, dev, func, 3, g_i219v.msix_vectors) > 0) {
-        serial_write_string("[I219V] init: MSI-X enabled, vectors=");
-        {
-            char vbuf[16];
-            vbuf[0] = hex_digits[(g_i219v.msix_vectors[0] >> 4) & 0xFu];
-            vbuf[1] = hex_digits[g_i219v.msix_vectors[0] & 0xFu];
-            vbuf[2] = '/';
-            vbuf[3] = hex_digits[(g_i219v.msix_vectors[1] >> 4) & 0xFu];
-            vbuf[4] = hex_digits[g_i219v.msix_vectors[1] & 0xFu];
-            vbuf[5] = '/';
-            vbuf[6] = hex_digits[(g_i219v.msix_vectors[2] >> 4) & 0xFu];
-            vbuf[7] = hex_digits[g_i219v.msix_vectors[2] & 0xFu];
-            vbuf[8] = '\n';
-            vbuf[9] = '\0';
-            serial_write_string(vbuf);
-        }
         g_api->pci.register_irq(g_i219v.msix_vectors[1], i219v_rx_irq, NULL);
-    } else {
-        serial_write_string("[I219V] init: WARN - MSI-X not available\n");
     }
 
     i219v_read_mac();
 
-    serial_write_string("[I219V] init: MAC=");
-    for (uint8_t i = 0; i < 6u; ++i) {
-        uint8_t b = g_i219v.mac[i];
-        char buf[4];
-        buf[0] = hex_digits[(b >> 4) & 0xFu];
-        buf[1] = hex_digits[b & 0xFu];
-        buf[2] = (i == 5u) ? '\n' : ':';
-        buf[3] = '\0';
-        serial_write_string(buf);
-    }
-
-    serial_write_string("[I219V] init: allocating RX ring...\n");
     uint64_t rx_desc_phys = 0;
     uint32_t rx_desc_size = (uint32_t)I219V_DESC_COUNT * (uint32_t)sizeof(e1000_rx_desc_t);
     volatile e1000_rx_desc_t *rx_desc = (volatile e1000_rx_desc_t *)dma_alloc_ex(
         (size_t)rx_desc_size, 16u, 0xFFFFFFFFu, &rx_desc_phys);
     if (rx_desc == NULL || rx_desc_phys == 0) {
-        serial_write_string("[I219V] init: FAILED - RX desc dma_alloc_ex\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -795,7 +604,6 @@ bool i219v_init(void)
     i219v_dma_buffer_t *rx_buffers = (i219v_dma_buffer_t *)malloc(
         (uint64_t)I219V_DESC_COUNT * (uint64_t)sizeof(i219v_dma_buffer_t));
     if (rx_buffers == NULL) {
-        serial_write_string("[I219V] init: FAILED - RX buffers malloc\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -806,7 +614,6 @@ bool i219v_init(void)
         uint64_t buf_phys = 0;
         uint8_t *buf = (uint8_t *)dma_alloc(I219V_BUF_SIZE, &buf_phys);
         if (buf == NULL || buf_phys == 0) {
-            serial_write_string("[I219V] init: FAILED - RX buf dma_alloc\n");
             for (uint16_t j = 0; j < i; ++j) {
                 dma_free(rx_buffers[j].virt, I219V_BUF_SIZE);
             }
@@ -838,46 +645,11 @@ bool i219v_init(void)
     mmio_write32(g_i219v.mmio, REG_RDLEN_S, rx_desc_size);
     mmio_write32(g_i219v.mmio, REG_RDH_S, 0);
     mmio_write32(g_i219v.mmio, REG_RDT_S, 0);
-    {
-        uint32_t rdb_s = mmio_read32(g_i219v.mmio, REG_RDBAL_S);
-        uint32_t rdh_s = mmio_read32(g_i219v.mmio, REG_RDH_S);
-        serial_write_string("[I219V] init: SPT regs written - phys=");
-        char b[17];
-        for (int i = 15; i >= 0; --i) { b[15-i] = hex_digits[(rx_desc_phys >> (i*4)) & 0xFu]; }
-        b[16] = '\0';
-        serial_write_string(b);
-        serial_write_string(" RDBAL_S=0x");
-        b[0] = hex_digits[(rdb_s >> 28) & 0xFu];
-        b[1] = hex_digits[(rdb_s >> 24) & 0xFu];
-        b[2] = hex_digits[(rdb_s >> 20) & 0xFu];
-        b[3] = hex_digits[(rdb_s >> 16) & 0xFu];
-        b[4] = hex_digits[(rdb_s >> 12) & 0xFu];
-        b[5] = hex_digits[(rdb_s >> 8) & 0xFu];
-        b[6] = hex_digits[(rdb_s >> 4) & 0xFu];
-        b[7] = hex_digits[rdb_s & 0xFu];
-        b[8] = '\0';
-        serial_write_string(b);
-        serial_write_string(" RDH_S=0x");
-        b[0] = hex_digits[(rdh_s >> 28) & 0xFu];
-        b[1] = hex_digits[(rdh_s >> 24) & 0xFu];
-        b[2] = hex_digits[(rdh_s >> 20) & 0xFu];
-        b[3] = hex_digits[(rdh_s >> 16) & 0xFu];
-        b[4] = hex_digits[(rdh_s >> 12) & 0xFu];
-        b[5] = hex_digits[(rdh_s >> 8) & 0xFu];
-        b[6] = hex_digits[(rdh_s >> 4) & 0xFu];
-        b[7] = hex_digits[rdh_s & 0xFu];
-        b[8] = '\0';
-        serial_write_string(b);
-        serial_write_string("\n");
-    }
-
-    serial_write_string("[I219V] init: allocating TX ring...\n");
     uint64_t tx_desc_phys = 0;
     uint32_t tx_desc_size = (uint32_t)I219V_DESC_COUNT * (uint32_t)sizeof(e1000_tx_desc_t);
     volatile e1000_tx_desc_t *tx_desc = (volatile e1000_tx_desc_t *)dma_alloc_ex(
         (size_t)tx_desc_size, 16u, 0xFFFFFFFFu, &tx_desc_phys);
     if (tx_desc == NULL || tx_desc_phys == 0) {
-        serial_write_string("[I219V] init: FAILED - TX desc dma_alloc_ex\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -887,7 +659,6 @@ bool i219v_init(void)
     i219v_dma_buffer_t *tx_buffers = (i219v_dma_buffer_t *)malloc(
         (uint64_t)I219V_DESC_COUNT * (uint64_t)sizeof(i219v_dma_buffer_t));
     if (tx_buffers == NULL) {
-        serial_write_string("[I219V] init: FAILED - TX buffers malloc\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -896,7 +667,6 @@ bool i219v_init(void)
 
     bool *tx_in_use = (bool *)malloc((uint64_t)I219V_DESC_COUNT);
     if (tx_in_use == NULL) {
-        serial_write_string("[I219V] init: FAILED - TX in_use malloc\n");
         spinlock_unlock(&g_i219v.lock);
         irq_restore(irq_flags);
         return false;
@@ -907,7 +677,6 @@ bool i219v_init(void)
         uint64_t buf_phys = 0;
         uint8_t *buf = (uint8_t *)dma_alloc(I219V_BUF_SIZE, &buf_phys);
         if (buf == NULL || buf_phys == 0) {
-            serial_write_string("[I219V] init: FAILED - TX buf dma_alloc\n");
             spinlock_unlock(&g_i219v.lock);
             irq_restore(irq_flags);
             return false;
@@ -929,101 +698,30 @@ bool i219v_init(void)
     mmio_write32(g_i219v.mmio, REG_TDLEN, tx_desc_size);
     mmio_write32(g_i219v.mmio, REG_TDH, 0);
     mmio_write32(g_i219v.mmio, REG_TDT, 0);
-    serial_write_string("[I219V] init: TX ring ready\n");
-
-    serial_write_string("[I219V] init: zeroing MTA...\n");
     for (uint32_t i = 0; i < 128u; ++i) {
         mmio_write32(g_i219v.mmio, REG_MTA(i), 0);
     }
 
     mmio_write32(g_i219v.mmio, REG_RFCTL, RFCTL_ACK_DIS | RFCTL_IPV6_EX_DIS);
-    serial_write_string("[I219V] init: RFCTL configured\n");
 
     {
         uint32_t rxpbs = mmio_read32(g_i219v.mmio, REG_RXPBS);
         rxpbs = (rxpbs & ~RXPBS_SIZE_MASK) | RXPBS_SIZE_384KB;
         mmio_write32(g_i219v.mmio, REG_RXPBS, rxpbs);
-        serial_write_string("[I219V] init: RXPBS set to 384KB\n");
-    }
-
-    {
-        uint32_t rxdctl_v = mmio_read32(g_i219v.mmio, REG_RXDCTL);
-        serial_write_string("[I219V] init: RXDCTL(before)=0x");
-        char buf[9];
-        buf[0] = hex_digits[(rxdctl_v >> 28) & 0xFu];
-        buf[1] = hex_digits[(rxdctl_v >> 24) & 0xFu];
-        buf[2] = hex_digits[(rxdctl_v >> 20) & 0xFu];
-        buf[3] = hex_digits[(rxdctl_v >> 16) & 0xFu];
-        buf[4] = hex_digits[(rxdctl_v >> 12) & 0xFu];
-        buf[5] = hex_digits[(rxdctl_v >> 8) & 0xFu];
-        buf[6] = hex_digits[(rxdctl_v >> 4) & 0xFu];
-        buf[7] = hex_digits[rxdctl_v & 0xFu];
-        buf[8] = '\0';
-        serial_write_string(buf);
-        serial_write_string("\n");
     }
 
     mmio_write32(g_i219v.mmio, REG_SRRCTL, SRRCTL_DESCTYPE_LEGACY | SRRCTL_BSIZE_2048);
-    {
-        uint32_t srrctl_v = mmio_read32(g_i219v.mmio, REG_SRRCTL);
-        serial_write_string("[I219V] init: SRRCTL value=0x");
-        char buf[9];
-        buf[0] = hex_digits[(srrctl_v >> 28) & 0xFu];
-        buf[1] = hex_digits[(srrctl_v >> 24) & 0xFu];
-        buf[2] = hex_digits[(srrctl_v >> 20) & 0xFu];
-        buf[3] = hex_digits[(srrctl_v >> 16) & 0xFu];
-        buf[4] = hex_digits[(srrctl_v >> 12) & 0xFu];
-        buf[5] = hex_digits[(srrctl_v >> 8) & 0xFu];
-        buf[6] = hex_digits[(srrctl_v >> 4) & 0xFu];
-        buf[7] = hex_digits[srrctl_v & 0xFu];
-        buf[8] = '\0';
-        serial_write_string(buf);
-        serial_write_string("\n");
-    }
-
     {
         uint32_t rxdctl = mmio_read32(g_i219v.mmio, REG_RXDCTL);
         rxdctl |= RXDCTL_ENABLE;
         mmio_write32(g_i219v.mmio, REG_RXDCTL, rxdctl);
     }
-    {
-        uint32_t rxdctl_v = mmio_read32(g_i219v.mmio, REG_RXDCTL);
-        uint32_t rxdctl_std = mmio_read32(g_i219v.mmio, REG_RXDCTL_STD);
-        serial_write_string("[I219V] init: RXDCTL(after)=0x");
-        char buf[9];
-        buf[0] = hex_digits[(rxdctl_v >> 28) & 0xFu];
-        buf[1] = hex_digits[(rxdctl_v >> 24) & 0xFu];
-        buf[2] = hex_digits[(rxdctl_v >> 20) & 0xFu];
-        buf[3] = hex_digits[(rxdctl_v >> 16) & 0xFu];
-        buf[4] = hex_digits[(rxdctl_v >> 12) & 0xFu];
-        buf[5] = hex_digits[(rxdctl_v >> 8) & 0xFu];
-        buf[6] = hex_digits[(rxdctl_v >> 4) & 0xFu];
-        buf[7] = hex_digits[rxdctl_v & 0xFu];
-        buf[8] = '\0';
-        serial_write_string(buf);
-        serial_write_string(" STD=0x");
-        buf[0] = hex_digits[(rxdctl_std >> 28) & 0xFu];
-        buf[1] = hex_digits[(rxdctl_std >> 24) & 0xFu];
-        buf[2] = hex_digits[(rxdctl_std >> 20) & 0xFu];
-        buf[3] = hex_digits[(rxdctl_std >> 16) & 0xFu];
-        buf[4] = hex_digits[(rxdctl_std >> 12) & 0xFu];
-        buf[5] = hex_digits[(rxdctl_std >> 8) & 0xFu];
-        buf[6] = hex_digits[(rxdctl_std >> 4) & 0xFu];
-        buf[7] = hex_digits[rxdctl_std & 0xFu];
-        buf[8] = '\0';
-        serial_write_string(buf);
-        serial_write_string("\n");
-    }
-
     mmio_write32(g_i219v.mmio, REG_FEXTNVM3,
         mmio_read32(g_i219v.mmio, REG_FEXTNVM3) | FEXTNVM3_DISABLE_RX_PB);
-    serial_write_string("[I219V] init: FEXTNVM3 workaround set\n");
 
     mmio_write32(g_i219v.mmio, REG_IAM, 0);
-    serial_write_string("[I219V] init: IAM disabled\n");
 
     mmio_write32(g_i219v.mmio, REG_RCTRL, RCTRL_EN | RCTRL_UPE | RCTRL_MPE | RCTRL_BAM | RCTRL_BSIZE_2048 | RCTRL_SECRC);
-    serial_write_string("[I219V] init: RCTRL configured\n");
 
     uint32_t mac_low = (uint32_t)g_i219v.mac[0] |
                        ((uint32_t)g_i219v.mac[1] << 8) |
@@ -1033,18 +731,14 @@ bool i219v_init(void)
                         ((uint32_t)g_i219v.mac[5] << 8);
     mmio_write32(g_i219v.mmio, REG_RAL(0), mac_low);
     mmio_write32(g_i219v.mmio, REG_RAH(0), mac_high | RAH_AV);
-    serial_write_string("[I219V] init: MAC filter set\n");
 
     mmio_write32(g_i219v.mmio, REG_RDT, (uint32_t)(I219V_DESC_COUNT - 1u));
     mmio_write32(g_i219v.mmio, REG_RDT_S, (uint32_t)(I219V_DESC_COUNT - 1u));
-    serial_write_string("[I219V] init: RX ring kicked (RDT=count-1)\n");
 
     mmio_write32(g_i219v.mmio, REG_TCTRL, TCTRL_EN | TCTRL_PSP |
                  (0x0Fu << TCTRL_CT_SHIFT) | TCTRL_COLD_HD);
-    serial_write_string("[I219V] init: TCTRL configured\n");
 
     mmio_write32(g_i219v.mmio, REG_IMS, ICR_RXT0 | ICR_RXDMT0 | ICR_LSC | ICR_TXQE);
-    serial_write_string("[I219V] init: interrupts enabled\n");
 
     g_i219v.mtu = I219V_DEFAULT_MTU;
     g_i219v.ready = 1;
@@ -1052,7 +746,6 @@ bool i219v_init(void)
     spinlock_unlock(&g_i219v.lock);
     irq_restore(irq_flags);
 
-    serial_write_string("[I219V] init: ready\n");
     return true;
 }
 
@@ -1130,9 +823,6 @@ void i219v_poll(void)
         return;
     }
 
-    const char *hex_digits = "0123456789abcdef";
-    g_i219v.poll_count++;
-
     bool processed = false;
     uint16_t cleaned = g_i219v.rx_ring.next_to_clean;
 
@@ -1162,187 +852,6 @@ void i219v_poll(void)
             (uint16_t)(cleaned - 1u);
         mmio_write32(g_i219v.mmio, REG_RDT, (uint32_t)rdt);
         mmio_write32(g_i219v.mmio, REG_RDT_S, (uint32_t)rdt);
-    }
-
-    if ((g_i219v.poll_count & 0xFFu) == 0u && !processed) {
-        uint32_t rdh = mmio_read32(g_i219v.mmio, REG_RDH);
-        uint32_t rdh_s = mmio_read32(g_i219v.mmio, REG_RDH_S);
-        uint32_t rdt = mmio_read32(g_i219v.mmio, REG_RDT);
-        uint32_t icr = mmio_read32(g_i219v.mmio, REG_ICR);
-        uint32_t gprc = mmio_read32(g_i219v.mmio, REG_GPRC);
-        uint32_t delta = gprc - g_i219v.last_gprc;
-        g_i219v.last_gprc = gprc;
-        uint32_t streg = mmio_read32(g_i219v.mmio, REG_STATUS);
-        uint32_t rxdctl = mmio_read32(g_i219v.mmio, REG_RXDCTL);
-        uint32_t rxdctl_std = mmio_read32(g_i219v.mmio, REG_RXDCTL_STD);
-        uint32_t rxdbal = mmio_read32(g_i219v.mmio, REG_RDBAL);
-        uint32_t rxdlen = mmio_read32(g_i219v.mmio, REG_RDLEN);
-        uint8_t st0 = g_i219v.rx_ring.desc[0].status;
-        uint8_t st1 = g_i219v.rx_ring.desc[1].status;
-        serial_write_string("[I219V] dbg: RDH=");
-        {
-            char b[10];
-            b[0] = hex_digits[(rdh >> 12) & 0xFu];
-            b[1] = hex_digits[(rdh >> 8) & 0xFu];
-            b[2] = hex_digits[(rdh >> 4) & 0xFu];
-            b[3] = hex_digits[rdh & 0xFu];
-            b[4] = '/';
-            b[5] = hex_digits[(rdh_s >> 12) & 0xFu];
-            b[6] = hex_digits[(rdh_s >> 8) & 0xFu];
-            b[7] = hex_digits[(rdh_s >> 4) & 0xFu];
-            b[8] = hex_digits[rdh_s & 0xFu];
-            b[9] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" T=");
-        {
-            char b[5];
-            b[0] = hex_digits[(rdt >> 12) & 0xFu];
-            b[1] = hex_digits[(rdt >> 8) & 0xFu];
-            b[2] = hex_digits[(rdt >> 4) & 0xFu];
-            b[3] = hex_digits[rdt & 0xFu];
-            b[4] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" ICR=");
-        {
-            char b[10];
-            b[0] = hex_digits[(icr >> 28) & 0xFu];
-            b[1] = hex_digits[(icr >> 24) & 0xFu];
-            b[2] = hex_digits[(icr >> 20) & 0xFu];
-            b[3] = hex_digits[(icr >> 16) & 0xFu];
-            b[4] = hex_digits[(icr >> 12) & 0xFu];
-            b[5] = hex_digits[(icr >> 8) & 0xFu];
-            b[6] = hex_digits[(icr >> 4) & 0xFu];
-            b[7] = hex_digits[icr & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" GPRC+=");
-        {
-            char b[4];
-            b[0] = hex_digits[(delta >> 4) & 0xFu];
-            b[1] = hex_digits[delta & 0xFu];
-            b[2] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" st0=");
-        {
-            char b[3];
-            b[0] = hex_digits[(st0 >> 4) & 0xFu];
-            b[1] = hex_digits[st0 & 0xFu];
-            b[2] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" st1=");
-        {
-            char b[3];
-            b[0] = hex_digits[(st1 >> 4) & 0xFu];
-            b[1] = hex_digits[st1 & 0xFu];
-            b[2] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" STAT=");
-        {
-            char b[9];
-            b[0] = hex_digits[(streg >> 28) & 0xFu];
-            b[1] = hex_digits[(streg >> 24) & 0xFu];
-            b[2] = hex_digits[(streg >> 20) & 0xFu];
-            b[3] = hex_digits[(streg >> 16) & 0xFu];
-            b[4] = hex_digits[(streg >> 12) & 0xFu];
-            b[5] = hex_digits[(streg >> 8) & 0xFu];
-            b[6] = hex_digits[(streg >> 4) & 0xFu];
-            b[7] = hex_digits[streg & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" RXDCTL=");
-        {
-            char b[9];
-            b[0] = hex_digits[(rxdctl >> 28) & 0xFu];
-            b[1] = hex_digits[(rxdctl >> 24) & 0xFu];
-            b[2] = hex_digits[(rxdctl >> 20) & 0xFu];
-            b[3] = hex_digits[(rxdctl >> 16) & 0xFu];
-            b[4] = hex_digits[(rxdctl >> 12) & 0xFu];
-            b[5] = hex_digits[(rxdctl >> 8) & 0xFu];
-            b[6] = hex_digits[(rxdctl >> 4) & 0xFu];
-            b[7] = hex_digits[rxdctl & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" S=");
-        {
-            char b[9];
-            b[0] = hex_digits[(rxdctl_std >> 28) & 0xFu];
-            b[1] = hex_digits[(rxdctl_std >> 24) & 0xFu];
-            b[2] = hex_digits[(rxdctl_std >> 20) & 0xFu];
-            b[3] = hex_digits[(rxdctl_std >> 16) & 0xFu];
-            b[4] = hex_digits[(rxdctl_std >> 12) & 0xFu];
-            b[5] = hex_digits[(rxdctl_std >> 8) & 0xFu];
-            b[6] = hex_digits[(rxdctl_std >> 4) & 0xFu];
-            b[7] = hex_digits[rxdctl_std & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" BAL=");
-        {
-            char b[5];
-            b[0] = hex_digits[(rxdbal >> 12) & 0xFu];
-            b[1] = hex_digits[(rxdbal >> 8) & 0xFu];
-            b[2] = hex_digits[(rxdbal >> 4) & 0xFu];
-            b[3] = hex_digits[rxdbal & 0xFu];
-            b[4] = '\0';
-            serial_write_string(b);
-        }
-        {
-            uint32_t sbal = mmio_read32(g_i219v.mmio, REG_RDBAL_S);
-            uint32_t sbaH = mmio_read32(g_i219v.mmio, REG_RDBAH_S);
-            serial_write_string(" sBAL=");
-            char b[9];
-            b[0] = hex_digits[(sbal >> 28) & 0xFu];
-            b[1] = hex_digits[(sbal >> 24) & 0xFu];
-            b[2] = hex_digits[(sbal >> 20) & 0xFu];
-            b[3] = hex_digits[(sbal >> 16) & 0xFu];
-            b[4] = hex_digits[(sbal >> 12) & 0xFu];
-            b[5] = hex_digits[(sbal >> 8) & 0xFu];
-            b[6] = hex_digits[(sbal >> 4) & 0xFu];
-            b[7] = hex_digits[sbal & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-            serial_write_string(" sBAH=");
-            b[0] = hex_digits[(sbaH >> 28) & 0xFu];
-            b[1] = hex_digits[(sbaH >> 24) & 0xFu];
-            b[2] = hex_digits[(sbaH >> 20) & 0xFu];
-            b[3] = hex_digits[(sbaH >> 16) & 0xFu];
-            b[4] = hex_digits[(sbaH >> 12) & 0xFu];
-            b[5] = hex_digits[(sbaH >> 8) & 0xFu];
-            b[6] = hex_digits[(sbaH >> 4) & 0xFu];
-            b[7] = hex_digits[sbaH & 0xFu];
-            b[8] = '\0';
-            serial_write_string(b);
-        }
-        {
-            uint32_t srdt = mmio_read32(g_i219v.mmio, REG_RDT_S);
-            serial_write_string(" sT=");
-            char b[5];
-            b[0] = hex_digits[(srdt >> 12) & 0xFu];
-            b[1] = hex_digits[(srdt >> 8) & 0xFu];
-            b[2] = hex_digits[(srdt >> 4) & 0xFu];
-            b[3] = hex_digits[srdt & 0xFu];
-            b[4] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string(" LEN=");
-        {
-            char b[5];
-            b[0] = hex_digits[(rxdlen >> 12) & 0xFu];
-            b[1] = hex_digits[(rxdlen >> 8) & 0xFu];
-            b[2] = hex_digits[(rxdlen >> 4) & 0xFu];
-            b[3] = hex_digits[rxdlen & 0xFu];
-            b[4] = '\0';
-            serial_write_string(b);
-        }
-        serial_write_string("\n");
     }
 
     i219v_reap_tx();
@@ -1399,7 +908,6 @@ static const driver_module_descriptor_t g_i219v_module = {
 #undef map_mmio_range
 #undef pci_read_config
 #undef pci_write_config
-#undef serial_write_string
 #undef timer_msleep
 #undef hal_cpu_save_interrupts
 #undef hal_cpu_restore_interrupts

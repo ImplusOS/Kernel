@@ -29,46 +29,6 @@ void ig9_sim_mmio_write32(uint32_t offset, uint32_t value);
 #endif
 
 /* ------------------------------------------------------------------ *
- * Logging
- * ------------------------------------------------------------------ */
-
-void ig9_log(const char *str)
-{
-    if (g_ig9_api != NULL && g_ig9_api->serial_write_string != NULL &&
-        str != NULL) {
-        g_ig9_api->serial_write_string(str);
-    }
-}
-
-void ig9_log_hex(uint32_t value)
-{
-    if (g_ig9_api != NULL && g_ig9_api->serial_write_uint32 != NULL) {
-        g_ig9_api->serial_write_uint32(value);
-    }
-}
-
-void ig9_log_dec(uint32_t value)
-{
-    char buf[11];
-    uint32_t pos = sizeof(buf) - 1u;
-    buf[pos] = '\0';
-    do {
-        buf[--pos] = (char)('0' + (char)(value % 10u));
-        value /= 10u;
-    } while (value != 0u && pos != 0u);
-    ig9_log(&buf[pos]);
-}
-
-void ig9_log_val(const char *msg, uint32_t value)
-{
-    ig9_log("[IntelGen9] ");
-    ig9_log(msg);
-    ig9_log(" 0x");
-    ig9_log_hex(value);
-    ig9_log("\n");
-}
-
-/* ------------------------------------------------------------------ *
  * Memory helpers
  * ------------------------------------------------------------------ */
 
@@ -323,7 +283,6 @@ static bool ig9_pci_prepare(void)
                 ig9_msleep(10u);   /* D3hot -> D0 needs 10 ms (PCI PM 1.2) */
                 pmcsr = api->pci.read_config(bus, dev, fn, pmcsr_off);
                 if ((pmcsr & 0x3u) != 0u) {
-                    ig9_log("[IntelGen9] pci: device will not enter D0\n");
                     return false;
                 }
             }
@@ -358,7 +317,6 @@ bool ig9_uncore_init(void)
         bar0.address == 0u || bar0.is_io != 0u ||
         bar0.size < 4u * 1024u * 1024u || bar0.size > 64u * 1024u * 1024u ||
         (bar0.size & (bar0.size - 1u)) != 0u) {
-        ig9_log("[IntelGen9] uncore: BAR0 (GTTMMADR) unusable\n");
         return false;
     }
 
@@ -372,7 +330,6 @@ bool ig9_uncore_init(void)
     }
 
     if (!ig9_pci_prepare()) {
-        ig9_log("[IntelGen9] uncore: PCI prepare failed\n");
         return false;
     }
 
@@ -380,7 +337,6 @@ bool ig9_uncore_init(void)
         (volatile uint8_t *)api->hw.map_mmio_range(bar0.address,
                                                    (size_t)bar0.size);
     if (mmio == NULL) {
-        ig9_log("[IntelGen9] uncore: BAR0 map failed\n");
         return false;
     }
 
@@ -388,17 +344,6 @@ bool ig9_uncore_init(void)
     g_ig9_bars.mmio_size = bar0.size;
     s_mmio = mmio;
 
-    ig9_log("[IntelGen9] BAR0 0x");
-    ig9_log_hex((uint32_t)(bar0.address >> 32));
-    ig9_log_hex((uint32_t)bar0.address);
-    ig9_log(" size 0x");
-    ig9_log_hex((uint32_t)bar0.size);
-    ig9_log(", aperture 0x");
-    ig9_log_hex((uint32_t)(g_ig9_bars.gmadr_phys >> 32));
-    ig9_log_hex((uint32_t)g_ig9_bars.gmadr_phys);
-    ig9_log(" size 0x");
-    ig9_log_hex((uint32_t)g_ig9_bars.gmadr_size);
-    ig9_log("\n");
     return true;
 }
 
@@ -451,19 +396,12 @@ static bool ig9_fw_domain_get(ig9_fw_domain_t *d)
         return true;
     }
 
-    if (!ig9_fw_wait_ack(d, IG9_FORCEWAKE_KERNEL, false)) {
-        /* A stale ack from a previous owner; i915 warns and carries on. */
-        ig9_log("[IntelGen9] forcewake: ");
-        ig9_log(d->name);
-        ig9_log(" ack still set before request\n");
-    }
+    /* A stale ack from a previous owner; i915 warns and carries on. */
+    (void)ig9_fw_wait_ack(d, IG9_FORCEWAKE_KERNEL, false);
     ig9_write32(d->set_reg, IG9_MASKED_ENABLE(IG9_FORCEWAKE_KERNEL));
     if (!ig9_fw_wait_ack(d, IG9_FORCEWAKE_KERNEL, true) &&
         !ig9_fw_ack_fallback(d)) {
         ig9_write32(d->set_reg, IG9_MASKED_DISABLE(IG9_FORCEWAKE_KERNEL));
-        ig9_log("[IntelGen9] forcewake: ");
-        ig9_log(d->name);
-        ig9_log(" ack timeout\n");
         return false;
     }
     d->refs = 1u;

@@ -3,7 +3,6 @@
 #include "Core/process/ProcessManager.h"
 #include "Core/memory/SharedMemory.h"
 #include "Core/syscall/Syscall_File.h"
-#include "Debug/serial/Serial.h"
 #include "Core/timer/Timer.h"
 #include "Core/syscall/Poll_Wait.h"
 #include "kernel/config.h"
@@ -125,14 +124,6 @@ typedef struct {
     uint32_t fds_head, fds_tail;
     spinlock_t lock;
 } unix_sock_t;
-
-#ifndef PROCESS_STALL_DUMP
-#define PROCESS_STALL_DUMP 0
-#endif
-#if PROCESS_STALL_DUMP
-static void usock_wire_note_dir(int32_t from, int32_t to, uint8_t dir,
-                                const uint8_t *buf, uint64_t len);
-#endif
 
 static unix_sock_t g_usocks[UNIX_SOCK_MAX];
 static int g_usock_init_done = 0;
@@ -269,15 +260,6 @@ int64_t unix_socket_create(int32_t type) {
         }
     }
     free(buf);
-    /* Say so once: from the caller's side a full table and an empty heap
-     * both used to read as "socketpair: Cannot allocate memory". */
-    static int s_full_reported;
-    if (!s_full_reported) {
-        s_full_reported = 1;
-        serial_write_string("[usock] endpoint table full (UNIX_SOCK_MAX=");
-        serial_write_uint64((uint64_t)UNIX_SOCK_MAX);
-        serial_write_string(")\n");
-    }
     return -23; /* ENFILE: the system-wide table is full */
 }
 
@@ -344,60 +326,7 @@ int64_t unix_socket_listen(int32_t fd, int32_t backlog) {
     unix_sock_t *s = usock_get(fd);
     if (!s) return -9;
     s->listening = 1;
-    /* Bring-up trace: one line per listening socket, so a client that cannot
-     * find the server has something concrete to be compared against. */
-    if (OS_CONFIG_FOREIGN_TRACE) {
-        serial_write_string("[usock] listen '");
-        serial_write_string(s->path);
-        serial_write_string("'\n");
-    }
     return 0;
-}
-
-/* Bring-up trace for the X11 handshake over AF_UNIX (TODO_Doom_Xorg_MethodA.md
- * M22). A client that connects, is accepted, and then goes away looks exactly
- * like an authorization refusal and exactly like a lost reply, so log the
- * connect/accept pairing and the first few payload sizes. Hard-capped so it
- * cannot flood the console. */
-#define USOCK_TRACE_MAX 512
-/* Distinct connect failures reported before going quiet; see below. */
-#define USOCK_CONNECT_FAIL_MAX 8u
-static uint32_t g_usock_trace_count;
-
-/* "nothing buffered yet" is the overwhelming majority of the traffic on a
- * non-blocking socket -- a poll loop produces thousands of them a second --
- * and tracing it used up the whole budget before the first real byte moved.
- * Skip it: an EAGAIN is the absence of an event, and what a stalled
- * connection needs is the presence or absence of the tx/rx around it. */
-/* "nothing buffered yet" is the overwhelming majority of the traffic on a
- * non-blocking socket -- a poll loop produces thousands of them a second --
- * and tracing it used up the whole budget before the first real byte moved.
- * Skip it: an EAGAIN is the absence of an event, and what a stalled
- * connection needs is the presence or absence of the tx/rx around it. */
-static void usock_trace2(const char *tag, int32_t a, int64_t b)
-{
-    /* Off with the rest of the foreign trace. This is one COM1 line per
-     * AF_UNIX packet and AF_UNIX *is* the X11 transport, so leaving it on put
-     * hundreds of lines -- seconds of 115200 baud -- into the middle of every
-     * client handshake. Worse, once a terminal streams the kernel log back
-     * into a window, each line drawn produces more X traffic and so more
-     * lines: a feedback loop with the console as the amplifier. */
-    if (!OS_CONFIG_FOREIGN_TRACE) {
-        return;
-    }
-    if (tag[0] == 'r' && tag[1] == 'x' && tag[2] == '-' && tag[3] == 'E' &&
-        tag[4] == 'A') {
-        return;
-    }
-    if (g_usock_trace_count >= USOCK_TRACE_MAX) return;
-    ++g_usock_trace_count;
-    serial_write_string("[usock] ");
-    serial_write_string(tag);
-    serial_write_string(" fd=");
-    serial_write_uint64((uint64_t)(uint32_t)a);
-    serial_write_string(" n=");
-    serial_write_uint64((uint64_t)b);
-    serial_write_char('\n');
 }
 
 /* Bytes queued in a ring. */
@@ -471,7 +400,6 @@ int64_t unix_socket_accept(int32_t fd) {
                 spinlock_unlock(&s->lock);
                 g_usocks[i].peer_fd = (int32_t)new_fd;
             }
-            usock_trace2("accept", fd, new_fd);
             return new_fd;
         }
     }
@@ -492,32 +420,10 @@ int64_t unix_socket_connect(int32_t fd, const char *path) {
             if (plen == clen && memcmp(g_usocks[i].path, path, plen) == 0) {
                 s->connected = 1;
                 s->peer_fd = UNIX_SOCK_FD_BASE + i;
-                usock_trace2("conn-ok", fd, UNIX_SOCK_FD_BASE + i);
                 /* The listening socket is now readable: wake whoever is
                  * parked in accept()'s poll. */
                 poll_wait_notify();
                 return 0;
-            }
-        }
-    }
-    /* Only on failure, and capped. ECONNREFUSED here is what an X client sees
-     * as "Couldn't connect to display!", with no further detail, so the first
-     * few are worth having even in a quiet boot. The cap matters because a
-     * failing connect is often on a retry timer that never gives up: Xorg's
-     * dbus-core re-tries /run/dbus/system_bus_socket every 10 seconds for the
-     * life of the server, and on a machine with no dbus that is two COM1
-     * lines every 10 seconds forever. */
-    {
-        static uint32_t failed_reported;
-        if (OS_CONFIG_FOREIGN_TRACE || failed_reported < USOCK_CONNECT_FAIL_MAX) {
-            ++failed_reported;
-            serial_write_string("[usock] connect FAILED '");
-            serial_write_string(path);
-            serial_write_string("'\n");
-            if (!OS_CONFIG_FOREIGN_TRACE &&
-                failed_reported == USOCK_CONNECT_FAIL_MAX) {
-                serial_write_string("[usock] (further connect failures "
-                                    "silenced)\n");
             }
         }
     }
@@ -596,11 +502,6 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
     if (written == 0 && len > 0 && !peer->seqpacket) {
         return -11; /* EAGAIN: ring full */
     }
-#if PROCESS_STALL_DUMP
-        usock_wire_note_dir((int32_t)(s - g_usocks) + UNIX_SOCK_FD_BASE,
-                            s->peer_fd,
-                        0u, data, written);
-#endif
     /* The peer is now readable. Cut short any poll()/select()/epoll_wait()
      * that is parked waiting for exactly this -- an X11 round trip crosses
      * that wait twice, so leaving it to time out cost ~16 ms per request. */
@@ -611,11 +512,9 @@ static int64_t usock_enqueue(unix_sock_t *s, const uint8_t *data, uint64_t len,
 int64_t unix_socket_send(int32_t fd, const void *buf, uint64_t len) {
     unix_sock_t *s = usock_get(fd);
     if (!s || !s->connected || !buf) {
-        usock_trace2("tx-BADF", fd, (int64_t)len);
         return -14;
     }
     int64_t rc = usock_enqueue(s, (const uint8_t *)buf, len, NULL, 0);
-    usock_trace2(rc >= 0 ? "tx" : "tx-ERR", fd, rc);
     return rc;
 }
 
@@ -717,7 +616,6 @@ static int64_t usock_dequeue(unix_sock_t *s, uint8_t *dst, uint64_t len,
 int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
     unix_sock_t *s = usock_get(fd);
     if (!s || !buf) {
-        usock_trace2("rx-BADF", fd, (int64_t)len);
         return -14;
     }
     /* The destination is user memory written without going through
@@ -729,7 +627,6 @@ int64_t unix_socket_recv(int32_t fd, void *buf, uint64_t len) {
     int64_t rc = usock_dequeue(s, (uint8_t *)buf, len, objs, &nobjs,
                                UNIX_SOCK_FD_MAX);
     for (uint32_t i = 0; i < nobjs; ++i) usock_release_passed(objs[i]);
-    usock_trace2(rc > 0 ? "rx" : (rc == 0 ? "rx-EOF" : "rx-EAGAIN"), fd, rc);
     return rc;
 }
 
@@ -1059,7 +956,6 @@ int64_t unix_socket_close(int32_t fd) {
      * would be reported as a failure to spawn. */
     int32_t caller = process_get_current_pid();
     if (!usock_owner_test(s, caller)) {
-        usock_trace2("close-NOTOWNER", fd, (int64_t)s->owner_pid);
         return 0;
     }
     usock_owner_clear(s, caller);
@@ -1135,11 +1031,6 @@ int unix_socket_fd_in_range(int32_t fd) {
            fd < UNIX_SOCK_FD_BASE + UNIX_SOCK_MAX;
 }
 
-void unix_socket_trace_note(const char *tag, int32_t fd)
-{
-    usock_trace2(tag, fd, 0);
-}
-
 int unix_socket_set_nonblock(int32_t fd, int on)
 {
     unix_sock_t *s = usock_get(fd);
@@ -1158,111 +1049,6 @@ int unix_socket_is_nonblock(int32_t fd)
     unix_sock_t *s = usock_get(fd);
     return (s && s->nonblock) ? 1 : 0;
 }
-
-#ifndef PROCESS_STALL_DUMP
-#define PROCESS_STALL_DUMP 0
-#endif
-#if PROCESS_STALL_DUMP
-/* Every live endpoint with how much is queued on it, for the stall dump.
- * A client blocked in poll() on an X connection and a server blocked in
- * epoll_wait() on the same pair look identical from the syscall side; the
- * byte counts are what say whether a request is sitting undelivered. */
-void unix_socket_debug_dump(void);
-void unix_socket_debug_dump(void)
-{
-    for (int i = 0; i < UNIX_SOCK_MAX; ++i) {
-        unix_sock_t *s = &g_usocks[i];
-        if (!s->used) {
-            continue;
-        }
-        spinlock_lock(&s->lock);
-        uint32_t queued = (s->buf_head + UNIX_SOCK_BUF_SIZE - s->buf_tail) %
-                          UNIX_SOCK_BUF_SIZE;
-        uint32_t fds    = (s->fds_head + UNIX_SOCK_FD_MAX - s->fds_tail) %
-                          UNIX_SOCK_FD_MAX;
-        int32_t  peer   = s->peer_fd;
-        int32_t  owner  = s->owner_pid;
-        uint8_t  conn   = s->connected;
-        uint8_t  lst    = s->listening;
-        spinlock_unlock(&s->lock);
-
-        serial_write_string("[usock] ");
-        serial_write_uint32((uint32_t)(UNIX_SOCK_FD_BASE + i));
-        serial_write_string(" own=");
-        serial_write_uint32((uint32_t)owner);
-        serial_write_string(" peer=");
-        serial_write_uint32((uint32_t)peer);
-        serial_write_string(conn ? " c" : (lst ? " l" : " -"));
-        serial_write_string(" q=");
-        serial_write_uint32(queued);
-        serial_write_string(" fds=");
-        serial_write_uint32(fds);
-        serial_write_char('\n');
-    }
-}
-#endif
-
-#if PROCESS_STALL_DUMP
-/* Ring of the most recent transfers, for the stall dump: which endpoint, how
- * many bytes, and the first four of them. An X client and the X server that
- * are both asleep look the same whether the client never sent its request or
- * the server never answered it; the wire trace is what tells them apart. */
-#define USOCK_WIRE_MAX 48u
-typedef struct {
-    uint32_t ms;
-    int32_t  from;
-    int32_t  to;
-    uint32_t len;
-    uint8_t  dir;      /* 0 = send into the peer, 1 = recv out of this ring */
-    uint8_t  head[4];
-} usock_wire_t;
-static usock_wire_t g_usock_wire[USOCK_WIRE_MAX];
-static uint32_t     g_usock_wire_pos;
-static spinlock_t   g_usock_wire_lock;
-
-static void usock_wire_note_dir(int32_t from, int32_t to, uint8_t dir,
-                                const uint8_t *buf, uint64_t len)
-{
-    uint64_t flags = irq_save_disable();
-    spinlock_lock(&g_usock_wire_lock);
-    usock_wire_t *w = &g_usock_wire[g_usock_wire_pos % USOCK_WIRE_MAX];
-    ++g_usock_wire_pos;
-    w->ms   = (uint32_t)(timer_monotonic_ns() / 1000000ull);
-    w->from = from;
-    w->to   = to;
-    w->dir  = dir;
-    w->len  = (uint32_t)len;
-    for (uint32_t i = 0; i < 4u; ++i) {
-        w->head[i] = (i < len) ? buf[i] : 0u;
-    }
-    spinlock_unlock(&g_usock_wire_lock);
-    irq_restore(flags);
-}
-
-void unix_socket_wire_dump(void);
-void unix_socket_wire_dump(void)
-{
-    uint32_t pos = g_usock_wire_pos;
-    uint32_t n = (pos < USOCK_WIRE_MAX) ? pos : USOCK_WIRE_MAX;
-    for (uint32_t k = 0; k < n; ++k) {
-        const usock_wire_t *w = &g_usock_wire[(pos - n + k) % USOCK_WIRE_MAX];
-        serial_write_string("[wire] t=");
-        serial_write_uint32(w->ms);
-        serial_write_string(w->dir ? " rx " : " tx ");
-        serial_write_uint32((uint32_t)w->from);
-        serial_write_string(">");
-        serial_write_uint32((uint32_t)w->to);
-        serial_write_string(" l=");
-        serial_write_uint32(w->len);
-        serial_write_string(" b=");
-        for (uint32_t i = 0; i < 4u; ++i) {
-            serial_write_uint32(w->head[i]);
-            serial_write_string(",");
-        }
-        serial_write_char('\n');
-    }
-}
-#endif
 
 uint32_t unix_socket_rx_seq(int32_t fd)
 {

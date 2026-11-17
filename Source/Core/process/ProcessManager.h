@@ -365,7 +365,6 @@ void process_perf_note_syscall(int32_t pid);
 void process_perf_note_ipc_send(int32_t pid);
 void process_perf_note_ipc_recv(int32_t pid);
 void process_perf_note_display(int32_t pid, uint32_t rect_count, uint64_t bytes);
-void process_debug_dump_cpu_usage(const char *reason, uint64_t interval_ns);
 void process_record_page_fault(int32_t pid, uint64_t fault_addr, uint64_t rip,
                                uint32_t error_code, int is_guard);
 int32_t process_get_debug_info(int32_t pid, void *info_out);

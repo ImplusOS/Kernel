@@ -102,35 +102,6 @@ static bool ps2_deadline_passed(uint32_t start_ms, uint32_t budget_ms)
     return (uint32_t)(ps2_now_ms() - start_ms) >= budget_ms;
 }
 
-static void ps2_log_string(const char *str)
-{
-    if (g_driver_api != NULL && g_driver_api->serial_write_string != NULL) {
-        g_driver_api->serial_write_string(str);
-    }
-}
-
-static void ps2_log_u32(uint32_t value)
-{
-    char buf[10];
-    int pos = 0;
-
-    if (value == 0u) {
-        ps2_log_string("0");
-        return;
-    }
-    while (value > 0u && pos < (int)sizeof(buf)) {
-        buf[pos++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    }
-    while (pos > 0) {
-        if (g_driver_api != NULL && g_driver_api->serial_write_char != NULL) {
-            g_driver_api->serial_write_char(buf[--pos]);
-        } else {
-            --pos;
-        }
-    }
-}
-
 #include "Drivers/Module/Display_Main.h"
 
 static uint8_t g_input_initialized = 0;
@@ -534,7 +505,6 @@ bool ps2_input_init(void)
     int port1_ok = 0;
     int port2_ok = 0;
     bool ok = false;
-    bool budget_hit = false;
     uint32_t start_ms = 0;
 
     g_input_initialized = 0;
@@ -568,7 +538,6 @@ bool ps2_input_init(void)
      * PS/2 hardware (or one whose controller stopped answering) keeps
      * whatever the earlier steps found, and USB HID carries the input. */
     if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
-        budget_hit = true;
         g_controller_absent = 1u;
         goto done;
     }
@@ -584,7 +553,6 @@ bool ps2_input_init(void)
     }
 
     if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
-        budget_hit = true;
         goto done;
     }
 
@@ -601,7 +569,6 @@ bool ps2_input_init(void)
     }
 
     if (ps2_deadline_passed(start_ms, PS2_INIT_BUDGET_MS)) {
-        budget_hit = true;
         controller_flush_output();
         ok = (port1_ok != 0) || (g_mouse_available != 0);
         goto done;
@@ -638,15 +605,6 @@ bool ps2_input_init(void)
     ok = true;
 
 done:
-    /* One line per init. input_init is the boot phase this runs in, and this
-     * is the part of it the kernel does not time itself. */
-    ps2_log_string("[PS2] init ");
-    ps2_log_u32((uint32_t)(ps2_now_ms() - start_ms));
-    ps2_log_string("ms kbd=");
-    ps2_log_string(g_keyboard_available != 0u ? "1" : "0");
-    ps2_log_string(" mouse=");
-    ps2_log_string(g_mouse_available != 0u ? "1" : "0");
-    ps2_log_string(budget_hit ? " budget\n" : "\n");
     return ok;
 }
 

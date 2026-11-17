@@ -50,12 +50,6 @@ extern bool g_ig9_have_match;
  * Utilities (IG9_Uncore.c)
  * ------------------------------------------------------------------ */
 
-void ig9_log(const char *str);
-void ig9_log_hex(uint32_t value);
-void ig9_log_dec(uint32_t value);
-/* "[IntelGen9] <msg> 0x<value>\n" */
-void ig9_log_val(const char *msg, uint32_t value);
-
 void *ig9_memset(void *dst, int value, size_t n);
 void ig9_memcpy(void *dst, const void *src, size_t n);
 
@@ -164,7 +158,6 @@ typedef struct {
 bool ig9_engine_init(void);
 bool ig9_engine_ready(void);
 ig9_submit_mode_t ig9_engine_mode(void);
-const char *ig9_engine_mode_name(void);
 /* Copy the same rectangles from src to dst (same x/y in both surfaces).
  * Synchronous: returns once the GPU has finished writing, or false after
  * a timeout/hang (in which case the engine has been reset, and may have

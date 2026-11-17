@@ -9,7 +9,6 @@
 #include "Core/process/ProcessManager.h"
 #include "Core/sync/Spinlock.h"
 #include "kernel/config.h"
-#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -156,9 +155,6 @@ static void copy_page_bytes(uint8_t *dst, const uint8_t *src)
  * Taken with interrupts off, and never while holding it is anything else
  * acquired, so it cannot deadlock against the fault locks above it.
  */
-#ifndef PAGING_LOST_MAPPING_TRACE
-#define PAGING_LOST_MAPPING_TRACE 0
-#endif
 
 static spinlock_t g_page_table_lock;
 
@@ -915,9 +911,7 @@ static void paging_identity_mark_2mb_uncached(uint64_t phys_addr)
  * power-on WT entry. */
 void paging_setup_pat(void)
 {
-    static volatile uint32_t pat_reported_cpus;
     uint64_t pat = hal_cpu_read_msr(IA32_PAT_MSR);
-    uint64_t power_on = pat;
     bool changed = false;
 
     /* PAT index = (PAT bit << 2) | (PCD bit << 1) | PWT bit.
@@ -944,22 +938,6 @@ void paging_setup_pat(void)
     if (changed) {
         hal_cpu_write_msr(IA32_PAT_MSR, pat);
     }
-
-    /* Print the value each CPU ends up with; the first CPU also prints the
-     * power-on value, so firmware interference is distinguishable from a
-     * bug here on the first look (AP bring-up is serialized by smp_init, so
-     * the counter needs no lock). */
-    uint32_t cpu_rank =
-        __atomic_fetch_add(&pat_reported_cpus, 1u, __ATOMIC_RELAXED);
-    if (cpu_rank == 0u) {
-        serial_write_string("[pat] power-on MSR 0x277 = ");
-        serial_write_uint64(power_on);
-        serial_write_string("\n[pat] entries 1,5 -> WC on bsp; this cpu now ");
-    } else {
-        serial_write_string("[pat] ap now MSR 0x277 = ");
-    }
-    serial_write_uint64(pat);
-    serial_write_string("\n");
 }
 
 static void *map_mmio_virt_internal(uint64_t phys_addr, bool write_combining)
@@ -1842,20 +1820,6 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
     if (cr3 == 0 || size == 0) {
         return -1;
     }
-#if PAGING_LOST_MAPPING_TRACE
-    if (start < 0x4080000000ULL && start + size > 0x4000000000ULL) {
-        static volatile uint32_t seen;
-        if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) < 16u) {
-            serial_write_string("[lostmap] unmap_range start=");
-            serial_write_uint64(start);
-            serial_write_string(" size=");
-            serial_write_uint64(size);
-            serial_write_string(" cr3=");
-            serial_write_uint64(cr3);
-            serial_write_string("\n");
-        }
-    }
-#endif
 
     uint64_t end = start + size;
     if (end <= start) {
@@ -1936,26 +1900,6 @@ static int paging_unmap_range_locked(uint64_t cr3, uint64_t start, uint64_t size
         }
 
         if (!any_present) {
-#if PAGING_LOST_MAPPING_TRACE
-            /* Clearing a PD entry drops 2 MiB of mappings at once. Record the
-             * address that asked for it and the table it landed in: if the
-             * table is shared with another address space, this is where the
-             * other one's memory disappears. */
-            {
-                static volatile uint32_t seen;
-                if (__atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED) < 24u) {
-                    serial_write_string("[lostmap] clear pde addr=");
-                    serial_write_uint64(addr);
-                    serial_write_string(" cr3=");
-                    serial_write_uint64(cr3);
-                    serial_write_string(" pd=");
-                    serial_write_uint64((uint64_t)(uintptr_t)pd_table);
-                    serial_write_string(" idx=");
-                    serial_write_uint64(pd_index);
-                    serial_write_string("\n");
-                }
-            }
-#endif
             deferred->frames[deferred->count++] = pt;
             pd_table[pd_index] = 0;
         }
@@ -2215,21 +2159,6 @@ static int paging_map_user_page_locked(uint64_t cr3,
             pmm_page_is_allocated(old_phys) == 1;
         if (can_map_identity_frame == 0 &&
             can_shadow_legacy_et_exec == 0) {
-#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
-            static volatile uint32_t identity_failures;
-            if (__atomic_fetch_add(&identity_failures, 1u,
-                                   __ATOMIC_RELAXED) < 32u) {
-                serial_write_string("[wine-map] identity-map rejected va=");
-                serial_write_uint64(virt_addr);
-                serial_write_string(" old=");
-                serial_write_uint64(old_phys);
-                serial_write_string(" new=");
-                serial_write_uint64(phys_addr & PAGE_FRAME_MASK);
-                serial_write_string(" allocated=");
-                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(old_phys));
-                serial_write_char('\n');
-            }
-#endif
             if (saved_cr3 != kernel_cr3) {
                 write_cr3(saved_cr3);
             }
@@ -2420,18 +2349,6 @@ int paging_map_user_range_alloc(uint64_t cr3,
                          * translation. Reuse the exact frame only when it is
                          * free and can be claimed atomically. */
                         if (pmm_reserve_free_page(identity_phys) < 0) {
-                            serial_write_string("[pagemap] identity frame busy cr3=");
-                            serial_write_uint64(cr3);
-                            serial_write_string(" vaddr=");
-                            serial_write_uint64(addr);
-                            serial_write_string(" phys=");
-                            serial_write_uint64(identity_phys);
-                            serial_write_string(" state=");
-                            serial_write_uint64((uint64_t)(int64_t)
-                                                pmm_page_is_allocated(identity_phys));
-                            serial_write_string(" free_pages=");
-                            serial_write_uint64(memory_free_pages());
-                            serial_write_char('\n');
                             return -1;
                         }
                         phys_page = (void *)(uintptr_t)identity_phys;
@@ -2443,15 +2360,6 @@ int paging_map_user_range_alloc(uint64_t cr3,
             phys_page = alloc_page();
         }
         if (phys_page == NULL) {
-            serial_write_string("[pagemap] alloc_page failed cr3=");
-            serial_write_uint64(cr3);
-            serial_write_string(" vaddr=");
-            serial_write_uint64(addr);
-            serial_write_string(" flags=");
-            serial_write_uint64(flags);
-            serial_write_string(" free_pages=");
-            serial_write_uint64(memory_free_pages());
-            serial_write_char('\n');
             return -1;
         }
 
@@ -2462,17 +2370,6 @@ int paging_map_user_range_alloc(uint64_t cr3,
                                           (uint64_t)(uintptr_t)phys_page,
                                           flags);
         if (map_rc < 0) {
-            serial_write_string("[pagemap] map leaf failed cr3=");
-            serial_write_uint64(cr3);
-            serial_write_string(" vaddr=");
-            serial_write_uint64(addr);
-            serial_write_string(" phys=");
-            serial_write_uint64((uint64_t)(uintptr_t)phys_page);
-            serial_write_string(" rc=");
-            serial_write_uint64((uint64_t)(int64_t)map_rc);
-            serial_write_string(" free_pages=");
-            serial_write_uint64(memory_free_pages());
-            serial_write_char('\n');
             free_page(phys_page);
             return -1;
         }
@@ -2533,67 +2430,10 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
             return 1;
         }
 
-#if PAGING_LOST_MAPPING_TRACE
-        /* The main executable's PT_LOADs are mapped eagerly by the ELF loader,
-         * so nothing in the code window should ever reach demand-zero. If it
-         * does, a mapping that existed has gone missing -- which is the
-         * signature of the SMP corruption being chased. Rate limited. */
-        if (virt_addr >= 0x4000000000ULL && virt_addr < 0x4080000000ULL) {
-            static volatile uint32_t lost_reported;
-            if (__atomic_fetch_add(&lost_reported, 1u, __ATOMIC_RELAXED) < 16u) {
-                /* Walk it by hand: whether the leaf table is gone or merely
-                 * has a hole says whether a page table was reused or a single
-                 * entry was cleared. */
-                uint64_t *l4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
-                uint64_t e4 = l4[PML4_INDEX(virt_addr)];
-                uint64_t e3 = 0, e2 = 0;
-                uint32_t present_in_pt = 0xFFFFFFFFu;
-                if ((e4 & PAGE_PRESENT) != 0) {
-                    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & PAGE_FRAME_MASK);
-                    e3 = l3[PDPT_INDEX(virt_addr)];
-                    if ((e3 & PAGE_PRESENT) != 0 && (e3 & PAGE_PS) == 0) {
-                        uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & PAGE_FRAME_MASK);
-                        e2 = l2[PD_INDEX(virt_addr)];
-                        if ((e2 & PAGE_PRESENT) != 0 && (e2 & PAGE_PS) == 0) {
-                            uint64_t *l1 =
-                                (uint64_t *)(uintptr_t)(e2 & PAGE_FRAME_MASK);
-                            present_in_pt = 0u;
-                            for (uint32_t k = 0; k < 512u; ++k) {
-                                if ((l1[k] & PAGE_PRESENT) != 0) ++present_in_pt;
-                            }
-                        }
-                    }
-                }
-                serial_write_string("[lostmap] demand-zero code va=");
-                serial_write_uint64(virt_addr);
-                serial_write_string(" pml4e=");
-                serial_write_uint64(e4);
-                serial_write_string(" pdpte=");
-                serial_write_uint64(e3);
-                serial_write_string(" pde=");
-                serial_write_uint64(e2);
-                serial_write_string(" ptes_present=");
-                serial_write_uint64((uint64_t)present_in_pt);
-                /* Are the tables themselves still owned? A "free" here means
-                 * the frame was handed back to the allocator while the level
-                 * above still pointed at it. */
-                serial_write_string(" pdpt_alloc=");
-                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(
-                    e4 & PAGE_FRAME_MASK));
-                serial_write_string(" pd_alloc=");
-                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(
-                    e3 & PAGE_FRAME_MASK));
-                serial_write_string("\n");
-            }
-        }
-#endif
         void *phys_page = alloc_page();
         if (phys_page == NULL) {
             spinlock_unlock(&g_demand_fault_lock);
             irq_restore(dz_irq);
-            serial_write_string("[PF] demand-zero: alloc_page failed (PMM OOM) va=");
-            serial_write_uint64(virt_addr);
-            serial_write_string("\n");
             return 0;
         }
 
@@ -2603,9 +2443,6 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
             free_page(phys_page);
             spinlock_unlock(&g_demand_fault_lock);
             irq_restore(dz_irq);
-            serial_write_string("[PF] demand-zero: map_user_page failed (page-table OOM) va=");
-            serial_write_uint64(virt_addr);
-            serial_write_string("\n");
             return 0;
         }
 

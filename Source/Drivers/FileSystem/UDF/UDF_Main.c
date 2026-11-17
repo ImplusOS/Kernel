@@ -1,5 +1,4 @@
 #include "Drivers/FileSystem/UDF/UDF_Main.h"
-#include "Debug/serial/Serial.h"
 #include "kernel/config.h"
 #include "Platform/io/IO_Main.h"
 #ifndef IMPLUS_DRIVER_MODULE
@@ -16,8 +15,6 @@ static const driver_binary_t *g_driver_api = NULL;
 #define hal_cpu_pause               g_driver_api->hal.cpu_pause
 #define disk_read                   g_driver_api->hw.disk_read
 #define disk_get_partition_lba      g_driver_api->hw.disk_get_partition_lba
-#define serial_write_string         g_driver_api->dbg.write_string
-#define serial_write_uint32         g_driver_api->dbg.write_uint32
 #define udf_heap_alloc(sz)          g_driver_api->malloc((uint64_t)(sz))
 #define udf_heap_free(p)            g_driver_api->free((p))
 
@@ -323,9 +320,6 @@ static bool _udf_init(void) {
 
     if (udf_find_nsr() && udf_parse_anchor()) {
         g_udf.valid = true;
-        serial_write_string("[UDF] mounted, root FE LBA ");
-        serial_write_uint32(g_udf.root_fe_lba);
-        serial_write_string("\n");
         return true;
     }
 
@@ -338,7 +332,6 @@ static bool _udf_init(void) {
         }
     }
 
-    serial_write_string("[UDF] no UDF volume found\n");
     return false;
 }
 
@@ -857,8 +850,6 @@ static const driver_module_descriptor_t g_udf_module = {
 #undef hal_cpu_pause
 #undef disk_read
 #undef disk_get_partition_lba
-#undef serial_write_string
-#undef serial_write_uint32
 #undef memset
 #undef memcpy
 

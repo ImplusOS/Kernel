@@ -136,7 +136,6 @@ static void ig9_pci_find_device(void)
     const driver_binary_t *api = g_ig9_api;
     if (api == NULL || api->pci.get_device_count == NULL ||
         api->pci.get_device == NULL) {
-        ig9_log("[IntelGen9] probe: no PCI client\n");
         return;
     }
 
@@ -163,25 +162,9 @@ static void ig9_pci_find_device(void)
             g_ig9_match.has_llc = g_ig9_devices[d].gen != IG9_GEN_BROXTON &&
                                   g_ig9_devices[d].gen != IG9_GEN_GEMINILAKE;
             g_ig9_have_match = true;
-            ig9_log("[IntelGen9] found ");
-            ig9_log(g_ig9_devices[d].name);
-            ig9_log(" id 0x");
-            ig9_log_hex(dev.device_id);
-            ig9_log(" rev 0x");
-            ig9_log_hex(dev.revision);
-            ig9_log("\n");
             return;
         }
-        if (dev.class_code == IG9_PCI_CLASS_DISPLAY) {
-            ig9_log("[IntelGen9] display device id 0x");
-            ig9_log_hex(dev.device_id);
-            ig9_log(" class 0x");
-            ig9_log_hex(((uint32_t)dev.class_code << 16) |
-                        ((uint32_t)dev.subclass << 8) | (uint32_t)dev.prog_if);
-            ig9_log(" not in the allowlist\n");
-        }
     }
-    ig9_log("[IntelGen9] probe: no supported GPU\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -417,36 +400,18 @@ static bool ig9_match_plane(uint32_t fb_ggtt, uint32_t pitch)
             g_scanout.pipe_w = (src >> 16) + 1u;
             g_scanout.pipe_h = (src & 0xFFFFu) + 1u;
 
-            ig9_log("[IntelGen9] scanout: pipe ");
-            ig9_log_dec(pipe);
-            ig9_log(" plane ");
-            ig9_log_dec(plane);
-            ig9_log(" ctl 0x");
-            ig9_log_hex(ctl);
-            ig9_log(" stride ");
-            ig9_log_dec(stride);
-            ig9_log(" pipe-src ");
-            ig9_log_dec(g_scanout.pipe_w);
-            ig9_log("x");
-            ig9_log_dec(g_scanout.pipe_h);
-            ig9_log("\n");
-
             if ((ctl & IG9_PLANE_CTL_TILED_MASK) != IG9_PLANE_CTL_TILED_LINEAR) {
-                ig9_log("[IntelGen9] scanout: plane is tiled; blitter disabled\n");
                 return false;
             }
             if ((ctl & IG9_PLANE_CTL_FORMAT_MASK) != IG9_PLANE_CTL_FORMAT_XRGB8888) {
-                ig9_log("[IntelGen9] scanout: plane is not 8888; blitter disabled\n");
                 return false;
             }
             if (stride != pitch) {
-                ig9_log("[IntelGen9] scanout: plane stride differs from GOP pitch; blitter disabled\n");
                 return false;
             }
             return true;
         }
     }
-    ig9_log("[IntelGen9] scanout: no enabled plane scans out the GOP framebuffer\n");
     return true;   /* not fatal: the fence check below still guards tiling */
 }
 
@@ -465,7 +430,6 @@ static bool ig9_fb_fenced(uint32_t ggtt, uint64_t bytes)
         uint64_t start = lo & 0xFFFFF000u;
         uint64_t end = (uint64_t)(hi & 0xFFFFF000u) + IG9_PAGE_BYTES;
         if (start < hi_addr && lo_addr < end) {
-            ig9_log_val("scanout: framebuffer covered by fence", i);
             return true;
         }
     }
@@ -492,34 +456,24 @@ static bool ig9_fb_locate(void)
         phys - g_ig9_bars.gmadr_phys + bytes <= g_ig9_bars.gmadr_size) {
         ggtt = (uint32_t)(phys - g_ig9_bars.gmadr_phys);
         if (!ig9_ggtt_range_present(ggtt, bytes)) {
-            ig9_log("[IntelGen9] scanout: aperture range not fully mapped\n");
             return false;
         }
-        ig9_log_val("scanout: GOP framebuffer via aperture, ggtt", ggtt);
     } else {
         uint32_t index = 0u;
         if (!ig9_ggtt_find_phys(phys, &index)) {
-            ig9_log("[IntelGen9] scanout: framebuffer is neither in the aperture nor in the GGTT\n");
             return false;
         }
         ggtt = index * IG9_PAGE_BYTES + (uint32_t)(phys & (IG9_PAGE_BYTES - 1u));
         if (!ig9_ggtt_range_maps(ggtt, phys, bytes)) {
-            ig9_log("[IntelGen9] scanout: framebuffer not linearly mapped in the GGTT\n");
             return false;
         }
-        ig9_log_val("scanout: framebuffer found in GGTT at", ggtt);
     }
 
-    ig9_log_val("scanout: first PTE (low)",
-                (uint32_t)ig9_ggtt_read_pte(ggtt / IG9_PAGE_BYTES));
-
     if ((ggtt & 63u) != 0u) {
-        ig9_log("[IntelGen9] scanout: framebuffer not 64-byte aligned\n");
         return false;
     }
     if (pitch > IG9_BLT_MAX_PITCH || g_fb.width > IG9_BLT_MAX_COORD ||
         g_fb.height > IG9_BLT_MAX_COORD) {
-        ig9_log("[IntelGen9] scanout: beyond blitter limits\n");
         return false;
     }
     if (!ig9_match_plane(ggtt, pitch) || ig9_fb_fenced(ggtt, bytes)) {
@@ -540,7 +494,6 @@ static bool ig9_back_buffer_map(void)
         return false;
     }
     if (!ig9_ggtt_map(g_fb.back, 0u, g_fb.back_bytes, &g_fb.back_ggtt)) {
-        ig9_log("[IntelGen9] back buffer: GGTT map failed\n");
         return false;
     }
     g_fb.back_mapped = true;
@@ -555,11 +508,9 @@ static void ig9_hw_bringup(void)
     g_hw_attempted = true;
 
     if (!ig9_uncore_init() || !ig9_ggtt_init()) {
-        ig9_log("[IntelGen9] bringup: CPU present path only\n");
         return;
     }
     if (!ig9_forcewake_get(IG9_FW_GT)) {
-        ig9_log("[IntelGen9] bringup: no GT forcewake, CPU present path only\n");
         return;
     }
 
@@ -567,19 +518,10 @@ static void ig9_hw_bringup(void)
     if (g_scanout.found) {
         ig9_detect_output(g_scanout.pipe);
         g_scanout.refresh_millihz = ig9_measure_refresh(g_scanout.pipe);
-        ig9_log("[IntelGen9] output ");
-        ig9_log(g_scanout.output_name);
-        ig9_log(" refresh ");
-        ig9_log_dec(g_scanout.refresh_millihz);
-        ig9_log(" mHz\n");
     }
 
-    if (fb_ok && ig9_engine_init() && ig9_back_buffer_map()) {
-        ig9_log("[IntelGen9] blitter present enabled (");
-        ig9_log(ig9_engine_mode_name());
-        ig9_log(")\n");
-    } else {
-        ig9_log("[IntelGen9] bringup: CPU present path only\n");
+    if (fb_ok && ig9_engine_init()) {
+        (void)ig9_back_buffer_map();
     }
     ig9_forcewake_put(IG9_FW_GT);
 }
@@ -640,7 +582,6 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *fb)
         cpu = g_ig9_api->hw.map_mmio_range(phys, (size_t)bytes);
     }
     if (cpu == NULL) {
-        ig9_log("[IntelGen9] fb: map failed\n");
         goto out;
     }
 
@@ -648,7 +589,6 @@ static bool ig9_fb_set(const driver_boot_framebuffer_t *fb)
                          ~(uint64_t)(IG9_PAGE_BYTES - 1u);
     void *raw = g_ig9_api->malloc(map_bytes + IG9_PAGE_BYTES);
     if (raw == NULL) {
-        ig9_log("[IntelGen9] fb: back buffer allocation failed\n");
         goto out;
     }
     uint32_t *back = (uint32_t *)(void *)
@@ -898,7 +838,6 @@ static void ig9_present_chunk(const ig9_blit_rect_t *rects, uint32_t n)
         if (ig9_engine_copy_rects(&dst, &src, rects, n)) {
             return;
         }
-        ig9_log("[IntelGen9] present: GPU copy failed, CPU fallback\n");
     }
     for (uint32_t i = 0; i < n; ++i) {
         ig9_cpu_copy(&rects[i]);
@@ -1005,7 +944,6 @@ const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
     }
 
     g_ig9_api = api;
-    ig9_log("[IntelGen9] module init\n");
     return &descriptor;
 }
 

@@ -1,8 +1,5 @@
 #include "IDT_Main.h"
 
-#ifndef LINUX_SYSCALL_PROFILE
-#define LINUX_SYSCALL_PROFILE 0
-#endif
 #include "interfaces/hal_cpu.h"
 #include "kernel/config.h"
 
@@ -743,24 +740,6 @@ int32_t page_fault_handler(uint64_t error_code,
         g_pf_depth[pf_cpu] = (uint8_t)(g_pf_depth[pf_cpu] + 1u);
     }
 
-#if OS_CONFIG_DEBUG_PAGE_FAULT_DUMP
-    {
-        extern void serial_write_string(const char *str);
-        extern void serial_write_uint64(uint64_t value);
-        extern const char *process_get_current_name_str(void);
-        extern uint64_t process_get_current_kernel_stack_base(void);
-        extern void process_scheduler_debug_dump_cpus(void);
-        serial_write_string("[OS] [PF] pid=");
-        serial_write_uint64((uint64_t)(uint32_t)pid);
-        serial_write_string(" name=");
-        const char *pn = process_get_current_name_str();
-        serial_write_string(pn ? pn : "?");
-        serial_write_string(" kstack=");
-        serial_write_uint64(process_get_current_kernel_stack_base());
-        serial_write_string("\n");
-        process_scheduler_debug_dump_cpus();
-    }
-#endif
     /* Demand-fault user pages for BOTH user-mode faults and kernel-mode faults
      * at a user address -- the latter is copy_to/from_user() memcpy'ing into a
      * lazily-committed anonymous mmap() buffer (USER_MMAP arena). Chromium's
@@ -769,19 +748,6 @@ int32_t page_fault_handler(uint64_t error_code,
      * panic the kernel. paging_handle_swap_fault()/cow_fault() self-gate to
      * canonical user addresses, so a genuine kernel wild pointer still falls
      * through to the panic path below. */
-#if LINUX_SYSCALL_PROFILE
-    /* Page faults are not syscalls, so the syscall profile cannot see them --
-     * and a demand-paged program spends its life here, not in syscalls. */
-    {
-        static volatile uint32_t pf_total;
-        uint32_t n = __atomic_add_fetch(&pf_total, 1u, __ATOMIC_RELAXED);
-        if ((n % 100000u) == 0u) {
-            serial_write_string("[pfprof] faults=");
-            serial_write_uint64((uint64_t)n);
-            serial_write_string("\n");
-        }
-    }
-#endif
     int pf_serviced = 0;
     if (pid >= 0 && !pf_reentrant) {
         uint64_t cr3 = process_get_current_cr3();

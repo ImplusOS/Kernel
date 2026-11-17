@@ -13,7 +13,6 @@
 #include "MemoryManagement/Memory_Main.h"
 #include "mmu/Paging_Main.h"
 #include "Core/sync/Spinlock.h"
-#include "Debug/serial/Serial.h"
 #endif
 
 #ifdef IMPLUS_DRIVER_MODULE
@@ -791,17 +790,6 @@ bool virtio_net_init(void)
 
     spinlock_unlock(&g_virtio_net_lock);
     irq_restore(irq_flags);
-    
-    for (uint8_t i = 0; i < 6u; ++i) {
-        uint8_t b = g_virtio_net_mac[i];
-        char buf[4];
-        const char *hex = "0123456789abcdef";
-        buf[0] = hex[(b >> 4) & 0xFu];
-        buf[1] = hex[b & 0xFu];
-        buf[2] = (i == 5u) ? '\n' : ':';
-        buf[3] = '\0';
-        serial_write_string(buf);
-    }
     return true;
 }
 

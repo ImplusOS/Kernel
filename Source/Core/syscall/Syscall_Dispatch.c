@@ -1577,13 +1577,6 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
             uint64_t size = (uint64_t)stride * (uint64_t)h * 4ULL;
             uint64_t user_fb = 0u;
             if (!syscall_display_fb_map(ptr, size, cr3, &user_fb)) {
-                serial_write_string("[fbsys] cached map failed pid=");
-                serial_write_uint64((uint64_t)process_get_current_pid());
-                serial_write_string(" cr3=");
-                serial_write_uint64(cr3);
-                serial_write_string(" bytes=");
-                serial_write_uint64(size);
-                serial_write_char('\n');
                 set_syscall_result(saved_rsp, 0);
                 break;
             }

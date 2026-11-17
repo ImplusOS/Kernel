@@ -4,7 +4,6 @@
 
 #include "kernel/pnp.h"
 #include "IPC/PnP_Notifications.h"
-#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -284,13 +283,7 @@ void bus_registry_retry_unclaimed(void)
                                   : (const void *)&slot->ctx.pci;
         }
 
-        if (bus_registry_dispatch(&dev)) {
-            serial_write_string("[BusRegistry] deferred match claimed vid ");
-            serial_write_uint32(dev.vendor_id);
-            serial_write_string(" pid ");
-            serial_write_uint32(dev.device_id);
-            serial_write_string("\n");
-        }
+        (void)bus_registry_dispatch(&dev);
         /* Claimed or not, this was its one replay: a device that still has no
          * driver now is one that has none at all. */
         slot->in_use = false;

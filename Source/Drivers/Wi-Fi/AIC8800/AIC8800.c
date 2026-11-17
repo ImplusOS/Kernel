@@ -95,22 +95,6 @@ void aic_unlock(void)
     __sync_lock_release(&g_aic_lock);
 }
 
-/* ---- logging ---- */
-
-void aic_log(const char *msg)
-{
-    if (g_aic_api != NULL && g_aic_api->serial_write_string != NULL) {
-        g_aic_api->serial_write_string(msg);
-    }
-}
-
-void aic_log_hex32(uint32_t value)
-{
-    if (g_aic_api != NULL && g_aic_api->serial_write_uint32 != NULL) {
-        g_aic_api->serial_write_uint32(value);
-    }
-}
-
 /* ---- time ---- */
 
 uint64_t aic_now_ticks(void)
@@ -398,8 +382,6 @@ static uint32_t aic_rx_consume(aic_rx_pipe_t *pipe, const uint8_t *buf,
                 aic_memcpy(pipe->carry, buf + pos, left);
                 pipe->carry_len = left;
                 pipe->carry_need = chunk;
-            } else {
-                aic_log("[AIC8800] rx: oversized packet dropped\n");
             }
             pos = buf_len;
             break;
@@ -484,9 +466,6 @@ static bool aic_rx_service_pipe(aic_rx_pipe_t *pipe, uint32_t timeout_ms)
         /* Falling through means the async submit keeps failing: fall back
          * to sync reads for good. */
         pipe->use_async = false;
-        aic_log("[AIC8800] rx ep ");
-        aic_log_hex32((uint32_t)pipe->ep);
-        aic_log(": async submit failed, using sync reads\n");
     }
 
     /* Same truncation story as the async path: the buffer is all zeroes
@@ -575,9 +554,6 @@ static void aic_rx_pipe_enable_async(aic_rx_pipe_t *pipe)
         return;
     }
     pipe->use_async = true;
-    aic_log("[AIC8800] rx ep ");
-    aic_log_hex32((uint32_t)pipe->ep);
-    aic_log(" now async\n");
 }
 
 static void aic_rx_enable_async(void)
@@ -605,8 +581,6 @@ static void aic_rx_pipe_free_dma(aic_rx_pipe_t *pipe)
     if (pipe->dma_base != NULL && g_aic_api != NULL &&
         g_aic_api->dma_free != NULL && !armed) {
         g_aic_api->dma_free(pipe->dma_base, pipe->dma_base_size);
-    } else if (pipe->dma_base != NULL && armed) {
-        aic_log("[AIC8800] rx DMA buffer kept: transfer still in flight\n");
     }
     pipe->dma = NULL;
     pipe->dma_base = NULL;
@@ -856,14 +830,8 @@ static bool aic_probe(const bus_device_t *dev)
         bool probe_has_data_pair =
             (stage == AIC_STAGE_FDRV) && (first_in != cfg_in);
         if (!(probe_has_data_pair && !g_aic.rx_data.present) || g_aic.ready) {
-            aic_log("[AIC8800] another vendor interface at addr ");
-            aic_log_hex32((uint32_t)ctx->addr);
-            aic_log(" (iface ");
-            aic_log_hex32((uint32_t)ctx->interface);
-            aic_log(") ignored -- already driving this device\n");
             return false;
         }
-        aic_log("[AIC8800] switching to the interface with a data bulk pair\n");
     }
 
     /* probe() runs on the hotplug path, possibly while another CPU is in a
@@ -878,7 +846,6 @@ static bool aic_probe(const bus_device_t *dev)
         aic_msleep(1u);
     }
     if (!locked) {
-        aic_log("[AIC8800] probe: driver busy, deferring\n");
         return false;
     }
 
@@ -923,24 +890,6 @@ static bool aic_probe(const bus_device_t *dev)
 
     aic_fw_reset();
     aic_bring_reset();
-
-    aic_log("[AIC8800] ");
-    aic_log(stage == AIC_STAGE_LOADER ? "loader-stage device at usb addr "
-                                      : "firmware-stage device at usb addr ");
-    aic_log_hex32((uint32_t)g_aic.addr);
-    aic_log(" iface ");
-    aic_log_hex32((uint32_t)g_aic.interface);
-    aic_log(" id ");
-    aic_log_hex32(((uint32_t)dev->vendor_id << 16) | (uint32_t)g_aic.pid);
-    aic_log(" cfg-in 0x");
-    aic_log_hex32((uint32_t)cfg_in);
-    aic_log(" cfg-out 0x");
-    aic_log_hex32((uint32_t)cfg_out);
-    aic_log(" data-in 0x");
-    aic_log_hex32((uint32_t)(g_aic.rx_data.present ? first_in : 0u));
-    aic_log(" data-out 0x");
-    aic_log_hex32((uint32_t)first_out);
-    aic_log("\n");
 
     aic_unlock();
     return true;

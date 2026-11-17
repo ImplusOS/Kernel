@@ -8,7 +8,6 @@
 #include "Core/sync/Spinlock.h"
 #include "Core/timer/Timer.h"
 #include "Core/usercopy/Usercopy.h"
-#include "Debug/serial/Serial.h"
 #include "Drivers/Module/AudioManager.h"
 #include "Core/process/ProcessManager.h"
 #include "kernel/config.h"
@@ -354,19 +353,6 @@ static void alsa_select(int32_t index)
 {
     g_sel[alsa_cpu()] = (index >= 0 && index < ALSA_SUBSTREAMS) ? index : 0;
 }
-
-/* Periodic playback statistics on the serial console (bring-up aid). */
-#ifndef ALSA_STATS
-#define ALSA_STATS 0
-#endif
-
-/* Bring-up statistics, printed every couple of seconds while open. */
-static uint64_t g_stat_writei_frames;
-static int32_t g_stat_peak;
-static uint32_t g_stat_xruns;
-static uint32_t g_stat_quiet, g_stat_loud;
-static uint32_t g_stat_dry, g_stat_short;
-static uint64_t g_stat_last_ns, g_stat_max_gap_ns;
 
 
 
@@ -887,7 +873,6 @@ static void stream_update_locked(uint64_t dev_queued)
     if (avail >= g_pcm.stop_threshold && held_bytes == 0u) {
         g_pcm.state = ST_XRUN;
         g_pcm.trigger_tstamp = now_ts();
-        g_stat_xruns++;
     }
 }
 
@@ -897,13 +882,6 @@ static void pump_locked(void)
 {
     alsa_pcm_t *self = g_cur;
     uint64_t dev_queued = audio_manager_stream_queued();
-    {
-        uint64_t ns = timer_monotonic_ns();
-        if (g_stat_last_ns != 0u && ns - g_stat_last_ns > g_stat_max_gap_ns)
-            g_stat_max_gap_ns = ns - g_stat_last_ns;
-        g_stat_last_ns = ns;
-        if (g_dev_running && dev_queued == 0u) g_stat_dry++;
-    }
     int16_t tmp[256 * 2];
     int16_t mix[256 * 2];
     int32_t acc[256 * 2];
@@ -926,20 +904,14 @@ static void pump_locked(void)
             } else if (got > produced) {
                 memset(acc + produced * 2u, 0, (size_t)(got - produced) * 2u * sizeof(int32_t));
             }
-            int32_t cpk = 0;
             for (uint32_t k = 0; k < got * 2u; ++k) {
                 acc[k] += tmp[k];
-                int32_t a = tmp[k] < 0 ? -(int32_t)tmp[k] : tmp[k];
-                if (a > cpk) cpk = a;
             }
-            if (cpk > g_stat_peak) g_stat_peak = cpk;
-            if (cpk < 30) g_stat_quiet++; else g_stat_loud++;
             p->dev_end = g_dev_written + (uint64_t)got * g_dev_frame_bytes;
             p->dev_bytes += (uint64_t)got * g_dev_frame_bytes;
             if (got > produced) produced = got;
         }
         if (produced == 0u) {
-            if (dev_queued < g_dev_target_bytes / 2u) g_stat_short++;
             break;
         }
         for (uint32_t k = 0; k < produced * 2u; ++k) {
@@ -1001,49 +973,7 @@ void alsa_timer_tick(void)
     __atomic_store_n(&g_pump_tick_ns, timer_monotonic_ns(), __ATOMIC_RELAXED);
     uint64_t f = lock_irq();
     pump_locked();
-    static uint32_t ticks;
-    int report = ALSA_STATS && (++ticks % 500u) == 0u;
-    uint64_t appl = 0, hw = 0, dev = g_dev_written;
-    int32_t state = -1, peak = g_stat_peak;
-    for (int i = 0; i < ALSA_SUBSTREAMS; ++i) {
-        if (g_pcms[i].open && g_pcms[i].state >= ST_PREPARED) {
-            appl = g_pcms[i].appl; hw = g_pcms[i].hw; state = g_pcms[i].state;
-        }
-    }
-    if (state < 0) report = 0;
-    uint32_t xruns = g_stat_xruns;
-    uint32_t quiet = g_stat_quiet, loud = g_stat_loud;
-    uint64_t wf = g_stat_writei_frames;
-    if (report) { g_stat_peak = 0; g_stat_quiet = g_stat_loud = 0; }
     unlock_irq(f);
-    if (report) {
-        serial_write_string("[alsa] st=");
-        serial_write_uint32((uint32_t)state);
-        serial_write_string(" appl=");
-        serial_write_uint64(appl);
-        serial_write_string(" hw=");
-        serial_write_uint64(hw);
-        serial_write_string(" dev_bytes=");
-        serial_write_uint64(dev);
-        serial_write_string(" written=");
-        serial_write_uint64(wf);
-        serial_write_string(" peak=");
-        serial_write_uint32((uint32_t)peak);
-        serial_write_string(" xruns=");
-        serial_write_uint32(xruns);
-        serial_write_string(" quiet=");
-        serial_write_uint32(quiet);
-        serial_write_string(" loud=");
-        serial_write_uint32(loud);
-        serial_write_string(" dry=");
-        serial_write_uint32(g_stat_dry);
-        serial_write_string(" short=");
-        serial_write_uint32(g_stat_short);
-        serial_write_string(" maxgap_us=");
-        serial_write_uint32((uint32_t)(g_stat_max_gap_ns / 1000u));
-        g_stat_dry = g_stat_short = 0; g_stat_max_gap_ns = 0;
-        serial_write_string("\n");
-    }
 }
 
 /* ------------------------------------------------------------------------
@@ -1135,11 +1065,6 @@ int alsa_pcm_open(void)
     g_pcms[index].state = ST_OPEN;
     unlock_irq(f);
     spinlock_unlock(&g_open_lock);
-    serial_write_string("[alsa] pcm open pid=");
-    serial_write_uint32((uint32_t)process_get_current_pid());
-    serial_write_string(" substream=");
-    serial_write_uint32((uint32_t)index);
-    serial_write_string("\n");
     return index;
 }
 
@@ -1259,18 +1184,6 @@ static int64_t do_hw_params(uint64_t arg, int commit)
         g_pcm.pump_frac = 0u;
         g_pcm.state = ST_SETUP;
         unlock_irq(f);
-
-        serial_write_string("[alsa] hw_params rate=");
-        serial_write_uint32(rate);
-        serial_write_string(" ch=");
-        serial_write_uint32(channels);
-        serial_write_string(" fmt=");
-        serial_write_uint32(fmt);
-        serial_write_string(" period=");
-        serial_write_uint32(period);
-        serial_write_string(" buffer=");
-        serial_write_uint32(buffer);
-        serial_write_string("\n");
     }
     if (copy_to_user((void *)(uintptr_t)arg, &p, sizeof(p)) != 0u) {
         return E_FAULT;
@@ -1369,7 +1282,6 @@ static int64_t do_writei(uint64_t arg)
     f = lock_irq();
     if (g_pcm.buf == buf && g_pcm.appl == start) {
         g_pcm.appl += done;
-        g_stat_writei_frames += done;
         if (g_pcm.state == ST_PREPARED &&
             g_pcm.appl - g_pcm.hw >= g_pcm.start_threshold) {
             start_locked();
@@ -1441,22 +1353,10 @@ static void fill_pcm_info(pcm_info_t *info)
 
 static int64_t alsa_pcm_ioctl_impl(uint64_t request, uint64_t arg);
 
-/* Bring-up trace: every PCM ioctl that fails, and the first few of each
- * run, with the request and result. */
 int64_t alsa_pcm_ioctl(int32_t index, uint64_t request, uint64_t arg)
 {
     alsa_select(index);
-    int64_t rc = alsa_pcm_ioctl_impl(request, arg);
-    static volatile uint32_t traced;
-    if ((rc < 0 && rc != ALSA_WOULD_BLOCK && rc != E_AGAIN &&
-         __atomic_fetch_add(&traced, 1u, __ATOMIC_RELAXED) < 64u)) {
-        serial_write_string("[alsa] pcm ioctl ");
-        serial_write_uint64(request);
-        serial_write_string(" -> ");
-        serial_write_uint64((uint64_t)rc);
-        serial_write_string("\n");
-    }
-    return rc;
+    return alsa_pcm_ioctl_impl(request, arg);
 }
 
 static int64_t alsa_pcm_ioctl_impl(uint64_t request, uint64_t arg)
@@ -1703,7 +1603,6 @@ uint32_t alsa_pcm_poll(int32_t index, uint32_t events)
 
 int alsa_ctl_open(void)
 {
-    serial_write_string("[alsa] ctl open\n");
     if (!alsa_card_present()) {
         return E_NODEV;
     }

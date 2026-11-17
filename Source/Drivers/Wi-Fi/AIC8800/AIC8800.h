@@ -357,10 +357,6 @@ extern const driver_binary_t *g_aic_api;
 
 /* ---- AIC8800.c: transport + engine ---- */
 
-/* Serial logging, all no-ops when the kernel has no serial console. */
-void aic_log(const char *msg);
-void aic_log_hex32(uint32_t value);
-
 /* Sleep for at most `ms` (no-op when the kernel exposes no msleep). */
 void aic_msleep(uint32_t ms);
 

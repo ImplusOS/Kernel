@@ -114,13 +114,11 @@ static bool ig9_bo_alloc(ig9_bo_t *bo, uint32_t bytes, bool map_ggtt)
         virt = api->dma_alloc(bytes, &phys);
     }
     if (virt == NULL || phys == 0u) {
-        ig9_log_val("engine: dma_alloc failed, bytes", bytes);
         return false;
     }
     if ((phys & (IG9_PAGE_BYTES - 1u)) != 0u ||
         ((uintptr_t)virt & (IG9_PAGE_BYTES - 1u)) != 0u ||
         (phys & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
-        ig9_log_val("engine: unusable DMA buffer, phys lo", (uint32_t)phys);
         api->dma_free(virt, bytes);
         return false;
     }
@@ -201,55 +199,12 @@ static bool ig9_buffers_alloc(void)
     ig9_clflush_range(pd, IG9_PAGE_BYTES);
 
     s_eng.buffers = true;
-    ig9_log("[IntelGen9] engine: ring 0x");
-    ig9_log_hex(s_eng.ring.ggtt);
-    ig9_log(" batch 0x");
-    ig9_log_hex(s_eng.batch.ggtt);
-    ig9_log(" ctx 0x");
-    ig9_log_hex(s_eng.ctx.ggtt);
-    ig9_log(" fence 0x");
-    ig9_log_hex(s_eng.fence.ggtt);
-    ig9_log("\n");
     return true;
 }
-
-/* ------------------------------------------------------------------ *
- * Diagnostics
- * ------------------------------------------------------------------ */
 
 static volatile uint32_t *ig9_fence_slot(void)
 {
     return (volatile uint32_t *)(void *)(s_eng.fence.virt + IG9_FENCE_OFFSET);
-}
-
-static void ig9_engine_dump(const char *why)
-{
-    ig9_log("[IntelGen9] BCS ");
-    ig9_log(why);
-    ig9_log(": head 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_HEAD(BCS)));
-    ig9_log(" tail 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_TAIL(BCS)));
-    ig9_log(" sw-tail 0x");
-    ig9_log_hex(s_eng.tail);
-    ig9_log(" acthd 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_ACTHD(BCS)));
-    ig9_log(" ipehr 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_IPEHR(BCS)));
-    ig9_log(" instdone 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_INSTDONE(BCS)));
-    ig9_log(" mode 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_MODE(BCS)));
-    ig9_log(" el-status 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_EXECLIST_STATUS_LO(BCS)));
-    ig9_log(" csb-ptr 0x");
-    ig9_log_hex(ig9_read32(IG9_RING_CSB_PTR(BCS)));
-    ig9_log(" fence 0x");
-    ig9_clflush_range((const void *)ig9_fence_slot(), 4u);
-    ig9_log_hex(*ig9_fence_slot());
-    ig9_log(" seqno 0x");
-    ig9_log_hex(s_eng.seqno);
-    ig9_log("\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -263,11 +218,10 @@ static bool ig9_engine_reset(void)
 
     ig9_write32(IG9_RING_RESET_CTL(BCS),
                 IG9_MASKED_ENABLE(IG9_RESET_CTL_REQUEST_RESET));
-    if (!ig9_wait_reg(IG9_RING_RESET_CTL(BCS), IG9_RESET_CTL_READY_TO_RESET,
-                      IG9_RESET_CTL_READY_TO_RESET, 700u)) {
-        /* Same as i915 on a retry: reset anyway, the engine is stuck. */
-        ig9_log("[IntelGen9] reset: BCS not ready-to-reset, forcing\n");
-    }
+    /* On a timeout, do the same as i915 on a retry: reset anyway, the
+     * engine is stuck. */
+    (void)ig9_wait_reg(IG9_RING_RESET_CTL(BCS), IG9_RESET_CTL_READY_TO_RESET,
+                       IG9_RESET_CTL_READY_TO_RESET, 700u);
 
     ig9_write32(IG9_GEN6_GDRST, IG9_GDRST_BLT);
     bool done = ig9_wait_reg(IG9_GEN6_GDRST, IG9_GDRST_BLT, 0u,
@@ -279,9 +233,6 @@ static bool ig9_engine_reset(void)
         ig9_forcewake_put(IG9_FW_RENDER);
     }
 
-    if (!done) {
-        ig9_log("[IntelGen9] reset: GDRST.BLT did not clear\n");
-    }
     return done;
 }
 
@@ -391,7 +342,6 @@ static bool ig9_execlists_enable(void)
     (void)ig9_read32(IG9_RING_HWS_PGA(BCS));
 
     if ((ig9_read32(IG9_RING_MODE(BCS)) & IG9_GFX_RUN_LIST_ENABLE) == 0u) {
-        ig9_log("[IntelGen9] execlists: RUN_LIST_ENABLE did not stick\n");
         return false;
     }
     ig9_csb_reset_head();
@@ -443,14 +393,12 @@ static bool ig9_legacy_enable(void)
                       IG9_RING_CTL_VALID, 50000u) ||
         ig9_read32(IG9_RING_START(BCS)) != s_eng.ring.ggtt ||
         (ig9_read32(IG9_RING_HEAD(BCS)) & IG9_RING_HEAD_ADDR_MASK) != 0u) {
-        ig9_log("[IntelGen9] legacy: ring registers did not take\n");
         return false;
     }
     ig9_write32(IG9_RING_MI_MODE(BCS), IG9_MASKED_DISABLE(IG9_MI_MODE_STOP_RING));
 
     if ((ig9_read32(IG9_RING_MODE(BCS)) &
          (IG9_GFX_RUN_LIST_ENABLE | IG9_GFX_PPGTT_ENABLE)) != 0u) {
-        ig9_log("[IntelGen9] legacy: could not leave execlists/PPGTT mode\n");
         return false;
     }
     return true;
@@ -568,7 +516,6 @@ static bool ig9_run_batch(uint32_t dwords, uint32_t timeout_us)
             if (*slot == seqno) {
                 break;
             }
-            ig9_engine_dump("request timeout");
             return false;
         }
     }
@@ -585,7 +532,6 @@ static bool ig9_run_batch(uint32_t dwords, uint32_t timeout_us)
             if (ig9_deadline_expired(&d)) {
                 if (!s_eng.idle_event_missing_logged) {
                     s_eng.idle_event_missing_logged = true;
-                    ig9_engine_dump("no ACTIVE_IDLE event after breadcrumb");
                 }
                 break;
             }
@@ -593,7 +539,6 @@ static bool ig9_run_batch(uint32_t dwords, uint32_t timeout_us)
     } else if (!ig9_wait_reg(IG9_RING_HEAD(BCS), IG9_RING_HEAD_ADDR_MASK,
                              s_eng.tail & IG9_RING_HEAD_ADDR_MASK,
                              IG9_IDLE_TIMEOUT_US)) {
-        ig9_engine_dump("ring did not drain after breadcrumb");
     }
     return true;
 }
@@ -656,12 +601,10 @@ static bool ig9_selftest_store(void)
     b[n++] = marker;
     b[n++] = IG9_MI_BATCH_BUFFER_END;
     if (!ig9_run_batch(n, IG9_REQUEST_TIMEOUT_US)) {
-        ig9_log("[IntelGen9] selftest: store request did not complete\n");
         return false;
     }
     ig9_clflush_range(s_eng.test.virt, 64u);
     if (dst[0] != marker) {
-        ig9_log_val("selftest: store wrote", dst[0]);
         return false;
     }
     return true;
@@ -684,7 +627,6 @@ static bool ig9_selftest_fill(void)
                                     7u, 2u, 20u, 5u, color);
     b[n++] = IG9_MI_BATCH_BUFFER_END;
     if (!ig9_run_batch(n, IG9_REQUEST_TIMEOUT_US)) {
-        ig9_log("[IntelGen9] selftest: fill request did not complete\n");
         return false;
     }
     ig9_clflush_range(s_eng.test.virt, IG9_PAGE_BYTES);
@@ -693,15 +635,6 @@ static bool ig9_selftest_fill(void)
             bool inside = x >= 7u && x < 27u && y >= 2u && y < 7u;
             uint32_t want = inside ? color : bg;
             if (px[y * stride + x] != want) {
-                ig9_log("[IntelGen9] selftest: fill mismatch at (");
-                ig9_log_dec(x);
-                ig9_log(",");
-                ig9_log_dec(y);
-                ig9_log(") got 0x");
-                ig9_log_hex(px[y * stride + x]);
-                ig9_log(" want 0x");
-                ig9_log_hex(want);
-                ig9_log("\n");
                 return false;
             }
         }
@@ -729,7 +662,6 @@ static bool ig9_selftest_copy(void)
     uint32_t n = ig9_emit_copy_blt(b, &d, &s, 3u, 9u, 21u, 3u);
     b[n++] = IG9_MI_BATCH_BUFFER_END;
     if (!ig9_run_batch(n, IG9_REQUEST_TIMEOUT_US)) {
-        ig9_log("[IntelGen9] selftest: copy request did not complete\n");
         return false;
     }
     ig9_clflush_range(s_eng.test.virt, IG9_PAGE_BYTES);
@@ -739,15 +671,6 @@ static bool ig9_selftest_copy(void)
             bool inside = x >= 3u && x < 24u && y >= 9u && y < 12u;
             uint32_t want = inside ? (0x10000000u + i * 0x01010101u) : bg;
             if (dst[i] != want) {
-                ig9_log("[IntelGen9] selftest: copy mismatch at (");
-                ig9_log_dec(x);
-                ig9_log(",");
-                ig9_log_dec(y);
-                ig9_log(") got 0x");
-                ig9_log_hex(dst[i]);
-                ig9_log(" want 0x");
-                ig9_log_hex(want);
-                ig9_log("\n");
                 return false;
             }
         }
@@ -773,23 +696,12 @@ static bool ig9_selftests(void)
 
 static bool ig9_try_mode(ig9_submit_mode_t mode)
 {
-    const char *name = (mode == IG9_SUBMIT_EXECLISTS) ? "execlists"
-                                                      : "legacy ring";
     if (!ig9_mode_start(mode)) {
-        ig9_log("[IntelGen9] engine: ");
-        ig9_log(name);
-        ig9_log(" enable failed\n");
         return false;
     }
     if (!ig9_selftests()) {
-        ig9_log("[IntelGen9] engine: ");
-        ig9_log(name);
-        ig9_log(" self-tests failed\n");
         return false;
     }
-    ig9_log("[IntelGen9] engine: ");
-    ig9_log(name);
-    ig9_log(" submission verified (store, fill, copy)\n");
     return true;
 }
 
@@ -807,15 +719,6 @@ ig9_submit_mode_t ig9_engine_mode(void)
     return s_eng.ready ? s_eng.mode : IG9_SUBMIT_NONE;
 }
 
-const char *ig9_engine_mode_name(void)
-{
-    switch (ig9_engine_mode()) {
-    case IG9_SUBMIT_EXECLISTS:   return "execlists";
-    case IG9_SUBMIT_LEGACY_RING: return "legacy-ring";
-    default:                     return "none";
-    }
-}
-
 bool ig9_engine_init(void)
 {
     if (s_eng.ready) {
@@ -823,7 +726,6 @@ bool ig9_engine_init(void)
     }
     if (!s_eng.fw_held) {
         if (!ig9_forcewake_get(IG9_FW_GT)) {
-            ig9_log("[IntelGen9] engine: GT forcewake unavailable\n");
             return false;
         }
         s_eng.fw_held = true;
@@ -860,13 +762,11 @@ bool ig9_engine_init(void)
 static void ig9_engine_recover(void)
 {
     ++s_eng.hangs;
-    ig9_log_val("engine: hang, recovery attempt", s_eng.hangs);
     ig9_submit_mode_t mode = s_eng.mode;
     if (s_eng.hangs >= IG9_MAX_HANGS || !ig9_engine_reset() ||
         !ig9_mode_start(mode)) {
         s_eng.ready = false;
         s_eng.mode = IG9_SUBMIT_NONE;
-        ig9_log("[IntelGen9] engine: disabled for this boot\n");
     }
 }
 

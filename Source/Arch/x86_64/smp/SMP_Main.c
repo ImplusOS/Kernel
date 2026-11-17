@@ -2,7 +2,6 @@
 #include "cpu/GDT_Main.h"
 #include "cpu/IDT_Main.h"
 #include "mmu/Paging_Main.h"
-#include "Debug/serial/Serial.h"
 
 #include "kernel/config.h"
 #include "Platform/acpi/ACPI.h"
@@ -108,15 +107,6 @@ static volatile uint32_t g_tlb_inflight;
 /* Bring-up instrumentation for the shootdown cost. Enabled with
  * -DTLB_STATS=1; the counters are relaxed atomics and the dump is rate
  * limited, so it costs nothing measurable. */
-#ifndef TLB_STATS
-#define TLB_STATS 0
-#endif
-#if TLB_STATS
-static volatile uint64_t g_tlb_calls;   /* requests made */
-static volatile uint64_t g_tlb_ipis;    /* of those, ones that needed an IPI */
-static volatile uint64_t g_tlb_spins;   /* total spin iterations waiting */
-static volatile uint64_t g_tlb_maxspin; /* worst single wait */
-#endif
 
 extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
@@ -528,9 +518,6 @@ void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
     if (me >= (uint32_t)OS_CONFIG_SMP_MAX_CPUS) {
         me = 0;
     }
-#if TLB_STATS
-    __atomic_fetch_add(&g_tlb_calls, 1u, __ATOMIC_RELAXED);
-#endif
 
     /* This CPU's own flush happens either way. */
     if (pages == 0u) {
@@ -571,9 +558,6 @@ void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
     __atomic_fetch_add(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlb_slot[me].seq, seq, __ATOMIC_RELEASE);
 
-#if TLB_STATS
-    __atomic_fetch_add(&g_tlb_ipis, 1u, __ATOMIC_RELAXED);
-#endif
     lapic_send_ipi(0, (3u << 18) | (uint32_t)VECTOR_TLB_SHOOTDOWN);
 
     for (uint32_t spins = 0; spins < TLB_ACK_SPIN_LIMIT; ++spins) {
@@ -586,24 +570,6 @@ void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
             }
         }
         if (!pending) {
-#if TLB_STATS
-            __atomic_fetch_add(&g_tlb_spins, (uint64_t)spins, __ATOMIC_RELAXED);
-            if ((uint64_t)spins > __atomic_load_n(&g_tlb_maxspin, __ATOMIC_RELAXED)) {
-                __atomic_store_n(&g_tlb_maxspin, (uint64_t)spins, __ATOMIC_RELAXED);
-            }
-            uint64_t n = __atomic_load_n(&g_tlb_ipis, __ATOMIC_RELAXED);
-            if ((n & 0xFFu) == 0u) {
-                serial_write_string("[tlbstat] calls=");
-                serial_write_uint64(__atomic_load_n(&g_tlb_calls, __ATOMIC_RELAXED));
-                serial_write_string(" ipis=");
-                serial_write_uint64(n);
-                serial_write_string(" spins=");
-                serial_write_uint64(__atomic_load_n(&g_tlb_spins, __ATOMIC_RELAXED));
-                serial_write_string(" max=");
-                serial_write_uint64(__atomic_load_n(&g_tlb_maxspin, __ATOMIC_RELAXED));
-                serial_write_string("\n");
-            }
-#endif
             __atomic_fetch_sub(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
             return;
         }
@@ -612,19 +578,6 @@ void smp_tlb_shootdown_cr3(uint64_t cr3, uint64_t vaddr, uint64_t pages)
         __asm__ volatile("pause" ::: "memory");
     }
 
-    /* Timed out. Report it once in a while: reaching here means a CPU stopped
-     * answering, and the memory this shootdown was protecting is no longer
-     * protected. */
-    {
-        static volatile uint32_t reported;
-        if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) < 8u) {
-            serial_write_string("[tlb] ack timeout cpu=");
-            serial_write_uint32(me);
-            serial_write_string(" cr3=");
-            serial_write_uint64(cr3);
-            serial_write_string("\n");
-        }
-    }
     __atomic_fetch_sub(&g_tlb_inflight, 1u, __ATOMIC_RELAXED);
 }
 

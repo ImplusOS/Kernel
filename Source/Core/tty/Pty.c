@@ -9,7 +9,6 @@
 #include "Core/sync/Spinlock.h"
 #include "Core/syscall/Syscall_File.h"
 #include "Core/usercopy/Usercopy.h"
-#include "Debug/serial/Serial.h"
 
 /* ---- sizing ------------------------------------------------------------- */
 
@@ -637,43 +636,6 @@ static uint32_t pty_slave_readable_locked(const pty_t *pty)
     return pty->eof_pending != 0u ? pty->in_count : 0u;
 }
 
-/* ---- bring-up trace ------------------------------------------------------ */
-
-/* The first few transfers in each direction, with the bytes shown. A terminal
- * that comes up blank has exactly two possible causes -- the shell never wrote
- * a prompt, or the emulator never read it -- and nothing outside the pty can
- * tell them apart. Capped hard: COM1 is driven one character per syscall from
- * inside the syscall path, so an uncapped trace changes the timing it is
- * measuring. */
-#define PTY_TRACE_MAX 6u
-
-static void pty_trace_bytes(const char *what, int32_t index,
-                            const uint8_t *data, uint32_t length)
-{
-    static uint32_t emitted;
-    if (!OS_CONFIG_FOREIGN_TRACE || emitted >= PTY_TRACE_MAX) {
-        return;
-    }
-    emitted += 1u;
-    serial_write_string("[pty] ");
-    serial_write_string(what);
-    serial_write_string(" pair=");
-    serial_write_uint32((uint32_t)index);
-    serial_write_string(" n=");
-    serial_write_uint32(length);
-    serial_write_string(" \"");
-    uint32_t show = length < 24u ? length : 24u;
-    for (uint32_t i = 0; i < show; ++i) {
-        uint8_t c = data[i];
-        if (c >= 32u && c < 127u) {
-            serial_write_char((char)c);
-        } else {
-            serial_write_char('.');
-        }
-    }
-    serial_write_string("\"\n");
-}
-
 /* ---- read / write -------------------------------------------------------- */
 
 static int pty_signal_is_pending(void)
@@ -765,8 +727,6 @@ int64_t pty_read(int32_t index, int is_master, uint8_t *user_buffer,
             if (staged_count == 0u) {
                 return immediate;
             }
-            pty_trace_bytes(is_master ? "master read" : "slave read",
-                            index, staged, staged_count);
             if (copy_to_user(user_buffer, staged, staged_count) != 0u) {
                 return PTY_ERR_FAULT;
             }
@@ -869,8 +829,6 @@ int64_t pty_write(int32_t index, int is_master, const uint8_t *kernel_buffer,
         irq_restore(irq_flags);
 
         if (written > 0u) {
-            pty_trace_bytes(is_master ? "master write" : "slave write",
-                            index, kernel_buffer, (uint32_t)written);
             /* The other end of the pty is now readable. */
             poll_wait_notify();
         }
@@ -1162,13 +1120,6 @@ int64_t pty_ioctl(int32_t index, int is_master, uint64_t request, uint64_t arg)
             /* Logged because an unimplemented terminal ioctl is invisible
              * otherwise: the caller just gets ENOTTY and decides the fd is not
              * a terminal, which is how a whole terminal emulator gives up. */
-            if (OS_CONFIG_FOREIGN_TRACE) {
-                serial_write_string("[pty] unhandled ioctl req=");
-                serial_write_uint64(request);
-                serial_write_string(" pair=");
-                serial_write_uint32((uint32_t)index);
-                serial_write_string(is_master ? " master\n" : " slave\n");
-            }
             result = PTY_ERR_NOTTY;
             break;
     }

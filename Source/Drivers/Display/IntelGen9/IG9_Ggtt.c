@@ -121,7 +121,6 @@ bool ig9_ggtt_init(void)
 
     uint32_t ggms = ig9_read_ggms();
     if (ggms == 0u) {
-        ig9_log("[IntelGen9] ggtt: GMCH_CTRL.GGMS is 0 (GTT disabled)\n");
         return false;
     }
 
@@ -133,7 +132,6 @@ bool ig9_ggtt_init(void)
     }
     uint32_t entries = (uint32_t)(table_bytes / IG9_GGTT_PTE_BYTES);
     if (entries < IG9_GGTT_PRIVATE_ENTRIES * 4u) {
-        ig9_log_val("ggtt: table too small, entries", entries);
         return false;
     }
 
@@ -155,8 +153,6 @@ bool ig9_ggtt_init(void)
         }
         if (uniform) {
             s_empty_pte = last;
-            ig9_log_val("ggtt: unused entries point at scratch pte",
-                        (uint32_t)last);
         }
     }
 
@@ -164,13 +160,6 @@ bool ig9_ggtt_init(void)
     ig9_memset(s_maps, 0, sizeof(s_maps));
     s_ready = true;
 
-    ig9_log("[IntelGen9] ggtt: ");
-    ig9_log_dec(entries);
-    ig9_log(" entries (");
-    ig9_log_dec((uint32_t)(((uint64_t)entries * IG9_PAGE_BYTES) >> 20));
-    ig9_log(" MiB), private window at 0x");
-    ig9_log_hex(s_private_first * IG9_PAGE_BYTES);
-    ig9_log("\n");
     return true;
 }
 
@@ -292,7 +281,6 @@ bool ig9_ggtt_map(const void *virt, uint64_t phys, uint64_t bytes,
         uint64_t p = ig9_page_phys(virt, phys, i);
         if (p == 0u || (p & (IG9_PAGE_BYTES - 1u)) != 0u ||
             (p & ~IG9_GGTT_PTE_ADDR_MASK) != 0u) {
-            ig9_log_val("ggtt: unmappable page, phys lo", (uint32_t)p);
             return false;
         }
     }
@@ -322,7 +310,6 @@ bool ig9_ggtt_map(const void *virt, uint64_t phys, uint64_t bytes,
     }
     if (slot_first == UINT32_MAX) {
         ig9_spin_unlock(&s_lock);
-        ig9_log("[IntelGen9] ggtt: private window exhausted\n");
         return false;
     }
 
@@ -349,7 +336,6 @@ bool ig9_ggtt_map(const void *virt, uint64_t phys, uint64_t bytes,
         /* Keep the range reserved: its state could not be proven. */
         ig9_slots_set(slot_first, needed, true);
         ig9_spin_unlock(&s_lock);
-        ig9_log("[IntelGen9] ggtt: PTE readback mismatch, range quarantined\n");
         return false;
     }
 
@@ -392,9 +378,6 @@ bool ig9_ggtt_unmap(uint32_t ggtt)
         }
         map->used = false;
         ig9_spin_unlock(&s_lock);
-        if (!cleared) {
-            ig9_log("[IntelGen9] ggtt: PTE clear failed, range quarantined\n");
-        }
         return cleared;
     }
     ig9_spin_unlock(&s_lock);

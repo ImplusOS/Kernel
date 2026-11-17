@@ -149,50 +149,6 @@ static uint8_t g_usb_hub_count = 0;
 usb_hc_type_t usb_get_hc_type(void) { return g_hc_type; }
 usb_hc_type_t usb_get_device_hc_type(uint8_t addr) { return g_dev_hc[addr]; }
 
-/* Four hex digits over COM1. serial_write_uint32() through the module vtable
- * would pad every id to eight, and a vid/pid pair is read often enough here to
- * be worth the six lines. */
-static void usb_log_hex16(uint16_t value)
-{
-    static const char digits[] = "0123456789ABCDEF";
-    if (g_api == NULL || g_api->serial_write_char == NULL) {
-        return;
-    }
-    for (int shift = 12; shift >= 0; shift -= 4) {
-        g_api->serial_write_char(digits[(value >> shift) & 0xFu]);
-    }
-}
-
-static void usb_log_string(const char *str)
-{
-    if (g_api == NULL || g_api->serial_write_string == NULL) {
-        return;
-    }
-    g_api->serial_write_string(str);
-}
-
-static void usb_log_u32(uint32_t value)
-{
-    char buf[10];
-    int pos = 0;
-
-    if (value == 0u) {
-        usb_log_string("0");
-        return;
-    }
-    while (value > 0u && pos < (int)sizeof(buf)) {
-        buf[pos++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    }
-    while (pos > 0) {
-        if (g_api != NULL && g_api->serial_write_char != NULL) {
-            g_api->serial_write_char(buf[--pos]);
-        } else {
-            --pos;
-        }
-    }
-}
-
 static void usb_publish_hid_event(uint32_t device_class,
                                   uint16_t action,
                                   const char *device_name,
@@ -725,23 +681,6 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
                                            configured ? 150u : 300u));
     }
 
-    /* One line per enumerated device. Without it a device no driver claims
-     * leaves no trace at all on COM1 -- the only channel a real-hardware boot
-     * can be read from -- which made "the adapter is not recognised"
-     * impossible to tell apart from "the adapter never enumerated". */
-    if (g_api != NULL && g_api->serial_write_string != NULL) {
-        g_api->serial_write_string("[USB] dev vid=");
-        usb_log_hex16(desc.idVendor);
-        g_api->serial_write_string(" pid=");
-        usb_log_hex16(desc.idProduct);
-        g_api->serial_write_string(configured ? " configured" : " NOT-configured");
-        g_api->serial_write_string(" vendor-ifaces=");
-        if (g_api->serial_write_char != NULL) {
-            g_api->serial_write_char((char)('0' + (vendor_iface_count & 0x7u)));
-        }
-        g_api->serial_write_string("\n");
-    }
-
     if (configured && g_api != NULL && g_api->bus.report_device != NULL) {
         for (uint32_t v = 0u; v < vendor_iface_count; ++v) {
             const struct usb_vendor_iface *vi = &vendor_ifaces[v];
@@ -780,11 +719,7 @@ static bool usb_enumerate_device(uint8_t current_addr, usb_hc_type_t port_hc,
              * manifest (DriverDB.txt) and loads it, and holds the device for
              * one replay when it lands before the VFS is mounted, which at
              * boot it always does. */
-            bool claimed = g_api->bus.report_device(&bus_dev);
-            if (g_api->serial_write_string != NULL) {
-                g_api->serial_write_string(claimed ? "[USB]   vendor iface claimed\n"
-                                                   : "[USB]   vendor iface unclaimed\n");
-            }
+            (void)g_api->bus.report_device(&bus_dev);
         }
     }
 
@@ -1350,23 +1285,8 @@ static bool usb_enumerate_root_port_once(usb_hc_type_t hc, uint32_t port)
 
 static bool usb_enumerate_root_port(usb_hc_type_t hc, uint32_t port)
 {
-    uint32_t start_ms = usb_now_ms();
     bool ok = usb_enumerate_root_port_once(hc, port);
     usb_root_port_state_t *state = usb_root_port_state(hc, port);
-
-    /* A port that answers normally is done in tens of milliseconds. Anything
-     * slower is either a settling device (fine) or a port that will never
-     * answer (the interesting case -- this line is what tells a "boot takes a
-     * minute" report which port and which controller the minute went to). */
-    if (usb_deadline_passed(start_ms, 150u)) {
-        usb_log_string(ok ? "[USB] slow port hc=" : "[USB] dead port hc=");
-        usb_log_u32((uint32_t)hc);
-        usb_log_string(" p=");
-        usb_log_u32(port);
-        usb_log_string(" ");
-        usb_log_u32((uint32_t)(usb_now_ms() - start_ms));
-        usb_log_string("ms\n");
-    }
 
     if (!ok && state != NULL && state->enum_failures < 0xFFu &&
         usb_hc_port_valid(hc, port) && usb_hc_port_connected(hc, port)) {
@@ -1439,8 +1359,6 @@ rescan:;
      * re-sweep, both of which run where a retry costs wall time nobody is
      * waiting on. */
     uint32_t sweep_start_ms = usb_now_ms();
-    uint32_t ports_tried = 0u;
-    uint32_t ports_failed = 0u;
     bool budget_stopped = false;
 
     for (int pass = 0; pass < 3; pass++) {
@@ -1470,10 +1388,7 @@ rescan:;
                     budget_stopped = true;
                     break;
                 }
-                ++ports_tried;
-                if (!usb_enumerate_root_port(cur_hc, i)) {
-                    ++ports_failed;
-                }
+                (void)usb_enumerate_root_port(cur_hc, i);
             }
             if (budget_stopped) break;
         }
@@ -1486,18 +1401,6 @@ rescan:;
 
         if (bot_get_device_count() != 0) break;
     }
-
-    /* One line per sweep. This is the number a boot-time complaint about
-     * input_init needs: whether the time is here, how many ports had to be
-     * tried, and whether the budget cut the sweep short (which is the only
-     * case where a device can be missing until the post-boot poll). */
-    usb_log_string("[USB] sweep tried=");
-    usb_log_u32(ports_tried);
-    usb_log_string(" failed=");
-    usb_log_u32(ports_failed);
-    usb_log_string(" ");
-    usb_log_u32((uint32_t)(usb_now_ms() - sweep_start_ms));
-    usb_log_string(budget_stopped ? "ms budget-stop\n" : "ms done\n");
 }
 
 static bool usb_poll_hc_hotplug(usb_hc_type_t hc)
@@ -1721,11 +1624,6 @@ static void usb_master_init(void)
     }
     g_usb_initialized = true;
 
-    /* This whole function runs inside the kernel's input_init phase, so its
-     * duration is the phase's duration minus PS/2. One line at the end is
-     * what a boot-time complaint about input_init is measured against. */
-    uint32_t start_ms = usb_now_ms();
-
     if (g_api) g_api->memset(g_dev_hc, 0, sizeof(g_dev_hc));
     g_default_hc = USB_HC_NONE;
 
@@ -1752,16 +1650,8 @@ static void usb_master_init(void)
         usb_set_hc_type(USB_HC_UHCI);
     }
 
-    uint32_t controllers_done_ms = usb_now_ms();
-
     usb_hid_init();
     usb_core_init();
-
-    usb_log_string("[USB] init ");
-    usb_log_u32((uint32_t)(usb_now_ms() - start_ms));
-    usb_log_string("ms (hc-wait ");
-    usb_log_u32((uint32_t)(controllers_done_ms - start_ms));
-    usb_log_string("ms)\n");
 }
 
 static bool usb_storage_init(void)

@@ -9,7 +9,6 @@
 #include "Network/network_utils.h"
 #include "Core/sync/Spinlock.h"
 #include "Core/timer/Timer.h"
-#include "Debug/serial/Serial.h"
 
 #define TCP_HEADER_BYTES_MIN 20u
 #define TCP_MAX_PAYLOAD      1460u
@@ -983,29 +982,6 @@ uint32_t tcp_poll(int32_t conn_id, uint32_t events)
     return ready;
 }
 
-#ifndef TCP_STALL_DUMP
-#define TCP_STALL_DUMP 0
-#endif
-#if TCP_STALL_DUMP
-#include <stdio.h>
-static void tcp_dump_connections_locked(void)
-{
-    for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
-        const tcp_connection_t *c = &g_tcp_connections[i];
-        if (c->in_use == 0u || c->state == TCP_STATE_LISTEN) continue;
-        char line[200];
-        snprintf(line, sizeof(line),
-                 "[tcp] #%u st=%d rport=%u rcv_nxt=%u rq=%u rwnd=%u snd_una=%u snd_nxt=%u sq=%u swnd=%u rtx=%u\n",
-                 (unsigned)i, (int)c->state, (unsigned)c->remote_port,
-                 (unsigned)(c->rcv_nxt - c->irs), (unsigned)c->recv_count,
-                 (unsigned)c->rcv_wnd, (unsigned)(c->snd_una - c->iss),
-                 (unsigned)(c->snd_nxt - c->iss), (unsigned)c->send_count,
-                 (unsigned)c->snd_wnd, (unsigned)c->retransmit_count);
-        serial_write_string(line);
-    }
-}
-#endif
-
 void tcp_process_timer(void)
 {
     uint32_t hz = timer_hz();
@@ -1018,15 +994,6 @@ void tcp_process_timer(void)
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_tcp_lock);
 
-#if TCP_STALL_DUMP
-    {
-        static uint64_t last_dump;
-        if (now - last_dump >= (uint64_t)hz * 15u) {
-            last_dump = now;
-            tcp_dump_connections_locked();
-        }
-    }
-#endif
 
     for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; ++i) {
         tcp_connection_t *c = &g_tcp_connections[i];

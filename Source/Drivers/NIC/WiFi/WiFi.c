@@ -603,8 +603,6 @@ bool wifi_init(void)
     spinlock_unlock(&g_wifi.lock);
     irq_restore(irq_flags);
 
-    serial_write_string("[WiFi] init: controller found; hardware bring-up not yet implemented "
-                         "(driver foundation build)\n");
     return true;
 }
 

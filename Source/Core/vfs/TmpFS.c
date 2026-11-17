@@ -5,7 +5,6 @@
 
 #include "Core/sync/Spinlock.h"
 #include "Core/memory/SharedMemory.h"
-#include "Debug/serial/Serial.h"
 #include "kernel/config.h"
 #include "MemoryManagement/Memory_Main.h"
 
@@ -96,66 +95,6 @@ static const vfs_driver_t g_tmpfs_vfs_driver;
 
 static tmpfs_slot_t g_tmpfs_slots[TMPFS_MAX_FILES];
 
-/* How full the shared table gets. Logged at each new multiple-of-32 high-water
- * mark, and once if it ever fills, so a boot says whether the limit is still
- * in reach. Callers hold g_tmpfs_lock. */
-extern void serial_write_string(const char *str);
-extern void serial_write_uint32(uint32_t value);
-static uint32_t g_tmpfs_slots_used;
-static uint32_t g_tmpfs_slots_peak;
-static bool g_tmpfs_full_reported;
-
-/* These notification helpers only update state while g_tmpfs_lock is held.
- * Never write the serial log here: serial file logging appends to
- * /tmp/Kernel.log and therefore re-enters this same lock. */
-static bool tmpfs_note_claim_locked(uint32_t *peak_out)
-{
-    ++g_tmpfs_slots_used;
-    if (g_tmpfs_slots_used > g_tmpfs_slots_peak) {
-        g_tmpfs_slots_peak = g_tmpfs_slots_used;
-        if ((g_tmpfs_slots_peak % 32u) == 0u) {
-            if (peak_out != NULL) {
-                *peak_out = g_tmpfs_slots_peak;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-static void tmpfs_note_release_locked(void)
-{
-    if (g_tmpfs_slots_used > 0u) {
-        --g_tmpfs_slots_used;
-    }
-}
-
-static bool tmpfs_note_full_locked(void)
-{
-    if (g_tmpfs_full_reported) {
-        return false;
-    }
-    g_tmpfs_full_reported = true;
-    return true;
-}
-
-static void tmpfs_log_slots_reached(uint32_t peak)
-{
-    serial_write_string("[tmpfs] slots in use reached ");
-    serial_write_uint32(peak);
-    serial_write_string(" of ");
-    serial_write_uint32(TMPFS_MAX_FILES);
-    serial_write_string("\n");
-}
-
-static void tmpfs_log_full(const char *path)
-{
-    serial_write_string("[tmpfs] table full (");
-    serial_write_uint32(TMPFS_MAX_FILES);
-    serial_write_string(" slots) creating ");
-    serial_write_string(path);
-    serial_write_string("\n");
-}
 static spinlock_t g_tmpfs_lock;
 
 static tmpfs_slot_t *tmpfs_find_locked(const char *path)
@@ -407,9 +346,6 @@ static bool tmpfs_vfs_creat(const char *path)
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return false;
     }
-    bool report_peak = false;
-    uint32_t peak = 0u;
-    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) != NULL) {
         spinlock_unlock(&g_tmpfs_lock);
@@ -419,21 +355,13 @@ static bool tmpfs_vfs_creat(const char *path)
         if (!g_tmpfs_slots[i].in_use) {
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
-            report_peak = tmpfs_note_claim_locked(&peak);
             g_tmpfs_slots[i].mode = TMPFS_MODE_FILE;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
             spinlock_unlock(&g_tmpfs_lock);
-            if (report_peak) {
-                tmpfs_log_slots_reached(peak);
-            }
             return true;
         }
     }
-    report_full = tmpfs_note_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
-    if (report_full) {
-        tmpfs_log_full(path);
-    }
     return false;
 }
 
@@ -448,36 +376,21 @@ static bool tmpfs_vfs_mkdir(const char *path)
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return false;
     }
-    bool report_peak = false;
-    uint32_t peak = 0u;
-    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) == NULL) {
-        bool recorded = false;
         for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
             if (g_tmpfs_slots[i].in_use) {
                 continue;
             }
             memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
             g_tmpfs_slots[i].in_use = 1;
-            report_peak = tmpfs_note_claim_locked(&peak);
             g_tmpfs_slots[i].is_dir = 1;
             g_tmpfs_slots[i].mode = TMPFS_MODE_DIR;
             strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
-            recorded = true;
             break;
-        }
-        if (!recorded) {
-            report_full = tmpfs_note_full_locked();
         }
     }
     spinlock_unlock(&g_tmpfs_lock);
-    if (report_peak) {
-        tmpfs_log_slots_reached(peak);
-    }
-    if (report_full) {
-        tmpfs_log_full(path);
-    }
     return true;
 }
 
@@ -577,32 +490,11 @@ static bool tmpfs_is_dir_locked(const char *path)
     return false;
 }
 
-static bool g_tmpfs_dir_handles_full_reported = false;
-
-static bool tmpfs_note_dir_handles_full_locked(void)
-{
-    if (g_tmpfs_dir_handles_full_reported) {
-        return false;
-    }
-    g_tmpfs_dir_handles_full_reported = true;
-    return true;
-}
-
-static void tmpfs_log_dir_handles_full(const char *path)
-{
-    serial_write_string("[tmpfs] all ");
-    serial_write_uint32(TMPFS_DIR_HANDLE_MAX);
-    serial_write_string(" directory handles in use, opendir failed for ");
-    serial_write_string(path);
-    serial_write_string("\n");
-}
-
 static int32_t tmpfs_vfs_opendir(const char *path)
 {
     if (!tmpfs_path_ok(path) || strlen(path) >= TMPFS_PATH_MAX) {
         return -1;
     }
-    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (!tmpfs_is_dir_locked(path)) {
         spinlock_unlock(&g_tmpfs_lock);
@@ -626,11 +518,7 @@ static int32_t tmpfs_vfs_opendir(const char *path)
     /* Out of handles. Worth a line: the caller above sees only "-1", and the
      * syscall layer turns that into ENOENT, so without this the symptom is an
      * existing directory that stat() says is not there. */
-    report_full = tmpfs_note_dir_handles_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
-    if (report_full) {
-        tmpfs_log_dir_handles_full(path);
-    }
     return -1;
 }
 
@@ -693,7 +581,6 @@ static void tmpfs_free_slot_locked(tmpfs_slot_t *slot)
         (void)shared_memory_release(slot->shm_handle);
     }
     memset(slot, 0, sizeof(*slot));
-    tmpfs_note_release_locked();
 }
 
 static bool tmpfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
@@ -728,31 +615,6 @@ static bool tmpfs_vfs_close_file(vfs_file_t *file)
     return true;
 }
 
-/* Rate-limited diagnosis for a MAP_SHARED file mapping that could not be
- * turned into shared pages. Without the reason the caller only reports a
- * silent private copy, which is what a cross-process buffer looks like after
- * its first write. */
-static void tmpfs_share_fail_log(const char *why, const tmpfs_slot_t *slot,
-                                 uint64_t length)
-{
-    static uint32_t budget = 32u;
-    if (budget == 0u) {
-        return;
-    }
-    --budget;
-    serial_write_string("[tmpfs] share_map ");
-    serial_write_string(why);
-    serial_write_string(" path=");
-    serial_write_string(slot->path[0] != '\0' ? slot->path : "(unlinked)");
-    serial_write_string(" size=");
-    serial_write_uint32(slot->size);
-    serial_write_string(" shm_size=");
-    serial_write_uint32(slot->shm_size);
-    serial_write_string(" len=");
-    serial_write_uint64(length);
-    serial_write_string("\n");
-}
-
 int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
 {
     /* Identify tmpfs by its share_map hook, not by the address of
@@ -776,16 +638,12 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
     }
     if (slot->shm_handle > 0) {
         int32_t existing = length <= (uint64_t)slot->shm_size ? slot->shm_handle : -1;
-        if (existing < 0) {
-            tmpfs_share_fail_log("too-small", slot, length);
-        }
         spinlock_unlock(&g_tmpfs_lock);
         return existing;
     }
     uint64_t want = slot->size > length ? (uint64_t)slot->size : length;
     spinlock_unlock(&g_tmpfs_lock);
     if (want == 0u || want > 64ull * 1024ull * 1024ull) {
-        tmpfs_share_fail_log("bad-size", slot, length);
         return -1;
     }
 
@@ -793,7 +651,6 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
      * nobody else shared (or removed) the slot meanwhile. */
     int32_t handle = shared_memory_create((uint32_t)want);
     if (handle <= 0) {
-        tmpfs_share_fail_log("create", slot, length);
         return -1;
     }
     (void)shared_memory_set_public(handle);
@@ -803,9 +660,6 @@ int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length)
         (uint64_t)slot->size > want) {
         int32_t existing = (slot->in_use && slot->shm_handle > 0 &&
                             length <= (uint64_t)slot->shm_size) ? slot->shm_handle : -1;
-        if (existing < 0) {
-            tmpfs_share_fail_log("race", slot, length);
-        }
         spinlock_unlock(&g_tmpfs_lock);
         (void)shared_memory_release(handle);
         return existing;
@@ -859,9 +713,6 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
     if (target_len == 0u || target_len >= TMPFS_PATH_MAX) {
         return false;
     }
-    bool report_peak = false;
-    uint32_t peak = 0u;
-    bool report_full = false;
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(linkpath) != NULL) {
         spinlock_unlock(&g_tmpfs_lock); /* EEXIST -- symlink(2) never replaces */
@@ -878,23 +729,15 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
             return false;
         }
         g_tmpfs_slots[i].in_use = 1;
-        report_peak = tmpfs_note_claim_locked(&peak);
         g_tmpfs_slots[i].is_symlink = 1;
         g_tmpfs_slots[i].mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
         strncpy(g_tmpfs_slots[i].path, linkpath, TMPFS_PATH_MAX - 1u);
         memcpy(g_tmpfs_slots[i].data, target, target_len);
         g_tmpfs_slots[i].size = (uint32_t)target_len;
         spinlock_unlock(&g_tmpfs_lock);
-        if (report_peak) {
-            tmpfs_log_slots_reached(peak);
-        }
         return true;
     }
-    report_full = tmpfs_note_full_locked();
     spinlock_unlock(&g_tmpfs_lock);
-    if (report_full) {
-        tmpfs_log_full(linkpath);
-    }
     return false;
 }
 

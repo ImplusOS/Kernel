@@ -189,31 +189,10 @@
 #define OS_CONFIG_BOOT_FADE_MS 420u
 #endif
 
-/* Per-event tracing of the foreign (Linux-ABI) runtime: every shared-object
- * mmap, every AF_UNIX packet, every signal/exec/exit, and the periodic
- * syscall heartbeat. Invaluable while bringing a binary up, but it is written
- * to COM1 one character at a time from inside the syscall path, so an X
- * server plus a GL client -- which between them mmap ~400 segments and
- * exchange thousands of small packets before the first frame -- spend a large
- * part of their startup inside serial_write_string() -- at 115200 baud every
- * traced byte is ~87us of busy-wait, which no amount of KVM or faster silicon
- * makes cheaper. Off by default; set to 1 for a bring-up boot.
- * See Docs/Others/TODO_Doom_Xorg_MethodA.md. */
-#ifndef OS_CONFIG_FOREIGN_TRACE
-#define OS_CONFIG_FOREIGN_TRACE 0
-#endif
-
-/* Shared-memory handshake trace -- memfd_create, fcntl(F_GETFL),
- * and which branch of linux_mmap() each mapping took. */
-#ifndef SHM_HANDSHAKE_TRACE
-#define SHM_HANDSHAKE_TRACE 0
-#endif
-
 /* Always-on, one-line-per-event log of foreign (Linux-ABI) program launches:
- * exec, the interpreter that will run it, and the exit status. This is what
- * OS_CONFIG_FOREIGN_TRACE's per-syscall firehose is not -- a handful of lines
- * per program rather than thousands, cheap enough to leave on in a release
- * boot, and enough to see *that* an app started and how long it took. Read it
+ * exec, the interpreter that will run it, and the exit status -- a handful of
+ * lines per program, cheap enough to leave on in a release boot, and enough
+ * to see *that* an app started and how long it took. Read it
  * from inside the OS at /dev/kmsg (Core/vfs/DevFS.c). */
 #ifndef OS_CONFIG_FOREIGN_LAUNCH_LOG
 #define OS_CONFIG_FOREIGN_LAUNCH_LOG 1
@@ -237,10 +216,6 @@
  * out when chasing a filesystem bug. */
 #ifndef OS_CONFIG_BLOCK_CACHE
 #define OS_CONFIG_BLOCK_CACHE 1
-#endif
-
-#ifndef OS_CONFIG_DEBUG_PAGE_FAULT_DUMP
-#define OS_CONFIG_DEBUG_PAGE_FAULT_DUMP 0
 #endif
 
 #ifndef OS_CONFIG_SIGNAL_HANDLER_MAX_PER_PROCESS

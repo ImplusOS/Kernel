@@ -40,97 +40,6 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
 
-#ifndef LINUX_CLONE_TRACE
-#define LINUX_CLONE_TRACE 0
-#endif
-
-#ifndef LINUX_SYSCALL_PROFILE
-#define LINUX_SYSCALL_PROFILE 0
-#endif
-#if LINUX_SYSCALL_PROFILE
-/* Which Linux syscalls a foreign program actually spends its life in. Counts
- * only -- the point is to find a syscall being re-run in a loop, and a loop
- * shows up in the count. Dumped over serial every PROFILE_DUMP_EVERY calls,
- * busiest first (and cleared as it prints, so each line is a fresh window). */
-#define PROFILE_MAX_NR      512u
-#define PROFILE_DUMP_EVERY  100000u
-static volatile uint32_t g_prof_count[PROFILE_MAX_NR];
-static volatile uint32_t g_prof_total;
-
-static void linux_syscall_profile(uint64_t nr)
-{
-    if (nr < PROFILE_MAX_NR) {
-        __atomic_fetch_add(&g_prof_count[nr], 1u, __ATOMIC_RELAXED);
-    }
-    uint32_t total = __atomic_add_fetch(&g_prof_total, 1u, __ATOMIC_RELAXED);
-    if (total % PROFILE_DUMP_EVERY != 0u) {
-        return;
-    }
-    serial_write_string("[sysprof] total=");
-    serial_write_uint64((uint64_t)total);
-    for (int rank = 0; rank < 8; ++rank) {
-        uint32_t best = 0, best_nr = 0;
-        for (uint32_t i = 0; i < PROFILE_MAX_NR; ++i) {
-            uint32_t v = __atomic_load_n(&g_prof_count[i], __ATOMIC_RELAXED);
-            if (v > best) { best = v; best_nr = i; }
-        }
-        if (best == 0u) break;
-        serial_write_string(" #");
-        serial_write_uint64((uint64_t)best_nr);
-        serial_write_string("=");
-        serial_write_uint64((uint64_t)best);
-        __atomic_store_n(&g_prof_count[best_nr], 0u, __ATOMIC_RELAXED);
-    }
-    serial_write_string("\n");
-}
-#endif
-
-#ifndef SHM_HANDSHAKE_TRACE
-#define SHM_HANDSHAKE_TRACE 0
-#endif
-#if SHM_HANDSHAKE_TRACE
-/* Temporary bring-up trace for Chromium's shared-memory handshake (memfd ->
- * /proc/self/fd reopen -> fcntl(F_GETFL) access-mode check). Capped so a
- * stuck loop cannot bury the rest of the serial log. */
-static void chrome_shm_trace3(const char *a, uint64_t av, const char *b,
-                              uint64_t bv, const char *c, uint64_t cv)
-{
-    static uint32_t budget = 2000u;
-    if (budget == 0u) return;
-    --budget;
-    serial_write_string("[shmtr] ");
-    serial_write_string(a); serial_write_uint64(av);
-    if (b[0]) { serial_write_string(b); serial_write_uint64(bv); }
-    if (c[0]) { serial_write_string(c); serial_write_uint64(cv); }
-    serial_write_string("\n");
-}
-#endif
-
-#if SHM_HANDSHAKE_TRACE
-/* Which branch of linux_mmap() a file-backed mapping actually took. The memfd
- * and tmpfs paths map live shared pages; anything that falls through to the
- * eager read-in below gets a private snapshot that never writes back until
- * msync, which is invisible from userland until it loses data. */
-static void shm2(const char *what, uint64_t a, uint64_t b, uint64_t c)
-{
-    static uint32_t budget = 2000u;
-    if (budget == 0u) return;
-    --budget;
-    serial_write_string("[shm2] ");
-    serial_write_string(what);
-    serial_write_string(" a=");
-    serial_write_uint64(a);
-    serial_write_string(" b=");
-    serial_write_uint64(b);
-    serial_write_string(" c=");
-    serial_write_uint64(c);
-    serial_write_string("\n");
-}
-#else
-#define shm2(what, a, b, c) ((void)0)
-#endif
-
-
 #define LINUX_EBADF  (-9LL)
 #define LINUX_EFAULT (-14LL)
 #define LINUX_EBUSY  (-16LL)
@@ -826,23 +735,6 @@ int64_t syscall_ioctl_ex(int32_t fd, uint64_t request, uint64_t arg)
     if (syscall_file_is_pty(fd)) {
         return syscall_file_ioctl(fd, request, arg);
     }
-    if (OS_CONFIG_FOREIGN_TRACE &&
-        ((uint32_t)request == LINUX_TIOCGPTN ||
-         (uint32_t)request == LINUX_TIOCSPTLCK)) {
-        /* A pty-only ioctl on an fd the file layer does not consider a pty.
-         * Left in permanently: it is the difference between "the pty layer
-         * refused" and "the fd never became a pty", and nothing else in the
-         * system can tell those apart from userland. */
-        serial_write_string("[pty] pty ioctl on non-pty fd=");
-        serial_write_uint32((uint32_t)fd);
-        serial_write_string(" req=");
-        serial_write_uint64(request);
-        serial_write_string(" checks=");
-        serial_write_uint32(syscall_file_pty_debug(fd));
-        serial_write_string(" pid=");
-        serial_write_uint32((uint32_t)process_get_current_pid());
-        serial_write_char('\n');
-    }
     int64_t tty_rc = linux_ioctl_tty(fd, request, arg);
     if (tty_rc != LINUX_ENOTSUP) {
         return tty_rc;
@@ -971,20 +863,6 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
                 return r < 0 ? 0 : r;
             }
         case LINUX_F_GETFL:
-#if SHM_HANDSHAKE_TRACE
-            {
-                int64_t tr;
-                if (syscall_socket_fd_in_range(fd)) {
-                    int32_t sf = syscall_socket_get_status_flags(fd);
-                    tr = (sf < 0) ? sf : (0x0002 | sf);
-                } else if (unix_socket_fd_in_range(fd)) {
-                    tr = 0x0002 | (unix_socket_is_nonblock(fd) ? 0x0800 : 0);
-                } else {
-                    tr = syscall_file_get_status_flags(fd);
-                }
-                chrome_shm_trace3("F_GETFL fd=", (uint64_t)fd, " -> ", (uint64_t)tr, "", 0);
-            }
-#endif
             /* Socket fds are outside the generic file table; O_NONBLOCK for
              * them is tracked in the socket layer. Report O_RDWR|<nonblock>. */
             if (syscall_socket_fd_in_range(fd)) {
@@ -1002,7 +880,6 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
              * falls back to a temp file -- a path that then trips its own
              * fcntl(F_GETFL) access-mode CHECK. So this has to work. */
             int32_t rc = syscall_memfd_add_seals(fd, (uint32_t)arg);
-            shm2("memfd-seal", (uint64_t)(uint32_t)fd, arg, (uint64_t)(uint32_t)rc);
             if (rc == (int32_t)OS_STATUS_ACCESS_DENIED) return -1LL; /* EPERM */
             return (rc < 0) ? LINUX_EINVAL : 0;
         }
@@ -1696,17 +1573,6 @@ static int64_t linux_copy_cstring(char *out, uint64_t capacity,
     if (copy_from_user_trusted(out, user_ptr, len + 1u) != 0u) {
         return LINUX_EFAULT;
     }
-#ifdef LINUX_SYSCALL_TRACE
-    /* Every path-taking syscall funnels through here, so this is the one place
-     * that can name the file a traced syscall is about. Without it a trace is
-     * a list of pointers and a bring-up boot cannot tell which path failed.
-     * Silent until the trace arms, for the reason given at linux_trace_gate(). */
-    extern bool linux_trace_is_armed(void);
-    if (!linux_trace_is_armed()) return 0;
-    serial_write_string("[lxstr] '");
-    serial_write_string(out);
-    serial_write_string("'\n");
-#endif
     return 0;
 }
 
@@ -1930,120 +1796,6 @@ void linux_compat_mshared_release_pid(int32_t pid)
     }
 }
 
-/* Module map trace. A foreign binary's crash reports a raw RIP, and every
- * shared object it runs from was placed by us -- so without this the only way
- * to turn "RIP 0x410087B004" into "libevdev.so.2+0x1234" is to guess the load
- * base. Records which fd a .so was opened on, then the base each file-backed
- * mmap of that fd got. Two lines per shared object, only for .so files. */
-#define LINUX_MODULE_MAP_TRACE 0
-
-#if LINUX_MODULE_MAP_TRACE
-static int linux_path_is_shared_object(const char *path)
-{
-    uint64_t n = strlen(path);
-    for (uint64_t i = 0; i + 2 < n; ++i) {
-        if (path[i] == '.' && path[i + 1] == 's' && path[i + 2] == 'o' &&
-            (path[i + 3] == '\0' || path[i + 3] == '.')) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Keyed by (pid, fd): Xorg and the Doom client run at the same time and their
- * fd numbers collide, so an fd-only table hands out the wrong module name. */
-static int32_t g_module_map_fds[128];
-static int32_t g_module_map_pids[128];
-static char    g_module_map_names[128][64];
-
-static void linux_module_map_note_open(int32_t fd, const char *path)
-{
-    if (fd < 0 || !linux_path_is_shared_object(path)) return;
-    int32_t pid = process_get_current_pid();
-    uint64_t n = strlen(path);
-    uint64_t start = 0;
-    for (uint64_t i = 0; i < n; ++i) if (path[i] == '/') start = i + 1u;
-    uint32_t slot = 128u;
-    for (uint32_t i = 0; i < 128u; ++i) {
-        if (g_module_map_fds[i] == fd + 1 && g_module_map_pids[i] == pid) {
-            slot = i;
-            break;
-        }
-        if (slot == 128u && g_module_map_fds[i] == 0) slot = i;
-    }
-    if (slot == 128u) return;
-    g_module_map_fds[slot] = fd + 1;
-    g_module_map_pids[slot] = pid;
-    uint64_t j = 0;
-    for (; j < 63u && path[start + j]; ++j) {
-        g_module_map_names[slot][j] = path[start + j];
-    }
-    g_module_map_names[slot][j] = '\0';
-}
-
-static const char *linux_module_map_name(int32_t fd)
-{
-    int32_t pid = process_get_current_pid();
-    for (uint32_t i = 0; i < 128u; ++i) {
-        if (g_module_map_fds[i] == fd + 1 && g_module_map_pids[i] == pid) {
-            return g_module_map_names[i];
-        }
-    }
-    return NULL;
-}
-
-static void linux_module_map_note_mmap(int32_t fd, uint64_t base, uint64_t len,
-                                       uint64_t offset)
-{
-    if (!OS_CONFIG_FOREIGN_TRACE && !SHM_HANDSHAKE_TRACE) {
-        (void)base; (void)len; (void)offset;
-        return;
-    }
-    const char *name = linux_module_map_name(fd);
-    if (name == NULL) return;
-    /* pid= is essential here: Xorg and the Doom client load their modules
-     * concurrently onto the same shared COM1, and a faulting RIP can only be
-     * resolved against the map of the process that faulted. */
-    serial_write_string("[lxmap] pid=");
-    serial_write_uint32((uint32_t)process_get_current_pid());
-    serial_write_char(' ');
-    serial_write_string(name);
-    serial_write_string(" base=");
-    serial_write_uint64(base);
-    serial_write_string(" len=");
-    serial_write_uint64(len);
-    serial_write_string(" off=");
-    serial_write_uint64(offset);
-    serial_write_char('\n');
-}
-#endif
-
-/* Rate-limited report of a MAP_SHARED mapping that could not be backed by
- * shared pages. `why` separates a filesystem that would not publish the file
- * ("share") from a shared object that exists but could not be mapped
- * ("map-new"); the two have completely different fixes. */
-static void linux_mmap_shared_fail_log(const char *why, int32_t fd,
-                                       uint64_t length, int32_t handle)
-{
-    static volatile uint32_t reported;
-    if (__atomic_fetch_add(&reported, 1u, __ATOMIC_RELAXED) >= 32u) {
-        return;
-    }
-    serial_write_string("[mmap] shared MAP_SHARED fell back to a private copy (");
-    serial_write_string(why);
-    serial_write_string("), len=");
-    serial_write_uint64(length);
-    serial_write_string(" fd=");
-    serial_write_uint32((uint32_t)fd);
-    serial_write_string(" handle=");
-    serial_write_uint32((uint32_t)handle);
-    serial_write_string(" maps=");
-    serial_write_uint32(shared_memory_mapping_count(handle));
-    serial_write_string(" objects=");
-    serial_write_uint32(shared_memory_object_count());
-    serial_write_string("\n");
-}
-
 static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                           uint64_t flags, uint64_t fd, uint64_t offset)
 {
@@ -2059,18 +1811,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             (addr & (PAGE_SIZE - 1u)) != 0u) {
             return LINUX_EINVAL;
         }
-#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
-        if (addr <= 0x7FFE0000ULL &&
-            length > 0x7FFE0000ULL - addr) {
-            serial_write_string("[wine-map] shared-page request addr=");
-            serial_write_uint64(addr);
-            serial_write_string(" len=");
-            serial_write_uint64(length);
-            serial_write_string(" flags=");
-            serial_write_uint64(flags);
-            serial_write_char('\n');
-        }
-#endif
         if (addr >= LINUX_USER_MAP_LIMIT ||
             length > LINUX_USER_MAP_LIMIT - addr) {
             return LINUX_ENOMEM;
@@ -2109,19 +1849,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 (pte & (PAGE_PRESENT | PAGE_USER)) == PAGE_PRESENT &&
                 mapped_phys == page &&
                 paging_is_user_shadow_window(page);
-#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
-            if (page == 0x7FFE0000ULL) {
-                serial_write_string("[wine-map] shared-page precheck pte=");
-                serial_write_uint64(pte);
-                serial_write_string(" phys=");
-                serial_write_uint64(mapped_phys);
-                serial_write_string(" allocated=");
-                serial_write_uint64((uint64_t)(int64_t)pmm_page_is_allocated(page));
-                serial_write_string(" available=");
-                serial_write_uint64((uint64_t)identity_mapping_available);
-                serial_write_char('\n');
-            }
-#endif
             if (identity_mapping_available == 0) {
                 return LINUX_EEXIST;
             }
@@ -2171,12 +1898,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 paging_map_user_range_alloc(cr3, addr, length,
                                             PAGE_RW | PAGE_USER);
             if (map_result < 0) {
-#if defined(WINE_MAP_DIAGNOSTIC) && WINE_MAP_DIAGNOSTIC
-                if (addr <= 0x7FFE0000ULL &&
-                    length > 0x7FFE0000ULL - addr) {
-                    serial_write_string("[wine-map] shared-page map failed\n");
-                }
-#endif
                 return LINUX_ENOMEM;
             }
             return (int64_t)addr;
@@ -2246,16 +1967,11 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if (p == NULL) {
                 return LINUX_ENOMEM;
             }
-            shm2("mmap-memfd", (uint64_t)(uint32_t)fd,
-                 (uint64_t)(uint32_t)shm_handle, (uint64_t)(uintptr_t)p);
             return (int64_t)(uintptr_t)p;
         }
         /* Not promoted yet: ftruncate/posix_fallocate never ran (or failed)
          * on this memfd, so a map would fall through to the private snapshot
          * path below and silently diverge from the fd. */
-        if (syscall_file_is_memfd((int32_t)fd)) {
-            shm2("mmap-memfd-unpromoted", (uint64_t)(uint32_t)fd, offset, length);
-        }
     }
 
     /* MAP_SHARED of a file whose filesystem publishes shared pages (Chromium's
@@ -2283,21 +1999,8 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (share_handle > 0) {
             void *p = shared_memory_map_new(share_handle);
             if (p != NULL) {
-                shm2("mmap-tmpfs", (uint64_t)(uint32_t)fd,
-                     (uint64_t)(uint32_t)share_handle, (uint64_t)(uintptr_t)p);
                 return (int64_t)(uintptr_t)p;
             }
-            if (syscall_file_is_shareable((int32_t)fd)) {
-                /* Falling back to a private copy silently breaks whoever
-                 * shares this file; say so. */
-                linux_mmap_shared_fail_log("map-new", (int32_t)fd, length,
-                                           share_handle);
-                shm2("mmap-map-failed", (uint64_t)(uint32_t)fd, length,
-                     (uint64_t)(uint32_t)share_handle);
-            }
-        } else if (syscall_file_is_shareable((int32_t)fd)) {
-            linux_mmap_shared_fail_log("share", (int32_t)fd, length, 0);
-            shm2("mmap-share-failed", (uint64_t)(uint32_t)fd, length, offset);
         }
     }
 
@@ -2368,11 +2071,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 filemap_register(pid, (uint64_t)(uintptr_t)reserved, length,
                                  handle, offset,
                                  PAGE_RW | PAGE_USER) == 0) {
-#if LINUX_MODULE_MAP_TRACE
-                linux_module_map_note_mmap((int32_t)fd,
-                                           (uint64_t)(uintptr_t)reserved,
-                                           length, offset);
-#endif
                 return (int64_t)(uintptr_t)reserved;
             }
             /* Table full or no address space: fall through to the eager path
@@ -2430,19 +2128,6 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                                    (prot & 0x2u /* PROT_WRITE */) != 0u);
         }
     }
-    /* Only worth recording when the file is something a shared mapping
-     * should have covered: a memfd, or a file whose filesystem publishes
-     * shared pages. A plain file mapping through here is normal. */
-    if (syscall_file_is_memfd((int32_t)fd) ||
-        syscall_file_is_shareable((int32_t)fd)) {
-        shm2("mmap-private-snapshot", (uint64_t)(uint32_t)fd, length, offset);
-    }
-#if LINUX_MODULE_MAP_TRACE
-    /* Also on the eager path: an X input/video driver is well under the
-     * lazy-mapping threshold, so it never reaches the branch above. */
-    linux_module_map_note_mmap((int32_t)fd, (uint64_t)(uintptr_t)mapped,
-                               length, offset);
-#endif
     return (int64_t)(uintptr_t)mapped;
 }
 
@@ -2606,61 +2291,6 @@ typedef struct {
     int16_t revents;
 } linux_pollfd_t;
 
-#ifndef PROCESS_STALL_DUMP
-#define PROCESS_STALL_DUMP 0
-#endif
-#if PROCESS_STALL_DUMP
-/* The fd set a thread was last left waiting on, for the stall dump.
- *
- * "Everything is idle and nobody is making progress" is not diagnosable from
- * syscall counts: the question is always which descriptor a thread is waiting
- * on and whether the kernel thinks it is ready. Recorded only on the path
- * where the wait gave up with nothing ready, which is exactly the stalled
- * case. */
-#define LX_POLLTRACE_MAX_FDS 8u
-#define LX_POLLTRACE_MAX_PID 64u
-static uint8_t  g_lx_poll_n[LX_POLLTRACE_MAX_PID];
-static int32_t  g_lx_poll_fd[LX_POLLTRACE_MAX_PID][LX_POLLTRACE_MAX_FDS];
-static uint16_t g_lx_poll_ev[LX_POLLTRACE_MAX_PID][LX_POLLTRACE_MAX_FDS];
-
-static void linux_poll_trace_note(const linux_pollfd_t *pfds, uint64_t nfds)
-{
-    int32_t tid = process_get_current_tid();
-    if (tid < 0 || (uint32_t)tid >= LX_POLLTRACE_MAX_PID) {
-        return;
-    }
-    uint32_t n = (nfds > LX_POLLTRACE_MAX_FDS) ? LX_POLLTRACE_MAX_FDS
-                                               : (uint32_t)nfds;
-    for (uint32_t i = 0; i < n; ++i) {
-        g_lx_poll_fd[tid][i] = pfds[i].fd;
-        g_lx_poll_ev[tid][i] = (uint16_t)pfds[i].events;
-    }
-    g_lx_poll_n[tid] = (uint8_t)n;
-}
-
-void linux_poll_trace_dump_all(void);
-void linux_poll_trace_dump_all(void)
-{
-    for (uint32_t tid = 0; tid < LX_POLLTRACE_MAX_PID; ++tid) {
-        if (g_lx_poll_n[tid] == 0u) {
-            continue;
-        }
-        serial_write_string("[poll] ");
-        serial_write_uint32(tid);
-        for (uint32_t i = 0; i < g_lx_poll_n[tid]; ++i) {
-            int32_t fd = g_lx_poll_fd[tid][i];
-            serial_write_string(" ");
-            serial_write_uint32((uint32_t)fd);
-            serial_write_string("/w");
-            serial_write_uint32(g_lx_poll_ev[tid][i]);
-            serial_write_string("/r");
-            serial_write_uint32(syscall_poll_one_fd(fd, 0x1u | 0x4u));
-        }
-        serial_write_char('\n');
-    }
-}
-#endif
-
 static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
                                  int64_t timeout_ms, int *should_switch_out,
                                  int *restart_out)
@@ -2757,9 +2387,6 @@ static int64_t linux_poll_common(uint64_t fds_ptr, uint64_t nfds,
         }
         return ready_count;
     }
-#if PROCESS_STALL_DUMP
-    linux_poll_trace_note(pfds, nfds);
-#endif
     /* Nothing ready. Back the sleep off (4 -> 32 ms) and cap it at both the
      * caller's deadline and the nearest armed timerfd in the set: a timerfd
      * fires on the clock alone, without a poll_wait_notify(), so it is the
@@ -2977,167 +2604,6 @@ static int64_t linux_getcpu(uint64_t cpu_ptr, uint64_t node_ptr,
     return 0;
 }
 
-/*
- * Process-lifecycle trace.
- *
- * fork/exec/exit are rare enough that naming each one costs nothing, and
- * every multi-process question -- which slot a child landed in, whether it
- * exec'd or exited, in what order -- is unanswerable without it.
- *
- * Each line is assembled in a local buffer and handed to the serial port in
- * one call. serial_write_string() is not atomic against another CPU writing
- * at the same time, and a Chromium boot has four CPUs logging at once: a
- * line emitted field-by-field comes back interleaved character-by-character
- * with someone else's, which is exactly the state in which fork traces stop
- * being readable.
- */
-typedef struct {
-    char buf[224];
-    uint32_t len;
-} lx_trace_line_t;
-
-static void lx_trace_str(lx_trace_line_t *line, const char *text)
-{
-    while (*text != '\0' && line->len + 1u < sizeof(line->buf)) {
-        line->buf[line->len++] = *text++;
-    }
-    line->buf[line->len] = '\0';
-}
-
-static void lx_trace_hex(lx_trace_line_t *line, uint64_t value)
-{
-    char digits[17];
-    int i = 16;
-    digits[16] = '\0';
-    if (value == 0u) {
-        lx_trace_str(line, "0");
-        return;
-    }
-    while (value != 0u && i > 0) {
-        uint8_t nibble = (uint8_t)(value & 0xFu);
-        digits[--i] = (char)(nibble < 10u ? (uint8_t)('0' + nibble)
-                                          : (uint8_t)('a' + (nibble - 10u)));
-        value >>= 4;
-    }
-    lx_trace_str(line, "0x");
-    lx_trace_str(line, &digits[i]);
-}
-
-static void lx_trace_dec(lx_trace_line_t *line, uint64_t value)
-{
-    char digits[21];
-    int i = 20;
-    digits[20] = '\0';
-    if (value == 0u) {
-        lx_trace_str(line, "0");
-        return;
-    }
-    while (value != 0u && i > 0) {
-        digits[--i] = (char)('0' + (uint8_t)(value % 10u));
-        value /= 10u;
-    }
-    lx_trace_str(line, &digits[i]);
-}
-
-static void lx_trace_emit(lx_trace_line_t *line)
-{
-    lx_trace_str(line, "\n");
-    serial_write_string(line->buf);
-}
-
-__attribute__((unused))
-static void lx_proc_trace(const char *what, uint64_t a, uint64_t b)
-{
-    lx_trace_line_t line = { {0}, 0u };
-    lx_trace_str(&line, "[lxproc] ");
-    lx_trace_str(&line, what);
-    lx_trace_str(&line, " pid=");
-    lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_pid());
-    lx_trace_str(&line, " tid=");
-    lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_tid());
-    lx_trace_str(&line, " a=");
-    lx_trace_hex(&line, a);
-    lx_trace_str(&line, " b=");
-    lx_trace_hex(&line, b);
-    lx_trace_emit(&line);
-}
-
-/* Off by default: one line per fork/exec/exit plus a prefix of every new
- * process's syscalls is exactly what a multi-process bring-up needs and
- * exactly what nobody wants on a normal boot. Build with
- * -DLINUX_PROC_TRACE=1 to turn it on. */
-#ifndef LINUX_PROC_TRACE
-#define LINUX_PROC_TRACE 0
-#endif
-
-#if LINUX_PROC_TRACE
-#define LX_PROC_TRACE(what, a, b) lx_proc_trace((what), (uint64_t)(a), (uint64_t)(b))
-#else
-#define LX_PROC_TRACE(what, a, b) ((void)0)
-#endif
-
-/*
- * The first syscalls a forked child makes.
- *
- * A child that gets its resume state wrong says nothing about it: it simply
- * does something other than what the program's child branch does, and the
- * only visible consequence is the parent reporting a failure much later.
- * Recording a short prefix of each newborn's syscalls -- the child branch of
- * fork() is only a few dozen calls before execve() -- makes that first
- * divergence legible, and costs nothing for every other process.
- */
-#ifndef LINUX_NEWBORN_TRACE
-#define LINUX_NEWBORN_TRACE 160u
-#endif
-static uint8_t g_lx_newborn_left[OS_CONFIG_PROCESS_MAX_COUNT];
-
-static void lx_newborn_arm(int32_t pid, uint32_t calls)
-{
-    if (!LINUX_PROC_TRACE) {
-        return;
-    }
-    if (pid >= 0 && pid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
-        if (calls > 255u) {
-            calls = 255u;
-        }
-        g_lx_newborn_left[pid] = (uint8_t)calls;
-    }
-}
-
-/* Logged at syscall *exit* so the result is in the line: "which call went
- * wrong" is the question, and an argument list without a return value cannot
- * answer it. */
-static void lx_newborn_note(uint64_t num, uint64_t a1, uint64_t a2,
-                            int64_t result)
-{
-    if (!LINUX_PROC_TRACE) {
-        return;
-    }
-    int32_t pid = process_get_current_pid();
-    if (pid < 0 || pid >= (int32_t)OS_CONFIG_PROCESS_MAX_COUNT ||
-        g_lx_newborn_left[pid] == 0u) {
-        return;
-    }
-    --g_lx_newborn_left[pid];
-    lx_trace_line_t line = { {0}, 0u };
-    lx_trace_str(&line, "[lxnew] pid=");
-    lx_trace_dec(&line, (uint64_t)(uint32_t)pid);
-    lx_trace_str(&line, " nr=");
-    lx_trace_dec(&line, num);
-    lx_trace_str(&line, " a1=");
-    lx_trace_hex(&line, a1);
-    lx_trace_str(&line, " a2=");
-    lx_trace_hex(&line, a2);
-    lx_trace_str(&line, " -> ");
-    if (result < 0) {
-        lx_trace_str(&line, "-");
-        lx_trace_dec(&line, (uint64_t)(-result));
-    } else {
-        lx_trace_hex(&line, (uint64_t)result);
-    }
-    lx_trace_emit(&line);
-}
-
 static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
                            uint64_t parent_tid, uint64_t child_tid,
                            uint64_t tls, uint64_t child_arg3,
@@ -3174,7 +2640,6 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
      * only their own stack.
      */
     if ((flags & LINUX_CLONE_THREAD) == 0u) {
-        LX_PROC_TRACE("fork-enter", flags, stack);
         uint32_t fork_opts = 0u;
         if ((flags & 0x20000000u) != 0u) fork_opts |= PROCESS_FORK_NEWPID;
         if ((flags & LINUX_CLONE_FS) != 0u) fork_opts |= PROCESS_FORK_SHARE_FS;
@@ -3193,34 +2658,6 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
          * sandbox chroots from a CLONE_FS helper) and CLONE_NEWPID (the
          * child is a namespace init and sees itself as pid 1) were applied
          * inside process_fork_ex(), before the child could run. */
-        {
-            /* fork() is rare and every multi-process bring-up question starts
-             * here, so this line is unconditional. It names the slot the child
-             * landed in and the user-mode state it will resume with -- a child
-             * that comes back at RIP 0 is the signature of a frame that was
-             * copied from the wrong place. */
-            const uint64_t *f = (const uint64_t *)(uintptr_t)saved_rsp;
-            lx_trace_line_t line = { {0}, 0u };
-            if (!LINUX_PROC_TRACE) {
-                goto arm_newborn;
-            }
-            lx_trace_str(&line, "[lxfork] pid=");
-            lx_trace_dec(&line, (uint64_t)(uint32_t)process_get_current_pid());
-            lx_trace_str(&line, " child=");
-            lx_trace_dec(&line, (uint64_t)(uint32_t)child_pid);
-            lx_trace_str(&line, " rip=");
-            lx_trace_hex(&line, f[SYSCALL_FRAME_RCX]);
-            lx_trace_str(&line, " ursp=");
-            lx_trace_hex(&line, process_get_current_user_rsp());
-            lx_trace_str(&line, " flags=");
-            lx_trace_hex(&line, flags);
-            lx_trace_emit(&line);
-        arm_newborn:
-            /* Both sides: the child's divergence and the parent's handling of
-             * it (wait4, the socket handshake) are the same story. */
-            lx_newborn_arm(child_pid, LINUX_NEWBORN_TRACE);
-            lx_newborn_arm(process_get_current_pid(), LINUX_NEWBORN_TRACE);
-        }
         if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u && parent_tid != 0u) {
             int32_t pid32 = child_pid;
             (void)copy_to_user_trusted((void *)(uintptr_t)parent_tid,
@@ -3259,21 +2696,8 @@ static int64_t linux_clone(uint64_t saved_rsp, uint64_t flags, uint64_t stack,
         /* EAGAIN is the errno glibc/Chromium expect for "couldn't spawn a
          * thread" (resource exhaustion); -1/EPERM sent them down a fatal
          * path. */
-        serial_write_string("[lx] clone/thread create failed\n");
         return LINUX_EAGAIN;
     }
-#if LINUX_CLONE_TRACE
-    /* Optional clone diagnostics for foreign-thread bring-up. */
-    serial_write_string("[clone] tid=");
-    serial_write_uint32((uint32_t)tid);
-    serial_write_string(" stack=");
-    serial_write_uint64(stack);
-    serial_write_string(" tls=");
-    serial_write_uint64(has_tls ? tls : 0u);
-    serial_write_string(" flags=");
-    serial_write_uint64(flags);
-    serial_write_char('\n');
-#endif
     if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u && parent_tid != 0u) {
         int32_t tid32 = tid;
         if (copy_to_user_trusted((void *)(uintptr_t)parent_tid,
@@ -3341,7 +2765,6 @@ static int64_t linux_clone3(uint64_t saved_rsp, uint64_t args_ptr,
         if (args.stack_size == 0u) {
             child_stack = args.stack;
         } else if (child_stack > UINT64_MAX - args.stack_size) {
-            serial_write_string("[clone3] EINVAL stack overflow\n");
             return LINUX_EINVAL;
         } else {
             /* clone3.stack is the low address; clone's child_stack is the
@@ -3731,18 +3154,6 @@ static int64_t linux_open_resolved(char *path, uint64_t flags, uint64_t mode)
         result = (int64_t)syscall_file_register_dir(path);
     } else {
         result = (int64_t)syscall_file_open(path, flags);
-#if SHM_HANDSHAKE_TRACE
-        if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
-            path[3] == 'o' && path[4] == 'c') {
-            serial_write_string("[shmtr] open '");
-            serial_write_string(path);
-            serial_write_string("' flags=");
-            serial_write_uint64(flags);
-            serial_write_string(" -> ");
-            serial_write_uint64((uint64_t)result);
-            serial_write_string("\n");
-        }
-#endif
         if (result == LINUX_ENOENT && (flags & LINUX_O_CREAT) != 0u) {
             /* Create it, then open it with the caller's flags: the access mode
              * open() reports back has to be the one that was asked for. */
@@ -3772,37 +3183,7 @@ static int64_t linux_open_resolved(char *path, uint64_t flags, uint64_t mode)
                 result = (int64_t)dir_fd;
             }
         }
-#if LINUX_MODULE_MAP_TRACE
-        if (result >= 0) {
-            linux_module_map_note_open((int32_t)result, path);
-        }
-#endif
     }
-#ifdef LINUX_SYSCALL_TRACE
-    serial_write_string("[lx] open '");
-    serial_write_string(path);
-    serial_write_string("' -> ");
-    serial_write_uint64((uint64_t)result);
-    if (result >= 0) {
-        /* peek the first 8 bytes so we can tell which file actually got
-         * opened / whether the content is an ELF at all */
-        uint8_t hdr[8] = {0};
-        int64_t saved = syscall_file_seek((int32_t)result, 0, LINUX_SEEK_CUR);
-        (void)syscall_file_seek((int32_t)result, 0, LINUX_SEEK_SET);
-        int64_t n = syscall_file_read((int32_t)result, hdr, sizeof(hdr));
-        if (saved >= 0) {
-            (void)syscall_file_seek((int32_t)result, saved, LINUX_SEEK_SET);
-        }
-        serial_write_string(" hdr[");
-        serial_write_uint64((uint64_t)n);
-        serial_write_string("]=");
-        for (int i = 0; i < 8; ++i) {
-            serial_write_uint64((uint64_t)hdr[i]);
-            serial_write_char(' ');
-        }
-    }
-    serial_write_char('\n');
-#endif
     return result;
 }
 
@@ -6340,134 +5721,16 @@ static int64_t linux_prctl_ext(uint64_t option, uint64_t arg2, uint64_t arg3,
     }
 }
 
-/* Compile-time syscall trace (TODO_Chromium_LinuxABI.md section 6 / P3).
- * Build the kernel with -DLINUX_SYSCALL_TRACE to log every Linux-ABI
- * syscall (number, the six args, and the return value) to COM1. Zero cost
- * when the macro is undefined. Kept deliberately allocation-free and
- * lock-free so it is safe to call from the raw syscall path. */
-#ifdef LINUX_SYSCALL_TRACE
-/* Compact hex: serial_write_uint64() always emits 16 digits, and a full
- * trace of a Chromium startup is ~15k syscalls -- the leading zeros alone
- * are megabytes of COM1 time. */
-static void linux_trace_hex(uint64_t v)
-{
-    char buf[17];
-    int i = 16;
-    buf[16] = '\0';
-    if (v == 0u) {
-        serial_write_char('0');
-        return;
-    }
-    while (v != 0u && i > 0) {
-        uint8_t d = (uint8_t)(v & 0xFu);
-        buf[--i] = (char)(d < 10u ? (uint8_t)('0' + d)
-                                  : (uint8_t)('a' + (d - 10u)));
-        v >>= 4;
-    }
-    serial_write_string(&buf[i]);
-}
-
-/* A trace that starts at exec() is almost all dynamic linker: ~40k syscalls
- * of open/mmap before the program's own first instruction, and on COM1 that
- * costs minutes and changes the timing of whatever is being chased. So hold
- * the trace off until the process touches an AF_UNIX socket -- the display
- * connection is the point every graphical bring-up question is downstream
- * of -- and then stop again after LINUX_TRACE_MAX lines. */
-#ifndef LINUX_TRACE_MAX
-#define LINUX_TRACE_MAX 6000u
-#endif
-static bool     g_lx_trace_armed;
-static uint32_t g_lx_trace_left = LINUX_TRACE_MAX;
-
-bool linux_trace_is_armed(void) { return g_lx_trace_armed; }
-
-static bool linux_trace_gate(uint64_t a1)
-{
-    if (!g_lx_trace_armed) {
-        if (!unix_socket_fd_in_range((int32_t)a1)) return false;
-        g_lx_trace_armed = true;
-        serial_write_string("[lx] trace armed\n");
-    }
-    if (g_lx_trace_left == 0u) return false;
-    if (--g_lx_trace_left == 0u) {
-        serial_write_string("[lx] trace cap reached\n");
-        return false;
-    }
-    return true;
-}
-
-static void linux_trace_enter(uint64_t num, uint64_t a1, uint64_t a2,
-                              uint64_t a3, uint64_t a4, uint64_t a5,
-                              uint64_t a6)
-{
-    if (!linux_trace_gate(a1)) return;
-    serial_write_string("[lx]p");
-    linux_trace_hex((uint64_t)(uint32_t)process_get_current_pid());
-    serial_write_string(" #");
-    linux_trace_hex(num);
-    serial_write_char('(');
-    linux_trace_hex(a1); serial_write_char(',');
-    linux_trace_hex(a2); serial_write_char(',');
-    linux_trace_hex(a3); serial_write_char(',');
-    linux_trace_hex(a4); serial_write_char(',');
-    linux_trace_hex(a5); serial_write_char(',');
-    linux_trace_hex(a6);
-    serial_write_string(")\n");
-}
-
-static void linux_trace_exit(uint64_t num, int64_t result)
-{
-    if (!g_lx_trace_armed || g_lx_trace_left == 0u) return;
-    serial_write_string("[lx]p");
-    linux_trace_hex((uint64_t)(uint32_t)process_get_current_pid());
-    serial_write_string(" #");
-    linux_trace_hex(num);
-    serial_write_string("=");
-    if (result < 0) {
-        serial_write_char('-');
-        linux_trace_hex((uint64_t)(-result));
-    } else {
-        linux_trace_hex((uint64_t)result);
-    }
-    serial_write_char('\n');
-}
-#define LINUX_TRACE_ENTER(n, a1, a2, a3, a4, a5, a6) \
-    linux_trace_enter((n), (a1), (a2), (a3), (a4), (a5), (a6))
-#define LINUX_TRACE_EXIT(n, r) linux_trace_exit((n), (r))
-#else
-#define LINUX_TRACE_ENTER(n, a1, a2, a3, a4, a5, a6) ((void)0)
-#define LINUX_TRACE_EXIT(n, r) ((void)0)
-#endif
-
-/* Progress heartbeat for foreign processes.
- *
- * When Xorg goes silent there is no way to tell "still working" from "wedged",
- * and a full syscall trace drowns the shared COM1. Instead remember the last
- * syscall each pid entered plus how many it has made, and dump that table
- * whenever HEARTBEAT_PERIOD_MS has elapsed. Any process that is still running
- * drives the dump, so a stalled one shows up as a frozen count against the
- * syscall number it is parked in. */
+/* The last syscall each thread entered, for the fault dump in IDT_Main.c:
+ * it is the only handle the kernel has on what a crashed foreign thread was
+ * doing just before. */
 #define LX_HEARTBEAT_MAX_PID     64u
-#define LX_HEARTBEAT_PERIOD_MS   5000ull
 
 static uint32_t g_lx_hb_last_num[LX_HEARTBEAT_MAX_PID];
-static uint64_t g_lx_hb_last_arg[LX_HEARTBEAT_MAX_PID];
-static uint64_t g_lx_hb_last_rip[LX_HEARTBEAT_MAX_PID];
-static uint64_t g_lx_hb_count[LX_HEARTBEAT_MAX_PID];
-static uint64_t g_lx_hb_next_dump_ns;
 
-/* Read-only views of the per-pid heartbeat, for the timer-driven stall dump in
- * ProcessManager_Create.c. That dump has to be driven by the timer rather than
- * by the syscall path: the case it exists to diagnose is "every thread is
- * blocked and no syscalls are happening at all", which the syscall-driven
- * heartbeat below can never report. */
 uint32_t linux_heartbeat_last_num(int32_t pid);
-uint64_t linux_heartbeat_count(int32_t pid);
-uint64_t linux_heartbeat_last_arg(int32_t pid);
-uint64_t linux_heartbeat_last_rip(int32_t pid);
 
-static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1,
-                                    uint64_t saved_rsp)
+static void linux_syscall_heartbeat(uint64_t num)
 {
     /* Indexed by thread, not by memory owner: a stalled multithreaded process
      * is only diagnosable if each thread's last syscall is visible separately.
@@ -6476,50 +5739,7 @@ static void linux_syscall_heartbeat(uint64_t num, uint64_t arg1,
     int32_t pid = process_get_current_tid();
     if (pid >= 0 && (uint32_t)pid < LX_HEARTBEAT_MAX_PID) {
         g_lx_hb_last_num[pid] = (uint32_t)num;
-        g_lx_hb_last_arg[pid] = arg1;
-        g_lx_hb_count[pid]++;
-#if defined(__x86_64__)
-        /* SYSCALL leaves the user return address in RCX, and the entry stub
-         * saves it in the frame -- the same word linux_syscall_restart()
-         * rewinds. It is the only handle the kernel has on where a stalled
-         * foreign binary actually is. */
-        g_lx_hb_last_rip[pid] =
-            ((const uint64_t *)(uintptr_t)saved_rsp)[SYSCALL_FRAME_RCX];
-#else
-        (void)saved_rsp;
-#endif
     }
-
-    if (!OS_CONFIG_FOREIGN_TRACE) {
-        return;
-    }
-
-    uint64_t now = timer_monotonic_ns();
-    if (g_lx_hb_next_dump_ns == 0u) {
-        g_lx_hb_next_dump_ns = now + LX_HEARTBEAT_PERIOD_MS * 1000000ull;
-        return;
-    }
-    if (now < g_lx_hb_next_dump_ns) {
-        return;
-    }
-    g_lx_hb_next_dump_ns = now + LX_HEARTBEAT_PERIOD_MS * 1000000ull;
-
-    serial_write_string("[hb]");
-    for (uint32_t i = 0; i < LX_HEARTBEAT_MAX_PID; ++i) {
-        if (g_lx_hb_count[i] == 0u) continue;
-        serial_write_string(" p");
-        serial_write_uint32(i);
-        serial_write_string("=#");
-        serial_write_uint32(g_lx_hb_last_num[i]);
-        serial_write_string("/a");
-        serial_write_uint64(g_lx_hb_last_arg[i]);
-        serial_write_string("/n");
-        serial_write_uint64(g_lx_hb_count[i]);
-    }
-    serial_write_char('\n');
-    /* Whose kernel-side reference is keeping a finished child unreapable is
-     * only visible per CPU, so dump that alongside. */
-    process_scheduler_debug_dump_cpus();
 }
 
 /* A blocking AF_UNIX read that found the ring empty. EAGAIN is not a value a
@@ -6546,12 +5766,6 @@ static void linux_unix_block_retry(uint64_t generation, int32_t fd,
     }
     if (unix_socket_fd_in_range(fd)) {
         if (unix_socket_is_nonblock(fd)) {
-            /* Bring-up trace: the caller asked for a non-blocking read, so
-             * EAGAIN is the right answer and it is on the caller to wait.
-             * Printed because "the client gave up after one EAGAIN" looks
-             * identical whether the socket really was non-blocking or we
-             * simply failed to block. */
-            unix_socket_trace_note("rx-NB", fd);
             return;
         }
     } else if (syscall_file_is_pipe(fd) || syscall_file_is_pty(fd)) {
@@ -7329,18 +6543,13 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
     flight_rec(FR_TAG_SYSCALL, num, (uint64_t)(uint32_t)process_get_current_pid());
     process_run_pending_teardowns();
-    linux_syscall_heartbeat(num, arg1, saved_rsp);
+    linux_syscall_heartbeat(num);
     /* Back in a syscall: whatever rewound frame there was has been run. */
     const int32_t lx_tid = process_get_current_tid();
     if (lx_tid >= 0 && lx_tid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
         g_lx_wait_num[lx_tid] = 0u;
         g_lx_wait_rip[lx_tid] = 0u;
     }
-#if LINUX_SYSCALL_PROFILE
-    linux_syscall_profile(num);
-#endif
-
-    LINUX_TRACE_ENTER(num, arg1, arg2, arg3, arg4, arg5, arg6);
 
     /* Before anything is checked for readiness: a blocking read that finds
      * nothing parks against this, so a wakeup between the check and the
@@ -7790,14 +6999,11 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         }
 
         case LINUX_SYS_EXECVE:
-            LX_PROC_TRACE("execve", (uint64_t)(uint32_t)num, 0u);
-            lx_newborn_arm(process_get_current_pid(), LINUX_NEWBORN_TRACE);
             result = linux_execve(arg1, arg2, arg3);
             request_switch = 1;
             break;
 
         case LINUX_SYS_EXIT:
-            LX_PROC_TRACE("exit", arg1, (uint64_t)process_is_current_thread());
             if (process_is_current_thread()) {
                 process_thread_exit_current((int32_t)arg1 & 0xFF);
             } else {
@@ -7808,7 +7014,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_EXIT_GROUP:
-            LX_PROC_TRACE("exit_group", arg1, 0u);
             process_exit_current_with_status((int32_t)arg1 & 0xFF);
             process_retire_current_thread();
             result = 0;
@@ -7859,7 +7064,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
 
         case LINUX_SYS_FTRUNCATE:
             result = syscall_ftruncate((int32_t)arg1, (int64_t)arg2);
-            shm2("ftruncate", arg1, arg2, (uint64_t)result);
             /* A memfd seal refuses the resize with EPERM on Linux, not EACCES,
              * and Mojo's seal self-check only accepts EINVAL/ENOSYS/EPERM. */
             if (result == (int64_t)OS_STATUS_ACCESS_DENIED) {
@@ -7870,7 +7074,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         case LINUX_SYS_FALLOCATE:
             result = linux_fallocate((int32_t)arg1, (uint32_t)arg2,
                                      (int64_t)arg3, (int64_t)arg4);
-            shm2("fallocate", arg1, (uint64_t)arg4, (uint64_t)result);
             break;
 
         case LINUX_SYS_GETCWD:
@@ -8174,28 +7377,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             } else if (!futex_done) {
                 result = syscall_futex(arg1, arg2, arg3, futex_timeout, arg5, arg6);
             }
-            if ((result < 0 && result != LINUX_EAGAIN && result != -4 &&
-                 result != -110) ||
-                (result == -110 && arg4 == 0u) ||
-                (result > 0 && (futex_cmd == 0u || futex_cmd == 9u))) {
-                /* glibc aborts on anything else ("The futex facility returned
-                 * an unexpected error code."); leave a trace of what it was. */
-                static volatile uint32_t futex_err_reported;
-                if (__atomic_fetch_add(&futex_err_reported, 1u,
-                                       __ATOMIC_RELAXED) < 32u) {
-                    serial_write_string("[lxfutex] rc=");
-                    serial_write_uint64((uint64_t)result);
-                    serial_write_string(" op=");
-                    serial_write_uint64(arg2);
-                    serial_write_string(" uaddr=");
-                    serial_write_uint64(arg1);
-                    serial_write_string(" val=");
-                    serial_write_uint64(arg3);
-                    serial_write_string(" tid=");
-                    serial_write_uint64((uint64_t)(uint32_t)process_get_current_tid());
-                    serial_write_string("\n");
-                }
-            }
             if (futex_restart) {
                 request_restart = 1;
                 request_switch = 1;
@@ -8400,9 +7581,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                                                         LINUX_FD_CLOEXEC);
             }
         }
-#if SHM_HANDSHAKE_TRACE
-            chrome_shm_trace3("memfd_create flags=", arg2, " -> ", (uint64_t)result, "", 0);
-#endif
             break;
 
         case LINUX_SYS_STATX:
@@ -9137,75 +8315,6 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
         result = lx_fd_post(num, lx_orig, result, lx_cloexec);
     }
 lx_fd_finished:
-    /* Name every syscall this layer does not implement, once each. An
-     * external Linux binary that dies for want of a syscall otherwise says
-     * nothing useful: glibc turns ENOSYS into an ordinary errno and the
-     * caller reports its own high-level failure (or none at all). One bit
-     * per number keeps this allocation-free and silent after the first hit,
-     * so it can stay on outside bring-up boots. Numbers above the bitmap are
-     * rare enough to report every time. */
-    if (result == LINUX_ENOSYS) {
-        static uint8_t reported[512u / 8u];
-        bool first = true;
-        if (num < 512u) {
-            uint8_t bit = (uint8_t)(1u << (num & 7u));
-            if ((reported[num >> 3u] & bit) != 0u) {
-                first = false;
-            } else {
-                reported[num >> 3u] |= bit;
-            }
-        }
-        if (first) {
-            serial_write_string("[lxsys] ENOSYS #");
-            serial_write_uint64(num);
-            serial_write_string(" (");
-            serial_write_uint64(arg1);
-            serial_write_string(",");
-            serial_write_uint64(arg2);
-            serial_write_string(",");
-            serial_write_uint64(arg3);
-            serial_write_string(")\n");
-        }
-    }
-
-    /* Bring-up trace (TODO_Doom_Xorg_MethodA.md M8). Xorg can only run
-     * xkbcomp through Popen(), i.e. pipe() + fork() + dup2() +
-     * execve("/bin/sh"), and when any one of those fails it reports nothing
-     * but "XKB: Could not invoke xkbcomp" -- which is then fatal. Name the
-     * failing call here instead of guessing. Restricted to this handful of
-     * process-spawn syscalls and to failures only, so it stays silent once
-     * the path works. */
-    if (result < 0 && !request_restart) {
-        switch (num) {
-        case LINUX_SYS_PIPE:
-        case LINUX_SYS_PIPE2:
-        case LINUX_SYS_CLONE:
-        case LINUX_SYS_FORK:
-        case LINUX_SYS_VFORK:
-        case LINUX_SYS_EXECVE:
-        case LINUX_SYS_DUP2:
-        case LINUX_SYS_DUP3:
-        case LINUX_SYS_SETITIMER:
-        case LINUX_SYS_WAIT4:
-            serial_write_string("[lxproc] syscall ");
-            serial_write_uint64(num);
-            serial_write_string(" failed -> ");
-            serial_write_uint64((uint64_t)result);
-            serial_write_char('\n');
-            break;
-        default:
-            break;
-        }
-    }
-
-    LINUX_TRACE_EXIT(num, result);
-    /* Skip in-kernel restarts: a blocking wait4() or futex re-runs from the
-     * top every slice, and logging each pass buries the one line that matters
-     * under a hundred identical ones. User space only ever sees the last. */
-    if (!request_restart) {
-        lx_newborn_note(num, arg1, arg2, result);
-    }
-
     if (request_restart) {
         linux_syscall_restart(saved_rsp, num);
 #if defined(__x86_64__)
@@ -9238,22 +8347,4 @@ uint32_t linux_heartbeat_last_num(int32_t pid)
 {
     if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0xFFFFFFFFu;
     return g_lx_hb_last_num[pid];
-}
-
-uint64_t linux_heartbeat_count(int32_t pid)
-{
-    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
-    return g_lx_hb_count[pid];
-}
-
-uint64_t linux_heartbeat_last_arg(int32_t pid)
-{
-    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
-    return g_lx_hb_last_arg[pid];
-}
-
-uint64_t linux_heartbeat_last_rip(int32_t pid)
-{
-    if (pid < 0 || (uint32_t)pid >= LX_HEARTBEAT_MAX_PID) return 0u;
-    return g_lx_hb_last_rip[pid];
 }

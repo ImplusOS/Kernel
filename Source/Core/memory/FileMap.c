@@ -5,7 +5,6 @@
 #include "MemoryManagement/Memory_Main.h"
 #include "mmu/Paging_Main.h"
 #include "interfaces/hal_cpu.h"
-#include "Debug/serial/Serial.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -97,13 +96,6 @@ int filemap_register(int32_t pid, uint64_t start, uint64_t length,
     }
     spinlock_unlock(&g_filemap_lock);
     irq_restore(irq);
-    if (result != 0) {
-        /* Never fail this quietly again: the caller has no way to report it
-         * and the damage only shows up as zero-filled pages much later. */
-        serial_write_string("[filemap] table full, mapping dropped for pid ");
-        serial_write_uint32((uint32_t)pid);
-        serial_write_char('\n');
-    }
     return result;
 }
 
@@ -249,19 +241,6 @@ int filemap_handle_fault(int32_t pid, uint64_t cr3, uint64_t fault_addr)
 
     int64_t got = syscall_file_mmap_read(handle, file_offset, frames,
                                          (uint32_t)(pages * PAGE_SIZE));
-    if (got >= 0 && (uint64_t)got < pages * PAGE_SIZE) {
-        static uint32_t warned;
-        if (warned < 16u) {
-            ++warned;
-            serial_write_string("[filemap] short read off=");
-            serial_write_uint64(file_offset);
-            serial_write_string(" want=");
-            serial_write_uint64(pages * PAGE_SIZE);
-            serial_write_string(" got=");
-            serial_write_uint64((uint64_t)got);
-            serial_write_char('\n');
-        }
-    }
     if (got < 0) {
         pmm_free_pages(frames, (size_t)pages);
         return 0;

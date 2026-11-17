@@ -217,18 +217,12 @@ static bool fw_upload_begin(const char *name, uint32_t addr)
         return false;
     }
     if (!g_aic_api->fs.find_file(path, &g_aic.file)) {
-        aic_log("[AIC8800] firmware file missing: ");
-        aic_log(path);
-        aic_log("\n");
         return false;
     }
 
     size = g_aic_api->fs.get_file_size(&g_aic.file);
     if (size == 0u || size > AIC_FW_FILE_MAX) {
         (void)g_aic_api->fs.close_file(&g_aic.file);
-        aic_log("[AIC8800] firmware file has an unusable size: ");
-        aic_log(path);
-        aic_log("\n");
         return false;
     }
 
@@ -237,13 +231,6 @@ static bool fw_upload_begin(const char *name, uint32_t addr)
     g_aic.file_addr = addr;
     g_aic.file_open = true;
 
-    aic_log("[AIC8800] flashing ");
-    aic_log(name);
-    aic_log(" at ");
-    aic_log_hex32(addr);
-    aic_log(" (");
-    aic_log_hex32(size);
-    aic_log(" bytes)\n");
     return true;
 }
 
@@ -450,10 +437,6 @@ static bool fw_pt_parse_inf(void)
                 g_aic.ext_patch_addr[i] = aic_rd32(blk.data + 44u + (i * 8u));
             }
             g_aic.ext_patch_nb = i;
-            if (nb > i) {
-                aic_log("[AIC8800] patch table lists more ext images than "
-                        "this driver supports; ignoring the rest\n");
-            }
         }
         found = true;
         break;
@@ -474,7 +457,6 @@ static bool fw_pt_load(void)
         return false;
     }
     if (!g_aic_api->fs.find_file(path, &g_aic.file)) {
-        aic_log("[AIC8800] " AIC_FW_FILE_PATCH_TABLE " not found in " AIC_FW_DIR "\n");
         return false;
     }
 
@@ -508,7 +490,6 @@ static bool fw_pt_load(void)
     g_aic.patch_table_len = size;
 
     if (!aic_memequal(g_aic.patch_table, AIC_FW_PT_TAG, AIC_FW_PT_TAG_LEN)) {
-        aic_log("[AIC8800] " AIC_FW_FILE_PATCH_TABLE " is not a patch table\n");
         return false;
     }
 
@@ -516,22 +497,13 @@ static bool fw_pt_load(void)
     walk = AIC_FW_PT_HDR_LEN;
     while (walk < size) {
         if (!fw_pt_next(&walk, &blk)) {
-            aic_log("[AIC8800] malformed patch table\n");
             return false;
         }
     }
     if (!fw_pt_parse_inf()) {
-        aic_log("[AIC8800] patch table has no INF block\n");
         return false;
     }
 
-    aic_log("[AIC8800] patch table: adid ");
-    aic_log_hex32(g_aic.addr_adid);
-    aic_log(", patch ");
-    aic_log_hex32(g_aic.addr_patch);
-    aic_log(", ext images ");
-    aic_log_hex32(g_aic.ext_patch_nb);
-    aic_log("\n");
     return true;
 }
 
@@ -618,11 +590,6 @@ static bool fw_sys_config(void)
     }
     g_aic.chip_id = (uint8_t)((value >> 16) & 0xFFu);
 
-    aic_log("[AIC8800] chip id ");
-    aic_log_hex32((uint32_t)g_aic.chip_id);
-    aic_log(g_aic.chip_mcu_id != 0u ? " (mcu) " : " (rom) ");
-    aic_log(AIC_CHIP_ID_H(g_aic.chip_id) ? "H-variant\n" : "standard\n");
-
     if (g_aic.chip_mcu_id != 0u) {
         if (!fw_mem_read(AIC_SYSCFG_CACHE_ADDR, &value)) {
             return false;
@@ -694,11 +661,6 @@ static bool fw_patch_config(void)
         }
     }
 
-    aic_log("[AIC8800] firmware version ");
-    aic_log_hex32(version);
-    aic_log(", patch descriptor at ");
-    aic_log_hex32(str_base);
-    aic_log("\n");
     return true;
 }
 
@@ -750,13 +712,6 @@ static void fw_ladder_reset(void)
 static void fw_fail(const char *what)
 {
     g_aic.fw_last_error = what;
-    aic_log("[AIC8800] firmware download: ");
-    aic_log(what);
-    aic_log(" failed (attempt ");
-    aic_log_hex32(g_aic.fw_attempts + 1u);
-    aic_log("/");
-    aic_log_hex32(AIC_MAX_ATTEMPTS);
-    aic_log(")\n");
 
     fw_pt_free();
     fw_upload_abort();
@@ -765,8 +720,6 @@ static void fw_fail(const char *what)
     ++g_aic.fw_attempts;
     if (g_aic.fw_attempts >= AIC_MAX_ATTEMPTS) {
         g_aic.fw_phase = AIC_FW_FAILED;
-        aic_log("[AIC8800] giving up: are the firmware blobs installed in "
-                AIC_FW_DIR "?\n");
     }
 }
 
@@ -809,9 +762,6 @@ void aic_fw_step(void)
         /* Printed before the first USB command, so a log that ends here
          * points at that command (no reply from the loader), and a log that
          * ends at the probe line means nothing is driving the driver. */
-        aic_log("[AIC8800] firmware download: starting (attempt ");
-        aic_log_hex32(g_aic.fw_attempts + 1u);
-        aic_log("), reading the chip id\n");
     }
 
     switch (g_aic.fw_phase) {
@@ -904,8 +854,6 @@ void aic_fw_step(void)
             fw_fail("start app");
             return;
         }
-        aic_log("[AIC8800] firmware started; waiting for the adapter to "
-                "re-enumerate with its firmware product id (8d81)\n");
         g_fw_loaded_this_boot = true;
         g_aic.fw_done = true;
         g_aic.fw_phase = AIC_FW_DONE;

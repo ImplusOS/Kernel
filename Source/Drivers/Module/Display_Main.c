@@ -7,7 +7,6 @@
 #include "Drivers/Module/DeviceRegistry.h"
 #include "Drivers/Module/DriverManager.h"
 #include "Drivers/Module/DriverSelect.h"
-#include "Debug/serial/Serial.h"
 #include "MemoryManagement/Memory_Main.h"
 
 const driver_display_t *g_active_display_driver = NULL;
@@ -76,29 +75,6 @@ static bool display_sync_geometry(void)
     return display_ensure_shadow_buffer();
 }
 
-static uint32_t g_display_log_budget = 80u;
-
-static void display_log(const char *s)
-{
-    if (g_display_log_budget != 0u) {
-        serial_write_string(s);
-    }
-}
-
-static void display_log_num(uint64_t v)
-{
-    if (g_display_log_budget != 0u) {
-        serial_write_uint64(v);
-    }
-}
-
-static void display_log_done(void)
-{
-    if (g_display_log_budget != 0u) {
-        --g_display_log_budget;
-    }
-}
-
 static volatile uint32_t g_display_picking;
 
 static bool display_refresh_driver(void)
@@ -126,8 +102,6 @@ static bool display_refresh_driver(void)
         g_active_display_module_name = NULL;
         g_fb_width = 0;
         g_fb_height = 0;
-        display_log("[disp] pick=null\n");
-        display_log_done();
         return false;
     }
 
@@ -143,16 +117,6 @@ static bool display_refresh_driver(void)
         }
     }
 
-    display_log("[disp] pick name=");
-    display_log(g_active_display_module_name != NULL ? g_active_display_module_name
-                                                     : "(no-dev-name)");
-    display_log(" w=");
-    display_log_num(g_fb_width);
-    display_log(" h=");
-    display_log_num(g_fb_height);
-    display_log("\n");
-    display_log_done();
-
     return display_sync_geometry();
 }
 
@@ -160,16 +124,6 @@ bool display_init(void) {
     g_active_display_driver = NULL;
     g_active_display_module_name = NULL;
     bool ok = display_refresh_driver();
-    display_log("[disp] init r=");
-    display_log_num(ok ? 1u : 0u);
-    display_log(" w=");
-    display_log_num(g_fb_width);
-    display_log(" h=");
-    display_log_num(g_fb_height);
-    display_log(" fb=");
-    display_log_num((uint64_t)(uintptr_t)g_framebuffer);
-    display_log("\n");
-    display_log_done();
     if (!ok) {
         return false;
     }
@@ -178,14 +132,7 @@ bool display_init(void) {
         return false;
     }
 
-    bool sb = display_ensure_shadow_buffer();
-    display_log("[disp] shadow r=");
-    display_log_num(sb ? 1u : 0u);
-    display_log(" fb=");
-    display_log_num((uint64_t)(uintptr_t)g_framebuffer);
-    display_log("\n");
-    display_log_done();
-    return sb;
+    return display_ensure_shadow_buffer();
 }
 
 bool display_is_ready(void) {
@@ -283,15 +230,6 @@ void display_present(void) {
         return;
     }
 
-    /* Present runs once per compositor frame. Logging every frame
-     * serialized the fast path through the UART and made the desktop feel
-     * sluggish; keep only a one-time boot diagnostic. */
-    static uint32_t present_log_budget = 1u;
-    if (present_log_budget != 0u) {
-        --present_log_budget;
-        display_log("[disp] present\n");
-        display_log_done();
-    }
     g_active_display_driver->present();
 }
 
@@ -311,33 +249,12 @@ void display_present_rects(const display_rect_t *rects, uint32_t count) {
     }
 }
 
-void display_get_framebuffer_dbg_log(void *ptr) __attribute__((unused));
-void display_get_framebuffer_dbg_log(void *ptr) {
-    /* GET_DISPLAY_FRAMEBUFFER is queried repeatedly during redraw. Emit this
-     * diagnostic once instead of writing to the serial console on every call. */
-    static uint32_t getfb_log_budget = 1u;
-    if (getfb_log_budget == 0u) {
-        return;
-    }
-    --getfb_log_budget;
-    display_log("[disp] getfb ptr=");
-    display_log_num((uint64_t)(uintptr_t)ptr);
-    display_log(" w=");
-    display_log_num(g_fb_width);
-    display_log(" h=");
-    display_log_num(g_fb_height);
-    display_log("\n");
-    display_log_done();
-}
-
 void *display_get_framebuffer(void) {
     if (!display_is_ready() || g_active_display_driver->get_framebuffer == NULL) {
         return NULL;
     }
 
-    void *ptr = g_active_display_driver->get_framebuffer();
-    display_get_framebuffer_dbg_log(ptr);
-    return ptr;
+    return g_active_display_driver->get_framebuffer();
 }
 
 uint32_t display_generation(void)

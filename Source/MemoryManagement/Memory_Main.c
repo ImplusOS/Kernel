@@ -83,7 +83,6 @@ static uint32_t heap_page_count = HEAP_PAGE_COUNT_MIN;
 static spinlock_t heap_lock;
 static spinlock_t page_lock;
 static uint32_t   page_alloc_hint = 0;
-static uint32_t   g_oom_total     = 0;
 static uint32_t   g_oom_malloc    = 0;
 static uint32_t   g_oom_pages     = 0;
 
@@ -179,27 +178,6 @@ uint64_t memory_free_pages(void)
     spinlock_unlock(&page_lock);
     irq_restore(irq_flags);
     return free_pages > g_max_pages ? g_max_pages : free_pages;
-}
-
-/* Running out of physical memory used to be completely silent: this counted
- * the event and threw the site and size away, so every caller that degraded on
- * a NULL page (execve building a new address space, for one) failed with no
- * trace at all. Report it, but only the first few times -- an OOM tends to
- * arrive in storms and the serial console is the only channel there is. */
-static void memory_report_oom(const char *site, uint64_t request)
-{
-    ++g_oom_total;
-    if (g_oom_total <= 8u) {
-        serial_write_string("[mem] OOM at ");
-        serial_write_string(site ? site : "?");
-        serial_write_string(" request=");
-        serial_write_uint64(request);
-        serial_write_string(" free_pages=");
-        serial_write_uint64(memory_free_pages());
-        serial_write_string(" total_pages=");
-        serial_write_uint64(g_max_pages);
-        serial_write_char('\n');
-    }
 }
 
 static memory_block_t *split_block_if_needed(memory_block_t *block, uint64_t size)
@@ -455,7 +433,6 @@ void memory_init(void)
 
     heap_initialized  = 1;
     used_memory       = 0;
-    g_oom_total       = 0;
     g_oom_malloc      = 0;
     g_oom_pages       = 0;
     for (uint32_t i = 0; i < OS_CONFIG_SMP_MAX_CPUS; ++i) {
@@ -475,7 +452,6 @@ void *malloc(uint64_t size)
     irq_restore(irq_flags);
     if (ptr != NULL) return ptr;
     ++g_oom_malloc;
-    memory_report_oom("malloc", size);
     return NULL;
 }
 
@@ -669,7 +645,6 @@ void *alloc_page(void) {
     if (cpu_id >= OS_CONFIG_SMP_MAX_CPUS) cpu_id = 0;
     if (g_alloc_page_recursion_depth[cpu_id] >= MAX_ALLOC_PAGE_RECURSION_DEPTH) {
         ++g_oom_pages;
-        memory_report_oom("alloc_page (recursion limit)", PAGE_SIZE);
         return NULL;
     }
     uint64_t irq_flags = irq_save_disable();
@@ -689,7 +664,6 @@ void *alloc_page(void) {
     --g_alloc_page_recursion_depth[cpu_id];
     if (reclaim_result > 0) return alloc_page();
     ++g_oom_pages;
-    memory_report_oom("alloc_page", PAGE_SIZE);
     return NULL;
 }
 
@@ -704,7 +678,6 @@ void *alloc_contiguous_pages(uint32_t page_count, uint32_t align_pages) {
     if (cpu_id >= OS_CONFIG_SMP_MAX_CPUS) cpu_id = 0;
     if (g_alloc_page_recursion_depth[cpu_id] >= MAX_ALLOC_PAGE_RECURSION_DEPTH) {
         ++g_oom_pages;
-        memory_report_oom("alloc_contiguous_pages (recursion limit)", (uint64_t)page_count * PAGE_SIZE);
         return NULL;
     }
     if (align_pages == 0) align_pages = 1;
@@ -749,7 +722,6 @@ void *alloc_contiguous_pages(uint32_t page_count, uint32_t align_pages) {
     --g_alloc_page_recursion_depth[cpu_id];
     if (reclaim_result > 0) return alloc_contiguous_pages(page_count, align_pages);
     ++g_oom_pages;
-    memory_report_oom("alloc_contiguous_pages", (uint64_t)page_count * PAGE_SIZE);
     return NULL;
 }
 
@@ -766,7 +738,6 @@ void memory_init_page_refcounts(void)
     }
     void *mem = alloc_contiguous_pages((uint32_t)need_pages, 1);
     if (mem == NULL) {
-        serial_write_string("[mem] COW refcount table alloc failed; COW disabled\n");
         return;
     }
     memset(mem, 0, (size_t)(need_pages * PAGE_SIZE));

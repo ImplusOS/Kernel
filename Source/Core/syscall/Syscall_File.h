@@ -80,7 +80,6 @@ int syscall_file_is_pipe(int32_t fd);
  * instead of answering ENOTTY for everything. */
 int32_t syscall_file_is_pty(int32_t fd);
 /* Bitmask of which syscall_file_is_pty() checks passed; see the definition. */
-uint32_t syscall_file_pty_debug(int32_t fd);
 int32_t syscall_file_get_status_flags(int32_t fd);
 int32_t syscall_file_set_status_flags(int32_t fd, uint32_t flags);
 int32_t syscall_file_get_descriptor_flags(int32_t fd);

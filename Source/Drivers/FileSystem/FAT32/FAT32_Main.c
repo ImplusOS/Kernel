@@ -1,5 +1,4 @@
 #include "Drivers/FileSystem/FAT32/FAT32_Main.h"
-#include "Debug/serial/Serial.h"
 #include "kernel/config.h"
 #include <string.h>
 #include <stddef.h>
@@ -18,8 +17,6 @@ static const driver_binary_t *g_driver_api = NULL;
 #define disk_read           g_driver_api->hw.disk_read
 #define disk_write          g_driver_api->hw.disk_write
 #define disk_get_partition_lba g_driver_api->hw.disk_get_partition_lba
-#define serial_write_string g_driver_api->dbg.write_string
-#define serial_write_uint32 g_driver_api->dbg.write_uint32
 
 typedef struct { volatile int locked; } spinlock_t;
 static inline void spinlock_init(spinlock_t *l)   { l->locked = 0; }
@@ -2430,8 +2427,6 @@ static const driver_module_descriptor_t g_fat32_module = {
 #undef disk_get_partition_lba
 #undef memset
 #undef memcpy
-#undef serial_write_string
-#undef serial_write_uint32
 
 const driver_module_descriptor_t *driver_module_init(const driver_binary_t *api)
 {

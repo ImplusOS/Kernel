@@ -31,7 +31,6 @@ extern general_protection_fault_handler
 extern machine_check_handler
 extern page_fault_handler
 extern irq_handler
-extern timer_note_irq_rip
 extern smp_tlb_shootdown_handler
 extern process_preempt_from_user_irq
 extern cpu_exception_handler
@@ -105,10 +104,6 @@ isr_default:
 isr_irq0:
     SWAPGS_IF_USER_ENTER 8
     SAVE_REGS
-
-    ; Where the tick interrupted (latency diagnostics, Core/timer/Timer.c).
-    mov rdi, [rsp + 15 * 8]
-    call timer_note_irq_rip
 
     mov rdi, 32
     call irq_handler

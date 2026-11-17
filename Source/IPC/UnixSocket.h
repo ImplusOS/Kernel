@@ -32,7 +32,6 @@ int unix_socket_exists(int32_t fd);
 int unix_socket_set_passcred(int32_t fd, int on);
 int unix_socket_peer_pid(int32_t fd, int32_t *pid_out);
 /* Bring-up trace hook, bounded by the same cap as the other [usock] lines. */
-void unix_socket_trace_note(const char *tag, int32_t fd);
 #define AF_UNIX 1
 #define SOCK_STREAM_UNIX 1
 

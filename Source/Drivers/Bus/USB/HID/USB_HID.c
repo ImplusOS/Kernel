@@ -23,7 +23,6 @@ static inline void irq_restore(uint64_t flags) { hal_cpu_restore_interrupts(flag
 #else
 #include "Core/sync/Spinlock.h"
 #include "interfaces/hal_cpu.h"
-#include "Debug/serial/Serial.h"
 #endif
 
 #include "kernel/keycodes.h"
@@ -528,12 +527,6 @@ void usb_hid_add_mouse(uint8_t dev_addr, uint8_t interface,
     g_last_abs_y = 0xFFFFu;
     spinlock_unlock(&g_mouse_lock);
     irq_restore(flags);
-
-    if (g_api != NULL && g_api->serial_write_string != NULL) {
-        g_api->serial_write_string(layout.absolute ?
-                                   "[USB-HID] absolute pointer\n" :
-                                   "[USB-HID] relative pointer\n");
-    }
 
     if (!hid_alloc_dma(&g_usd_mouse)) {
         return;

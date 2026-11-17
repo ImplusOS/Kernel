@@ -347,24 +347,11 @@ static uint32_t devfs_kmsg_poll(int32_t index, uint32_t events)
 /* Second half of open(2). A /dev/ptmx open allocates the pair here rather than
  * in find_file() so that stat()/access() probes -- which never close what they
  * look up -- cannot leak pairs. */
-static void devfs_pty_trace(const char *what, int32_t value)
-{
-    if (!OS_CONFIG_FOREIGN_TRACE) {
-        return;
-    }
-    serial_write_string("[pty] ");
-    serial_write_string(what);
-    serial_write_string(" ");
-    serial_write_uint32((uint32_t)value);
-    serial_write_char('\n');
-}
-
 static bool devfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
 {
     switch (devfs_kind_of(file)) {
         case DEVFS_KIND_PTMX: {
             int32_t index = pty_allocate();
-            devfs_pty_trace("ptmx open -> pair", index);
             if (index < 0) {
                 return false;
             }
@@ -373,9 +360,7 @@ static bool devfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
         }
         case DEVFS_KIND_PTS: {
             int32_t index = devfs_pty_index_of(file);
-            devfs_pty_trace("pts open -> pair", index);
             if (index < 0 || pty_slave_acquire(index) < 0) {
-                devfs_pty_trace("pts open REFUSED for pair", index);
                 return false;
             }
             /* Opening a terminal without O_NOCTTY makes it the caller's

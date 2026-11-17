@@ -13,10 +13,7 @@
 #include "Network/network_main.h"
 #include "smp/SMP_Main.h"
 #include "Platform/timer/HPET.h"
-#include "Debug/serial/Serial.h"
 #include "kernel/config.h"
-
-#include <stdio.h>
 
 static const timer_hal_t* g_timer_hal = NULL;
 static volatile uint64_t g_tick_count = 0;
@@ -25,36 +22,21 @@ static int g_timer_initialized = 0;
 static volatile uint32_t g_timer_clock_started = 0;
 static volatile uint32_t g_timer_services_started = 0;
 #define TIMER_DEFAULT_HZ 250u
-#define TIMER_ENABLE_PERIODIC_PERF_LOGS 0u
-#define TIMER_DEBUG_LOG_TICK_MULTIPLIER 2u
 #define TIMER_RUN_DRIVER_POLLS_IN_IRQ 0u
 
-#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u || TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
+#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u
 static volatile uint32_t g_timer_async_poll_active = 0;
-#endif
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-static volatile uint64_t g_timer_async_poll_runs = 0;
-static volatile uint64_t g_timer_async_poll_busy = 0;
-static volatile uint64_t g_timer_async_poll_total_ns = 0;
-static volatile uint64_t g_timer_async_poll_max_ns = 0;
-static uint64_t g_timer_cpu_log_last_ns = 0;
 #endif
 static uint32_t g_requested_hz = 0;
 
-#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u || TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
+#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u
 static void timer_run_async_polls(void)
 {
     if (__atomic_exchange_n(&g_timer_async_poll_active, 1u,
                             __ATOMIC_ACQUIRE) != 0u) {
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-        __atomic_fetch_add(&g_timer_async_poll_busy, 1u, __ATOMIC_RELAXED);
-#endif
         return;
     }
 
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-    uint64_t start_ns = timer_monotonic_ns();
-#endif
 #if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u
     input_manager_poll();
 
@@ -62,100 +44,13 @@ static void timer_run_async_polls(void)
         network_stack_poll();
     }
 #endif
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-    uint64_t end_ns = timer_monotonic_ns();
-    uint64_t duration_ns = (end_ns >= start_ns) ? (end_ns - start_ns) : 0u;
-    __atomic_fetch_add(&g_timer_async_poll_runs, 1u, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_timer_async_poll_total_ns, duration_ns,
-                       __ATOMIC_RELAXED);
-
-    uint64_t max_ns = __atomic_load_n(&g_timer_async_poll_max_ns,
-                                      __ATOMIC_RELAXED);
-    while (duration_ns > max_ns &&
-           !__atomic_compare_exchange_n(&g_timer_async_poll_max_ns,
-                                        &max_ns,
-                                        duration_ns,
-                                        0,
-                                        __ATOMIC_RELAXED,
-                                        __ATOMIC_RELAXED)) {
-    }
-#endif
 
     __atomic_store_n(&g_timer_async_poll_active, 0u, __ATOMIC_RELEASE);
 }
 #endif
 
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-static void timer_debug_dump_async_poll(uint64_t interval_ns)
-{
-    uint64_t runs = __atomic_exchange_n(&g_timer_async_poll_runs, 0u,
-                                        __ATOMIC_ACQ_REL);
-    uint64_t busy = __atomic_exchange_n(&g_timer_async_poll_busy, 0u,
-                                        __ATOMIC_ACQ_REL);
-    uint64_t total_ns = __atomic_exchange_n(&g_timer_async_poll_total_ns, 0u,
-                                            __ATOMIC_ACQ_REL);
-    uint64_t max_ns = __atomic_exchange_n(&g_timer_async_poll_max_ns, 0u,
-                                          __ATOMIC_ACQ_REL);
-    uint64_t pct_x100 = 0u;
-    if (interval_ns != 0u) {
-        pct_x100 = (total_ns * 10000ULL) / interval_ns;
-    }
-    uint64_t avg_us = runs != 0u ? (total_ns / runs) / 1000ULL : 0u;
-
-    char line[192];
-    snprintf(line, sizeof(line),
-             "[timer:async] interval_ms=%llu runs=%llu busy=%llu total=%llu.%02llu%% avg_us=%llu max_us=%llu\n",
-             (unsigned long long)(interval_ns / 1000000ULL),
-             (unsigned long long)runs,
-             (unsigned long long)busy,
-             (unsigned long long)(pct_x100 / 100ULL),
-             (unsigned long long)(pct_x100 % 100ULL),
-             (unsigned long long)avg_us,
-             (unsigned long long)(max_ns / 1000ULL));
-    serial_write_string(line);
-}
-#endif
-
-/* Latency diagnostics: where each CPU's last tick interrupted it, and how
- * long it went without one. A long gap means that CPU ran with interrupts
- * off; the tick that ends it lands just after whatever re-enabled them. */
-#ifndef TIMER_GAP_TRACE
-#define TIMER_GAP_TRACE 0
-#endif
-static uint64_t g_irq_rip[OS_CONFIG_SMP_MAX_CPUS];
-static uint64_t g_tick_ns[OS_CONFIG_SMP_MAX_CPUS];
-
-void timer_note_irq_rip(uint64_t rip)
-{
-    uint32_t cpu = smp_get_current_cpu_id();
-    if (cpu < OS_CONFIG_SMP_MAX_CPUS) {
-        g_irq_rip[cpu] = rip;
-    }
-}
-
-static void timer_gap_check(uint32_t cpu)
-{
-    if (!TIMER_GAP_TRACE || cpu >= OS_CONFIG_SMP_MAX_CPUS ||
-        __atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) == 0u) {
-        return;
-    }
-    uint64_t now = timer_monotonic_ns();
-    uint64_t last = g_tick_ns[cpu];
-    g_tick_ns[cpu] = now;
-    static volatile uint32_t printed;
-    if (last != 0u && now - last > 60000000ull &&
-        __atomic_fetch_add(&printed, 1u, __ATOMIC_RELAXED) < 64u) {
-        char line[96];
-        snprintf(line, sizeof(line), "[tick] cpu%u gap=%llums rip=%llx\n",
-                 (unsigned)cpu, (unsigned long long)((now - last) / 1000000ull),
-                 (unsigned long long)g_irq_rip[cpu]);
-        serial_write_string(line);
-    }
-}
-
 static void timer_core_handler(void) {
     uint32_t cpu_id = smp_get_current_cpu_id();
-    timer_gap_check(cpu_id);
     if (cpu_id != 0u) {
         /* The APs keep no time, but they do run tasks, and those need their
          * slices counted for the timer ISR's preemption check
@@ -170,18 +65,6 @@ static void timer_core_handler(void) {
 
     if (__atomic_load_n(&g_timer_services_started, __ATOMIC_ACQUIRE) != 0u) {
         process_on_timer_tick();
-#if PROCESS_STALL_DUMP
-        {
-            extern void process_stall_dump_tick(void);
-            process_stall_dump_tick();
-        }
-#endif
-#if PROCESS_MEMORY_REPORT
-        {
-            extern void process_memory_report_tick(void);
-            process_memory_report_tick();
-        }
-#endif
     }
 
     g_tick_count++;
@@ -206,25 +89,8 @@ static void timer_core_handler(void) {
             driver_manager_schedule_hotplug_poll();
         }
         network_stack_on_timer_tick();
-#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u || TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
+#if TIMER_RUN_DRIVER_POLLS_IN_IRQ != 0u
         timer_run_async_polls();
-#endif
-#if TIMER_ENABLE_PERIODIC_PERF_LOGS != 0u
-        uint32_t log_interval = g_requested_hz != 0u ?
-                                g_requested_hz :
-                                TIMER_DEFAULT_HZ;
-        log_interval *= TIMER_DEBUG_LOG_TICK_MULTIPLIER;
-        if (log_interval != 0u && (g_tick_count % log_interval) == 0u) {
-            uint64_t now_ns = timer_monotonic_ns();
-            uint64_t interval_ns = 1000000000ULL;
-            if (g_timer_cpu_log_last_ns != 0u &&
-                now_ns >= g_timer_cpu_log_last_ns) {
-                interval_ns = now_ns - g_timer_cpu_log_last_ns;
-            }
-            g_timer_cpu_log_last_ns = now_ns;
-            process_debug_dump_cpu_usage("periodic", interval_ns);
-            timer_debug_dump_async_poll(interval_ns);
-        }
 #endif
     }
 }
