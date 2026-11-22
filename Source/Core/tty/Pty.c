@@ -756,7 +756,7 @@ int64_t pty_read(int32_t index, int is_master, uint8_t *user_buffer,
          * Same cure as syscall_pipe_read(): park (pty_write()'s
          * poll_wait_notify() cuts it short) and report EAGAIN, which
          * linux_unix_block_retry() turns into a restart for a blocking fd. */
-        if (process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+        if (PROCESS_ABI_IS_LINUX(process_get_current_abi_mode())) {
             (void)poll_wait_park(generation, 20u);
             return PTY_ERR_AGAIN;
         }

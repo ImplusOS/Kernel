@@ -5,8 +5,12 @@
 #include "Core/sync/Spinlock.h"
 
 /* Process ABI modes (from ProcessScheduler.h). */
+#ifndef PROCESS_ABI_IMPLUS
 #define PROCESS_ABI_IMPLUS 0
+#endif
+#ifndef PROCESS_ABI_LINUX
 #define PROCESS_ABI_LINUX  1
+#endif
 
 /* File table types - shared between Syscall_File.c, ProcessScheduler.h, ProcessManager_Create.c */
 

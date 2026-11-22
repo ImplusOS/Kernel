@@ -651,6 +651,51 @@ int paging_addr_is_user(uint64_t virt_addr)
     return is_user_virtual_address(virt_addr);
 }
 
+/* See the header. Unlocked, like its arm64 twin: only allocated frames are
+ * followed as tables, so a space torn down meanwhile reads as smaller, not
+ * as a wild pointer. */
+uint64_t paging_debug_cow_copies(void)
+{
+    return 0;   /* not counted on x86_64 */
+}
+
+uint64_t paging_debug_count_user_pages(uint64_t cr3, uint64_t *shared_out,
+                                       uint64_t *tables_out)
+{
+    uint64_t own = 0, shared = 0, tables = 0;
+    paging_space_t *space = (cr3 != 0u) ? find_space_by_cr3(cr3) : NULL;
+    if (space != NULL) {
+        for (uint64_t i = 0; i < MAX_PDPT_ENTRIES; ++i) {
+            const uint64_t *pd = space->pd_tables[i];
+            if (pd == NULL || pmm_page_is_allocated((uint64_t)(uintptr_t)pd) != 1) {
+                continue;
+            }
+            ++tables;
+            for (uint64_t j = 0; j < 512; ++j) {
+                const uint64_t pde = pd[j];
+                if ((pde & PAGE_PRESENT) == 0 || (pde & PAGE_PS) != 0 ||
+                    pmm_page_is_allocated(pde & PAGE_FRAME_MASK) != 1) {
+                    continue;
+                }
+                ++tables;
+                const uint64_t *pt = (const uint64_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
+                for (uint64_t k = 0; k < 512; ++k) {
+                    const uint64_t pte = pt[k];
+                    if ((pte & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER) ||
+                        (pte & PAGE_EXTERNAL) != 0u) {
+                        continue;
+                    }
+                    ++own;
+                    if (pmm_page_ref_get(pte & PAGE_FRAME_MASK) > 1u) ++shared;
+                }
+            }
+        }
+    }
+    if (shared_out != NULL) *shared_out = shared;
+    if (tables_out != NULL) *tables_out = tables;
+    return own;
+}
+
 uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt_addr)
 {
     uint64_t *pml4e = NULL, *pdpte = NULL, *pde = NULL, *pte = NULL;
@@ -2234,6 +2279,16 @@ static int paging_leaf_table_ready(uint64_t cr3, uint64_t virt_addr,
     return 1;
 }
 
+int paging_map_user_page_cow(uint64_t cr3, uint64_t virt_addr,
+                             uint64_t phys_addr, uint64_t flags)
+{
+    uint64_t f = flags & ~(uint64_t)PAGE_RW;
+    if ((flags & PAGE_RW) != 0u) {
+        f |= PAGE_COW;
+    }
+    return paging_map_user_page(cr3, virt_addr, phys_addr, f);
+}
+
 int paging_map_user_page(uint64_t cr3,
                          uint64_t virt_addr,
                          uint64_t phys_addr,
@@ -2397,6 +2452,183 @@ int paging_swap_reclaim_one_page(void)
  * dispatch table read back as a NULL entry and Doom jumped to address 0. */
 static spinlock_t g_demand_fault_lock;
 
+/* ------------------------------------------------------------------------ */
+/* Linux i386 address window (OS_CONFIG_LINUX_I386_WINDOW_*, USER32_*).     */
+/*                                                                          */
+/* A 32-bit process can only use the low 4 GiB, all of which every address */
+/* space here carries as the kernel's identity map. kernel_main withholds   */
+/* the window's physical frames from the allocator at boot (so no kernel   */
+/* object, page table or user page can ever be reached through an address */
+/* in it) and only then marks it available; an i386 process's page tables */
+/* then have the window's identity entries removed outright                */
+/* (paging_prepare_compat32_window), which leaves it a hole the process    */
+/* fills with private pages: its image, mmap() and stack, demand-zero on   */
+/* first touch from user or kernel mode alike.                              */
+/* ------------------------------------------------------------------------ */
+volatile int g_paging_compat32_window_ready = 0;
+
+int paging_compat32_window_available(void)
+{
+    return g_paging_compat32_window_ready != 0;
+}
+
+void paging_compat32_window_set_available(int available)
+{
+    g_paging_compat32_window_ready = available ? 1 : 0;
+}
+
+static int compat32_window_contains(uint64_t va)
+{
+    return g_paging_compat32_window_ready &&
+           va >= USER32_WINDOW_BASE && va < USER32_WINDOW_LIMIT;
+}
+
+int paging_prepare_compat32_window(uint64_t cr3)
+{
+    if (!g_paging_compat32_window_ready || cr3 == 0 ||
+        cr3 == paging_get_kernel_cr3()) {
+        return -1;
+    }
+
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_page_table_lock);
+    uint64_t saved_cr3 = read_cr3();
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (saved_cr3 != kernel_cr3) {
+        write_cr3(kernel_cr3);
+    }
+
+    int rc = 0;
+    paging_space_t *space = find_space_by_cr3(cr3);
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(cr3 & PAGE_FRAME_MASK);
+    for (uint64_t va = USER32_WINDOW_BASE; va < USER32_WINDOW_LIMIT; va += MB2) {
+        uint16_t i4 = (uint16_t)PML4_INDEX(va);
+        uint16_t i3 = (uint16_t)PDPT_INDEX(va);
+        uint16_t i2 = (uint16_t)PD_INDEX(va);
+
+        if ((pml4[i4] & PAGE_PRESENT) == 0) {
+            continue;
+        }
+        uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4[i4] & PAGE_FRAME_MASK);
+        if (is_kernel_table(pdpt)) {
+            uint64_t *cloned = alloc_zeroed_page_table();
+            if (cloned == NULL) { rc = -1; break; }
+            copy_page_entries(cloned, pdpt);
+            pdpt = cloned;
+            pml4[i4] = ((uint64_t)(uintptr_t)pdpt) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+            if (space != NULL) {
+                space->pdpt = cloned;
+            }
+        }
+        if ((pdpt[i3] & PAGE_PRESENT) == 0) {
+            continue;
+        }
+        if ((pdpt[i3] & PAGE_PS) != 0) {
+            rc = -1; /* a 1 GiB identity page: never built by init_paging() */
+            break;
+        }
+        uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[i3] & PAGE_FRAME_MASK);
+        if (is_kernel_table(pd)) {
+            uint64_t *cloned = alloc_zeroed_page_table();
+            if (cloned == NULL) { rc = -1; break; }
+            copy_page_entries(cloned, pd);
+            pd = cloned;
+            pdpt[i3] = ((uint64_t)(uintptr_t)pd) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+        } else {
+            pdpt[i3] |= PAGE_USER;
+        }
+        if (space != NULL && i3 < MAX_PDPT_ENTRIES) {
+            space->pd_tables[i3] = pd;
+        }
+
+        uint64_t pde = pd[i2];
+        if ((pde & PAGE_PRESENT) == 0) {
+            continue;
+        }
+        if ((pde & PAGE_PS) != 0) {
+            if ((pde & PAGE_USER) == 0) {
+                pd[i2] = 0; /* the 2 MiB identity block */
+            }
+            continue;
+        }
+        /* A page table: the kernel's own (split for an attribute change and
+         * inherited through the PD copy) is simply dropped; a private one
+         * keeps its user pages and loses only identity entries. */
+        uint64_t kernel_pde = (i3 < MAX_PDPT_ENTRIES) ? g_kernel_pd[i3][i2] : 0u;
+        if ((pde & PAGE_FRAME_MASK) == (kernel_pde & PAGE_FRAME_MASK)) {
+            pd[i2] = 0;
+            continue;
+        }
+        uint64_t *pt = (uint64_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
+        for (uint32_t j = 0; j < 512u; ++j) {
+            if ((pt[j] & PAGE_PRESENT) != 0 && (pt[j] & PAGE_USER) == 0) {
+                pt[j] = 0;
+            }
+        }
+        pd[i2] |= PAGE_USER;
+    }
+
+    /* Reloading CR3 drops this CPU's translations (no PGE, no PCID); a
+     * fresh address space is not live on any other CPU yet. */
+    write_cr3(saved_cr3);
+    spinlock_unlock(&g_page_table_lock);
+    irq_restore(irq);
+    return rc;
+}
+
+/* A fault in the window: demand-zero where the process has nothing at all,
+ * which is exactly where paging_prepare_compat32_window() removed the
+ * identity map (a 64-bit process still has it there, present and
+ * supervisor-only, and is refused). Returns 1 handled, 0 refused, -1 for a
+ * swapped-out page the generic path below brings back. */
+static int compat32_window_fault(uint64_t cr3, uint64_t virt_addr)
+{
+    uint64_t *pml4e = NULL, *pdpte = NULL, *pde = NULL, *pte = NULL;
+    /* Decide and fill under one hold of the lock: two threads faulting on
+     * the same page must not both map one (see g_demand_fault_lock). */
+    uint64_t irq = irq_save_disable();
+    spinlock_lock(&g_demand_fault_lock);
+    int leaf_res = resolve_fault_leaf_entry(cr3, virt_addr, &pml4e, &pdpte,
+                                            &pde, &pte);
+    if (leaf_res >= 0 && pte != NULL) {
+        uint64_t entry = *pte;
+        if ((entry & PAGE_PRESENT) != 0 ||
+            ((entry & PAGE_SWAP) != 0 && (entry & PAGE_USER) != 0)) {
+            spinlock_unlock(&g_demand_fault_lock);
+            irq_restore(irq);
+            if ((entry & PAGE_PRESENT) == 0) {
+                return -1; /* swapped out */
+            }
+            /* Present: a protection fault, the identity map of a 64-bit
+             * process (not ours to replace), or a page another CPU just
+             * filled -- page_fault_handler() checks for that last case
+             * itself once the handlers have declined. */
+            return 0;
+        }
+    }
+
+    void *phys_page = alloc_page();
+    if (phys_page == NULL) {
+        spinlock_unlock(&g_demand_fault_lock);
+        irq_restore(irq);
+        return 0;
+    }
+    memset(phys_page, 0, PAGE_SIZE_BYTES);
+    if (paging_map_user_page(cr3, virt_addr, (uint64_t)(uintptr_t)phys_page,
+                             PAGE_RW) < 0) {
+        free_page(phys_page);
+        spinlock_unlock(&g_demand_fault_lock);
+        irq_restore(irq);
+        return 0;
+    }
+    spinlock_unlock(&g_demand_fault_lock);
+    irq_restore(irq);
+    if (cr3 == read_cr3()) {
+        invlpg_addr(virt_addr);
+    }
+    return 1;
+}
+
 int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
 {
     if (cr3 == 0) return 0;
@@ -2404,7 +2636,14 @@ int paging_handle_swap_fault(uint64_t cr3, uint64_t fault_addr)
     uint64_t virt_addr = fault_addr & PAGE_MASK;
 
     if (!is_user_virtual_address(virt_addr)) {
-        return 0;
+        if (!compat32_window_contains(virt_addr)) {
+            return 0;
+        }
+        int handled = compat32_window_fault(cr3, virt_addr);
+        if (handled >= 0) {
+            return handled;
+        }
+        /* swapped out: the generic swap-in below */
     }
 
     uint64_t *pml4e = NULL, *pdpte = NULL, *pde = NULL, *pte = NULL;

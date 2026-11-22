@@ -27,4 +27,14 @@ bool ipv4_send(uint32_t dst_ipv4_addr,
                const void *payload,
                uint16_t payload_len);
 
+/* ipv4_send() with the source address chosen by the caller: IPV4_SRC_LOCAL
+ * for the configured address, or any value (0.0.0.0 for DHCP before a lease)
+ * when dst is the limited broadcast 255.255.255.255. */
+#define IPV4_SRC_LOCAL 0x100000000ull
+bool ipv4_send_from(uint64_t src_ipv4_addr,
+                    uint32_t dst_ipv4_addr,
+                    uint8_t protocol,
+                    const void *payload,
+                    uint16_t payload_len);
+
 void ipv4_process_timer(void);

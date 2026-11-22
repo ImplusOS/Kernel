@@ -427,7 +427,7 @@ static int fd_in_unix_hole_for(int32_t pid, int32_t fd)
      * ones and the POSIX layer indexes 1024-entry tables by them. */
     if (fd >= (int32_t)FILE_FD_HOLE_END) {
         return !(pid == process_get_current_pid() &&
-                 process_get_current_abi_mode() == PROCESS_ABI_LINUX);
+                 PROCESS_ABI_IS_LINUX(process_get_current_abi_mode()));
     }
     return 0;
 }
@@ -1719,7 +1719,7 @@ static int64_t syscall_pipe_read(int32_t fd, uint8_t *buffer, uint64_t len)
          * good (Chromium's shutdown detector, every glib/libevent wakeup
          * pipe) kept a CPU spinning. The registration made here is what lets
          * the writer's poll_wait_notify() cut the sleep short. */
-        if (process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+        if (PROCESS_ABI_IS_LINUX(process_get_current_abi_mode())) {
             (void)poll_wait_park(generation, 20u);
             return -11;
         }
@@ -1752,7 +1752,7 @@ static int64_t syscall_pipe_write_wait(int32_t fd, kernel_pipe_t *pipe,
          * between one round trip per millisecond and one per read. */
         uint64_t generation = poll_wait_generation();
         if (waited_ms != 0u &&
-            process_get_current_abi_mode() == PROCESS_ABI_LINUX) {
+            PROCESS_ABI_IS_LINUX(process_get_current_abi_mode())) {
             /* Same as the read side: park once, then let the Linux layer
              * sleep and restart the write rather than spin here. */
             (void)poll_wait_park(generation, 20u);
@@ -1953,6 +1953,25 @@ int64_t syscall_file_mmap_read(int32_t handle, uint64_t offset,
         return -1;
     }
     return (int64_t)length;
+}
+
+int syscall_file_mmap_identity(int32_t handle, uint64_t *mount_out,
+                               uint64_t *id_out)
+{
+    if (handle < 0 || handle >= FILE_MAX_FD || mount_out == NULL ||
+        id_out == NULL) {
+        return 0;
+    }
+    const kernel_open_file_t *open_file = &g_open_files[handle];
+    const struct vfs_driver *fs = open_file->file.fs_driver;
+    if (open_file->used == 0 || fs == NULL ||
+        fs->media_kind != VFS_MEDIA_KIND_OPTICAL ||
+        open_file->file.internal_id == 0u) {
+        return 0;
+    }
+    *mount_out = (uint64_t)(uintptr_t)fs;
+    *id_out = open_file->file.internal_id;
+    return 1;
 }
 
 void syscall_file_mmap_release(int32_t handle)

@@ -16,6 +16,8 @@ void* realloc(void* ptr, uint64_t new_size);
 void memory_init(void);
 void init_physical_memory(void *memory_map, size_t map_size, size_t desc_size, uint64_t detected_pages);
 void physical_memory_reserve_region(uint64_t base, uint64_t size);
+/* 1 when every frame of [base, base+size) is RAM nobody has allocated yet. */
+int  physical_memory_region_is_free(uint64_t base, uint64_t size);
 
 void* alloc_page(void);
 void  free_page(void* addr);

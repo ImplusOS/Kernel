@@ -25,3 +25,8 @@ void linux_compat_layer_register(void);
  * file-backed MAP_SHARED write-back mappings owned by a terminating process.
  * Called from the process exit path. */
 void linux_compat_mshared_release_pid(int32_t pid);
+
+/* Diagnostics (the out-of-memory report): file mappings big enough to be
+ * demand-paged that were read in up front instead because the FileMap
+ * table was full -- how many, and how many bytes. */
+void linux_mmap_debug_eager_stats(uint32_t *count_out, uint64_t *bytes_out);

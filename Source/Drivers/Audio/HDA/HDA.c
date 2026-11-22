@@ -1,4 +1,5 @@
 #include "Drivers/Module/DriverBinary.h"
+#include "interfaces/mmio.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,22 +39,33 @@ static uint64_t g_buffer_phys;
 static bool g_ready;
 static bool g_open;
 
-static uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(g_regs + off); }
-static uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(g_regs + off); }
-static void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(g_regs + off) = v; }
-static void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(g_regs + off) = v; }
+/* Every register access goes through interfaces/mmio.h: on arm64 under HVF
+ * a writeback or pair access to the controller's BAR cannot be replayed by
+ * the hypervisor, and a plain volatile dereference does not stop GCC from
+ * emitting one. */
+static uint16_t rd16(uint32_t off) { return mmio_read16(g_regs + off); }
+static uint32_t rd32(uint32_t off) { return mmio_read32(g_regs + off); }
+static void wr16(uint32_t off, uint16_t v) { mmio_write16(g_regs + off, v); }
+static void wr32(uint32_t off, uint32_t v) { mmio_write32(g_regs + off, v); }
+
+/* Output stream descriptor registers (offsets from g_stream). */
+static uint8_t sd_rd8(uint32_t off) { return mmio_read8(g_stream + off); }
+static uint32_t sd_rd32(uint32_t off) { return mmio_read32(g_stream + off); }
+static void sd_wr8(uint32_t off, uint8_t v) { mmio_write8(g_stream + off, v); }
+static void sd_wr16(uint32_t off, uint16_t v) { mmio_write16(g_stream + off, v); }
+static void sd_wr32(uint32_t off, uint32_t v) { mmio_write32(g_stream + off, v); }
 
 static uint32_t stream_ctl_read(void)
 {
-    return (uint32_t)g_stream[0] |
-           ((uint32_t)g_stream[1] << 8u) |
-           ((uint32_t)g_stream[2] << 16u);
+    return (uint32_t)sd_rd8(0x00u) |
+           ((uint32_t)sd_rd8(0x01u) << 8u) |
+           ((uint32_t)sd_rd8(0x02u) << 16u);
 }
 
 static void stream_ctl_write(uint32_t value)
 {
-    *(volatile uint16_t *)(g_stream + 0x00u) = (uint16_t)value;
-    *(volatile uint8_t *)(g_stream + 0x02u) = (uint8_t)(value >> 16u);
+    sd_wr16(0x00u, (uint16_t)value);
+    sd_wr8(0x02u, (uint8_t)(value >> 16u));
 }
 
 static bool stream_ctl_wait(uint32_t mask, uint32_t expected)
@@ -115,6 +127,7 @@ static bool hda_verb(uint8_t node, uint16_t verb, uint16_t payload,
             (uint64_t)HDA_TIMEOUT_MS * 1000000ULL) {
             return false;
         }
+        g_api->hal.cpu_pause();
     }
     if (response != NULL) {
         *response = rd32(0x64u);
@@ -123,11 +136,12 @@ static bool hda_verb(uint8_t node, uint16_t verb, uint16_t payload,
     return true;
 }
 
+/* PCI class 04h/03h (HD Audio) with a memory BAR0. Works on both
+ * architectures: on arm64 the controller sits on the virt machine's ECAM
+ * bus with BAR0 assigned by the firmware, and is reached through the same
+ * map_mmio_range() the VirtIO drivers use. */
 static bool hda_find(void)
 {
-#if !defined(PLATFORM_X86_64)
-    return false;
-#else
     uint32_t count = g_api->pci.get_device_count();
     for (uint32_t i = 0u; i < count; ++i) {
         driver_pci_device_t device;
@@ -145,7 +159,6 @@ static bool hda_find(void)
         return g_regs != NULL;
     }
     return false;
-#endif
 }
 
 static bool hda_configure_codec(void)
@@ -218,7 +231,7 @@ static uint32_t g_last_lpib;  /* LPIB at the last update */
 
 static uint32_t hda_lpib(void)
 {
-    uint32_t lpib = *(volatile uint32_t *)(g_stream + 0x04u);
+    uint32_t lpib = sd_rd32(0x04u);
     return lpib < HDA_RING_BYTES ? lpib : 0u;
 }
 
@@ -273,12 +286,12 @@ static bool hda_program_stream(void)
     }
     g_api->mem.memset(g_buffer, 0, HDA_RING_BYTES);
     __sync_synchronize();
-    *(volatile uint32_t *)(g_stream + 0x18u) = (uint32_t)g_bdl_phys;
-    *(volatile uint32_t *)(g_stream + 0x1Cu) = (uint32_t)(g_bdl_phys >> 32u);
-    *(volatile uint32_t *)(g_stream + 0x08u) = HDA_RING_BYTES;         /* CBL */
-    *(volatile uint16_t *)(g_stream + 0x0Cu) = (uint16_t)(HDA_RING_ENTRIES - 1u); /* LVI */
-    *(volatile uint16_t *)(g_stream + 0x12u) = 0x0011u; /* 48 kHz, 16-bit, 2 ch */
-    *(volatile uint8_t *)(g_stream + 0x03u) = 0x1Cu;    /* clear status */
+    sd_wr32(0x18u, (uint32_t)g_bdl_phys);                   /* BDPL */
+    sd_wr32(0x1Cu, (uint32_t)(g_bdl_phys >> 32u));          /* BDPU */
+    sd_wr32(0x08u, HDA_RING_BYTES);                         /* CBL */
+    sd_wr16(0x0Cu, (uint16_t)(HDA_RING_ENTRIES - 1u));      /* LVI */
+    sd_wr16(0x12u, 0x0011u); /* FMT: 48 kHz, 16-bit, 2 ch */
+    sd_wr8(0x03u, 0x1Cu);    /* STS: clear */
     hda_run(false);
     g_running = false;
     g_written = 0u;

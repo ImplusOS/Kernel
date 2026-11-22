@@ -192,6 +192,22 @@ static bool tmpfs_ensure_capacity_locked(tmpfs_slot_t *slot, uint32_t required)
     return true;
 }
 
+uint64_t tmpfs_debug_bytes(uint32_t *files_out, uint64_t *shared_bytes_out)
+{
+    uint64_t bytes = 0, shared = 0;
+    uint32_t files = 0;
+    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
+        const tmpfs_slot_t *slot = &g_tmpfs_slots[i];
+        if (!slot->in_use || slot->is_dir) continue;
+        ++files;
+        bytes += slot->capacity;
+        if (slot->shm_handle > 0) shared += slot->shm_size;
+    }
+    if (files_out != NULL) *files_out = files;
+    if (shared_bytes_out != NULL) *shared_bytes_out = shared;
+    return bytes;
+}
+
 static bool tmpfs_vfs_read_at(vfs_file_t *file, uint32_t offset,
                               uint8_t *buffer, uint32_t size)
 {
@@ -598,6 +614,32 @@ static bool tmpfs_vfs_open_file(vfs_file_t *file, uint64_t flags)
     return true;
 }
 
+/* Give back the growth slack of a page-backed file once nobody has it open.
+ * tmpfs_ensure_capacity_locked() over-allocates so a file written piece by
+ * piece is not copied on every write -- by up to half for a file under
+ * 1 MiB, a quarter above -- and that slack used to stay for the file's
+ * lifetime. Wine's prefix alone is 751 DLLs (709 MiB) copied into
+ * /tmp/wine, which held ~1 GiB of RAM that way. The tail pages of the
+ * contiguous run go straight back to the page allocator; a later write
+ * grows the file again as usual. */
+static void tmpfs_trim_locked(tmpfs_slot_t *slot)
+{
+    if (slot->shm_handle > 0 || slot->data == NULL ||
+        slot->capacity < TMPFS_PAGE_BACKED_MIN) {
+        return;
+    }
+    uint64_t keep = ((uint64_t)slot->size + 4095u) & ~(uint64_t)4095u;
+    if (keep < TMPFS_PAGE_BACKED_MIN) {
+        keep = TMPFS_PAGE_BACKED_MIN;   /* stays page-backed: see tmpfs_buf_free */
+    }
+    if (keep >= slot->capacity) {
+        return;
+    }
+    free_contiguous_pages(slot->data + keep,
+                          (uint32_t)((slot->capacity - keep) / 4096u));
+    slot->capacity = (uint32_t)keep;
+}
+
 static bool tmpfs_vfs_close_file(vfs_file_t *file)
 {
     if (file == NULL || file->driver_data == NULL) {
@@ -609,6 +651,8 @@ static bool tmpfs_vfs_close_file(vfs_file_t *file)
         --slot->open_count;
         if (slot->open_count == 0u && slot->unlinked) {
             tmpfs_free_slot_locked(slot);
+        } else if (slot->open_count == 0u) {
+            tmpfs_trim_locked(slot);
         }
     }
     spinlock_unlock(&g_tmpfs_lock);

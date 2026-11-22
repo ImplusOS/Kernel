@@ -97,11 +97,17 @@ static int32_t procfs_resolve_pid(const char *path, const char **suffix_out)
     if (!had_digit || (*cursor != '/' && *cursor != '\0')) {
         return -1;
     }
-    if (pid != current && !process_is_alive(pid)) {
+    /* The number is the pid as the caller sees it (its pid namespace's
+     * init is 1). This used to answer with the caller itself for every
+     * number, so /proc/1/stat of a namespace init named the init as its own
+     * parent, and anything walking up the process tree (fastfetch looking
+     * for its shell and terminal) went round forever. */
+    int32_t real = process_pid_from_current_view(pid);
+    if (real != current && !process_is_alive(real)) {
         return -1;
     }
     *suffix_out = (*cursor == '/') ? cursor + 1 : cursor;
-    return current;
+    return real;
 }
 
 /* The command name of any live process. process_get_current_name() only ever
@@ -634,6 +640,13 @@ static bool procfs_generate(const char *path, char *buf, uint32_t cap,
 
     if (strcmp(path, "/proc/meminfo") == 0) {
         *size_out = procfs_build_meminfo(buf, cap);
+        return true;
+    }
+    /* Opening it writes process_debug_memory_report() to the serial log --
+     * the same breakdown an out-of-memory fault prints, on demand. */
+    if (strcmp(path, "/proc/memdebug") == 0) {
+        process_debug_memory_report("/proc/memdebug", 1);
+        *size_out = (uint32_t)snprintf(buf, cap, "see the serial log\n");
         return true;
     }
     if (strcmp(path, "/proc/cpuinfo") == 0) {

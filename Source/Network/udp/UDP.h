@@ -21,6 +21,14 @@ bool udp_send(uint32_t dst_ipv4_addr,
               const void *payload,
               uint16_t payload_len);
 
+/* udp_send() with an explicit IPv4 source (see ipv4_send_from()). */
+bool udp_send_from(uint64_t src_ipv4_addr,
+                   uint32_t dst_ipv4_addr,
+                   uint16_t src_port,
+                   uint16_t dst_port,
+                   const void *payload,
+                   uint16_t payload_len);
+
 bool udp_syscall_send(uint32_t dst_ipv4_addr,
                       uint16_t src_port,
                       uint16_t dst_port,

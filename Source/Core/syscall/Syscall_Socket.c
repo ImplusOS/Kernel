@@ -345,6 +345,27 @@ int32_t syscall_socket_recv(int32_t fd, void *data, uint16_t length)
     return syscall_socket_recvfrom(fd, data, length, NULL, NULL);
 }
 
+/* What a failed tcp_send/tcp_recv means, as a negative errno, or 0 for "no
+ * better answer than EIO". A connection that died reports why (ECONNRESET,
+ * ECONNREFUSED, ETIMEDOUT), and one still in its handshake is not ready yet
+ * (EAGAIN). Both used to read back as EIO; Chromium maps an unknown errno
+ * to ERR_FAILED, so a reset or timed-out connection failed the page instead
+ * of being reported -- and retried -- as what it was. */
+static int32_t socket_tcp_failure(int32_t connection_id)
+{
+    int32_t error = tcp_connection_error(connection_id);
+    if (error > 0) {
+        return -error;
+    }
+    tcp_connection_info_t info;
+    if (tcp_get_connection_info(connection_id, &info) == 0 &&
+        (info.state == TCP_STATE_SYN_SENT ||
+         info.state == TCP_STATE_SYN_RECEIVED)) {
+        return (int32_t)OS_STATUS_WOULD_BLOCK;
+    }
+    return 0;
+}
+
 /* sendto(2)/UDP: if dst_ip/dst_port are both 0, falls back to the
  * connect(2)-recorded default peer (matches plain send()). */
 int32_t syscall_socket_sendto(int32_t fd, const void *data, uint16_t length,
@@ -387,6 +408,10 @@ int32_t syscall_socket_sendto(int32_t fd, const void *data, uint16_t length,
     if (connection_id < 0) return (int32_t)OS_STATUS_INVALID_ARG;
     int32_t result = tcp_send(connection_id, data, length);
     if (result < 0) {
+        int32_t failure = socket_tcp_failure(connection_id);
+        if (failure != 0) {
+            return failure;
+        }
         /* Connection torn down (RST/FIN) -> EPIPE so the caller (and the
          * SIGPIPE path in the Linux layer) behaves like a POSIX write to a
          * broken stream; a transient failure is still EIO. */
@@ -463,7 +488,8 @@ int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
     }
     int32_t result = tcp_recv(connection_id, data, length);
     if (result < 0) {
-        return (int32_t)OS_STATUS_IO_ERROR;
+        int32_t failure = socket_tcp_failure(connection_id);
+        return failure != 0 ? failure : (int32_t)OS_STATUS_IO_ERROR;
     }
     if (result == 0 && length != 0u && syscall_socket_is_nonblocking(fd)) {
         /* Non-blocking read with an empty receive buffer. Distinguish a
@@ -582,6 +608,9 @@ int32_t syscall_socket_get_option(int32_t fd, int32_t level,
         socket->last_error = 0;
         spinlock_unlock(&g_socket_lock);
 
+        if (error == 0 && connection_id >= 0) {
+            error = tcp_connection_error(connection_id);
+        }
         if (error == 0 && connection_id >= 0) {
             tcp_connection_info_t info;
             if (tcp_get_connection_info(connection_id, &info) < 0 ||

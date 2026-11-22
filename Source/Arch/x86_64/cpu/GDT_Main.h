@@ -39,6 +39,13 @@ struct __attribute__((packed)) TSS {
     uint16_t io_map_base;
 };
 
+/* Linux i386 TLS descriptors (set_thread_area): GDT entries 12..14. */
+#define GDT_TLS_ENTRY_MIN 12u
+#define GDT_TLS_ENTRIES   3u
+
 void init_gdt(void);
+/* Load the three TLS descriptors (raw 8-byte GDT entries, 0 = empty) into
+ * this CPU's GDT. The caller reloads any selector that refers to them. */
+void gdt_set_tls_entries(const uint64_t desc[GDT_TLS_ENTRIES]);
 void gdt_set_kernel_rsp0(uint64_t rsp0);
 void gdt_set_ist(uint8_t ist_index, uint64_t rsp);

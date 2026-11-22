@@ -13,6 +13,12 @@
 #include "kernel/config.h"
 #include "smp/SMP_Main.h"
 
+/* ProcessManager_Create.c: a Linux AArch64 program's own handler for a
+ * synchronous fault. */
+int process_signal_deliver_trap_now_arm64(arm64_exception_frame_t *f,
+                                          int32_t signum, int32_t si_code,
+                                          uint64_t si_addr);
+
 #define ESR_EC_SHIFT 26
 #define ESR_EC_MASK  0x3FU
 
@@ -197,7 +203,15 @@ static void handle_abort(arm64_exception_frame_t *frame, uint64_t type,
     int serviced = 0;
     if (pid >= 0 && !reentrant && paging_addr_is_user(far)) {
         uint64_t space = process_get_current_cr3();
-        if (filemap_handle_fault(pid, space, far) > 0) {
+        /* A write to a page fork shared: copy it. First, as on x86_64: the
+         * file-mapping and demand-zero paths below both take a present
+         * page for something else. */
+        if ((error_code & (PF_ERR_WRITE | PF_ERR_PRESENT)) ==
+                (PF_ERR_WRITE | PF_ERR_PRESENT) &&
+            paging_handle_cow_fault(space, far) > 0) {
+            serviced = 1;
+        }
+        if (!serviced && filemap_handle_fault(pid, space, far) > 0) {
             serviced = 1;
         }
         if (!serviced &&
@@ -217,6 +231,9 @@ static void handle_abort(arm64_exception_frame_t *frame, uint64_t type,
     }
     if (serviced) {
         return;
+    }
+    if (reentrant) {
+        serial_write_string("[OS] [PF] nested abort not serviced\n");
     }
 
     /* The raw frame first: everything below may take the process table
@@ -255,6 +272,12 @@ static void handle_abort(arm64_exception_frame_t *frame, uint64_t type,
         }
         process_record_page_fault(pid, far, frame->elr_el1,
                                   (uint32_t)error_code, guard);
+        /* A Linux program's own SIGSEGV handler gets the fault (SEGV_MAPERR
+         * for a missing page, SEGV_ACCERR for a permission fault). */
+        if (process_signal_deliver_trap_now_arm64(
+                frame, 11, (error_code & PF_ERR_PRESENT) ? 2 : 1, far)) {
+            return;
+        }
         if (pid >= 0) {
             process_debug_dump_pid(pid);
         }
@@ -292,6 +315,18 @@ static void handle_user_trap(arm64_exception_frame_t *frame, uint64_t type,
     default:               signum = 11; break; /* SIGSEGV */
     }
 
+    /* Delivered to the program when it installed a handler (si_code: ILL_ILLOPC,
+     * BUS_ADRALN, FPE_FLTINV, TRAP_BRKPT, SEGV_MAPERR). */
+    {
+        int32_t si_code = signum == 4 ? 1 : signum == 7 ? 1 :
+                          signum == 8 ? 7 : signum == 5 ? 1 : 1;
+        uint64_t si_addr = (signum == 7 || signum == 11) ? frame->far_el1
+                                                         : frame->elr_el1;
+        if (process_signal_deliver_trap_now_arm64(frame, signum, si_code,
+                                                  si_addr)) {
+            return;
+        }
+    }
     const char *name = process_get_current_name_str();
     serial_write_string("[OS] [EXC] user ");
     serial_write_string(exception_class_name(ec));

@@ -375,6 +375,24 @@ void init_physical_memory(void *memory_map, size_t map_size, size_t desc_size,
     }
 }
 
+int physical_memory_region_is_free(uint64_t base, uint64_t size)
+{
+    if (g_page_bitmap == NULL || size == 0) {
+        return 0;
+    }
+    uint64_t start_page = base / PAGE_SIZE;
+    uint64_t end_page = (base + size + PAGE_SIZE - 1ULL) / PAGE_SIZE;
+    if (end_page <= start_page || end_page > g_max_pages) {
+        return 0;
+    }
+    for (uint64_t page = start_page; page < end_page; ++page) {
+        if (page_bitmap_get(page) != 0u) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void physical_memory_reserve_region(uint64_t base, uint64_t size)
 {
     if (g_page_bitmap == NULL || size == 0) {

@@ -31,8 +31,12 @@
 #define PROCESS_STATE_ZOMBIE  5
 #define PROCESS_STATE_BLOCKED 6
 
+#ifndef PROCESS_ABI_IMPLUS
 #define PROCESS_ABI_IMPLUS 0
+#endif
+#ifndef PROCESS_ABI_LINUX
 #define PROCESS_ABI_LINUX  1
+#endif
 
 typedef struct {
     uint8_t used;
@@ -65,6 +69,20 @@ typedef struct __attribute__((aligned(16))) {
     uint8_t  full_restore;
     uint64_t full_rcx;
     uint64_t full_r11;
+    /* Linux i386 (PROCESS_ABI_LINUX_I386) threads, x86_64 only: the three
+     * set_thread_area() descriptors (raw GDT entries 12..14, loaded into the
+     * CPU's GDT whenever the thread runs) and the FS/GS selectors it last
+     * had loaded -- glibc keeps its thread pointer in %gs. A 32-bit task
+     * always returns through IRETQ with full_rcx as its real ECX, so every
+     * entry from it keeps full_rcx current. */
+    uint64_t compat_tls[3];
+    uint16_t compat_fs_sel;
+    uint16_t compat_gs_sel;
+    /* Linux i386, memory owner only: which pages of [USER32_MMAP_BASE,
+     * USER32_MMAP_LIMIT) are handed out (one bit per page), so munmap()ed
+     * address space can be reused -- the 64-bit arena is a bump cursor over
+     * 15 TiB, which a 32-bit window cannot afford. */
+    uint64_t *compat_vm_map;
 
     uint64_t cr3;
     uint8_t *kernel_stack_base;
@@ -192,6 +210,9 @@ typedef struct __attribute__((aligned(16))) {
      * The native waitpid path ignores these and keeps its legacy convention. */
     uint8_t  exit_by_signal;
     uint8_t  exit_term_signal;
+    /* prctl(PR_SET_PDEATHSIG): sent to this process when its parent exits.
+     * Not inherited by fork. */
+    uint8_t  pdeath_signal;
     uint64_t thread_stack_region_base;
     uint64_t thread_stack_region_size;
     user_alloc_t user_allocs[PROCESS_USER_ALLOC_MAX];

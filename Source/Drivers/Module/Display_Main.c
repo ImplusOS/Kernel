@@ -8,6 +8,7 @@
 #include "Drivers/Module/DriverManager.h"
 #include "Drivers/Module/DriverSelect.h"
 #include "MemoryManagement/Memory_Main.h"
+#include "interfaces/hal_cpu.h"
 
 const driver_display_t *g_active_display_driver = NULL;
 static const char *g_active_display_module_name = NULL;
@@ -75,7 +76,22 @@ static bool display_sync_geometry(void)
     return display_ensure_shadow_buffer();
 }
 
+/* Held by whoever may call a display driver's init(): the picker below and
+ * display_init_3d_backend(). init() resets the hardware, and a second reset
+ * of a VirtIO GPU that is already up -- its scanout set, its framebuffer
+ * handed out -- wedges the control queue or swaps the framebuffer under
+ * the first caller. Both paths check is_ready() first, but only under this
+ * flag is that check worth anything. */
 static volatile uint32_t g_display_picking;
+
+static void display_init_wait_and_lock(void)
+{
+    while (__atomic_exchange_n(&g_display_picking, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        while (__atomic_load_n(&g_display_picking, __ATOMIC_RELAXED) != 0u) {
+            hal_cpu_pause();
+        }
+    }
+}
 
 static bool display_refresh_driver(void)
 {
@@ -444,10 +460,24 @@ bool display_init_3d_backend(void)
 
         /* Render and scanout are independent roles. A VirtIO GPU can serve
          * Mesa while Intel owns the physical panel. Initialize this device
-         * without changing g_active_display_driver. */
+         * without changing g_active_display_driver.
+         *
+         * This runs from drm_kms_init() on the boot CPU with interrupts on,
+         * and the picker runs from anything that draws -- including the
+         * timer interrupt on this same CPU. Both found the GPU not ready and
+         * both initialised it: the interrupt brought it up and picked it,
+         * then this reset it again underneath, and the boot either hung on
+         * the wedged queue or carried on with a framebuffer the picker had
+         * never seen. Take the picker's flag (waiting is fine here; the
+         * picker never waits, it reports "not ready" until we are done) and
+         * look again before initialising. */
         if (candidate->is_ready != NULL && !candidate->is_ready()) {
             if (candidate->probe != NULL && !candidate->probe()) continue;
-            if (candidate->init == NULL || !candidate->init()) continue;
+            display_init_wait_and_lock();
+            bool up = candidate->is_ready() ||
+                      (candidate->init != NULL && candidate->init());
+            __atomic_store_n(&g_display_picking, 0u, __ATOMIC_RELEASE);
+            if (!up) continue;
         }
         if ((candidate->is_ready == NULL || candidate->is_ready()) &&
             candidate->gpu_has_3d()) {

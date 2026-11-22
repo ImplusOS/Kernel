@@ -296,6 +296,45 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
      * 0x7FFE0000 in every Windows process (see Paging_Main.h). */
     physical_memory_reserve_region(PAGING_WIN_SHARED_DATA_BASE,
                                    PAGING_WIN_SHARED_DATA_SIZE);
+#if OS_CONFIG_LINUX_I386_WINDOW_SIZE != 0
+    /* The Linux i386 window (kernel/config.h, OS_CONFIG_LINUX_I386_WINDOW_*):
+     * withheld like the two above, before the heap exists. Only when every
+     * frame of it is still free RAM -- frames the firmware or the boot
+     * manager already hold are reached by the kernel through their identity
+     * addresses, which an i386 process's page tables no longer have. Without
+     * the window, 32-bit programs are refused by the ELF loader. */
+    if (physical_memory_region_is_free(OS_CONFIG_LINUX_I386_WINDOW_BASE,
+                                       OS_CONFIG_LINUX_I386_WINDOW_SIZE)) {
+        physical_memory_reserve_region(OS_CONFIG_LINUX_I386_WINDOW_BASE,
+                                       OS_CONFIG_LINUX_I386_WINDOW_SIZE);
+        paging_compat32_window_set_available(1);
+    } else {
+        serial_write_string("[OS] [i386] address window not free RAM; "
+                            "Linux i386 programs disabled\n");
+    }
+#endif
+#endif
+#ifdef PLATFORM_ARM64
+    /* Low memory for Windows programs under Wine (arm64 Paging_Main.h):
+     * withhold the frames behind the window -- only when they are free RAM
+     * -- so a process may shadow that range of the identity map with its
+     * own pages. The whole window if possible, else the user-shared-data
+     * tail alone. */
+    if (physical_memory_region_is_free(PAGING_WIN_LOW_BASE,
+                                       PAGING_WIN_LOW_LIMIT - PAGING_WIN_LOW_BASE)) {
+        physical_memory_reserve_region(PAGING_WIN_LOW_BASE,
+                                       PAGING_WIN_LOW_LIMIT - PAGING_WIN_LOW_BASE);
+        paging_win_low_window_set(PAGING_WIN_LOW_BASE);
+    } else if (physical_memory_region_is_free(PAGING_WIN_SHARED_DATA_BASE,
+                                              PAGING_WIN_LOW_LIMIT - PAGING_WIN_SHARED_DATA_BASE)) {
+        physical_memory_reserve_region(PAGING_WIN_SHARED_DATA_BASE,
+                                       PAGING_WIN_LOW_LIMIT - PAGING_WIN_SHARED_DATA_BASE);
+        paging_win_low_window_set(PAGING_WIN_SHARED_DATA_BASE);
+        serial_write_string("[OS] [arm64] low window for Wine not free RAM; "
+                            "only the user shared data page\n");
+    } else {
+        serial_write_string("[OS] [arm64] no low window for Wine\n");
+    }
 #endif
     boot_profile_end("pmm", phase_ns);
 

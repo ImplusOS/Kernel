@@ -30,8 +30,15 @@
 #define ELFOSABI_LINUX_ENTRY_HINT 0x4000000000ULL
 #define ET_DYN  3
 
+#define EM_386     3
 #define EM_X86_64  62
 #define EM_AARCH64 183
+
+#define EI_CLASS    4
+#define EI_DATA     5
+#define ELFCLASS32  1
+#define ELFCLASS64  2
+#define ELFDATA2LSB 1
 
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
@@ -120,6 +127,37 @@ typedef struct {
     uint64_t p_memsz;
     uint64_t p_align;
 } Elf64_Phdr;
+
+/* ELFCLASS32 headers (Linux i386 programs on the x86_64 kernel). They are
+ * widened to the Elf64 forms as soon as they are read, so everything past
+ * the header parsing handles one shape. */
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf32_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} Elf32_Phdr;
 
 typedef struct {
     uint32_t sh_name;
@@ -1072,6 +1110,63 @@ static bool apply_relocations(const uint8_t     *image,
     return true;
 }
 
+/* An ELFCLASS32 header, widened in place of the Elf64 one. Only Linux i386
+ * images are accepted, and only on the x86_64 kernel (32-bit compatibility
+ * mode); the program header entries are still 32 bytes each, which
+ * e_phentsize keeps saying (AT_PHENT must report the real size). */
+static bool elf_ehdr32_to_64(const uint8_t *raw, uint64_t file_size,
+                             Elf64_Ehdr *out)
+{
+#if defined(PLATFORM_X86_64)
+    Elf32_Ehdr h;
+    memcpy(&h, raw, sizeof(h));
+    if (h.e_ident[0] != ELF_MAGIC_0 || h.e_ident[1] != ELF_MAGIC_1 ||
+        h.e_ident[2] != ELF_MAGIC_2 || h.e_ident[3] != ELF_MAGIC_3 ||
+        h.e_ident[EI_CLASS] != ELFCLASS32 ||
+        h.e_ident[EI_DATA] != ELFDATA2LSB ||
+        h.e_machine != EM_386 ||
+        (h.e_type != ET_EXEC && h.e_type != ET_DYN) ||
+        h.e_phentsize != sizeof(Elf32_Phdr) || h.e_phnum == 0 ||
+        !range_in_file(file_size, h.e_phoff,
+                       (uint64_t)h.e_phnum * sizeof(Elf32_Phdr))) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    memcpy(out->e_ident, h.e_ident, sizeof(out->e_ident));
+    out->e_type = h.e_type;
+    out->e_machine = h.e_machine;
+    out->e_version = h.e_version;
+    out->e_entry = h.e_entry;
+    out->e_phoff = h.e_phoff;
+    out->e_shoff = h.e_shoff;
+    out->e_flags = h.e_flags;
+    out->e_ehsize = h.e_ehsize;
+    out->e_phentsize = h.e_phentsize;
+    out->e_phnum = h.e_phnum;
+    out->e_shentsize = h.e_shentsize;
+    out->e_shnum = h.e_shnum;
+    out->e_shstrndx = h.e_shstrndx;
+    return true;
+#else
+    (void)raw;
+    (void)file_size;
+    (void)out;
+    return false;
+#endif
+}
+
+static void elf_phdr32_to_64(const Elf32_Phdr *in, Elf64_Phdr *out)
+{
+    out->p_type = in->p_type;
+    out->p_flags = in->p_flags;
+    out->p_offset = in->p_offset;
+    out->p_vaddr = in->p_vaddr;
+    out->p_paddr = in->p_paddr;
+    out->p_filesz = in->p_filesz;
+    out->p_memsz = in->p_memsz;
+    out->p_align = in->p_align;
+}
+
 /* Window at the very top of the user code region reserved for the dynamic
  * linker (PT_INTERP) when the main image is a PIE. The main executable is
  * loaded at USER_CODE_BASE and must stay below this. */
@@ -1132,20 +1227,43 @@ static bool elf_load_image_biased(uint64_t target_cr3,
         goto fail;
     }
 
-    if ((uint64_t)file.size < sizeof(Elf64_Ehdr)) {
+    if ((uint64_t)file.size < sizeof(Elf32_Ehdr)) {
         ELF_SET_ERROR("file too small for ELF header");
         goto fail;
     }
 
-    Elf64_Ehdr ehdr;
-    if (!vfs_read_at(&file, 0u, (uint8_t *)&ehdr, sizeof(ehdr))) {
+    uint8_t ehdr_raw[sizeof(Elf64_Ehdr)];
+    memset(ehdr_raw, 0, sizeof(ehdr_raw));
+    uint32_t ehdr_len = (uint64_t)file.size >= sizeof(Elf64_Ehdr) ?
+        (uint32_t)sizeof(Elf64_Ehdr) : (uint32_t)sizeof(Elf32_Ehdr);
+    if (!vfs_read_at(&file, 0u, ehdr_raw, ehdr_len)) {
         ELF_SET_ERROR("failed to read ELF header");
         goto fail;
     }
 
-    if (!elf_validate_ehdr_arch(&ehdr, (uint64_t)file.size, true)) {
-        ELF_SET_ERROR("ELF header validation failed (arch/type)");
-        goto fail;
+    /* ELFCLASS32 is a Linux i386 program: x86_64 kernel only, and only when
+     * the boot reserved its address window (see USER32_WINDOW_*). */
+    Elf64_Ehdr ehdr;
+    const bool elf32 = ehdr_raw[EI_CLASS] == ELFCLASS32;
+    if (elf32) {
+        if (!elf_ehdr32_to_64(ehdr_raw, (uint64_t)file.size, &ehdr)) {
+            ELF_SET_ERROR("ELF32 header validation failed (need EM_386, LSB)");
+            goto fail;
+        }
+        if (!paging_compat32_window_available()) {
+            ELF_SET_ERROR("i386 program, but the i386 address window is not reserved");
+            goto fail;
+        }
+    } else {
+        if ((uint64_t)file.size < sizeof(Elf64_Ehdr)) {
+            ELF_SET_ERROR("file too small for ELF header");
+            goto fail;
+        }
+        memcpy(&ehdr, ehdr_raw, sizeof(ehdr));
+        if (!elf_validate_ehdr_arch(&ehdr, (uint64_t)file.size, true)) {
+            ELF_SET_ERROR("ELF header validation failed (arch/type)");
+            goto fail;
+        }
     }
 
     {
@@ -1157,26 +1275,71 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             goto fail;
         }
 
-        phdrs = (Elf64_Phdr *)malloc((size_t)phdr_table_bytes);
+        phdrs = (Elf64_Phdr *)malloc((size_t)ehdr.e_phnum * sizeof(Elf64_Phdr));
         if (!phdrs) {
             ELF_SET_ERROR("PHDR table alloc failed (out of memory)");
             goto fail;
         }
 
-        if (!vfs_read_at(&file,
-                         (uint32_t)ehdr.e_phoff,
-                         (uint8_t *)phdrs,
-                         (uint32_t)phdr_table_bytes)) {
+        if (elf32) {
+            Elf32_Phdr *raw32 = (Elf32_Phdr *)malloc((size_t)phdr_table_bytes);
+            if (raw32 == NULL) {
+                ELF_SET_ERROR("PHDR table alloc failed (out of memory)");
+                goto fail;
+            }
+            if (!vfs_read_at(&file, (uint32_t)ehdr.e_phoff, (uint8_t *)raw32,
+                             (uint32_t)phdr_table_bytes)) {
+                free(raw32);
+                ELF_SET_ERROR("failed to read PHDR table");
+                goto fail;
+            }
+            for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
+                elf_phdr32_to_64(&raw32[i], &phdrs[i]);
+            }
+            free(raw32);
+        } else if (!vfs_read_at(&file,
+                                (uint32_t)ehdr.e_phoff,
+                                (uint8_t *)phdrs,
+                                (uint32_t)phdr_table_bytes)) {
             ELF_SET_ERROR("failed to read PHDR table");
             goto fail;
         }
     }
 
-    bool linux_image =
+    /* Native ImplusOS images are linked at USER_CODE_BASE; a SYSV-ABI image
+     * whose entry lies below it is a Linux one. (A small PIE can have its
+     * entry inside the first page, so any non-zero entry counts.) */
+    bool linux_image = elf32 ||
         (ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX) ||
         (ehdr.e_ident[EI_OSABI] == 0 &&
-         ehdr.e_entry >= 0x1000 &&
+         ehdr.e_entry != 0 &&
          ehdr.e_entry < ELFOSABI_LINUX_ENTRY_HINT);
+    uint8_t image_abi = PROCESS_ABI_IMPLUS;
+    if (linux_image) {
+#if defined(PLATFORM_ARM64)
+        image_abi = PROCESS_ABI_LINUX_ARM64;
+#else
+        image_abi = elf32 ? PROCESS_ABI_LINUX_I386 : PROCESS_ABI_LINUX;
+#endif
+    }
+
+    /* A 32-bit image is confined to its window, the interpreter to the
+     * interpreter's slot in it, whatever the caller's policy said. */
+    elf_load_policy_t eff_policy = *policy;
+    if (elf32) {
+        eff_policy.min_vaddr = is_interp ? USER32_INTERP_BASE : USER32_WINDOW_BASE;
+        eff_policy.max_vaddr = is_interp ? USER32_INTERP_LIMIT : USER32_IMAGE_LIMIT;
+        if (!is_interp) {
+            /* Give this address space the window: drop the kernel's identity
+             * entries there so the program's pages (and its demand-zero
+             * faults) are its own. */
+            if (paging_prepare_compat32_window(target_cr3) < 0) {
+                ELF_SET_ERROR("could not prepare the i386 address window");
+                goto fail;
+            }
+        }
+    }
+    policy = &eff_policy;
 #if defined(PLATFORM_X86_64)
     bool demand_page_image = !is_interp && target_pid >= 0 && linux_image &&
                              (uint64_t)file.size >= ELF_DEMAND_PAGE_MIN_BYTES;
@@ -1217,7 +1380,8 @@ static bool elf_load_image_biased(uint64_t target_cr3,
             }
         }
         if (lowest_load != UINT64_MAX && lowest_load < USER_CODE_BASE) {
-            bias = (bias_override != 0u) ? bias_override : USER_CODE_BASE;
+            bias = (bias_override != 0u) ? bias_override :
+                   (elf32 ? USER32_PIE_BIAS : USER_CODE_BASE);
         }
     }
     uint64_t max_seg_end = 0u; /* highest biased vaddr+memsz seen (for interp fit check) */
@@ -1252,6 +1416,18 @@ static bool elf_load_image_biased(uint64_t target_cr3,
         }
 
         uint64_t seg_vaddr = bias + ph->p_vaddr;
+
+#if defined(PLATFORM_ARM64)
+        /* Below the user windows the arm64 TTBR0 tables are the kernel's
+         * own, shared by every process (Arch/arm64/mmu/Paging_Main.c): a
+         * fixed-address (ET_EXEC) program linked there cannot be given
+         * private pages. PIE and the dynamic linker are relocated above. */
+        if (seg_vaddr < USER_CODE_BASE) {
+            ELF_SET_ERROR("segment below 0x4000000000 (arm64 runs Linux PIE "
+                          "images only; relink with -pie or -static-pie)");
+            goto fail;
+        }
+#endif
 
         if (!in_vaddr_range(seg_vaddr, ph->p_memsz,
                             policy->min_vaddr, policy->max_vaddr)) {
@@ -1529,12 +1705,16 @@ static bool elf_load_image_biased(uint64_t target_cr3,
     image_out->interp_base = 0u;
     image_out->interp_path[0] = '\0';
     image_out->linux_abi   = linux_image ? 1u : 0u;
+    image_out->abi_mode    = image_abi;
+    image_out->image_end   = max_seg_end;
 
     if (interp_path[0] != '\0' && !is_interp) {
         /* Load the dynamic linker high in the code region, clear of the main
-         * image, and hand its (biased) entry back as the process entry. */
-        uint64_t interp_bias =
-            (policy->max_vaddr - ELF_INTERP_BIAS_RESERVE) & ~0xFFFULL;
+         * image, and hand its (biased) entry back as the process entry. A
+         * 32-bit one goes to its own slot of the i386 window (the policy of
+         * the nested load is recomputed from its ELF class). */
+        uint64_t interp_bias = elf32 ? USER32_INTERP_BASE :
+            ((policy->max_vaddr - ELF_INTERP_BIAS_RESERVE) & ~0xFFFULL);
         if (max_seg_end > interp_bias) {
             ELF_SET_ERROR("main image overlaps interpreter window");
             goto fail;
@@ -1548,6 +1728,10 @@ static bool elf_load_image_biased(uint64_t target_cr3,
         }
         if (interp_info.interp_path[0] != '\0') {
             ELF_SET_ERROR("nested interpreter not supported");
+            goto fail;
+        }
+        if (interp_info.abi_mode != image_abi) {
+            ELF_SET_ERROR("interpreter is for a different ABI than the program");
             goto fail;
         }
         image_out->entry = interp_info.entry;
@@ -1680,6 +1864,13 @@ bool elf_loader_load_from_memory(uint64_t target_cr3,
         (ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX) ||
         (ehdr->e_ident[EI_OSABI] == 0 &&
          ehdr->e_entry >= 0x1000 && ehdr->e_entry < ELFOSABI_LINUX_ENTRY_HINT) ? 1u : 0u;
+#if defined(PLATFORM_ARM64)
+    image_out->abi_mode = image_out->linux_abi ? PROCESS_ABI_LINUX_ARM64
+                                               : PROCESS_ABI_IMPLUS;
+#else
+    image_out->abi_mode = image_out->linux_abi ? PROCESS_ABI_LINUX
+                                               : PROCESS_ABI_IMPLUS;
+#endif
     return true;
 }
 

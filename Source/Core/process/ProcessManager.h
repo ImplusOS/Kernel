@@ -25,6 +25,21 @@
 #define USER_HEAP_LIMIT   USER_STACK_BASE
 
 /*
+ * Where SYSCALL_GET_DISPLAY_FRAMEBUFFER maps the display framebuffer into a
+ * process: from the stack top up. The limit is how far each architecture's
+ * process page tables reach there -- on x86_64 one PDPT slot past the stack
+ * (MAX_PDPT_ENTRIES), on arm64 the rest of the first 512 GiB, whose L1 slots
+ * every process owns outright (paging_create_process_space; the kernel
+ * reaches physical addresses from 256 GiB up through its TTBR1 alias).
+ */
+#define USER_DISPLAY_FB_BASE  USER_STACK_TOP
+#if defined(PLATFORM_ARM64)
+#define USER_DISPLAY_FB_LIMIT 0x0000008000000000ULL
+#else
+#define USER_DISPLAY_FB_LIMIT (USER_STACK_TOP + 0x40000000ULL)
+#endif
+
+/*
  * Anonymous mmap() arena. Separate from the (eagerly-committed, bump-managed)
  * heap so that mmap() can hand out multi-GiB *lazily-committed* reservations:
  * pages here are not backed by physical frames until first touch, which is
@@ -46,6 +61,19 @@
 
 #define USER_MMAP_BASE    0x0000010000000000ULL
 #define USER_MMAP_LIMIT   0x0000100000000000ULL
+/* Where a Linux program may map at an address of its own choosing (MAP_FIXED,
+ * MAP_FIXED_NOREPLACE): demand-zero like the arena. The kernel itself still
+ * places mappings in [USER_MMAP_BASE, USER_MMAP_LIMIT). On arm64 it is the
+ * whole 47-bit range an x86_64 Linux program expects: Wine probes for free
+ * space downward from 0x7fffffff0000 in 64 KiB steps, and with 16 TiB the
+ * last address the kernel would accept, a single allocation took hours of
+ * refused mmap() calls. (Nothing of the kernel's lives in TTBR0 above the
+ * first 512 GiB.) */
+#if defined(PLATFORM_ARM64)
+#define USER_MMAP_FIXED_LIMIT 0x0000800000000000ULL
+#else
+#define USER_MMAP_FIXED_LIMIT USER_MMAP_LIMIT
+#endif
 
 #if (USER_CODE_BASE >= USER_CODE_LIMIT)
 #error "Invalid user code range"
@@ -62,6 +90,81 @@
 #if (USER_MMAP_BASE >= USER_MMAP_LIMIT) || (USER_MMAP_BASE < USER_STACK_TOP)
 #error "Invalid user mmap range"
 #endif
+
+/*
+ * Syscall ABIs a process can run under (process_t.abi_mode). Which compat
+ * layer answers a process's syscalls is looked up by this value in
+ * Kernel/Source/Compat/compat_registry.c:
+ *   LINUX        Linux x86_64 (SYSCALL)          -- x86_64 kernel
+ *   LINUX_I386   Linux i386 (int $0x80, ILP32)   -- x86_64 kernel, 32-bit
+ *                compatibility mode, inside USER32_WINDOW_* below
+ *   LINUX_ARM64  Linux AArch64 (svc #0, generic) -- arm64 kernel
+ * "Is this a Linux program at all" is PROCESS_ABI_IS_LINUX(); the fd table,
+ * /proc and the pty layer care about that, not about which one.
+ */
+#ifndef PROCESS_ABI_IMPLUS
+#define PROCESS_ABI_IMPLUS      0
+#endif
+#ifndef PROCESS_ABI_LINUX
+#define PROCESS_ABI_LINUX       1
+#endif
+#define PROCESS_ABI_LINUX_I386  2
+#define PROCESS_ABI_LINUX_ARM64 3
+static inline int process_abi_is_linux(uint8_t mode)
+{
+    return mode >= PROCESS_ABI_LINUX && mode <= PROCESS_ABI_LINUX_ARM64;
+}
+#define PROCESS_ABI_IS_LINUX(m) process_abi_is_linux((uint8_t)(m))
+#define PROCESS_ABI_IS_COMPAT32(m) ((m) == PROCESS_ABI_LINUX_I386)
+
+/*
+ * Address space of a Linux i386 process (x86_64 kernel only). Everything it
+ * can map lives in one window of the low 4 GiB whose physical frames the
+ * kernel withholds at boot -- see OS_CONFIG_LINUX_I386_WINDOW_* in
+ * kernel/config.h for why. Inside it, from the bottom:
+ *
+ *   [WINDOW_BASE, IMAGE_LIMIT)   the main image (ET_EXEC at its link address,
+ *                                a PIE at PIE_BIAS) and the program break
+ *   [MMAP_BASE, MMAP_LIMIT)      anonymous/file mmap(), page-granular and
+ *                                reusable (process_user_reserve)
+ *   [HEAP_BASE, HEAP_LIMIT)      the bump allocator (shared memory, SysV shm)
+ *   [INTERP_BASE, INTERP_LIMIT)  PT_INTERP (ld-linux.so.2)
+ *   [STACK_BASE, STACK_TOP)      main thread stack, demand-zero
+ *   SIGPAGE                      signal-return trampolines
+ */
+#define USER32_WINDOW_BASE   OS_CONFIG_LINUX_I386_WINDOW_BASE
+#define USER32_WINDOW_SIZE   OS_CONFIG_LINUX_I386_WINDOW_SIZE
+#define USER32_WINDOW_LIMIT  (USER32_WINDOW_BASE + USER32_WINDOW_SIZE)
+#define USER32_SIGPAGE       (USER32_WINDOW_LIMIT - 0x1000ULL)
+#define USER32_STACK_TOP     (USER32_WINDOW_LIMIT - 0x10000ULL)
+#define USER32_STACK_SIZE    (8ULL * 1024ULL * 1024ULL)
+#define USER32_STACK_BASE    (USER32_STACK_TOP - USER32_STACK_SIZE)
+#define USER32_INTERP_BASE   ((USER32_STACK_BASE - 0x900000ULL) & ~0xFFFFFULL)
+#define USER32_INTERP_LIMIT  (USER32_STACK_BASE - 0x10000ULL)
+#define USER32_HEAP_SIZE     (16ULL * 1024ULL * 1024ULL)
+#define USER32_HEAP_BASE     (USER32_INTERP_BASE - USER32_HEAP_SIZE)
+#define USER32_HEAP_LIMIT    USER32_INTERP_BASE
+#define USER32_IMAGE_LIMIT   (USER32_WINDOW_BASE + USER32_WINDOW_SIZE / 4ULL)
+#define USER32_PIE_BIAS      (USER32_WINDOW_BASE + 0x200000ULL)
+#define USER32_MMAP_BASE     USER32_IMAGE_LIMIT
+#define USER32_MMAP_LIMIT    USER32_HEAP_BASE
+
+#if OS_CONFIG_LINUX_I386_WINDOW_SIZE != 0
+#if (OS_CONFIG_LINUX_I386_WINDOW_SIZE < 0x4000000ULL) || \
+    ((OS_CONFIG_LINUX_I386_WINDOW_SIZE & 0x1FFFFFULL) != 0) || \
+    ((OS_CONFIG_LINUX_I386_WINDOW_BASE & 0x1FFFFFULL) != 0) || \
+    (OS_CONFIG_LINUX_I386_WINDOW_BASE + OS_CONFIG_LINUX_I386_WINDOW_SIZE > 0x80000000ULL)
+/* Below 2 GiB: an i386 pointer then reads the same whether a 32-bit argument
+ * is zero- or sign-extended (Compat/Linux/i386 sign-extends int arguments). */
+#error "OS_CONFIG_LINUX_I386_WINDOW_*: 2 MiB aligned, >= 64 MiB, below 2 GiB"
+#endif
+#endif
+
+/* Signal-return trampoline page of a Linux AArch64 process (it has no vDSO,
+ * and glibc relies on the kernel for the return path): one read-only,
+ * executable page in the unused gap between the code and heap windows --
+ * still inside the range fork() copies and usercopy accepts. */
+#define USER_ARM64_SIGPAGE   USER_CODE_LIMIT
 
 typedef uint64_t process_capability_mask_t;
 
@@ -261,6 +364,24 @@ int process_sigaltstack(uint64_t new_sp, uint64_t new_size, uint32_t new_flags,
                         int has_new, uint64_t *old_sp_out,
                         uint64_t *old_size_out, uint32_t *old_flags_out);
 int64_t process_signal_rt_sigreturn(uint64_t saved_rsp);
+/* Linux i386 sigreturn (rt == 0) / rt_sigreturn (x86_64 kernel) and Linux
+ * AArch64 rt_sigreturn (arm64 kernel): restore the interrupted context from
+ * the signal frame at the user stack pointer; return the restored result
+ * register. */
+int64_t process_signal_sigreturn_compat32(uint64_t saved_rsp, int rt);
+int64_t process_signal_rt_sigreturn_arm64(uint64_t saved_rsp);
+
+/* clone(CLONE_THREAD) from a copy of the caller's syscall frame -- see the
+ * definition. Linux i386 and AArch64. */
+int32_t process_create_thread_clone(uint64_t parent_frame, uint64_t user_sp,
+                                    int has_tls, uint64_t tls_value,
+                                    const uint64_t *compat_tls);
+/* Linux i386 helpers (x86_64 kernel). */
+void process_compat32_note_syscall_entry(uint64_t ecx);
+int  process_compat32_get_tls(uint64_t out[3]);
+int  process_compat32_set_tls(const uint64_t desc[3]);
+void process_user_compat_release(uint64_t addr, uint64_t length);
+void process_user_compat_claim(uint64_t addr, uint64_t length);
 #if defined(__x86_64__)
 int process_signal_deliver_fault_now(int32_t pid, int32_t signum,
                                      uint64_t fault_addr,
@@ -284,6 +405,9 @@ uint64_t process_signal_get_mask(void);
 int process_signal_set_mask(uint64_t mask);
 int process_signal_deliver(int32_t pid, int32_t signum);
 int process_signal_deliver_group(int32_t pid, int32_t signum);
+/* prctl(PR_SET/GET_PDEATHSIG) for the calling process. */
+int process_set_pdeath_signal(int32_t signum);
+int32_t process_get_pdeath_signal(void);
 int process_signal_deliver_pgrp(int32_t pid, int32_t signum);
 int process_signal_deliver_session(int32_t sid, int32_t signum);
 void process_run_pending_teardowns(void);
@@ -355,6 +479,14 @@ int process_wake_pid(int32_t pid);
 int32_t process_terminate(int32_t pid);
 int32_t process_get_full_info(int32_t pid, void *info_out);
 int32_t process_get_perf_info(int32_t pid, process_perf_info_t *info_out);
+
+/* Where physical memory went, on the serial log: free pages, tmpfs, shared
+ * memory, the FileMap table, then every address space's resident frames.
+ * Called when a page allocation for a fault fails (`force` 0: at most once
+ * every few seconds) and by reads of /proc/memdebug (`force` 1). Safe from
+ * the fault path: it only try-locks the process table and skips the
+ * per-process part when that is held. */
+void process_debug_memory_report(const char *why, int force);
 int32_t process_get_capacity(void);
 int32_t process_count_threads(int32_t owner_pid);
 /* Ascending walks backing /proc/<pid>/task and /proc itself; -1 to start,

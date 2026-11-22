@@ -90,7 +90,41 @@ typedef struct {
 static syscall_display_fb_map_t
     g_display_fb_maps[OS_CONFIG_PROCESS_MAX_COUNT];
 static spinlock_t g_display_fb_map_lock;
-static uint64_t g_display_fb_next_user = 0x0000004800000000ULL;
+
+/* Unmapped gap left between the stack top and the first framebuffer
+ * mapping of an address space. */
+#define DISPLAY_FB_GUARD_BYTES 0x200000ULL
+
+/* The lowest framebuffer VA above every mapping a live slot holds in this
+ * address space (caller holds g_display_fb_map_lock).
+ *
+ * The VA used to come from one counter shared by every process, which only
+ * ever grew: each process that mapped the framebuffer took the next few MiB
+ * for good. Only one address space needs a VA to be unused -- the one it is
+ * mapped into -- so a process gets the bottom of the window unless another
+ * slot of the same address space (another thread, or this one before a
+ * mode change grew the framebuffer) already sits there. A slot whose CR3
+ * value is reused by a later address space after its process died is told
+ * apart by its first page not being mapped there. The window ends at
+ * USER_DISPLAY_FB_LIMIT, as far as the process page tables reach. */
+static uint64_t syscall_display_fb_next_va_locked(uint64_t cr3)
+{
+    uint64_t next = USER_DISPLAY_FB_BASE + DISPLAY_FB_GUARD_BYTES;
+    for (uint32_t i = 0u; i < OS_CONFIG_PROCESS_MAX_COUNT; ++i) {
+        const syscall_display_fb_map_t *s = &g_display_fb_maps[i];
+        if (!s->used || s->cr3 != cr3 || s->user_base == 0u ||
+            s->user_base + s->mapped_bytes <= next) {
+            continue;
+        }
+        /* A busy slot is being mapped right now: its range is taken even
+         * though no page of it is there yet. */
+        if (!s->busy && paging_virt_to_phys(cr3, s->user_base) == 0u) {
+            continue;
+        }
+        next = s->user_base + s->mapped_bytes;
+    }
+    return next;
+}
 
 static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
                                    uint64_t cr3, uint64_t *user_fb_out)
@@ -226,7 +260,13 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
         }
 
         if (slot->user_base == 0u || slot->mapped_bytes < map_bytes) {
-            if (g_display_fb_next_user > UINT64_MAX - map_bytes) {
+            /* A slot that grows gives up its old range: leave it out of the
+             * search so the new one does not have to start above it. */
+            slot->user_base = 0u;
+            slot->mapped_bytes = 0u;
+            uint64_t next = syscall_display_fb_next_va_locked(cr3);
+            if (next > USER_DISPLAY_FB_LIMIT ||
+                map_bytes > USER_DISPLAY_FB_LIMIT - next) {
                 if (newly_allocated_slot) {
                     memset(slot, 0, sizeof(*slot));
                 }
@@ -234,11 +274,7 @@ static bool syscall_display_fb_map(void *kernel_fb, uint64_t size,
                 irq_restore(irq);
                 return false;
             }
-            /* Preserve the existing first allocation convention: advance
-             * before returning so the guard/stack boundary at 0x4800000000
-             * is not used as the framebuffer mapping itself. */
-            user_base = g_display_fb_next_user + map_bytes;
-            g_display_fb_next_user = user_base;
+            user_base = next;
             slot->user_base = user_base;
             slot->mapped_bytes = map_bytes;
         } else {
@@ -722,6 +758,20 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
      * so a future second compat layer doesn't require editing this file.
      * See Kernel/Compat/compat_registry.h and Syscall_Init.c's
      * syscall_init() (where layers actually register themselves). */
+#if defined(__x86_64__)
+    /* `int $0x80` is the Linux i386 trap and the only one an i386 task may
+     * use; which trap a call came in by decides which registers hold its
+     * arguments, so a mismatch in either direction is refused rather than
+     * guessed at. */
+    {
+        int via_int80 = syscall_consume_int80_entry();
+        int is_i386 = process_get_current_abi_mode() == PROCESS_ABI_LINUX_I386;
+        if (via_int80 != is_i386) {
+            set_syscall_result(saved_rsp, (uint64_t)(int64_t)-38 /* ENOSYS */);
+            goto pre_schedule;
+        }
+    }
+#endif
     const compat_layer_t *compat = compat_registry_find(process_get_current_abi_mode());
     if (compat != NULL) {
         syscall_arch_user_access_begin();

@@ -83,6 +83,15 @@ typedef struct {
      * socket closes; freeing it at once let tcp_connect hand the same id to a
      * new socket, and two sockets then shared one byte stream. */
     uint8_t  user_ref;
+    /* Why the connection died, as a positive errno (0 while it is alive):
+     * ECONNREFUSED (RST answering our SYN), ECONNRESET (RST later) or
+     * ETIMEDOUT (retransmissions exhausted). recv/send/SO_ERROR/poll report
+     * it; without it every dead connection read back as a generic EIO, which
+     * Chromium maps to ERR_FAILED. */
+    uint8_t  error;
+    /* Largest payload the peer takes per segment: the MSS option of its
+     * SYN, capped at TCP_MAX_SEGMENT_DATA (RFC 879's 536 without one). */
+    uint16_t snd_mss;
     int32_t  parent_conn_id;  
     uint16_t listen_backlog;
 } tcp_connection_t;
@@ -103,6 +112,10 @@ void tcp_init(void);
 
 
 int32_t tcp_connect(uint32_t remote_ip, uint16_t remote_port, uint16_t local_port);
+
+/* The positive errno a dead connection failed with (tcp_connection_t.error),
+ * or 0. */
+int32_t tcp_connection_error(int32_t conn_id);
 int tcp_local_port_in_use(uint16_t local_port);
 
 

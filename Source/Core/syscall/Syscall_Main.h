@@ -287,6 +287,12 @@ void     syscall_set_user_rsp(uint64_t user_rsp);
 uint64_t syscall_get_kernel_rsp(void);
 void     syscall_set_kernel_rsp(uint64_t kernel_rsp);
 void     syscall_set_full_restore(int enabled, uint64_t rcx, uint64_t r11);
+/* x86_64: the user CS/SS the next return to user mode uses on this CPU --
+ * 32-bit compatibility-mode code for a Linux i386 task. No-op on arm64. */
+void     syscall_set_user_segments(int compat32);
+/* x86_64: 1 when the syscall now being dispatched on this CPU came in by
+ * `int $0x80` (Linux i386 ABI) rather than SYSCALL; clears the flag. */
+int      syscall_consume_int80_entry(void);
 /* Point this CPU's GS base at its per-CPU area for `cpu_id` (x86_64). */
 void     syscall_percpu_bind(uint32_t cpu_id);
 

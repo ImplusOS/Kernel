@@ -149,6 +149,14 @@ int32_t syscall_file_mmap_reacquire(int32_t handle);
 int64_t syscall_file_mmap_read(int32_t handle, uint64_t offset,
                                uint8_t *kernel_buffer, uint32_t length);
 void    syscall_file_mmap_release(int32_t handle);
+/* For FileMap's shared page cache: 1 when the mmap'd file lives on
+ * read-only media (a mount whose vfs_media_kind_t is OPTICAL), so its bytes
+ * can never change and one physical copy of each page may serve every
+ * process; *mount_out and *id_out then name the file (the mount's driver
+ * copy and the filesystem's internal id). 0 otherwise. Lock-free, like
+ * syscall_file_mmap_read(): the caller holds a reference. */
+int     syscall_file_mmap_identity(int32_t handle, uint64_t *mount_out,
+                                   uint64_t *id_out);
 
 /* Returns 1 if `fd` is a directory handle (opendir/O_DIRECTORY open) owned by
  * the calling process. Used by the Linux compat fstat/statx path so opendir()

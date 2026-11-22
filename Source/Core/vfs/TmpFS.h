@@ -22,3 +22,9 @@ const vfs_driver_t *tmpfs_vfs_get_driver(void);
  * same pages. Returns a handle > 0, or <= 0 when `file` is not a tmpfs file
  * (or is empty, or too large) and the caller should use its normal path. */
 int32_t tmpfs_share_mapping(vfs_file_t *file, uint64_t length);
+
+/* Diagnostics (the out-of-memory report): bytes of file data tmpfs holds
+ * itself (allocated capacity), the number of files, and in
+ * *shared_bytes_out the size of the files mapped MAP_SHARED, whose bytes
+ * live in shared-memory objects instead. Unlocked; approximate. */
+uint64_t tmpfs_debug_bytes(uint32_t *files_out, uint64_t *shared_bytes_out);

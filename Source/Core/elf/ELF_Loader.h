@@ -31,7 +31,11 @@ typedef struct {
     uint64_t load_bias;    /* base the main executable was loaded at (0 for ET_EXEC) */
     uint64_t interp_base;  /* base the PT_INTERP interpreter was loaded at (0 if none; auxv AT_BASE) */
     char     interp_path[64]; /* PT_INTERP interpreter path ("" if none) */
-    uint8_t  linux_abi;
+    uint8_t  linux_abi;    /* any Linux ABI (abi_mode below says which) */
+    /* PROCESS_ABI_* the image runs under: native, Linux x86_64, Linux i386
+     * (an ELFCLASS32 EM_386 image, x86_64 kernel only) or Linux AArch64. */
+    uint8_t  abi_mode;
+    uint64_t image_end;    /* highest biased vaddr+memsz of the main image */
 } elf_loaded_image_info_t;
 
 const char *elf_loader_last_error(void);

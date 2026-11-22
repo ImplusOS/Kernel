@@ -254,6 +254,17 @@ bool udp_send(uint32_t dst_ipv4_addr,
               const void *payload,
               uint16_t payload_len)
 {
+    return udp_send_from(IPV4_SRC_LOCAL, dst_ipv4_addr, src_port, dst_port,
+                         payload, payload_len);
+}
+
+bool udp_send_from(uint64_t src_ipv4_addr,
+                   uint32_t dst_ipv4_addr,
+                   uint16_t src_port,
+                   uint16_t dst_port,
+                   const void *payload,
+                   uint16_t payload_len)
+{
     if (dst_ipv4_addr == 0u || src_port == 0u || dst_port == 0u) {
         return false;
     }
@@ -277,9 +288,14 @@ bool udp_send(uint32_t dst_ipv4_addr,
         memcpy(datagram + UDP_HEADER_BYTES, payload, payload_len);
     }
 
-    uint32_t src_ip = ipv4_local_address();
-    if (src_ip == 0u) {
-        return false;
+    uint32_t src_ip;
+    if (src_ipv4_addr == IPV4_SRC_LOCAL) {
+        src_ip = ipv4_local_address();
+        if (src_ip == 0u) {
+            return false;
+        }
+    } else {
+        src_ip = (uint32_t)src_ipv4_addr;
     }
 
     uint16_t checksum = udp_checksum(src_ip, dst_ipv4_addr, datagram, udp_len);
@@ -288,7 +304,8 @@ bool udp_send(uint32_t dst_ipv4_addr,
     }
     udp_write_be16(datagram + 6u, checksum);
 
-    return ipv4_send(dst_ipv4_addr, UDP_PROTOCOL_NUMBER, datagram, udp_len);
+    return ipv4_send_from(src_ipv4_addr, dst_ipv4_addr, UDP_PROTOCOL_NUMBER,
+                          datagram, udp_len);
 }
 
 bool udp_syscall_send(uint32_t dst_ipv4_addr,

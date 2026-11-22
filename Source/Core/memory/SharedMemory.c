@@ -719,6 +719,17 @@ uint32_t shared_memory_size(int32_t handle)
     return size;
 }
 
+uint64_t shared_memory_debug_pages(void)
+{
+    uint64_t pages = 0;
+    for (uint32_t i = 0u; i < SHARED_MEMORY_OBJECT_MAX; ++i) {
+        if (g_shared_objects[i].used) {
+            pages += g_shared_objects[i].page_count;
+        }
+    }
+    return pages;
+}
+
 uint32_t shared_memory_object_count(void)
 {
     shared_memory_init_once();

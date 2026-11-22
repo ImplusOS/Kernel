@@ -2,15 +2,33 @@ BITS 64
 section .text
 global syscall_entry
 global syscall_enter_user_from_frame
+global isr_int80
 extern syscall_dispatch
 extern process_scheduler_clear_leaving_pid
 
+; Per-CPU syscall state (syscall_cpu_state_t in Core/syscall/Syscall_Init.c),
+; reached through the kernel GS base.
+%define PERCPU_USER_RSP      0
+%define PERCPU_KERNEL_RSP    8
+%define PERCPU_FULL_RESTORE  16
+%define PERCPU_FULL_RCX      24
+%define PERCPU_FULL_R11      32
+%define PERCPU_USER_CS       48
+%define PERCPU_USER_SS       56
+%define PERCPU_INT80         64
+
+; Selectors (kernel/config.h): 64-bit user code, and the user data segment a
+; 32-bit (Linux i386) task also needs in DS/ES -- in compatibility mode a null
+; data segment faults on the first memory access.
+%define USER_CS64   (0x28 | 3)
+%define USER_DS     (0x20 | 3)
+
 syscall_entry:
     swapgs
-    
-    mov [gs:0], rsp
-    mov rsp, [gs:8]
-    
+
+    mov [gs:PERCPU_USER_RSP], rsp
+    mov rsp, [gs:PERCPU_KERNEL_RSP]
+
     push r11
     push rcx
     push rbp
@@ -26,7 +44,7 @@ syscall_entry:
     push rsi
     push rdx
     push rax
-    
+
     ; Marshal to syscall_dispatch(saved_rsp, num, a1, a2, a3, a4, a5, a6).
     ; Frame offsets after the pushes above: [0]=rax [8]=rdx [16]=rsi [24]=rdi
     ; [32]=r8 [40]=r9 [48]=r10. Linux passes the 4th arg in r10, not rcx.
@@ -51,7 +69,70 @@ syscall_entry:
     push r10               ; a5
 
     call syscall_dispatch
-    
+    jmp syscall_exit_common
+
+; Linux i386 system call: `int $0x80` from 32-bit compatibility mode (an
+; interrupt gate with DPL 3, so IF is clear here). Number in EAX, arguments in
+; EBX, ECX, EDX, ESI, EDI, EBP, result back in EAX, and every other register
+; preserved -- ECX included, which is why this always leaves through the IRETQ
+; ("full restore") exit with the real RCX/R11 handed back.
+;
+; The frame is built exactly where syscall_entry builds it, at the top of the
+; task's kernel stack (TSS.RSP0 and PERCPU_KERNEL_RSP are the same address):
+; fork, signal delivery and preemption all find a task's registers there. The
+; CPU pushed its own frame into those same bytes, so it is read out first.
+isr_int80:
+    swapgs
+    cld
+    mov [gs:PERCPU_FULL_RCX], rcx
+    mov [gs:PERCPU_FULL_R11], r11
+    mov rcx, [rsp + 0]          ; user eip
+    mov r11, [rsp + 16]         ; user eflags
+    push rax
+    mov rax, [rsp + 8 + 24]     ; user esp
+    mov [gs:PERCPU_USER_RSP], rax
+    pop rax
+    mov rsp, [gs:PERCPU_KERNEL_RSP]
+
+    push r11
+    push rcx
+    push rbp
+    push rbx
+    push r15
+    push r14
+    push r13
+    push r12
+    push r10
+    push r9
+    push r8
+    push rdi
+    push rsi
+    push rdx
+    push rax
+
+    mov qword [gs:PERCPU_FULL_RESTORE], 1
+    mov qword [gs:PERCPU_INT80], 1
+
+    ; syscall_dispatch(saved_rsp, eax, ebx, ecx, edx, esi, edi, ebp), every
+    ; value zero-extended: the upper halves of the registers mean nothing to a
+    ; 32-bit program.
+    mov rdi, rsp
+    mov esi, eax                    ; num
+    mov edx, ebx                    ; a1 = ebx
+    mov ecx, [gs:PERCPU_FULL_RCX]   ; a2 = ecx
+    mov r8d, [rsp + 1 * 8]          ; a3 = edx
+    mov r9d, [rsp + 2 * 8]          ; a4 = esi
+    mov eax, [rsp + 12 * 8]         ; a6 = ebp
+    mov r10d, [rsp + 3 * 8]         ; a5 = edi
+
+    sub rsp, 8
+    push rax                        ; a6
+    push r10                        ; a5
+
+    call syscall_dispatch
+    ; fall through
+
+syscall_exit_common:
     mov rsp, rax
 
     ; Only now is the previous task's kernel stack abandoned: everything up to
@@ -69,9 +150,13 @@ syscall_entry:
     ; The task being resumed may need RCX and R11 back as well (it was
     ; preempted in its own code, or is returning from a signal handler):
     ; SYSRET cannot give it that, IRETQ can. See syscall_set_full_restore().
-    cmp qword [gs:16], 0
+    ; A 32-bit task always goes that way: SYSRET would return it to 64-bit
+    ; code, and its ECX is a preserved register.
+    cmp qword [gs:PERCPU_FULL_RESTORE], 0
     jne .full_restore
-    
+    cmp qword [gs:PERCPU_USER_CS], USER_CS64
+    jne .full_restore
+
     pop rax
     pop rdx
     pop rsi
@@ -88,8 +173,8 @@ syscall_entry:
     pop rcx
     pop r11
 
-    mov rsp, [gs:0]
-    
+    mov rsp, [gs:PERCPU_USER_RSP]
+
     swapgs
     o64 sysret
 
@@ -98,18 +183,26 @@ syscall_entry:
 ; Slots 10..14 are reused in place as the IRETQ frame once their contents
 ; are in registers.
 .full_restore:
-    mov qword [gs:16], 0
+    mov qword [gs:PERCPU_FULL_RESTORE], 0
     mov r15, [rsp + 10 * 8]
     mov rbx, [rsp + 11 * 8]
     mov rbp, [rsp + 12 * 8]
     mov rcx, [rsp + 13 * 8]         ; rip
     mov r11, [rsp + 14 * 8]         ; rflags
-    mov rax, [gs:0]                 ; user rsp
+    mov rax, [gs:PERCPU_USER_RSP]   ; user rsp
     mov [rsp + 10 * 8], rcx
-    mov qword [rsp + 11 * 8], (0x28 | 3)   ; user cs
+    mov rdx, [gs:PERCPU_USER_CS]
+    mov [rsp + 11 * 8], rdx         ; user cs (64-bit or 32-bit, per task)
     mov [rsp + 12 * 8], r11
     mov [rsp + 13 * 8], rax
-    mov qword [rsp + 14 * 8], (0x20 | 3)   ; user ss
+    mov rdx, [gs:PERCPU_USER_SS]
+    mov [rsp + 14 * 8], rdx         ; user ss
+    cmp qword [gs:PERCPU_USER_CS], USER_CS64
+    je .full_restore_regs
+    mov edx, USER_DS
+    mov ds, dx
+    mov es, dx
+.full_restore_regs:
     mov rax, [rsp + 0 * 8]
     mov rdx, [rsp + 1 * 8]
     mov rsi, [rsp + 2 * 8]
@@ -120,8 +213,8 @@ syscall_entry:
     mov r12, [rsp + 7 * 8]
     mov r13, [rsp + 8 * 8]
     mov r14, [rsp + 9 * 8]
-    mov rcx, [gs:24]
-    mov r11, [gs:32]
+    mov rcx, [gs:PERCPU_FULL_RCX]
+    mov r11, [gs:PERCPU_FULL_R11]
     add rsp, 10 * 8
     swapgs
     iretq
@@ -144,12 +237,18 @@ syscall_enter_user_from_frame:
     mov rax, [rbx + (13 * 8)]
     mov rdx, [rbx + (14 * 8)]
 
-    push qword (0x20 | 3)
+    push qword [gs:PERCPU_USER_SS]
     push rsi
     push rdx
-    push qword (0x28 | 3)
+    push qword [gs:PERCPU_USER_CS]
     push rax
 
+    cmp qword [gs:PERCPU_USER_CS], USER_CS64
+    je .enter_regs
+    mov eax, USER_DS
+    mov ds, ax
+    mov es, ax
+.enter_regs:
     mov rax, [rbx + (0 * 8)]
     mov rdx, [rbx + (1 * 8)]
     mov rsi, [rbx + (2 * 8)]
@@ -164,14 +263,14 @@ syscall_enter_user_from_frame:
     mov rbp, [rbx + (12 * 8)]
     mov rcx, [rbx + (13 * 8)]
     mov r11, [rbx + (14 * 8)]
-    cmp qword [gs:16], 0
+    cmp qword [gs:PERCPU_FULL_RESTORE], 0
     je .enter_plain
-    mov qword [gs:16], 0
-    mov rcx, [gs:24]
-    mov r11, [gs:32]
+    mov qword [gs:PERCPU_FULL_RESTORE], 0
+    mov rcx, [gs:PERCPU_FULL_RCX]
+    mov r11, [gs:PERCPU_FULL_R11]
 .enter_plain:
     mov rbx, [rbx + (11 * 8)]
-    
+
     swapgs
 
     iretq

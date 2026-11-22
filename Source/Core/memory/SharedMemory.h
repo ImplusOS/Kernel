@@ -69,6 +69,9 @@ uint32_t shared_memory_size(int32_t handle);
 /* Number of shared-memory objects currently in use (diagnostics). */
 uint32_t shared_memory_object_count(void);
 
+/* Diagnostics: pages held by all shared-memory objects. Unlocked. */
+uint64_t shared_memory_debug_pages(void);
+
 /* Number of mappings the object behind `handle` has in this address space
  * (diagnostics; useful when shared_memory_map_new() refuses). */
 uint32_t shared_memory_mapping_count(int32_t handle);

@@ -238,6 +238,55 @@
 #define OS_CONFIG_NET_IPV4_GATEWAY 0x0A000202ULL
 #endif
 
+/* The same, for the other two Linux ABIs the kernel runs (see
+ * Docs/Architecture/Compat_Layers.md): 32-bit x86 programs on the x86_64
+ * kernel and AArch64 programs on the arm64 kernel. Debian/Ubuntu multiarch
+ * directory names first, then the plain FHS ones a non-multiarch runtime
+ * (Alpine, a hand-staged sysroot) uses. */
+#ifndef OS_CONFIG_LINUX_RUNTIME_LIB_PATH_I386
+#define OS_CONFIG_LINUX_RUNTIME_LIB_PATH_I386 \
+    "/lib:/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu:/usr/lib32:/usr/lib"
+#endif
+#ifndef OS_CONFIG_LINUX_RUNTIME_LIB_PATH_ARM64
+#define OS_CONFIG_LINUX_RUNTIME_LIB_PATH_ARM64 \
+    "/lib64:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib"
+#endif
+
+/* Linux programs built for the other CPU: x86_64 programs on the arm64
+ * kernel, AArch64 programs on the x86_64 kernel. exec() and spawn start the
+ * translator for that CPU in their place -- <dir>/x86_64.ELF or
+ * <dir>/aarch64.ELF, built from Userland/Application/Translator -- which
+ * loads and interprets the program (see Docs/Architecture/Compat_Layers.md,
+ * section 7). The same job binfmt_misc + qemu-user do on Linux. An empty
+ * string turns it off; so does a missing translator file. */
+#ifndef OS_CONFIG_TRANSLATOR_DIR
+#define OS_CONFIG_TRANSLATOR_DIR "/Userland/Translator"
+#endif
+
+/* Linux i386 (32-bit x86) programs on the x86_64 kernel.
+ *
+ * A 32-bit program can only address the low 4 GiB, and on x86_64 every
+ * address space carries the kernel's identity map of exactly that range
+ * (Arch/x86_64/mmu/Paging_Main.c): a low virtual address is the kernel's
+ * pointer to the same physical address. So a 32-bit process gets one window
+ * of it, whose physical frames are withheld from the allocator at boot (as
+ * for the BusyBox ET_EXEC window) and whose identity entries are removed from
+ * that process's page tables -- everything the process maps, its image, ld.so,
+ * brk, mmap and stack, lives inside it. The base covers the conventional
+ * non-PIE i386 link address 0x08048000.
+ *
+ * The cost is OS_CONFIG_LINUX_I386_WINDOW_SIZE bytes of RAM whether or not a
+ * 32-bit program ever runs; 0 disables i386 support (and the reservation).
+ * Must be a multiple of 2 MiB and at least 64 MiB. The reservation is skipped,
+ * and i386 programs refused, if any frame of the window is not free RAM when
+ * the kernel boots. */
+#ifndef OS_CONFIG_LINUX_I386_WINDOW_BASE
+#define OS_CONFIG_LINUX_I386_WINDOW_BASE 0x08000000ULL
+#endif
+#ifndef OS_CONFIG_LINUX_I386_WINDOW_SIZE
+#define OS_CONFIG_LINUX_I386_WINDOW_SIZE (256ULL * 1024ULL * 1024ULL)
+#endif
+
 /* Where the init process lives inside the image, as the kernel sees it in
  * the VFS. This is image layout rather than kernel behaviour, so it is named
  * once here instead of being spelled out at every place that needs it

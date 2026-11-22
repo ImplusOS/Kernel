@@ -1,4 +1,5 @@
 #include "GDT_Main.h"
+#include <string.h>
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
 #include "Debug/serial/Serial.h"
@@ -12,8 +13,17 @@ typedef struct {
     struct GDTEntry  user_compat_code;
     struct GDTEntry  user_data;
     struct GDTEntry  user_code;
-    struct GDTEntry64 tss;
+    struct GDTEntry64 tss;            /* entries 6-7 */
+    struct GDTEntry  unused[4];       /* entries 8-11 */
+    /* Entries 12-14: the running Linux i386 thread's set_thread_area()
+     * descriptors (same entry numbers as Linux on x86_64, so a program that
+     * remembers its selector -- 0x63 for glibc's %gs -- sees the same one),
+     * rewritten on every switch to such a thread. */
+    struct GDTEntry  tls[GDT_TLS_ENTRIES];
 } __attribute__((packed)) GDT_Table;
+
+_Static_assert(__builtin_offsetof(GDT_Table, tls) == GDT_TLS_ENTRY_MIN * 8,
+               "GDT TLS entries must start at entry GDT_TLS_ENTRY_MIN");
 
 static GDT_Table g_gdt[GDT_MAX_CPUS];
 static struct GDTR g_gdtr[GDT_MAX_CPUS];
@@ -52,8 +62,17 @@ void init_gdt(void) {
     gdt->kernel_data = make_gdt_entry(0xFFFFF, 0x92, 0x80);
 
     gdt->user_compat_code = make_gdt_entry(0xFFFFF, 0xFA, 0xC0);
-    gdt->user_data = make_gdt_entry(0xFFFFF, 0xF2, 0x80);
+    /* D/B set: in 64-bit mode the flag means nothing, but a 32-bit
+     * (compatibility-mode) Linux i386 program uses this as SS, DS and ES,
+     * and with it clear its stack would be a 16-bit one. */
+    gdt->user_data = make_gdt_entry(0xFFFFF, 0xF2, 0xC0);
     gdt->user_code = make_gdt_entry(0xFFFFF, 0xFA, 0xA0);
+    for (uint32_t i = 0; i < 4u; ++i) {
+        gdt->unused[i] = make_gdt_entry(0, 0, 0);
+    }
+    for (uint32_t i = 0; i < GDT_TLS_ENTRIES; ++i) {
+        gdt->tls[i] = make_gdt_entry(0, 0, 0);
+    }
 
     uint64_t tss_base = (uint64_t)tss;
     uint32_t tss_limit = sizeof(struct TSS) - 1;
@@ -111,4 +130,16 @@ void gdt_set_ist(uint8_t ist_index, uint64_t rsp)
         cpu_id = GDT_MAX_CPUS - 1;
     }
     g_tss[cpu_id].ist[ist_index - 1] = rsp & ~0xFULL;
+}
+
+void gdt_set_tls_entries(const uint64_t desc[GDT_TLS_ENTRIES])
+{
+    uint32_t cpu_id = gdt_current_cpu_id();
+    if (cpu_id >= GDT_MAX_CPUS) {
+        cpu_id = GDT_MAX_CPUS - 1;
+    }
+    for (uint32_t i = 0; i < GDT_TLS_ENTRIES; ++i) {
+        uint64_t d = desc != NULL ? desc[i] : 0u;
+        memcpy(&g_gdt[cpu_id].tls[i], &d, sizeof(d));
+    }
 }

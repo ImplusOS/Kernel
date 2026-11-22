@@ -684,6 +684,13 @@ void init_idt(void)
     }
     set_interrupt_handler(14, isr_page_fault);
     set_interrupt_handler(18, isr_machine_check);
+    {
+        /* Linux i386 system calls (`int $0x80` from 32-bit compatibility
+         * mode): DPL 3 so user code may raise it. See Syscall_Entry.asm. */
+        extern void isr_int80(void);
+        set_interrupt_handler(0x80, isr_int80);
+        idt[0x80].type_attr = 0xEE;
+    }
     set_interrupt_handler(VECTOR_TLB_SHOOTDOWN, isr_tlb_shootdown);
     {
         extern void isr_resched(void);

@@ -308,6 +308,10 @@ typedef struct {
     uint64_t avail_max;
 
     ts_t trigger_tstamp;
+
+    /* A blocking DRAIN returned ALSA_WOULD_BLOCK and the Linux layer will run
+     * it again. See PCM_IOCTL_DRAIN. */
+    int drain_wait;
 } alsa_pcm_t;
 
 /* Several playback substreams, mixed into the one hardware stream. Linux
@@ -1436,6 +1440,7 @@ static int64_t alsa_pcm_ioctl_impl(uint64_t request, uint64_t arg)
         g_pcm.pump = g_pcm.hw;
         g_pcm.pump_frac = 0u;
         g_pcm.state = ST_PREPARED;
+        g_pcm.drain_wait = 0;
         unlock_irq(f);
         return 0;
     case PCM_IOCTL_RESET:
@@ -1477,7 +1482,13 @@ static int64_t alsa_pcm_ioctl_impl(uint64_t request, uint64_t arg)
         switch (g_pcm.state) {
         case ST_OPEN:
         case ST_SETUP:
-            rc = E_BADFD;
+            /* A blocking DRAIN parks and is run again (ALSA_WOULD_BLOCK).
+             * When the timer tick's pump finishes the drain -- or a DROP
+             * ends it -- in between, the re-run finds SETUP: that is this
+             * drain completing, as on Linux, not a DRAIN of an idle stream.
+             * Answering EBADFD there failed snd_pcm_drain() whenever the
+             * last period played out between two re-runs. */
+            rc = g_pcm.drain_wait ? 0 : E_BADFD;
             break;
         case ST_XRUN:
             g_pcm.state = ST_SETUP;
@@ -1508,6 +1519,7 @@ static int64_t alsa_pcm_ioctl_impl(uint64_t request, uint64_t arg)
             rc = E_BADFD;
             break;
         }
+        g_pcm.drain_wait = rc == ALSA_WOULD_BLOCK;
         unlock_irq(f);
         return rc;
     }

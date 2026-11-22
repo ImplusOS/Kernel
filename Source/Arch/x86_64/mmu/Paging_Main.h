@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "kernel/config.h"
 
 #define PAGE_PRESENT (1ULL << 0)
 #define PAGE_RW      (1ULL << 1)
@@ -42,12 +43,37 @@
 #define PAGING_WIN_SHARED_DATA_SIZE  0x00020000ULL
 #define PAGING_WIN_SHARED_DATA_LIMIT (PAGING_WIN_SHARED_DATA_BASE + PAGING_WIN_SHARED_DATA_SIZE)
 
+/* The Linux i386 window (OS_CONFIG_LINUX_I386_WINDOW_* in kernel/config.h):
+ * shadowable only once kernel_main has withheld its frames and called
+ * paging_compat32_window_set_available(1). */
+extern volatile int g_paging_compat32_window_ready;
+int paging_compat32_window_available(void);
+void paging_compat32_window_set_available(int available);
+/* Remove the window's identity entries from `cr3` (an i386 process's
+ * address space), leaving a hole the process fills with private pages,
+ * demand-zero (paging_handle_swap_fault). User pages already mapped there
+ * are kept. 0 on success. */
+int paging_prepare_compat32_window(uint64_t cr3);
+
 /* Low identity-mapped ranges whose physical frames are never handed to the
  * kernel allocator, so a process may map private pages over them. */
 static inline int paging_is_user_shadow_window(uint64_t va)
 {
     return (va >= PAGING_LEGACY_ET_EXEC_BASE && va < PAGING_LEGACY_ET_EXEC_LIMIT) ||
-           (va >= PAGING_WIN_SHARED_DATA_BASE && va < PAGING_WIN_SHARED_DATA_LIMIT);
+           (va >= PAGING_WIN_SHARED_DATA_BASE && va < PAGING_WIN_SHARED_DATA_LIMIT) ||
+           (g_paging_compat32_window_ready &&
+            va >= OS_CONFIG_LINUX_I386_WINDOW_BASE &&
+            va < OS_CONFIG_LINUX_I386_WINDOW_BASE + OS_CONFIG_LINUX_I386_WINDOW_SIZE);
+}
+
+/* May a process place a fixed-address mapping at [addr, addr + len)? On
+ * x86_64 the low identity map is policed per page by the leaf mapper (only
+ * free identity frames and the shadow windows can be taken). */
+static inline int paging_user_fixed_range_allowed(uint64_t addr, uint64_t len)
+{
+    (void)addr;
+    (void)len;
+    return 1;
 }
 
 #define PML4_INDEX(x) (((x) >> 39) & 0x1FF)
@@ -70,6 +96,15 @@ uint64_t paging_get_active_cr3(void);
 void paging_switch_cr3(uint64_t cr3);
 uint64_t paging_create_process_space(void);
 void paging_destroy_process_space(uint64_t cr3);
+/* Whether some CPU may still be running on this address space. Not tracked
+ * here yet: always "yes", so a deferred teardown (ProcessManager_Create.c)
+ * keeps the space, as reaping did before. */
+static inline int paging_space_active_on_any_cpu(uint64_t cr3)
+{
+    (void)cr3;
+    return 1;
+}
+#define PAGING_TRACKS_ACTIVE_SPACE 0
 /* Diagnostic: count resident user pages of an address space. Returns the
  * total; *priv_out gets frames only this address space maps, *ext_out gets
  * PAGE_EXTERNAL (shared/COW) frames it merely participates in. Either output
@@ -102,6 +137,13 @@ int paging_map_user_page(uint64_t cr3,
                          uint64_t virt_addr,
                          uint64_t phys_addr,
                          uint64_t flags);
+/* Map a frame other mappings share, read-only and (when `flags` has
+ * PAGE_RW) PAGE_COW. The caller has counted the mapping in the frame's
+ * refcount. Note CR0.WP is clear: kernel writes go through unless
+ * paging_user_range_break_cow() ran first -- which is why FileMap does not
+ * share pages on this architecture yet (see FILEMAP_SHARE_PAGES). */
+int paging_map_user_page_cow(uint64_t cr3, uint64_t virt_addr,
+                             uint64_t phys_addr, uint64_t flags);
 int paging_map_user_range_alloc(uint64_t cr3,
                                 uint64_t start,
                                 uint64_t size,
@@ -122,6 +164,14 @@ int paging_user_range_is_writable(uint64_t cr3, uint64_t start, uint64_t len);
 
 /* Diagnostics: the leaf PTE for an address, 0 if unmapped. See the .c. */
 uint64_t paging_debug_leaf_pte(uint64_t cr3, uint64_t virt_addr);
+
+/* Diagnostics (the out-of-memory report): present user frames the address
+ * space owns (not PAGE_EXTERNAL), how many of them fork still shares in
+ * *shared_out, and its page-table pages in *tables_out. Approximate. */
+/* Diagnostics: pages copied by the copy-on-write fault handler so far. */
+uint64_t paging_debug_cow_copies(void);
+uint64_t paging_debug_count_user_pages(uint64_t cr3, uint64_t *shared_out,
+                                       uint64_t *tables_out);
 
 /* Non-zero when the address falls in a user address-space window. */
 int paging_addr_is_user(uint64_t virt_addr);

@@ -237,6 +237,16 @@ bool ipv4_send(uint32_t dst_ipv4_addr,
                const void *payload,
                uint16_t payload_len)
 {
+    return ipv4_send_from(IPV4_SRC_LOCAL, dst_ipv4_addr, protocol,
+                          payload, payload_len);
+}
+
+bool ipv4_send_from(uint64_t src_ipv4_addr,
+                    uint32_t dst_ipv4_addr,
+                    uint8_t protocol,
+                    const void *payload,
+                    uint16_t payload_len)
+{
     if ((payload == NULL && payload_len != 0u) || dst_ipv4_addr == 0u) {
         return false;
     }
@@ -260,7 +270,17 @@ bool ipv4_send(uint32_t dst_ipv4_addr,
     spinlock_unlock(&g_ipv4_lock);
     irq_restore(irq_flags);
 
-    if (local_ip == 0u) {
+    /* A source given explicitly is only allowed to differ from the
+     * configured address for a limited broadcast: DHCP, before it has a
+     * lease, sends from 0.0.0.0 (RFC 2131 4.1). */
+    uint32_t src_ip = local_ip;
+    if (src_ipv4_addr != IPV4_SRC_LOCAL) {
+        if (dst_ipv4_addr != 0xFFFFFFFFu &&
+            (uint32_t)src_ipv4_addr != local_ip) {
+            return false;
+        }
+        src_ip = (uint32_t)src_ipv4_addr;
+    } else if (local_ip == 0u) {
         return false;
     }
 
@@ -294,7 +314,7 @@ bool ipv4_send(uint32_t dst_ipv4_addr,
     packet[8] = IPV4_DEFAULT_TTL;
     packet[9] = protocol;
     write_be16(packet + 10u, 0u);
-    write_be32(packet + 12u, local_ip);
+    write_be32(packet + 12u, src_ip);
     write_be32(packet + 16u, dst_ipv4_addr);
 
     uint16_t header_checksum = net_checksum16(packet, IPV4_HEADER_BYTES_MIN);

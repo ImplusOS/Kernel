@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 #include "Compat/Linux/Syscall_LinuxCompat.h"
+#include "Compat/Linux/Linux_CompatCore.h"
 #include "Compat/Linux/SysvShm.h"
 #include "Compat/compat_registry.h"
 #include "Core/process/ProcessManager.h"
@@ -39,6 +40,9 @@ int64_t write(int fd, const void *buf, uint64_t count);
 #include "MemoryManagement/Memory_Main.h"
 #include "smp/SMP_Main.h"
 #include "Core/sync/Spinlock.h"
+#if defined(__aarch64__)
+#include "cpu/Exception.h"
+#endif
 
 #define LINUX_EBADF  (-9LL)
 #define LINUX_EFAULT (-14LL)
@@ -1385,10 +1389,25 @@ int64_t write(int fd, const void *buf, uint64_t count)
 #define LINUX_MAP_ANONYMOUS    0x20u
 #define LINUX_MAP_32BIT        0x40u
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000u
-#define LINUX_USER_MAP_LIMIT   USER_MMAP_LIMIT
+#define LINUX_USER_MAP_LIMIT   USER_MMAP_FIXED_LIMIT
 /* Keep all file mappings eager while isolating Wine's low-address MAP_FIXED
  * behavior from the separate demand-paging path. */
 #define LINUX_MMAP_LAZY_MIN_BYTES (1024u * 1024u)
+
+/* Lazy-sized file mappings that were read in eagerly after all (FileMap
+ * table full); see linux_mmap_debug_eager_stats(). */
+static uint32_t g_linux_mmap_eager_count;
+static uint64_t g_linux_mmap_eager_bytes;
+
+void linux_mmap_debug_eager_stats(uint32_t *count_out, uint64_t *bytes_out)
+{
+    if (count_out != NULL) {
+        *count_out = __atomic_load_n(&g_linux_mmap_eager_count, __ATOMIC_RELAXED);
+    }
+    if (bytes_out != NULL) {
+        *bytes_out = __atomic_load_n(&g_linux_mmap_eager_bytes, __ATOMIC_RELAXED);
+    }
+}
 
 #define LINUX_PROT_READ        0x1u
 #define LINUX_PROT_WRITE       0x2u
@@ -1481,15 +1500,26 @@ int64_t write(int fd, const void *buf, uint64_t count)
 
 #define LINUX_MAX_IO_BYTES (4ULL * 1024ULL * 1024ULL)
 
-static void linux_syscall_result(uint64_t saved_rsp, int64_t value)
+void linux_frame_set_result(uint64_t saved_rsp, uint8_t abi, int64_t value)
 {
 #if defined(__x86_64__)
     uint64_t *frame = (uint64_t *)(uintptr_t)saved_rsp;
-    frame[SYSCALL_FRAME_RAX] = (uint64_t)value;
+    /* EAX is all an i386 program sees; keep the upper half clean. */
+    frame[SYSCALL_FRAME_RAX] = abi == PROCESS_ABI_LINUX_I386 ?
+        (uint64_t)(uint32_t)value : (uint64_t)value;
+#elif defined(__aarch64__)
+    (void)abi;
+    ((arm64_exception_frame_t *)(uintptr_t)saved_rsp)->x[0] = (uint64_t)value;
 #else
     (void)saved_rsp;
+    (void)abi;
     (void)value;
 #endif
+}
+
+static void linux_syscall_result(uint64_t saved_rsp, int64_t value)
+{
+    linux_frame_set_result(saved_rsp, PROCESS_ABI_LINUX, value);
 }
 
 /* Re-arm the trap so the caller executes the very same syscall again the next
@@ -1501,12 +1531,39 @@ static void linux_syscall_result(uint64_t saved_rsp, int64_t value)
 static void linux_syscall_restart(uint64_t saved_rsp, uint64_t num)
 {
 #if defined(__x86_64__)
+    /* `int $0x80` (cd 80) is two bytes as well. */
     uint64_t *frame = (uint64_t *)(uintptr_t)saved_rsp;
     frame[SYSCALL_FRAME_RAX] = num;
     frame[SYSCALL_FRAME_RCX] -= 2u;
+#elif defined(__aarch64__)
+    /* AArch64: the number goes back in x8 and the PC over the 4-byte svc;
+     * x0, argument and result register at once, was never overwritten. */
+    arm64_exception_frame_t *frame = (arm64_exception_frame_t *)(uintptr_t)saved_rsp;
+    frame->x[8] = num;
+    frame->elr_el1 -= 4u;
 #else
     (void)saved_rsp;
     (void)num;
+#endif
+}
+
+/* The (number, PC) pair a re-armed frame now holds: what
+ * linux_signal_interrupts_wait() compares against. */
+static void linux_frame_wait_key(uint64_t saved_rsp, uint64_t *num, uint64_t *pc)
+{
+#if defined(__x86_64__)
+    const uint64_t *frame = (const uint64_t *)(uintptr_t)saved_rsp;
+    *num = frame[SYSCALL_FRAME_RAX];
+    *pc = frame[SYSCALL_FRAME_RCX];
+#elif defined(__aarch64__)
+    const arm64_exception_frame_t *frame =
+        (const arm64_exception_frame_t *)(uintptr_t)saved_rsp;
+    *num = frame->x[8];
+    *pc = frame->elr_el1;
+#else
+    (void)saved_rsp;
+    *num = 0;
+    *pc = 0;
 #endif
 }
 
@@ -1803,6 +1860,15 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (length == 0u) {
         return LINUX_EINVAL;
     }
+    /* A fixed address the architecture keeps for the kernel (arm64: the
+     * identity map below the user windows): taken, as far as the program is
+     * concerned. Wine probes the low 1.7 GiB this way and keeps its memory
+     * elsewhere on EEXIST; a fixed-address executable gets ENOMEM. */
+    if ((flags & (LINUX_MAP_FIXED | LINUX_MAP_FIXED_NOREPLACE)) != 0u &&
+        !paging_user_fixed_range_allowed(addr, length)) {
+
+        return (flags & LINUX_MAP_FIXED_NOREPLACE) != 0u ? LINUX_EEXIST : LINUX_ENOMEM;
+    }
     /* Honour MAP_FIXED_NOREPLACE without replacing an existing page-table
      * entry. The address-space implementation has no VMA tree, so page tables
      * are the source of truth for resident and inherited identity mappings. */
@@ -2041,10 +2107,23 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
      * fork() unusable -- see Core/memory/FileMap.c. Below the threshold the
      * proven eager path is kept: small mappings are cheap, and it bounds how
      * many records the (shared) filemap table has to hold. */
+    /* A read-only MAP_SHARED mapping of a file on read-only media takes the
+     * same path: nothing can write the file, so it reads exactly like a
+     * private mapping, and FileMap can then share its pages between
+     * processes. Chromium maps resources.pak and icudtl.dat (33 MB) that
+     * way in every one of its processes; the eager path below copied all of
+     * it into each. A shared mapping of a file that can change keeps the
+     * eager path, which flushes writes back. */
     if (length >= LINUX_MMAP_LAZY_MIN_BYTES &&
-        (flags & LINUX_MAP_SHARED) == 0u) {
+        ((flags & LINUX_MAP_SHARED) == 0u || (prot & LINUX_PROT_WRITE) == 0u)) {
         int32_t pid = process_get_current_pid();
         int32_t handle = syscall_file_mmap_acquire((int32_t)fd);
+        uint64_t ro_mount = 0, ro_id = 0;
+        if (handle >= 0 && (flags & LINUX_MAP_SHARED) != 0u &&
+            !syscall_file_mmap_identity(handle, &ro_mount, &ro_id)) {
+            syscall_file_mmap_release(handle);
+            handle = -1;
+        }
         if (handle >= 0) {
             void *reserved;
             if ((flags & LINUX_MAP_FIXED) != 0u) {
@@ -2076,6 +2155,8 @@ static int64_t linux_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             /* Table full or no address space: fall through to the eager path
              * rather than failing the mmap outright. */
             syscall_file_mmap_release(handle);
+            __atomic_add_fetch(&g_linux_mmap_eager_count, 1u, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_linux_mmap_eager_bytes, length, __ATOMIC_RELAXED);
         }
     }
 
@@ -2581,7 +2662,19 @@ static int64_t linux_uname(uint64_t uts_ptr)
     memcpy(uts + 1u * LINUX_UTSNAME_LEN, "implus", 6u);
     memcpy(uts + 2u * LINUX_UTSNAME_LEN, "6.1.0-implus", 12u);
     memcpy(uts + 3u * LINUX_UTSNAME_LEN, "#1 SMP ImplusOS", 15u);
-    memcpy(uts + 4u * LINUX_UTSNAME_LEN, "x86_64", 6u);
+    /* The machine the *program* runs as: uname -m, and what libraries and
+     * build systems key their choices on. */
+    switch (process_get_current_abi_mode()) {
+    case PROCESS_ABI_LINUX_I386:
+        memcpy(uts + 4u * LINUX_UTSNAME_LEN, "i686", 4u);
+        break;
+    case PROCESS_ABI_LINUX_ARM64:
+        memcpy(uts + 4u * LINUX_UTSNAME_LEN, "aarch64", 7u);
+        break;
+    default:
+        memcpy(uts + 4u * LINUX_UTSNAME_LEN, "x86_64", 6u);
+        break;
+    }
     if (copy_to_user_trusted((void *)(uintptr_t)uts_ptr, uts, sizeof(uts)) != 0u) {
         return LINUX_EFAULT;
     }
@@ -4577,7 +4670,21 @@ static int64_t linux_socket_getsockopt(uint64_t fd, uint64_t level,
         switch (option) {
             case LINUX_SO_TYPE:     synth = 1;      break; /* SOCK_STREAM */
             case LINUX_SO_PROTOCOL: synth = 0;      break;
-            case LINUX_SO_ERROR:    synth = 0;      break;
+            case LINUX_SO_ERROR:
+                /* An inet socket reports why its connection failed
+                 * (ECONNREFUSED/ECONNRESET/ETIMEDOUT). Answering 0 made a
+                 * non-blocking connect that never completed look
+                 * successful: the caller then wrote to a dead socket. */
+                synth = 0;
+                if (!unix_socket_fd_in_range((int32_t)fd) &&
+                    syscall_socket_get_type((int32_t)fd) >= 0) {
+                    int32_t so_error = 0;
+                    if (syscall_socket_get_option((int32_t)fd, 1, 4,
+                                                  &so_error) >= 0) {
+                        synth = so_error;
+                    }
+                }
+                break;
             case LINUX_SO_SNDBUF:   synth = 212992; break;
             case LINUX_SO_RCVBUF:   synth = 212992; break;
             case LINUX_SO_PASSCRED: synth = 0;      break;
@@ -5094,7 +5201,7 @@ static int64_t linux_madvise(uint64_t addr, uint64_t length, uint64_t advice)
      * this away from eagerly-mapped library images, which carry no filemap
      * record to recognise them by and must not be blanked. Outside the arena
      * the call stays the hint it always was. */
-    if (addr < USER_MMAP_BASE || end > USER_MMAP_LIMIT) {
+    if (addr < USER_MMAP_BASE || end > USER_MMAP_FIXED_LIMIT) {
         return 0;
     }
     /* Unmapped in runs, not page by page: paging_unmap_range() ends with a
@@ -5687,13 +5794,17 @@ static int64_t linux_inotify_add_watch(void)
 static int64_t linux_prctl_ext(uint64_t option, uint64_t arg2, uint64_t arg3,
                                uint64_t arg4, uint64_t arg5)
 {
-    (void)arg2;
     (void)arg3;
     (void)arg4;
     (void)arg5;
     switch (option) {
-        case 1u:   /* PR_SET_PDEATHSIG   - no parent-death tracking; accept */
-        case 2u:   /* PR_GET_PDEATHSIG   */
+        case 1u:   /* PR_SET_PDEATHSIG */
+            return process_set_pdeath_signal((int32_t)arg2) == 0 ? 0 : LINUX_EINVAL;
+        case 2u: { /* PR_GET_PDEATHSIG */
+            int32_t sig = process_get_pdeath_signal();
+            return copy_to_user((void *)(uintptr_t)arg2, &sig, sizeof(sig)) == 0u ?
+                   0 : LINUX_EFAULT;
+        }
         case 3u:   /* PR_GET_DUMPABLE    */
         case 4u:   /* PR_SET_DUMPABLE    */
         case 7u:   /* PR_SET_KEEPCAPS    */
@@ -6077,7 +6188,7 @@ static void lx_exit_hook(int32_t pid, int32_t unused)
 
 static int lx_current_is_linux(void)
 {
-    return process_get_current_abi_mode() == PROCESS_ABI_LINUX;
+    return PROCESS_ABI_IS_LINUX(process_get_current_abi_mode());
 }
 
 /* SCM_RIGHTS: user number -> global on send, global -> user number on
@@ -6537,6 +6648,22 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
                                 uint64_t arg5,
                                 uint64_t arg6)
 {
+    return linux_syscall_core(saved_rsp, NULL, num, arg1, arg2, arg3, arg4,
+                              arg5, arg6);
+}
+
+/* `call` NULL: a Linux x86_64 program's own syscall -- the result goes
+ * straight into its RAX. Otherwise see Linux_CompatCore.h. */
+uint64_t linux_syscall_core(uint64_t saved_rsp,
+                            linux_call_t *call,
+                            uint64_t num,
+                            uint64_t arg1,
+                            uint64_t arg2,
+                            uint64_t arg3,
+                            uint64_t arg4,
+                            uint64_t arg5,
+                            uint64_t arg6)
+{
     int64_t result = LINUX_ENOSYS;
     int request_switch = 0;
     int request_restart = 0;
@@ -6721,6 +6848,16 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
             break;
 
         case LINUX_SYS_MUNMAP: {
+            /* Linux: EINVAL, and nothing unmapped, for a zero length or an
+             * unaligned address. A zero length reached the shared-memory
+             * layer below as its "exactly the mapping at this address"
+             * (shmdt) request, and Wine's munmap(USER_SHARED_DATA, 0) took
+             * the shared user data page away from wineboot, which then
+             * faulted on it forever. */
+            if (arg2 == 0u || (arg1 & (PAGE_SIZE - 1u)) != 0u) {
+                result = LINUX_EINVAL;
+                break;
+            }
             int32_t self = process_get_current_pid();
             if (self >= 0 && arg2 != 0u) {
                 /* Flush + drop any MAP_SHARED file mapping in this range. */
@@ -8316,31 +8453,44 @@ uint64_t linux_syscall_dispatch(uint64_t saved_rsp,
     }
 lx_fd_finished:
     if (request_restart) {
-        linux_syscall_restart(saved_rsp, num);
-#if defined(__x86_64__)
+        linux_syscall_restart(saved_rsp, call != NULL ? call->orig_num : num);
         if (lx_is_signal_interruptible_wait(num) && lx_tid >= 0 &&
             lx_tid < (int32_t)OS_CONFIG_PROCESS_MAX_COUNT) {
-            g_lx_wait_num[lx_tid] = (uint16_t)num;
-            g_lx_wait_rip[lx_tid] =
-                ((const uint64_t *)(uintptr_t)saved_rsp)[SYSCALL_FRAME_RCX];
+            uint64_t frame_num = 0, frame_pc = 0;
+            linux_frame_wait_key(saved_rsp, &frame_num, &frame_pc);
+            g_lx_wait_num[lx_tid] = (uint16_t)frame_num;
+            g_lx_wait_rip[lx_tid] = frame_pc;
         }
-#endif
-    } else {
+    } else if (call == NULL) {
         linux_syscall_result(saved_rsp, result);
+    }
+    if (call != NULL) {
+        call->restarted = request_restart;
+        call->result = result;
     }
     return (uint64_t)(uint32_t)request_switch;
 }
 
+#if defined(__x86_64__)
 static const compat_layer_t g_linux_compat_layer = {
     .abi = PROCESS_ABI_LINUX,
-    .name = "Linux",
+    .name = "Linux x86_64",
     .dispatch = linux_syscall_dispatch,
 };
+#endif
 
+/* One registration for the Linux family: the fd-table/SCM/procfs hooks every
+ * Linux ABI shares, then whichever ABI front ends this kernel can run --
+ * x86_64 and i386 programs on x86_64, AArch64 programs on arm64. */
 void linux_compat_layer_register(void)
 {
     lx_fd_hooks_register();
+#if defined(__x86_64__)
     (void)compat_registry_register(&g_linux_compat_layer);
+    linux_i386_compat_layer_register();
+#elif defined(__aarch64__)
+    linux_arm64_compat_layer_register();
+#endif
 }
 
 uint32_t linux_heartbeat_last_num(int32_t pid)

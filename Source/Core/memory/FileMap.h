@@ -59,6 +59,24 @@ void filemap_unregister_range(int32_t pid, uint64_t start, uint64_t length);
  * those in place destroys it. */
 int  filemap_addr_is_file_backed(int32_t pid, uint64_t addr);
 
+/* Diagnostics: records in use, for `pid` (or for everyone when pid < 0),
+ * and the size of the table. */
+uint32_t filemap_debug_count(int32_t pid);
+uint32_t filemap_debug_capacity(void);
+
+/* Frees the shared page cache's frames that no mapping holds any more;
+ * returns how many. For a fault about to fail for want of memory (and run
+ * at every exit/exec). */
+uint64_t filemap_reclaim_shared_pages(void);
+
+/* Diagnostics: frames in the shared page cache, and in *unmapped_out how
+ * many of them no mapping holds (reclaimable). */
+uint32_t filemap_debug_shared_pages(uint32_t *unmapped_out);
+/* hits, inserts, refused-when-full, sweeps, ns spent sweeping, frames freed */
+void filemap_debug_cache_stats(uint64_t out[6]);
+/* file reads by the fault path: count, pages, ns */
+void filemap_debug_read_stats(uint64_t out[3]);
+
 /* execve()/exit(): drops every record owned by `pid`. */
 void filemap_release_pid(int32_t pid);
 

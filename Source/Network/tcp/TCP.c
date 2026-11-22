@@ -114,15 +114,27 @@ static uint16_t tcp_checksum(uint32_t src_ip, uint32_t dst_ip,
     return checksum_finalize(sum);
 }
 
-static bool tcp_send_segment(uint32_t src_ip, uint32_t dst_ip,
-                             uint16_t src_port, uint16_t dst_port,
-                             uint32_t seq, uint32_t ack,
-                             uint8_t flags, uint16_t window,
-                             const void *data, uint16_t data_len)
+#define TCP_OPT_MSS_BYTES 4u
+#define TCP_ERR_ECONNRESET   104u
+#define TCP_ERR_ETIMEDOUT    110u
+#define TCP_ERR_ECONNREFUSED 111u
+/* RFC 879: the MSS to assume when the peer's SYN carries none. */
+#define TCP_DEFAULT_PEER_MSS 536u
+/* Smallest MSS taken from a peer (Linux's TCP_MIN_MSS). */
+#define TCP_MIN_PEER_MSS     88u
+
+static bool tcp_send_segment_opts(uint32_t src_ip, uint32_t dst_ip,
+                                  uint16_t src_port, uint16_t dst_port,
+                                  uint32_t seq, uint32_t ack,
+                                  uint8_t flags, uint16_t window,
+                                  const uint8_t *opts, uint8_t opts_len,
+                                  const void *data, uint16_t data_len)
 {
-    uint16_t header_len = TCP_HEADER_BYTES_MIN;
+    uint16_t header_len = (uint16_t)(TCP_HEADER_BYTES_MIN + opts_len);
     uint16_t total_len = (uint16_t)(header_len + data_len);
-    uint8_t segment[TCP_HEADER_BYTES_MIN + TCP_MAX_PAYLOAD];
+    uint8_t segment[TCP_HEADER_BYTES_MIN + TCP_OPT_MSS_BYTES + TCP_MAX_PAYLOAD];
+
+    if ((opts_len & 3u) != 0u) return false;
 
     if (total_len > sizeof(segment)) return false;
     memset(segment, 0, sizeof(segment));
@@ -137,6 +149,9 @@ static bool tcp_send_segment(uint32_t src_ip, uint32_t dst_ip,
     tcp_write_be16(segment + 16, 0u);
     tcp_write_be16(segment + 18, 0u);
 
+    if (opts_len > 0u && opts != NULL) {
+        memcpy(segment + TCP_HEADER_BYTES_MIN, opts, opts_len);
+    }
     if (data_len > 0u && data != NULL) {
         memcpy(segment + header_len, data, data_len);
     }
@@ -147,6 +162,64 @@ static bool tcp_send_segment(uint32_t src_ip, uint32_t dst_ip,
     tcp_write_be16(segment + 16, cksum);
 
     return ipv4_send(dst_ip, TCP_PROTOCOL_NUMBER, segment, total_len);
+}
+
+static bool tcp_send_segment(uint32_t src_ip, uint32_t dst_ip,
+                             uint16_t src_port, uint16_t dst_port,
+                             uint32_t seq, uint32_t ack,
+                             uint8_t flags, uint16_t window,
+                             const void *data, uint16_t data_len)
+{
+    return tcp_send_segment_opts(src_ip, dst_ip, src_port, dst_port, seq, ack,
+                                 flags, window, NULL, 0u, data, data_len);
+}
+
+/* SYN and SYN-ACK carry our MSS. Without it the peer must assume 536 bytes
+ * (RFC 879) and sends everything in small segments. */
+static bool tcp_send_syn(uint32_t src_ip, uint32_t dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint32_t seq, uint32_t ack,
+                         uint8_t flags, uint16_t window)
+{
+    const uint8_t mss[TCP_OPT_MSS_BYTES] = {
+        2u, 4u, (uint8_t)(TCP_MAX_SEGMENT_DATA >> 8),
+        (uint8_t)(TCP_MAX_SEGMENT_DATA & 0xFFu),
+    };
+    return tcp_send_segment_opts(src_ip, dst_ip, src_port, dst_port, seq, ack,
+                                 flags, window, mss, TCP_OPT_MSS_BYTES,
+                                 NULL, 0u);
+}
+
+/* The MSS a SYN asks us to respect (its option 2), capped at what we send
+ * at most. Routers clamp it to the path: on an uplink with a smaller MTU
+ * (PPPoE, IPv4-over-IPv6) a 1460-byte segment never arrives, so a request
+ * larger than the clamped MSS -- a TLS ClientHello with a post-quantum key
+ * share is ~1.9 KB -- was retransmitted unchanged until the connection gave
+ * up. QEMU's SLIRP re-segments on the host, which hid this. */
+static uint16_t tcp_peer_mss(const uint8_t *tcp, uint16_t hdr_bytes)
+{
+    uint16_t mss = TCP_DEFAULT_PEER_MSS;
+    uint16_t o = TCP_HEADER_BYTES_MIN;
+    while (o < hdr_bytes) {
+        uint8_t kind = tcp[o];
+        if (kind == 0u) break;
+        if (kind == 1u) { ++o; continue; }
+        if ((uint16_t)(o + 1u) >= hdr_bytes) break;
+        uint8_t len = tcp[o + 1u];
+        if (len < 2u || (uint16_t)(o + len) > hdr_bytes) break;
+        if (kind == 2u && len == 4u) {
+            mss = (uint16_t)(((uint16_t)tcp[o + 2u] << 8) | tcp[o + 3u]);
+        }
+        o = (uint16_t)(o + len);
+    }
+    if (mss > TCP_MAX_SEGMENT_DATA) mss = TCP_MAX_SEGMENT_DATA;
+    if (mss < TCP_MIN_PEER_MSS) mss = TCP_MIN_PEER_MSS;
+    return mss;
+}
+
+static uint16_t tcp_conn_mss(const tcp_connection_t *c)
+{
+    return c->snd_mss != 0u ? c->snd_mss : (uint16_t)TCP_MAX_SEGMENT_DATA;
 }
 
 static void tcp_send_rst(uint32_t src_ip, uint32_t dst_ip,
@@ -390,11 +463,11 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
                 child->parent_conn_id = listen_id;
                 child->accept_pending = 1u;
                 child->last_send_tick = timer_ticks();
+                child->snd_mss     = tcp_peer_mss(payload, hdr_bytes);
 
-                tcp_send_segment(dst_ip, src_ip, dst_port, src_port,
-                                 child->iss, child->rcv_nxt,
-                                 TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                 child->rcv_wnd, NULL, 0);
+                tcp_send_syn(dst_ip, src_ip, dst_port, src_port,
+                             child->iss, child->rcv_nxt,
+                             TCP_FLAG_SYN | TCP_FLAG_ACK, child->rcv_wnd);
             }
         } else if (!(flags & TCP_FLAG_RST)) {
             uint32_t rst_seq = 0u;
@@ -411,6 +484,8 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
     tcp_connection_t *conn = &g_tcp_connections[conn_id];
 
     if (flags & TCP_FLAG_RST) {
+        conn->error = (uint8_t)(conn->state == TCP_STATE_SYN_SENT ?
+                                TCP_ERR_ECONNREFUSED : TCP_ERR_ECONNRESET);
         tcp_release_locked(conn);
         spinlock_unlock(&g_tcp_lock);
         irq_restore(irq_flags);
@@ -425,6 +500,7 @@ static void tcp_on_ipv4(uint32_t src_ip, uint32_t dst_ip,
                 conn->rcv_nxt = seq_num + 1u;
                 conn->snd_una = ack_num;
                 conn->snd_wnd = window;
+                conn->snd_mss = tcp_peer_mss(payload, hdr_bytes);
                 conn->state   = TCP_STATE_ESTABLISHED;
                 conn->retransmit_count = 0;
 
@@ -644,10 +720,9 @@ int32_t tcp_connect(uint32_t remote_ip, uint16_t remote_port, uint16_t local_por
     conn->parent_conn_id = -1;
     conn->user_ref    = 1u;
     
-    tcp_send_segment(conn->local_ip, conn->remote_ip,
-                     conn->local_port, conn->remote_port,
-                     conn->iss, 0u,
-                     TCP_FLAG_SYN, conn->rcv_wnd, NULL, 0);
+    tcp_send_syn(conn->local_ip, conn->remote_ip,
+                 conn->local_port, conn->remote_port,
+                 conn->iss, 0u, TCP_FLAG_SYN, conn->rcv_wnd);
 
     spinlock_unlock(&g_tcp_lock);
     irq_restore(irq_flags);
@@ -764,7 +839,7 @@ int32_t tcp_send(int32_t conn_id, const void *data, uint16_t len)
 
     while (sent < len) {
         uint16_t chunk = (uint16_t)(len - sent);
-        if (chunk > TCP_MAX_SEGMENT_DATA) chunk = TCP_MAX_SEGMENT_DATA;
+        if (chunk > tcp_conn_mss(conn)) chunk = tcp_conn_mss(conn);
 
         uint16_t buf_avail = (uint16_t)(TCP_SEND_BUF_SIZE - conn->send_count);
         if (chunk > buf_avail) chunk = buf_avail;
@@ -941,6 +1016,18 @@ int tcp_get_connection_info(int32_t conn_id, tcp_connection_info_t *info_out)
     return 0;
 }
 
+int32_t tcp_connection_error(int32_t conn_id)
+{
+    if (conn_id < 0 || conn_id >= (int32_t)TCP_MAX_CONNECTIONS) return 0;
+    uint64_t irq_flags = irq_save_disable();
+    spinlock_lock(&g_tcp_lock);
+    const tcp_connection_t *c = &g_tcp_connections[conn_id];
+    int32_t error = c->in_use != 0u ? (int32_t)c->error : 0;
+    spinlock_unlock(&g_tcp_lock);
+    irq_restore(irq_flags);
+    return error;
+}
+
 uint32_t tcp_poll(int32_t conn_id, uint32_t events)
 {
     if (conn_id < 0 || conn_id >= (int32_t)TCP_MAX_CONNECTIONS) return 0x0008u;
@@ -951,6 +1038,9 @@ uint32_t tcp_poll(int32_t conn_id, uint32_t events)
     uint32_t ready = 0u;
     if (connection->in_use == 0u || connection->state == TCP_STATE_CLOSED) {
         ready = 0x0010u;
+        if (connection->in_use != 0u && connection->error != 0u) {
+            ready |= 0x0008u; /* POLLERR: SO_ERROR has the reason */
+        }
     } else if (connection->state == TCP_STATE_LISTEN) {
         /* A listening socket is readable when accept() has a connection to
          * hand out -- the same condition tcp_accept() looks for. Without
@@ -1012,21 +1102,20 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                    c->error = (uint8_t)TCP_ERR_ETIMEDOUT;
                     tcp_release_locked(c);
                     continue;
                 }
                 c->last_send_tick = now;
                 if (c->state == TCP_STATE_SYN_SENT) {
-                    tcp_send_segment(c->local_ip, c->remote_ip,
-                                     c->local_port, c->remote_port,
-                                     c->iss, 0u,
-                                     TCP_FLAG_SYN, c->rcv_wnd, NULL, 0);
+                    tcp_send_syn(c->local_ip, c->remote_ip,
+                                 c->local_port, c->remote_port,
+                                 c->iss, 0u, TCP_FLAG_SYN, c->rcv_wnd);
                 } else {
-                    tcp_send_segment(c->local_ip, c->remote_ip,
-                                     c->local_port, c->remote_port,
-                                     c->iss, c->rcv_nxt,
-                                     TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                     c->rcv_wnd, NULL, 0);
+                    tcp_send_syn(c->local_ip, c->remote_ip,
+                                 c->local_port, c->remote_port,
+                                 c->iss, c->rcv_nxt,
+                                 TCP_FLAG_SYN | TCP_FLAG_ACK, c->rcv_wnd);
                 }
             }
         }
@@ -1036,6 +1125,7 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                    c->error = (uint8_t)TCP_ERR_ETIMEDOUT;
                     tcp_release_locked(c);
                     continue;
                 }
@@ -1053,11 +1143,12 @@ void tcp_process_timer(void)
             if ((now - c->last_send_tick) >= retransmit_ticks) {
                 c->retransmit_count++;
                 if (c->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                    c->error = (uint8_t)TCP_ERR_ETIMEDOUT;
                     tcp_release_locked(c);
                     continue;
                 }
                 uint32_t unacked = c->snd_nxt - c->snd_una;
-                if (unacked > TCP_MAX_SEGMENT_DATA) unacked = TCP_MAX_SEGMENT_DATA;
+                if (unacked > tcp_conn_mss(c)) unacked = tcp_conn_mss(c);
                 if (unacked > c->send_count) unacked = c->send_count;
 
                 uint8_t retx_buf[TCP_MAX_SEGMENT_DATA];

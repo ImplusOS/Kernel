@@ -23,6 +23,7 @@ static inline void wrmsr(uint32_t msr, uint64_t value) {
 #define IA32_EFER           0xC0000080
 #define IA32_STAR           0xC0000081
 #define IA32_LSTAR          0xC0000082
+#define IA32_CSTAR          0xC0000083
 #define IA32_FMASK          0xC0000084
 #define IA32_GS_BASE        0xC0000101
 #define IA32_KERNEL_GS_BASE 0xC0000102
@@ -81,7 +82,23 @@ typedef struct {
     uint64_t full_rcx;
     uint64_t full_r11;
     uint64_t cpu_index_plus1; /* gs:40 -- smp_get_current_cpu_id() */
+    /* gs:48/56 -- the code and stack selectors the IRETQ exits return with:
+     * 64-bit user code, or 32-bit compatibility-mode code for a Linux i386
+     * task. Set per task by syscall_set_user_segments() on every switch. */
+    uint64_t user_cs;
+    uint64_t user_ss;
+    /* gs:64 -- set by the `int $0x80` entry, consumed by the dispatcher:
+     * which trap a syscall arrived by is what selects its argument
+     * registers. */
+    uint64_t int80_entry;
 } syscall_cpu_state_t;
+
+_Static_assert(__builtin_offsetof(syscall_cpu_state_t, user_cs) == 48,
+               "Syscall_Entry.asm PERCPU_USER_CS");
+_Static_assert(__builtin_offsetof(syscall_cpu_state_t, user_ss) == 56,
+               "Syscall_Entry.asm PERCPU_USER_SS");
+_Static_assert(__builtin_offsetof(syscall_cpu_state_t, int80_entry) == 64,
+               "Syscall_Entry.asm PERCPU_INT80");
 
 static syscall_cpu_state_t g_syscall_cpu_state[SYSCALL_MAX_CPUS];
 static uint8_t g_syscall_kernel_stack[SYSCALL_MAX_CPUS][SYSCALL_KERNEL_STACK_SIZE]
@@ -112,6 +129,9 @@ static void syscall_init_cpu(uint32_t cpu_id)
     g_syscall_cpu_state[cpu_id].kernel_rsp = kernel_rsp & ~0xFULL;
     g_syscall_cpu_state[cpu_id].full_restore = 0;
     g_syscall_cpu_state[cpu_id].cpu_index_plus1 = (uint64_t)cpu_id + 1u;
+    g_syscall_cpu_state[cpu_id].user_cs = (uint64_t)GDT_USER_CODE | 3u;
+    g_syscall_cpu_state[cpu_id].user_ss = (uint64_t)GDT_USER_DATA | 3u;
+    g_syscall_cpu_state[cpu_id].int80_entry = 0;
     syscall_init_fpu_for_cpu();
 }
 
@@ -156,6 +176,21 @@ void syscall_set_full_restore(int enabled, uint64_t rcx, uint64_t r11)
     st->full_restore = enabled ? 1u : 0u;
 }
 
+void syscall_set_user_segments(int compat32)
+{
+    syscall_cpu_state_t *st = syscall_cpu_state_current();
+    st->user_cs = (uint64_t)(compat32 ? GDT_USER_COMPAT_CODE : GDT_USER_CODE) | 3u;
+    st->user_ss = (uint64_t)GDT_USER_DATA | 3u;
+}
+
+int syscall_consume_int80_entry(void)
+{
+    syscall_cpu_state_t *st = syscall_cpu_state_current();
+    int was = st->int80_entry != 0u;
+    st->int80_entry = 0;
+    return was;
+}
+
 void syscall_init_per_cpu(void) {
     uint32_t cpu_id = syscall_current_cpu_id();
     if (cpu_id >= SYSCALL_MAX_CPUS) {
@@ -173,6 +208,11 @@ void syscall_init_per_cpu(void) {
     wrmsr(IA32_EFER, efer);
 
     wrmsr(IA32_LSTAR, (uint64_t)syscall_entry);
+    /* SYSCALL from 32-bit compatibility mode (AMD only; Intel raises #UD)
+     * lands here. Linux i386 programs trap with `int $0x80`; one that uses
+     * SYSCALL anyway gets ENOSYS from the i386 layer rather than a jump to
+     * address 0 in kernel mode. */
+    wrmsr(IA32_CSTAR, (uint64_t)syscall_entry);
     uint64_t star =
         ((uint64_t)GDT_KERNEL_CODE << 32) |
         ((uint64_t)GDT_USER_COMPAT_CODE << 48);
