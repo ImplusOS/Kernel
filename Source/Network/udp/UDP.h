@@ -43,6 +43,13 @@ int32_t udp_user_recv(int32_t owner_pid,
                       uint16_t port,
                       uint8_t *out_buf,
                       uint32_t out_buf_len);
+/* udp_user_recv() that, with peek set (recv MSG_PEEK), leaves the datagram
+ * queued. */
+int32_t udp_user_recv_ex(int32_t owner_pid,
+                         uint16_t port,
+                         uint8_t *out_buf,
+                         uint32_t out_buf_len,
+                         int peek);
 /* Number of queued datagrams waiting for `port` (owned by `owner_pid`),
  * or -1 if not bound / not owned. Used for FIONREAD/poll. */
 int32_t udp_user_available(int32_t owner_pid, uint16_t port);

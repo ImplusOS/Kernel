@@ -18,6 +18,11 @@
 #define ARP_OP_REPLY       2u
 
 #define ARP_ENTRY_TTL_SECONDS 300u
+/* Past its TTL an entry stays usable while it is re-probed (once a second);
+ * only an entry nobody answered for this long is dropped. Dropping it at the
+ * TTL sent the next packet to the gateway through a blocking resolve in the
+ * middle of the TCP stack (see arp_resolve()). */
+#define ARP_ENTRY_STALE_GRACE_SECONDS 60u
 
 typedef struct __attribute__((packed)) {
     uint16_t htype;
@@ -36,12 +41,17 @@ typedef struct {
     uint8_t mac[6];
     uint32_t ipv4_addr;
     uint64_t last_updated_tick;
+    uint64_t last_probe_tick;
 } arp_entry_t;
 
 static spinlock_t g_arp_lock = {0};
 static arp_entry_t g_arp_table[ARP_TABLE_MAX_ENTRIES];
 
 static uint32_t g_local_ipv4_addr = 0;
+/* The last address a non-blocking arp_resolve() asked for, and when: a burst
+ * of packets to an unresolved next hop sends one request, not one each. */
+static uint32_t g_arp_pending_ip = 0;
+static uint64_t g_arp_pending_tick = 0;
 
 static void arp_table_update(uint32_t ipv4_addr, const uint8_t mac[6])
 {
@@ -258,6 +268,15 @@ bool arp_send_reply(const uint8_t target_mac[6], uint32_t target_ipv4_addr)
                          (uint16_t)sizeof(packet));
 }
 
+static bool arp_irq_state_enabled(uint64_t state)
+{
+#if defined(__aarch64__)
+    return (state & (1ull << 7)) == 0u; /* DAIF.I clear */
+#else
+    return (state & (1ull << 9)) != 0u; /* RFLAGS.IF */
+#endif
+}
+
 bool arp_resolve(uint32_t ipv4_addr, uint8_t mac_out[6], uint32_t timeout_ms)
 {
     if (mac_out == NULL || ipv4_addr == 0u) {
@@ -268,11 +287,42 @@ bool arp_resolve(uint32_t ipv4_addr, uint8_t mac_out[6], uint32_t timeout_ms)
         return true;
     }
 
-    (void)arp_send_request(ipv4_addr);
     uint32_t hz = timer_hz();
     if (hz == 0u) {
         hz = 60u;
     }
+
+    /* Waiting below means polling the NIC and halting until the next
+     * interrupt. A caller running with interrupts off holds a spinlock --
+     * every TCP transmission runs under the TCP lock, the retransmission
+     * timer in the timer interrupt -- and must not do either: the poll
+     * dispatches received segments straight into tcp_on_ipv4(), which spins
+     * forever on the lock this CPU already holds, and "sti; hlt" lets the
+     * timer interrupt in to do the same. Such a caller only starts the
+     * lookup; its packet is dropped, and TCP's retransmission sends it once
+     * the reply has filled the table. */
+    uint64_t irq_state = hal_cpu_save_interrupts();
+    hal_cpu_restore_interrupts(irq_state);
+    if (!arp_irq_state_enabled(irq_state)) {
+        uint64_t now = timer_ticks();
+        int send = 0;
+        uint64_t irq_flags = irq_save_disable();
+        spinlock_lock(&g_arp_lock);
+        if (g_arp_pending_ip != ipv4_addr ||
+            (now - g_arp_pending_tick) >= (uint64_t)hz / 4u + 1u) {
+            g_arp_pending_ip = ipv4_addr;
+            g_arp_pending_tick = now;
+            send = 1;
+        }
+        spinlock_unlock(&g_arp_lock);
+        irq_restore(irq_flags);
+        if (send) {
+            (void)arp_send_request(ipv4_addr);
+        }
+        return false;
+    }
+
+    (void)arp_send_request(ipv4_addr);
 
     uint64_t timeout_ticks = ((uint64_t)timeout_ms * (uint64_t)hz + 999u) / 1000u;
     if (timeout_ticks == 0u) {
@@ -291,6 +341,7 @@ bool arp_resolve(uint32_t ipv4_addr, uint8_t mac_out[6], uint32_t timeout_ms)
         ethernet_poll();
 
         if (arp_lookup(ipv4_addr, mac_out)) {
+            hal_cpu_restore_interrupts(irq_state); /* undo the cli below */
             return true;
         }
 
@@ -308,7 +359,8 @@ bool arp_resolve(uint32_t ipv4_addr, uint8_t mac_out[6], uint32_t timeout_ms)
         __asm__ volatile("sti; hlt; cli" ::: "memory");
 #endif
     }
-    
+
+    hal_cpu_restore_interrupts(irq_state);
     return false;
 }
 
@@ -320,23 +372,40 @@ void arp_process_timer(void)
     }
 
     uint64_t ttl_ticks = (uint64_t)ARP_ENTRY_TTL_SECONDS * (uint64_t)hz;
+    uint64_t grace_ticks = (uint64_t)ARP_ENTRY_STALE_GRACE_SECONDS * (uint64_t)hz;
     uint64_t now = timer_ticks();
+    uint32_t probe[8];
+    uint32_t probe_count = 0u;
 
     uint64_t irq_flags = irq_save_disable();
     spinlock_lock(&g_arp_lock);
 
     for (uint32_t i = 0; i < ARP_TABLE_MAX_ENTRIES; ++i) {
-        if (g_arp_table[i].valid == 0u) {
+        arp_entry_t *e = &g_arp_table[i];
+        if (e->valid == 0u) {
             continue;
         }
-        if ((now - g_arp_table[i].last_updated_tick) > ttl_ticks) {
-            g_arp_table[i].valid = 0u;
-            g_arp_table[i].ipv4_addr = 0u;
-            memset(g_arp_table[i].mac, 0, sizeof(g_arp_table[i].mac));
-            g_arp_table[i].last_updated_tick = 0u;
+        uint64_t age = now - e->last_updated_tick;
+        if (age > ttl_ticks + grace_ticks) {
+            e->valid = 0u;
+            e->ipv4_addr = 0u;
+            memset(e->mac, 0, sizeof(e->mac));
+            e->last_updated_tick = 0u;
+            e->last_probe_tick = 0u;
+        } else if (age > ttl_ticks &&
+                   (now - e->last_probe_tick) >= (uint64_t)hz &&
+                   probe_count < 8u) {
+            /* Stale: still used, and asked about again. The reply refreshes
+             * it through arp_on_ethernet(). */
+            e->last_probe_tick = now;
+            probe[probe_count++] = e->ipv4_addr;
         }
     }
 
     spinlock_unlock(&g_arp_lock);
     irq_restore(irq_flags);
+
+    for (uint32_t i = 0; i < probe_count; ++i) {
+        (void)arp_send_request(probe[i]);
+    }
 }

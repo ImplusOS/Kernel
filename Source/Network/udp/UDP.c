@@ -473,6 +473,15 @@ int32_t udp_user_recv(int32_t owner_pid,
                       uint8_t *out_buf,
                       uint32_t out_buf_len)
 {
+    return udp_user_recv_ex(owner_pid, port, out_buf, out_buf_len, 0);
+}
+
+int32_t udp_user_recv_ex(int32_t owner_pid,
+                         uint16_t port,
+                         uint8_t *out_buf,
+                         uint32_t out_buf_len,
+                         int peek)
+{
     if (out_buf == NULL || out_buf_len < UDP_USER_HEADER_BYTES) {
         return -1;
     }
@@ -506,8 +515,10 @@ int32_t udp_user_recv(int32_t owner_pid,
     }
     memcpy(local_copy, slot->data, payload_len);
 
-    b->head = (b->head + 1u) % UDP_USER_QUEUE_DEPTH;
-    b->count--;
+    if (!peek) {
+        b->head = (b->head + 1u) % UDP_USER_QUEUE_DEPTH;
+        b->count--;
+    }
 
     spinlock_unlock(&g_udp_user_lock);
     irq_restore(irq_flags);

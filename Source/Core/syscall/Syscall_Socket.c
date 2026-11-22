@@ -430,6 +430,16 @@ int32_t syscall_socket_sendto(int32_t fd, const void *data, uint16_t length,
 int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
                                 uint32_t *src_ip_out, uint16_t *src_port_out)
 {
+    return syscall_socket_recvfrom_flags(fd, data, length,
+                                         src_ip_out, src_port_out, 0u);
+}
+
+int32_t syscall_socket_recvfrom_flags(int32_t fd, void *data, uint16_t length,
+                                      uint32_t *src_ip_out,
+                                      uint16_t *src_port_out,
+                                      uint32_t flags)
+{
+    int peek = (flags & SYSCALL_SOCKET_RECV_PEEK) != 0u;
     socket_ensure_initialized();
     spinlock_lock(&g_socket_lock);
     kernel_socket_t *socket = socket_owned_locked(fd);
@@ -449,7 +459,7 @@ int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
         uint8_t staging[UDP_USER_HEADER_BYTES + 1472u];
         uint32_t want = (uint32_t)length + UDP_USER_HEADER_BYTES;
         if (want > sizeof(staging)) want = sizeof(staging);
-        int32_t got = udp_user_recv(owner_pid, port, staging, want);
+        int32_t got = udp_user_recv_ex(owner_pid, port, staging, want, peek);
         if (got < (int32_t)UDP_USER_HEADER_BYTES) {
             if (got < 0) return (int32_t)OS_STATUS_IO_ERROR;
             /* An empty queue on a non-blocking socket is EAGAIN, as on the
@@ -486,7 +496,8 @@ int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
             if (src_port_out != NULL) *src_port_out = info.remote_port;
         }
     }
-    int32_t result = tcp_recv(connection_id, data, length);
+    int32_t result = peek ? tcp_peek(connection_id, data, length)
+                          : tcp_recv(connection_id, data, length);
     if (result < 0) {
         int32_t failure = socket_tcp_failure(connection_id);
         return failure != 0 ? failure : (int32_t)OS_STATUS_IO_ERROR;
@@ -644,7 +655,7 @@ int32_t syscall_socket_shutdown(int32_t fd, int32_t how)
         close_write = 1;
     }
     spinlock_unlock(&g_socket_lock);
-    if (close_write && tcp_close(connection_id) < 0) {
+    if (close_write && tcp_shutdown_write(connection_id) < 0) {
         return (int32_t)OS_STATUS_IO_ERROR;
     }
     return 0;

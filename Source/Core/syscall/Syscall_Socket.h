@@ -30,6 +30,13 @@ int32_t syscall_socket_sendto(int32_t fd, const void *data, uint16_t length,
                               uint32_t dst_ip, uint16_t dst_port);
 int32_t syscall_socket_recvfrom(int32_t fd, void *data, uint16_t length,
                                 uint32_t *src_ip_out, uint16_t *src_port_out);
+/* recvfrom with recv(2) flags. SYSCALL_SOCKET_RECV_PEEK (MSG_PEEK) returns
+ * the data without taking it off the socket. */
+#define SYSCALL_SOCKET_RECV_PEEK 0x1u
+int32_t syscall_socket_recvfrom_flags(int32_t fd, void *data, uint16_t length,
+                                      uint32_t *src_ip_out,
+                                      uint16_t *src_port_out,
+                                      uint32_t flags);
 int32_t syscall_socket_close(int32_t fd);
 int32_t syscall_socket_get_info(int32_t fd, syscall_socket_info_t *info_out);
 int32_t syscall_socket_set_option(int32_t fd, int32_t level,

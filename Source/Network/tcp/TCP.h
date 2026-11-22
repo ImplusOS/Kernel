@@ -15,6 +15,13 @@
 #define TCP_RETRANSMIT_MS    1000u
 #define TCP_MAX_RETRANSMITS  5u
 #define TCP_TIME_WAIT_MS     2000u
+/* How long a connection whose socket is already closed may sit in
+ * FIN_WAIT_2 waiting for the peer's FIN (Linux's tcp_fin_timeout). A peer
+ * that never sends one used to keep the slot forever; enough of them and
+ * TCP_MAX_CONNECTIONS ran out. */
+#define TCP_FIN_WAIT2_MS     60000u
+/* Duplicate ACKs that trigger a fast retransmit (RFC 5681). */
+#define TCP_DUPACK_THRESHOLD 3u
 
 
 typedef enum {
@@ -92,7 +99,15 @@ typedef struct {
     /* Largest payload the peer takes per segment: the MSS option of its
      * SYN, capped at TCP_MAX_SEGMENT_DATA (RFC 879's 536 without one). */
     uint16_t snd_mss;
-    int32_t  parent_conn_id;  
+    /* Duplicate ACKs seen for snd_una (fast retransmit at
+     * TCP_DUPACK_THRESHOLD). */
+    uint8_t  dup_acks;
+    /* Set once a segment had to be retransmitted, until everything sent is
+     * acknowledged: each ACK that moves snd_una but not to snd_nxt (a
+     * "partial ACK") then resends the next segment at once (RFC 6582)
+     * instead of leaving it to the next retransmission timeout. */
+    uint8_t  recovering;
+    int32_t  parent_conn_id;
     uint16_t listen_backlog;
 } tcp_connection_t;
 
@@ -131,8 +146,17 @@ int32_t tcp_send(int32_t conn_id, const void *data, uint16_t len);
 
 int32_t tcp_recv(int32_t conn_id, void *buf, uint16_t buf_len);
 
+/* recv(MSG_PEEK): copies what tcp_recv() would return without taking it out
+ * of the receive buffer. */
+int32_t tcp_peek(int32_t conn_id, void *buf, uint16_t buf_len);
+
 
 int32_t tcp_close(int32_t conn_id);
+
+/* shutdown(SHUT_WR): sends our FIN like tcp_close(), but the socket still
+ * holds the connection (it can go on reading, and its slot is not recycled
+ * under it). */
+int32_t tcp_shutdown_write(int32_t conn_id);
 
 
 tcp_state_t tcp_get_state(int32_t conn_id);

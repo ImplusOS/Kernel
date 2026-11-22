@@ -4284,6 +4284,16 @@ static int64_t linux_socket_accept4(uint64_t fd, uint64_t addr_ptr,
  * the syscall should yield. */
 static int64_t linux_send_result_sigpipe(int64_t result, uint64_t flags)
 {
+    if (result == 0) {
+        /* The connection's send buffer is full (or the segment could not go
+         * out). send() never returns 0 for a non-empty buffer on Linux; a
+         * caller loops on it as "0 bytes written, try again" -- Chromium's
+         * SocketBIOAdapter did, burning the network thread instead of
+         * waiting for EPOLLOUT. EAGAIN is the real answer; for a blocking
+         * socket the dispatcher parks and restarts the call. Callers pass
+         * only non-empty writes here. */
+        return LINUX_EAGAIN;
+    }
     if (result == (int64_t)OS_STATUS_BROKEN_PIPE) {
         if ((flags & 0x4000u) == 0u) { /* MSG_NOSIGNAL */
             int32_t self = process_get_current_pid();
@@ -4342,6 +4352,9 @@ static int64_t linux_socket_sendto(uint64_t fd, uint64_t buf, uint64_t len,
                 return rc2;
             }
         }
+        if (len == 0u) {
+            return 0;
+        }
         int64_t sent = (int64_t)syscall_socket_send(
             (int32_t)fd, (const void *)(uintptr_t)buf, (uint16_t)len);
         return linux_send_result_sigpipe(sent, flags);
@@ -4356,11 +4369,18 @@ static int64_t linux_socket_sendto(uint64_t fd, uint64_t buf, uint64_t len,
                                           (uint16_t)len, dst_ip, dst_port);
 }
 
+/* recv(2) flags the inet path acts on. MSG_PEEK matters for correctness:
+ * Chromium probes connections with recv(fd, &c, 1, MSG_PEEK) -- before
+ * reusing a pooled one and before opening each new HTTP/2 stream -- and
+ * while the flag was ignored each probe ate a byte of the TLS stream
+ * (ERR_SSL_PROTOCOL_ERROR on everything that connection carried afterwards;
+ * see tcp_peek()). */
+#define LINUX_MSG_PEEK 0x2u
+
 static int64_t linux_socket_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
                                      uint64_t flags, uint64_t addr_ptr,
                                      uint64_t addr_len_ptr)
 {
-    (void)flags;
     if (len > 65535u) {
         len = 65535u;
     }
@@ -4389,9 +4409,10 @@ static int64_t linux_socket_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
     uint32_t src_ip = 0;
     uint16_t src_port = 0;
     int need_addr = (addr_ptr != 0u);
-    int64_t result = (int64_t)syscall_socket_recvfrom(
+    int64_t result = (int64_t)syscall_socket_recvfrom_flags(
         (int32_t)fd, (void *)(uintptr_t)buf, (uint16_t)len,
-        need_addr ? &src_ip : NULL, need_addr ? &src_port : NULL);
+        need_addr ? &src_ip : NULL, need_addr ? &src_port : NULL,
+        (flags & LINUX_MSG_PEEK) != 0u ? SYSCALL_SOCKET_RECV_PEEK : 0u);
 
     if (result >= 0 && need_addr) {
         linux_sockaddr_in_t addr;
@@ -4469,8 +4490,9 @@ static int64_t linux_inet_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
     uint8_t staging[LINUX_INET_MSG_STAGING];
     uint32_t src_ip = 0u;
     uint16_t src_port = 0u;
-    int64_t got = (int64_t)syscall_socket_recvfrom((int32_t)fd, staging, (uint16_t)want,
-                                                   &src_ip, &src_port);
+    int64_t got = (int64_t)syscall_socket_recvfrom_flags(
+        (int32_t)fd, staging, (uint16_t)want, &src_ip, &src_port,
+        (flags & LINUX_MSG_PEEK) != 0u ? SYSCALL_SOCKET_RECV_PEEK : 0u);
     if (got == 0 && want != 0u && (flags & 0x40u /* MSG_DONTWAIT */) != 0u &&
         syscall_socket_get_type((int32_t)fd) == (int32_t)LINUX_SOCK_DGRAM) {
         return LINUX_EAGAIN;
@@ -4548,6 +4570,9 @@ static int64_t linux_inet_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags)
         }
     }
     if (syscall_socket_get_type((int32_t)fd) == (int32_t)LINUX_SOCK_STREAM) {
+        if (len == 0u) {
+            return 0;
+        }
         int64_t sent = (int64_t)syscall_socket_send((int32_t)fd, staging, (uint16_t)len);
         return linux_send_result_sigpipe(sent, flags);
     }
@@ -5877,6 +5902,14 @@ static void linux_unix_block_retry(uint64_t generation, int32_t fd,
     }
     if (unix_socket_fd_in_range(fd)) {
         if (unix_socket_is_nonblock(fd)) {
+            return;
+        }
+    } else if (syscall_socket_fd_in_range(fd)) {
+        /* AF_INET: EAGAIN reaches here for a full send buffer, or a recv on
+         * a connection still in its handshake. On a blocking socket that
+         * means "wait", like the AF_UNIX case; tcp_on_ipv4() notifies
+         * pollers on every segment, which ends the park. */
+        if (syscall_socket_is_nonblocking(fd)) {
             return;
         }
     } else if (syscall_file_is_pipe(fd) || syscall_file_is_pty(fd)) {
@@ -7793,9 +7826,21 @@ uint64_t linux_syscall_core(uint64_t saved_rsp,
             result = linux_socket_accept4(arg1, arg2, arg3, arg4);
             break;
 
-        case LINUX_SYS_SENDTO:
+        case LINUX_SYS_SENDTO: {
+            int should_switch = 0;
             result = linux_socket_sendto(arg1, arg2, arg3, arg4, arg5, arg6);
+            /* A blocking TCP socket with a full send buffer waits for room
+             * instead of seeing EAGAIN. */
+            if ((arg4 & LINUX_MSG_DONTWAIT) == 0u &&
+                syscall_socket_fd_in_range((int32_t)arg1)) {
+                linux_unix_block_retry(lx_gen, (int32_t)arg1, &result,
+                                       &should_switch, &request_restart);
+            }
+            if (should_switch) {
+                request_switch = 1;
+            }
             break;
+        }
 
         case LINUX_SYS_RECVFROM: {
             int should_switch = 0;
@@ -7818,7 +7863,15 @@ uint64_t linux_syscall_core(uint64_t saved_rsp,
              * validated here, not the msg_iov/msg_control buffers it
              * points to (a pre-existing gap in unix_socket_sendmsg()). */
             if (syscall_socket_fd_in_range((int32_t)arg1)) {
+                int should_switch = 0;
                 result = linux_inet_sendmsg(arg1, arg2, arg3);
+                if ((arg3 & LINUX_MSG_DONTWAIT) == 0u) {
+                    linux_unix_block_retry(lx_gen, (int32_t)arg1, &result,
+                                           &should_switch, &request_restart);
+                }
+                if (should_switch) {
+                    request_switch = 1;
+                }
             } else if (!unix_socket_fd_in_range((int32_t)arg1)) {
                 result = LINUX_ENOTSUP;
             } else if (!process_user_buffer_is_valid(
