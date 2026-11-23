@@ -1,4 +1,5 @@
 #include "IO_Main.h"
+#include "IO_Stats.h"
 #include "Block_Cache.h"
 #include "Protocol/ATA/Protocol_ATA.h"
 #include "Protocol/USB_MassStorage/Protocol_USB_MassStorage.h"
@@ -622,7 +623,12 @@ static bool disk_read_raw(uint64_t lba, uint8_t *buffer, uint32_t sectors)
     if (!g_current_block_device || !g_current_block_device->read) {
         return false;
     }
-    return g_current_block_device->read(lba, buffer, sectors);
+    io_stats_token_t t = io_stats_begin(g_current_block_device,
+                                        g_current_device_index);
+    bool ok = g_current_block_device->read(lba, buffer, sectors);
+    io_stats_end(g_current_block_device, g_current_device_index, t,
+                 false, sectors, ok);
+    return ok;
 }
 
 bool disk_read(uint64_t lba, uint8_t *buffer, uint32_t sectors)
@@ -644,8 +650,13 @@ bool disk_write(uint64_t lba, const uint8_t *buffer, uint32_t sectors) {
     bool ok = false;
     if (g_current_block_device->select_device)
         g_current_block_device->select_device(g_current_device_index);
-    if (g_current_block_device->write)
+    if (g_current_block_device->write) {
+        io_stats_token_t t = io_stats_begin(g_current_block_device,
+                                            g_current_device_index);
         ok = g_current_block_device->write(lba, buffer, sectors);
+        io_stats_end(g_current_block_device, g_current_device_index, t,
+                     true, sectors, ok);
+    }
     /* Unconditional: a failed write may still have landed partially. */
     block_cache_invalidate(
         disk_cache_key(g_current_block_device, g_current_device_index),
@@ -771,6 +782,21 @@ bool disk_get_info(uint32_t index, io_disk_info_t *out_info) {
     return true;
 }
 
+bool disk_get_stats(uint32_t index, system_disk_stats_t *out_stats) {
+    if (!out_stats) return false;
+    if (index == SYSTEM_DISK_STATS_ALL) {
+        /* No disk list needed -- and so no wait for the deferred transport
+         * probe that the first disk listing triggers. */
+        io_stats_get(NULL, 0u, out_stats);
+        return true;
+    }
+    disk_scan_devices();
+    if (index >= g_detected_disk_count) return false;
+    io_stats_get(g_detected_disks[index], g_detected_disks_indices[index],
+                 out_stats);
+    return true;
+}
+
 static bool disk_raw_io(uint32_t       index,
                         uint64_t       lba,
                         uint8_t       *read_buffer,
@@ -797,9 +823,14 @@ static bool disk_raw_io(uint32_t       index,
 
     bool already_up = device->is_working && device->is_working();
     if (already_up || (device->init && device->init(0))) {
-        if (read_buffer  && device->read)  ok = device->read (lba, read_buffer,  sectors);
-        else if (write_buffer && device->write) {
+        if (read_buffer && device->read) {
+            io_stats_token_t t = io_stats_begin(device, dev_idx);
+            ok = device->read(lba, read_buffer, sectors);
+            io_stats_end(device, dev_idx, t, false, sectors, ok);
+        } else if (write_buffer && device->write) {
+            io_stats_token_t t = io_stats_begin(device, dev_idx);
             ok = device->write(lba, write_buffer, sectors);
+            io_stats_end(device, dev_idx, t, true, sectors, ok);
             /* This path reaches a device directly rather than through
              * disk_write(), so it has to drop the cached copy itself --
              * otherwise writing the install target and then reading it back

@@ -14,6 +14,7 @@
 #include "Core/sync/Spinlock.h"
 #include "Core/usercopy/Usercopy.h"
 #include "Core/timer/Timer.h"
+#include "Core/sysinfo/GpuStats.h"
 #include "Core/vfs/DevFS.h"
 #include "Core/vfs/SysFS.h"
 #include "Core/syscall/Syscall_File.h"
@@ -544,6 +545,23 @@ static int drm_sync_fence_of_fd(int32_t fd, uint64_t *out_fence);
 /* Render-backend lookup is defined below the DRM session tables. */
 static const driver_display_t *render_gpu_backend(void);
 
+/* Every page DRM holds for a buffer goes through these two, so the task
+ * manager can show how much memory GPU buffers take (GpuStats.h). */
+static void *drm_pages_alloc(uint32_t npages)
+{
+    void *kva = pmm_alloc_pages(npages);
+    if (kva != NULL) {
+        gpu_stats_note_memory((int64_t)npages * 4096);
+    }
+    return kva;
+}
+
+static void drm_pages_free(void *kva, uint32_t npages)
+{
+    pmm_free_pages(kva, npages);
+    gpu_stats_note_memory(-(int64_t)npages * 4096);
+}
+
 /* Take `bo`'s pages into a dma-buf block and hand the handle its reference.
  * A handle whose `prime` is < 0 owns its pages outright, so there is never an
  * existing block to collide with -- no lookup needed, and none wanted: a
@@ -598,7 +616,7 @@ static void prime_put_locked(int32_t idx)
             return;
         }
     }
-    if (p->kva != NULL) pmm_free_pages(p->kva, p->npages);
+    if (p->kva != NULL) drm_pages_free(p->kva, p->npages);
     memset(p, 0, sizeof(*p));
 }
 
@@ -612,7 +630,7 @@ static void dumb_release_locked(drm_dumb_t *bo)
     if (bo->prime >= 0) {
         prime_put_locked(bo->prime);
     } else if (bo->kva != NULL) {
-        pmm_free_pages(bo->kva, bo->npages);
+        drm_pages_free(bo->kva, bo->npages);
     }
     memset(bo, 0, sizeof(*bo));
 }
@@ -1354,13 +1372,13 @@ static int render_create_resource(drm_render_session_t *sess,
     }
     if (slot == NULL) { spinlock_unlock(&g_lock); return E_NOMEM; }
 
-    void *kva = pmm_alloc_pages(npages);
+    void *kva = drm_pages_alloc(npages);
     if (kva == NULL) { spinlock_unlock(&g_lock); return E_NOMEM; }
     memset(kva, 0, (size_t)allocation_bytes);
     uint64_t phys = paging_virt_to_phys(paging_get_kernel_cr3(),
                                         (uint64_t)(uintptr_t)kva);
     if (phys == 0u) {
-        pmm_free_pages(kva, npages);
+        drm_pages_free(kva, npages);
         spinlock_unlock(&g_lock);
         return E_NODEV;
     }
@@ -1535,13 +1553,13 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         for (int i = 0; i < DRM_MAX_DUMB; ++i)
             if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
-        void *kva = pmm_alloc_pages(npages);
+        void *kva = drm_pages_alloc(npages);
         if (!kva) { spinlock_unlock(&g_lock); return E_NOMEM; }
         memset(kva, 0, (size_t)npages * 4096u);
         uint64_t phys = paging_virt_to_phys(paging_get_kernel_cr3(),
                                             (uint64_t)(uintptr_t)kva);
         if (phys == 0u) {
-            pmm_free_pages(kva, npages);
+            drm_pages_free(kva, npages);
             spinlock_unlock(&g_lock);
             return E_NODEV;
         }
@@ -1842,15 +1860,21 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
                 if (fence == 0u) {
                     rc = E_INVAL;
                 } else {
+                    gpu_stats_note_submit(current_pid_get(), fence);
                     out_fence = fence;
                     for (uint32_t i = 0u; i < exec.num_bo_handles; ++i) {
                         drm_dumb_t *bo = render_dumb_by_handle(sess, handles[i]);
                         if (bo != NULL) bo_fence_set_locked(bo, fence);
                     }
                 }
-            } else if (!gpu->gpu_submit_3d(sess->context_id, commands,
-                                           exec.size)) {
-                rc = E_INVAL;
+            } else {
+                uint64_t t0 = timer_monotonic_ns();
+                if (!gpu->gpu_submit_3d(sess->context_id, commands,
+                                        exec.size)) {
+                    rc = E_INVAL;
+                }
+                gpu_stats_note_sync(current_pid_get(),
+                                    timer_monotonic_ns() - t0);
             }
         }
         spinlock_unlock(&g_lock);
@@ -1899,8 +1923,12 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
                 transfer.box.w, transfer.box.h, transfer.box.d,
                 (uint64_t)transfer.offset, transfer.level,
                 transfer.stride, transfer.layer_stride);
-            if (fence == 0u) rc = E_INVAL;
-            else bo_fence_set_locked(bo, fence);
+            if (fence == 0u) {
+                rc = E_INVAL;
+            } else {
+                gpu_stats_note_submit(current_pid_get(), fence);
+                bo_fence_set_locked(bo, fence);
+            }
         } else if (rc == 0 &&
             !gpu->gpu_transfer_3d(
                 sess->context_id, render_bo_gpu_resource_id_locked(bo),
@@ -2010,6 +2038,7 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
             }
         }
         if (rc == 0 && (so.flags & DRM_IMPLUS_SCANOUT_FLUSH) != 0u) {
+            uint64_t t0 = timer_monotonic_ns();
             if (g_render_scanout_resource != resource_id ||
                 g_render_scanout_session != (const void *)sess) {
                 rc = E_NODEV;
@@ -2019,6 +2048,12 @@ int64_t drm_render_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
                 g_render_scanout_resource = 0u;
                 g_render_scanout_session = NULL;
                 rc = E_NODEV;
+            } else {
+                /* A GPU-composited frame reaching the screen: the present
+                 * of this path, as far as GpuStats.h is concerned. */
+                gpu_stats_note_present(current_pid_get(), t0,
+                                       timer_monotonic_ns(),
+                                       (uint64_t)so.width * so.height * 4u);
             }
         }
         spinlock_unlock(&g_lock);
@@ -2336,6 +2371,10 @@ static bool kms_readback_issue_locked(drm_session_t *s,
                                                 false, 0u, 0u, 0u, width,
                                                 height, 1u, 0u, 0u, pitch, 0u);
     if (fence == 0u) return false;
+    /* May run from the vblank service, not the client's own ioctl: charge
+     * the readback to the session's client by name. */
+    gpu_stats_note_submit(s->client_pid >= 0 ? s->client_pid : s->owner_pid,
+                          fence);
     bo_fence_set_locked(bo, fence);
     s->rb_inflight = 1u;
     s->rb_fence = fence;
@@ -2697,6 +2736,9 @@ void drm_timer_tick(void)
         if (done != last_fence) {
             last_fence = done;
             wake = 1;
+            /* Charge the engine time of what just finished to whoever
+             * submitted it (GpuStats.h). */
+            gpu_stats_note_retired(done);
         }
     }
 
@@ -2905,7 +2947,7 @@ int64_t drm_kms_ioctl(int32_t file_slot, uint64_t request, uint64_t arg)
         drm_dumb_t *slot = NULL;
         for (int i = 0; i < DRM_MAX_DUMB; i++) if (!sess->dumbs[i].used) { slot = &sess->dumbs[i]; break; }
         if (!slot) { spinlock_unlock(&g_lock); return E_NOMEM; }
-        void *kva = pmm_alloc_pages(npages);
+        void *kva = drm_pages_alloc(npages);
         if (!kva) { spinlock_unlock(&g_lock); return E_NOMEM; }
         memset(kva, 0, (size_t)npages * 4096u);
         slot->used = 1;

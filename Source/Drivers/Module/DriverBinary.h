@@ -633,6 +633,29 @@ typedef struct __attribute__((packed)) {
     uint32_t h;
 } display_rect_t;
 
+/*
+ * Engine accounting a display driver may offer (driver_display_t.
+ * gpu_get_stats). An engine is busy while the device holds a request of its
+ * kind -- submitted, not yet completed -- so busy_ns is wall-clock time and
+ * never exceeds the time elapsed, however many requests overlap. Everything
+ * is cumulative since the driver came up; busy_ns includes a request still
+ * outstanding when the stats are read.
+ *
+ *   3D    render commands (virgl SUBMIT_3D, 3D transfers, contexts, 3D
+ *         resources)
+ *   COPY  2D transfers and flushes that feed scanout
+ */
+#define DRIVER_GPU_ENGINE_3D    0u
+#define DRIVER_GPU_ENGINE_COPY  1u
+#define DRIVER_GPU_ENGINE_COUNT 2u
+
+typedef struct {
+    uint64_t busy_ns[DRIVER_GPU_ENGINE_COUNT];
+    uint64_t commands[DRIVER_GPU_ENGINE_COUNT];
+    uint64_t command_bytes;            /* 3D command-stream bytes queued */
+    uint64_t dedicated_memory_bytes;   /* device-local memory, 0 if none */
+} driver_gpu_stats_t;
+
 typedef struct {
     const char *name;
     bool (*probe)(void);
@@ -725,6 +748,12 @@ typedef struct {
                             uint32_t height);
     bool (*gpu_scanout_flush)(uint32_t resource_id, int32_t x, int32_t y,
                               uint32_t width, uint32_t height);
+
+    /* Optional engine accounting for the task manager (see
+     * driver_gpu_stats_t). Called from process context, never from an
+     * interrupt. NULL: the kernel times presents itself and reports the
+     * display as having no engine of its own. */
+    bool (*gpu_get_stats)(driver_gpu_stats_t *out_stats);
 } driver_display_t;
 
 #define DRIVER_KBD_MOD_SHIFT (1u << 0)

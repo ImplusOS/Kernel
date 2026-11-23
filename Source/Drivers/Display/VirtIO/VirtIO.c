@@ -242,6 +242,7 @@ typedef struct {
      * timed out, and must complete before descriptor 0 is rewritten. */
     uint8_t sync_inflight;
     uint8_t sync_done;
+    uint8_t sync_engine;                /* DRIVER_GPU_ENGINE_* of it  */
 
     /* Fenced asynchronous requests. */
     uint32_t async_slots;               /* usable slots (<= VGPU_ASYNC_SLOTS) */
@@ -255,6 +256,7 @@ typedef struct {
     struct {
         uint8_t  busy;
         uint8_t  done;
+        uint8_t  engine;                /* DRIVER_GPU_ENGINE_*        */
         uint32_t ring_off;
         uint32_t ring_len;              /* aligned length at ring_off */
         uint32_t ring_consumed;         /* ring_len plus wrap waste */
@@ -580,6 +582,75 @@ static uint64_t gpu_now_ms(void)
     }
 #endif
     return 0ull;
+}
+
+/* Nanoseconds since boot, or 0 when the driver API offers no such clock
+ * (then engine busy time stays 0 and only the command counts move). */
+static uint64_t gpu_now_ns(void)
+{
+#ifdef IMPLUS_DRIVER_MODULE
+    if (g_driver_api != NULL && g_driver_api->timer.monotonic_ns != NULL) {
+        return g_driver_api->timer.monotonic_ns();
+    }
+#endif
+    return 0ull;
+}
+
+/* ---- engine accounting (driver_display_t.gpu_get_stats) ----------------
+ *
+ * An engine is busy from the moment a request of its kind is published on
+ * the control queue until its completion is drained from the used ring.
+ * Completions are drained by whoever holds the lock next: the MSI-X handler
+ * as soon as the device signals, the timer tick through
+ * virtio_gpu_fence_completed(), and every synchronous request while it
+ * waits -- so the busy interval can run long by at most one timer tick when
+ * there is no MSI-X. All of it runs with g_gpu_lock held. */
+static uint32_t g_vgpu_inflight[DRIVER_GPU_ENGINE_COUNT];
+static uint64_t g_vgpu_busy_since[DRIVER_GPU_ENGINE_COUNT];
+static uint64_t g_vgpu_busy_ns[DRIVER_GPU_ENGINE_COUNT];
+static uint64_t g_vgpu_commands[DRIVER_GPU_ENGINE_COUNT];
+static uint64_t g_vgpu_command_bytes;
+
+/* Scanout traffic is the copy engine; render work and the resource and
+ * context management that serves it is 3D. */
+static uint8_t vgpu_engine_of(uint32_t cmd_type)
+{
+    switch (cmd_type) {
+    case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+    case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+    case VIRTIO_GPU_CMD_GET_EDID:
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        return (uint8_t)DRIVER_GPU_ENGINE_COPY;
+    default:
+        return (uint8_t)DRIVER_GPU_ENGINE_3D;
+    }
+}
+
+/* Caller holds g_gpu_lock. */
+static void vgpu_engine_begin(uint8_t engine)
+{
+    if (engine >= DRIVER_GPU_ENGINE_COUNT) return;
+    g_vgpu_commands[engine]++;
+    if (g_vgpu_inflight[engine]++ == 0u) {
+        g_vgpu_busy_since[engine] = gpu_now_ns();
+    }
+}
+
+/* Caller holds g_gpu_lock. */
+static void vgpu_engine_end(uint8_t engine)
+{
+    if (engine >= DRIVER_GPU_ENGINE_COUNT || g_vgpu_inflight[engine] == 0u) {
+        return;
+    }
+    if (--g_vgpu_inflight[engine] == 0u) {
+        uint64_t now = gpu_now_ns();
+        if (now > g_vgpu_busy_since[engine]) {
+            g_vgpu_busy_ns[engine] += now - g_vgpu_busy_since[engine];
+        }
+    }
 }
 
 static int g_gpu_ready = 0;
@@ -1073,6 +1144,7 @@ static void vgpu_drain_used(virtqueue_t *vq) {
         uint32_t id = vq->used->ring[vq->used_idx_seen % vq->queue_size].id;
         vq->used_idx_seen++;
         if (id == 0u) {
+            if (vq->sync_inflight) vgpu_engine_end(vq->sync_engine);
             vq->sync_done = 1u;
             vq->sync_inflight = 0u;
             continue;
@@ -1080,6 +1152,7 @@ static void vgpu_drain_used(virtqueue_t *vq) {
         if (id < 2u || (id & 1u) != 0u) continue;
         uint32_t slot = (id - 2u) / 2u;
         if (slot >= vq->async_slots || !vq->async[slot].busy) continue;
+        if (!vq->async[slot].done) vgpu_engine_end(vq->async[slot].engine);
         vq->async[slot].done = 1u;
     }
     vgpu_retire_async(vq);
@@ -1158,6 +1231,7 @@ static uint64_t virtqueue_submit_async(virtqueue_t *vq, const void *cmd,
 
     vq->async[slot].busy = 1u;
     vq->async[slot].done = 0u;
+    vq->async[slot].engine = vgpu_engine_of(hdr->type);
     vq->async[slot].ring_off = off;
     vq->async[slot].ring_len = vgpu_align64(total);
     vq->async[slot].ring_consumed = consumed;
@@ -1177,6 +1251,8 @@ static uint64_t virtqueue_submit_async(virtqueue_t *vq, const void *cmd,
     vq->desc[d_in].flags = VIRTQ_DESC_F_WRITE;
     vq->desc[d_in].next = 0;
     memory_barrier();
+    vgpu_engine_begin(vq->async[slot].engine);
+    if (hdr->type == VIRTIO_GPU_CMD_SUBMIT_3D) g_vgpu_command_bytes += payload_len;
     vgpu_publish(vq, d_out);
     return fence;
 }
@@ -1226,6 +1302,8 @@ static int virtqueue_submit_sync(virtqueue_t *vq, void *cmd, uint32_t cmd_len,
 
     vq->sync_done = 0u;
     vq->sync_inflight = 1u;
+    vq->sync_engine = vgpu_engine_of(((const virtio_gpu_ctrl_hdr_t *)cmd)->type);
+    vgpu_engine_begin(vq->sync_engine);
     vgpu_publish(vq, 0u);
 
     VGPU_SPIN_UNTIL(vq, (vq->sync_done), ok);
@@ -2333,6 +2411,17 @@ bool virtio_gpu_init(void) {
     memset(&g_gpu_controlq, 0, sizeof(g_gpu_controlq));
     memset(&g_gpu_transport, 0, sizeof(g_gpu_transport));
     memset(g_gpu_monitors, 0, sizeof(g_gpu_monitors));
+    /* Whatever was in flight went with the old queue: it will never be
+     * drained, so it must not keep an engine busy. The totals carry on. */
+    for (uint32_t e = 0u; e < DRIVER_GPU_ENGINE_COUNT; ++e) {
+        if (g_vgpu_inflight[e] != 0u) {
+            uint64_t now = gpu_now_ns();
+            if (now > g_vgpu_busy_since[e]) {
+                g_vgpu_busy_ns[e] += now - g_vgpu_busy_since[e];
+            }
+            g_vgpu_inflight[e] = 0u;
+        }
+    }
 
     if (!find_virtio_gpu(&gpu)) {
         return false;
@@ -3063,6 +3152,29 @@ static bool virtio_gpu_set_mode(uint32_t monitor_index, uint32_t mode_index) {
                                    (uint32_t)(max_y - min_y));
 }
 
+static bool virtio_gpu_get_stats(driver_gpu_stats_t *out_stats)
+{
+    if (out_stats == NULL || !g_gpu_ready) {
+        return false;
+    }
+    memset(out_stats, 0, sizeof(*out_stats));
+    uint64_t irq_state = gpu_lock();
+    uint64_t now = gpu_now_ns();
+    for (uint32_t e = 0u; e < DRIVER_GPU_ENGINE_COUNT; ++e) {
+        out_stats->busy_ns[e] = g_vgpu_busy_ns[e];
+        if (g_vgpu_inflight[e] != 0u && now > g_vgpu_busy_since[e]) {
+            out_stats->busy_ns[e] += now - g_vgpu_busy_since[e];
+        }
+        out_stats->commands[e] = g_vgpu_commands[e];
+    }
+    out_stats->command_bytes = g_vgpu_command_bytes;
+    gpu_unlock(irq_state);
+    /* virtio-gpu has no device-local memory: every resource is backed by
+     * guest pages, which the DRM layer counts as shared memory. */
+    out_stats->dedicated_memory_bytes = 0u;
+    return true;
+}
+
 static const driver_display_t g_virtio_display_driver = {
     .name = VIRTIO_GPU_DEVICE_NAME,
     .probe = virtio_gpu_probe,
@@ -3103,6 +3215,7 @@ static const driver_display_t g_virtio_display_driver = {
     .gpu_set_fence_callback = virtio_gpu_set_fence_callback,
     .gpu_scanout_set = virtio_gpu_scanout_set,
     .gpu_scanout_flush = virtio_gpu_scanout_flush,
+    .gpu_get_stats = virtio_gpu_get_stats,
 };
 
 static void virtio_gpu_driver_shutdown(void)

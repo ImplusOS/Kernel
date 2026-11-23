@@ -34,6 +34,9 @@ static const pci_vendor_entry_t g_pci_vendors[] = {
     {0x1414, "Microsoft"},
     {0x1B36, "Red Hat"},
     {0x1AF4, "VirtIO"},
+    {0x1234, "QEMU"},
+    {0x15AD, "VMware"},
+    {0x1013, "Cirrus Logic"},
     {0x0000, NULL}
 };
 
@@ -46,6 +49,12 @@ static const pci_device_entry_t g_pci_devices[] = {
     {0x1AF4, 0x1002, "VirtIO Console"},
     {0x1AF4, 0x1004, "VirtIO SCSI Device"},
     {0x1AF4, 0x1009, "VirtIO SCSI Device (transitional)"},
+    /* Display adapters, so the task manager's GPU page has a name to show. */
+    {0x1AF4, 0x1050, "VirtIO GPU"},
+    {0x1234, 0x1111, "QEMU Standard VGA"},
+    {0x1B36, 0x0100, "QXL Paravirtual Graphics"},
+    {0x15AD, 0x0405, "VMware SVGA II"},
+    {0x1013, 0x00B8, "Cirrus Logic GD 5446"},
     {0xFFFF, 0xFFFF, NULL}
 };
 
@@ -304,6 +313,17 @@ os_status_t sysinfo_get_disk_info(uint32_t index, system_disk_info_t *out_info)
     sysinfo_copy_string(out_info->manufacturer, sizeof(out_info->manufacturer), disk_info.manufacturer);
     sysinfo_copy_string(out_info->model, sizeof(out_info->model), disk_info.model);
     
+    return OS_STATUS_OK;
+}
+
+os_status_t sysinfo_get_disk_stats(uint32_t index, system_disk_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
+        return OS_STATUS_INVALID_ARG;
+    }
+    if (!disk_get_stats(index, out_stats)) {
+        return OS_STATUS_NOT_FOUND;
+    }
     return OS_STATUS_OK;
 }
 

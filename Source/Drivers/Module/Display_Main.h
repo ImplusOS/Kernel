@@ -31,3 +31,5 @@ const char *display_main_get_active_driver_name(void);
 bool display_init_3d_backend(void);
 /* Returns a ready display module that exposes a complete 3D render backend. */
 const driver_display_t *display_get_3d_driver(void);
+/* The display driver on scanout now, or NULL when none is ready. */
+const driver_display_t *display_get_active_driver(void);

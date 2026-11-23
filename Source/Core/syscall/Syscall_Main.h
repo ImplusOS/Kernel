@@ -239,6 +239,13 @@
  * negative status. Native processes reach DRM ioctls through
  * SYSCALL_IOCTL_EX; this is the matching mmap. */
 #define SYSCALL_FILE_DEV_MMAP          278
+/* get_disk_stats(index, system_disk_stats_t *): cumulative I/O counters of
+ * disk `index` (the SYSCALL_GET_DISK_INFO numbering) -- operations, bytes,
+ * latency and busy time. See Platform/io/IO_Stats.h. */
+#define SYSCALL_GET_DISK_STATS         279
+/* get_gpu_usage(system_gpu_usage_t *): cumulative per-engine busy time,
+ * presents and GPU buffer memory. See Core/sysinfo/GpuStats.h. */
+#define SYSCALL_GET_GPU_USAGE          280
 
 #define SYSCALL_KVM_OPEN          240
 #define SYSCALL_KVM_IOCTL         241

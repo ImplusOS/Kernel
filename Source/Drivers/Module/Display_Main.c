@@ -9,6 +9,9 @@
 #include "Drivers/Module/DriverSelect.h"
 #include "MemoryManagement/Memory_Main.h"
 #include "interfaces/hal_cpu.h"
+#include "Core/process/ProcessManager.h"
+#include "Core/sysinfo/GpuStats.h"
+#include "Core/timer/Timer.h"
 
 const driver_display_t *g_active_display_driver = NULL;
 static const char *g_active_display_module_name = NULL;
@@ -241,12 +244,41 @@ void display_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t 
     g_active_display_driver->fill_rect(x, y, w, h, color);
 }
 
+/* Bytes of pixels `rects` cover on the display (all of it for none). */
+static uint64_t display_present_bytes(const display_rect_t *rects,
+                                      uint32_t count)
+{
+    uint64_t w = display_width(), h = display_height();
+    if (rects == NULL || count == 0u) {
+        return w * h * 4u;
+    }
+    uint64_t bytes = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        int64_t x0 = rects[i].x, y0 = rects[i].y;
+        int64_t x1 = x0 + (int64_t)rects[i].w, y1 = y0 + (int64_t)rects[i].h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int64_t)w) x1 = (int64_t)w;
+        if (y1 > (int64_t)h) y1 = (int64_t)h;
+        if (x1 > x0 && y1 > y0) {
+            bytes += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0) * 4u;
+        }
+    }
+    return bytes;
+}
+
+/* Every present is timed for the GPU numbers (GpuStats.h): on a display
+ * without an engine this copy is the scanout path, and either way it is
+ * charged to the presenting process. */
 void display_present(void) {
     if (!display_is_ready() || g_active_display_driver->present == NULL) {
         return;
     }
 
+    uint64_t start = timer_monotonic_ns();
     g_active_display_driver->present();
+    gpu_stats_note_present(current_pid_get(), start, timer_monotonic_ns(),
+                           display_present_bytes(NULL, 0u));
 }
 
 void display_present_rects(const display_rect_t *rects, uint32_t count) {
@@ -254,15 +286,26 @@ void display_present_rects(const display_rect_t *rects, uint32_t count) {
         return;
     }
 
+    uint64_t start = timer_monotonic_ns();
     if (rects != NULL && count != 0u &&
         g_active_display_driver->present_rects != NULL) {
         g_active_display_driver->present_rects(rects, count);
+    } else if (g_active_display_driver->present != NULL) {
+        g_active_display_driver->present();
+        rects = NULL;
+        count = 0u;
+    } else {
         return;
     }
+    gpu_stats_note_present(current_pid_get(), start, timer_monotonic_ns(),
+                           display_present_bytes(rects, count));
+}
 
-    if (g_active_display_driver->present != NULL) {
-        g_active_display_driver->present();
+const driver_display_t *display_get_active_driver(void) {
+    if (!display_is_ready()) {
+        return NULL;
     }
+    return g_active_display_driver;
 }
 
 void *display_get_framebuffer(void) {

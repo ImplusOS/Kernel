@@ -145,6 +145,12 @@ typedef struct __attribute__((aligned(16))) {
     uint64_t display_present_calls;
     uint64_t display_rects;
     uint64_t display_bytes;
+    /* Bytes this task's requests moved to and from disks (IO_Stats.c), and
+     * the GPU engine time its work occupied (GpuStats.c). */
+    uint64_t disk_read_bytes;
+    uint64_t disk_write_bytes;
+    uint64_t gpu_3d_ns;
+    uint64_t gpu_copy_ns;
     uint64_t last_scheduled_ns;
     uint64_t ready_since_ns;
     uint64_t blocked_since_ns;

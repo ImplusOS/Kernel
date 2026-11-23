@@ -2907,6 +2907,45 @@ uint64_t syscall_dispatch(uint64_t saved_rsp,
             break;
         }
 
+        case SYSCALL_GET_DISK_STATS: {
+            uint32_t index = (uint32_t)arg1;
+            void *stats_out = (void *)(uintptr_t)arg2;
+            if (!user_buffer_ok(stats_out, sizeof(system_disk_stats_t))) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_disk_stats_buffer");
+                break;
+            }
+            system_disk_stats_t stats = {0};
+            os_status_t status = sysinfo_get_disk_stats(index, &stats);
+            if (status == OS_STATUS_OK &&
+                copy_to_user_trusted(stats_out, &stats, sizeof(stats)) != 0u) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_disk_stats_buffer");
+                break;
+            }
+            set_syscall_status(saved_rsp, status);
+            break;
+        }
+
+        case SYSCALL_GET_GPU_USAGE: {
+            void *usage_out = (void *)(uintptr_t)arg1;
+            if (!user_buffer_ok(usage_out, sizeof(system_gpu_usage_t))) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_gpu_usage_buffer");
+                break;
+            }
+            system_gpu_usage_t usage = {0};
+            os_status_t status = sysinfo_get_gpu_usage(&usage);
+            if (status == OS_STATUS_OK &&
+                copy_to_user_trusted(usage_out, &usage, sizeof(usage)) != 0u) {
+                syscall_fail(saved_rsp, num, OS_STATUS_FAULT,
+                             "invalid_gpu_usage_buffer");
+                break;
+            }
+            set_syscall_status(saved_rsp, status);
+            break;
+        }
+
         case SYSCALL_SET_PROCESS_PRIORITY: {
             int32_t target_pid = (int32_t)arg1;
             uint32_t prio = (uint32_t)arg2;

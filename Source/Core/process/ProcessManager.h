@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "kernel/config.h"
 
@@ -212,6 +213,18 @@ typedef struct {
     uint64_t display_bytes;
     uint64_t memory_usage;
     uint64_t page_fault_count;
+    /* Thread group: the task whose address space this one shares (the
+     * process a thread belongs to), or `pid` itself for a process. A task
+     * manager adds a thread's numbers to that process's row. */
+    int32_t  owner_pid;
+    uint8_t  is_thread;
+    uint8_t  priority;           /* PROCESS_PRIORITY_* (0-3)               */
+    uint8_t  abi_mode;           /* PROCESS_ABI_*                          */
+    uint8_t  reserved2;
+    uint64_t disk_read_bytes;    /* cumulative, see process_perf_note_disk */
+    uint64_t disk_write_bytes;
+    uint64_t gpu_3d_ns;          /* cumulative, see process_perf_note_gpu  */
+    uint64_t gpu_copy_ns;
 } process_perf_info_t;
 
 #define PROCESS_SCHEDULE_REQUEST_SWITCH      1
@@ -497,6 +510,12 @@ void process_perf_note_syscall(int32_t pid);
 void process_perf_note_ipc_send(int32_t pid);
 void process_perf_note_ipc_recv(int32_t pid);
 void process_perf_note_display(int32_t pid, uint32_t rect_count, uint64_t bytes);
+/* Bytes a request of `pid`'s moved to (write) or from a disk. */
+void process_perf_note_disk(int32_t pid, bool write, uint64_t bytes);
+/* GPU engine time `pid`'s work occupied (Core/sysinfo/GpuStats.c). */
+#define PROCESS_GPU_ENGINE_3D   0u
+#define PROCESS_GPU_ENGINE_COPY 1u
+void process_perf_note_gpu(int32_t pid, uint32_t engine, uint64_t busy_ns);
 void process_record_page_fault(int32_t pid, uint64_t fault_addr, uint64_t rip,
                                uint32_t error_code, int is_guard);
 int32_t process_get_debug_info(int32_t pid, void *info_out);

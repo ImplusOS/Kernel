@@ -557,6 +557,10 @@ static void process_perf_reset(process_t *proc)
     proc->display_present_calls = 0;
     proc->display_rects = 0;
     proc->display_bytes = 0;
+    proc->disk_read_bytes = 0;
+    proc->disk_write_bytes = 0;
+    proc->gpu_3d_ns = 0;
+    proc->gpu_copy_ns = 0;
     proc->last_scheduled_ns = 0;
     proc->ready_since_ns = 0;
     proc->blocked_since_ns = 0;
@@ -9640,6 +9644,16 @@ int32_t process_get_perf_info(int32_t pid, process_perf_info_t *info_out)
     info_out->display_bytes = proc->display_bytes;
     info_out->memory_usage = process_memory_usage_locked(proc);
     info_out->page_fault_count = proc->page_fault_count;
+    process_t *owner = process_memory_owner_locked(proc);
+    info_out->owner_pid = (owner != NULL && owner != proc)
+                              ? (int32_t)(owner - g_processes) : pid;
+    info_out->is_thread = proc->is_thread ? 1u : 0u;
+    info_out->priority = proc->priority;
+    info_out->abi_mode = proc->abi_mode;
+    info_out->disk_read_bytes = proc->disk_read_bytes;
+    info_out->disk_write_bytes = proc->disk_write_bytes;
+    info_out->gpu_3d_ns = proc->gpu_3d_ns;
+    info_out->gpu_copy_ns = proc->gpu_copy_ns;
 
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
@@ -9674,6 +9688,26 @@ void process_perf_note_display(int32_t pid, uint32_t rect_count, uint64_t bytes)
         __atomic_fetch_add(&proc->display_present_calls, 1u, __ATOMIC_RELAXED);
         __atomic_fetch_add(&proc->display_rects, rect_count, __ATOMIC_RELAXED);
         __atomic_fetch_add(&proc->display_bytes, bytes, __ATOMIC_RELAXED);
+    }
+}
+
+void process_perf_note_disk(int32_t pid, bool write, uint64_t bytes)
+{
+    if (is_valid_pid(pid)) {
+        process_t *proc = &g_processes[pid];
+        __atomic_fetch_add(write ? &proc->disk_write_bytes
+                                 : &proc->disk_read_bytes,
+                           bytes, __ATOMIC_RELAXED);
+    }
+}
+
+void process_perf_note_gpu(int32_t pid, uint32_t engine, uint64_t busy_ns)
+{
+    if (is_valid_pid(pid) && busy_ns != 0u) {
+        process_t *proc = &g_processes[pid];
+        __atomic_fetch_add(engine == PROCESS_GPU_ENGINE_3D ? &proc->gpu_3d_ns
+                                                           : &proc->gpu_copy_ns,
+                           busy_ns, __ATOMIC_RELAXED);
     }
 }
 

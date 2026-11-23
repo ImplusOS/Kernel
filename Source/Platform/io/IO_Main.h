@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "interfaces/hal_io.h"
+#include "kernel/system_info.h"
 
 static inline void outsw(uint16_t port, const void *addr, int count) {
     hal_io_outsw(port, addr, (uint32_t)count);
@@ -75,5 +76,9 @@ io_protocol_type_t disk_io_get_protocol(void);
 uint64_t disk_get_partition_lba(void);
 uint32_t disk_get_count(void);
 bool disk_get_info(uint32_t index, io_disk_info_t *out_info);
+/* Cumulative I/O counters of disk `index` (the disk_get_info() numbering),
+ * or of every disk together for SYSTEM_DISK_STATS_ALL; see IO_Stats.h.
+ * False for an index past the last disk. */
+bool disk_get_stats(uint32_t index, system_disk_stats_t *out_stats);
 bool disk_raw_read(uint32_t index, uint64_t lba, uint8_t *buffer, uint32_t sectors);
 bool disk_raw_write(uint32_t index, uint64_t lba, const uint8_t *buffer, uint32_t sectors);
