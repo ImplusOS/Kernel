@@ -1444,7 +1444,12 @@ int32_t syscall_file_link(const char *old_path, const char *new_path)
     }
     vfs_file_t probe;
     if (vfs_find_file(new_path, &probe)) {
-        return (int32_t)OS_STATUS_INVALID_ARG; /* EEXIST */
+        /* EEXIST, not EINVAL: Xorg's LockServer() links its temp file onto
+         * /tmp/.Xn-lock and only goes on to check whether the lock is stale
+         * -- and take it over -- when link() fails with EEXIST. Anything
+         * else is fatal, so a lock left by a killed server made that display
+         * number unusable until reboot. */
+        return (int32_t)OS_STATUS_ALREADY_EXISTS;
     }
 
     uint32_t size = src.size;
@@ -2438,6 +2443,16 @@ int32_t syscall_memfd_get_seals(int32_t fd)
         return (int32_t)OS_STATUS_INVALID_ARG;
     }
     return (int32_t)g_memfds[fd]->seals;
+}
+
+/* 1 when `fd` is one of 0/1/2 still naming the console for the calling
+ * process (no table entry, and not closed by it) -- see g_std_closed. */
+int syscall_file_std_is_console(int32_t fd)
+{
+    if (fd < 0 || fd > 2 || g_files[fd].used != 0) {
+        return 0;
+    }
+    return !std_fd_is_closed_by(fd, process_get_current_pid());
 }
 
 int32_t syscall_file_get_status_flags(int32_t fd)

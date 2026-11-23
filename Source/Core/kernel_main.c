@@ -292,6 +292,17 @@ static void kernel_main_after_stack_switch(BOOT_INFO *boot_info)
      * will later replace. The kernel image itself starts at 0x01800000. */
     physical_memory_reserve_region(PAGING_LEGACY_ET_EXEC_BASE,
                                    PAGING_LEGACY_ET_EXEC_SIZE);
+    /* And the lld default image base below it (Firefox's launcher stub),
+     * when that RAM is still free -- see Paging_Main.h. */
+    if (physical_memory_region_is_free(PAGING_LOW_ET_EXEC_BASE,
+                                       PAGING_LOW_ET_EXEC_SIZE)) {
+        physical_memory_reserve_region(PAGING_LOW_ET_EXEC_BASE,
+                                       PAGING_LOW_ET_EXEC_SIZE);
+        paging_low_et_exec_window_set_available(1);
+    } else {
+        serial_write_string("[OS] 0x200000 ET_EXEC window not free RAM; "
+                            "programs linked there load only while it is\n");
+    }
     /* Same for Windows' fixed KUSER_SHARED_DATA page, which Wine maps at
      * 0x7FFE0000 in every Windows process (see Paging_Main.h). */
     physical_memory_reserve_region(PAGING_WIN_SHARED_DATA_BASE,

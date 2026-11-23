@@ -2465,6 +2465,13 @@ static spinlock_t g_demand_fault_lock;
 /* fills with private pages: its image, mmap() and stack, demand-zero on   */
 /* first touch from user or kernel mode alike.                              */
 /* ------------------------------------------------------------------------ */
+volatile int g_paging_low_et_exec_ready = 0;
+
+void paging_low_et_exec_window_set_available(int available)
+{
+    g_paging_low_et_exec_ready = available ? 1 : 0;
+}
+
 volatile int g_paging_compat32_window_ready = 0;
 
 int paging_compat32_window_available(void)

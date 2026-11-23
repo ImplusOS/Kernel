@@ -877,7 +877,18 @@ int64_t syscall_fcntl_ex(int32_t fd, int32_t cmd, uint64_t arg)
             if (unix_socket_fd_in_range(fd)) {
                 return 0x0002 | (unix_socket_is_nonblock(fd) ? 0x0800 : 0);
             }
-            return syscall_file_get_status_flags(fd);
+            {
+                int32_t fl = syscall_file_get_status_flags(fd);
+                if (fl >= 0) return fl;
+                /* An untouched 0/1/2 is the console (read and written
+                 * through the serial port), which a tty open would give
+                 * O_RDWR. It has no table entry, so the lookup above failed
+                 * -- with EFAULT, which GLib reported as "Error while getting
+                 * flags for FD: Bad address" for every GIOChannel on stdin.
+                 * Any other miss is a descriptor that is not open: EBADF. */
+                if (syscall_file_std_is_console(fd)) return 0x0002;
+                return LINUX_EBADF;
+            }
         case LINUX_F_ADD_SEALS: {
             /* memfd sealing. Chromium seals every shared-memory region right
              * after ftruncate() and, if the call fails, gives up on memfd and

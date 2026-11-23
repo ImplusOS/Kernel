@@ -16,6 +16,13 @@
 #define UNIX_SOCK_FD_MAX 64
 /* Message records per endpoint for the boundary-preserving types. */
 #define UNIX_SOCK_MSG_MAX 128
+/* How much of a caller's control buffer is looked at. A larger buffer is
+ * not an error: Linux accepts any msg_controllen on recvmsg() and fills
+ * only what it has, and a sendmsg() buffer is read up to its cmsgs' own
+ * lengths. Firefox's fork server receives with a 32 KiB one (MiniTransceiver
+ * passes kMaxDataSize where it means kMaxNumFds); refusing that dropped every
+ * descriptor of the fork request and the server crashed on "File handle not
+ * found in message!". 4 KiB holds far more descriptors than UNIX_SOCK_FD_MAX. */
 #define UNIX_CMSG_MAX_BYTES 4096u
 #define UNIX_IOV_MAX 16u
 #define FILE_O_RDWR_FLAG 0x0002u
@@ -63,6 +70,13 @@ struct usock_passed {
      * that arrives O_RDWR fails PlatformSharedMemoryRegion::Take() (the
      * pseudonymization salt, first thing every child process maps). */
     uint32_t status_flags;
+    /* SHM: the memfd's F_ADD_SEALS mask. On Linux seals belong to the inode
+     * and so arrive with the descriptor; the receiver here gets a fresh memfd
+     * object around the same shared memory, which has to be given them.
+     * Firefox refuses to map a region whose memfd is not F_SEAL_SHRINK'd
+     * ("Shared memory PlatformHandle is not safe to map") -- every content
+     * process died on its first shared-memory handle without this. */
+    uint32_t seals;
     /* Stream sockets: the byte position (unix_sock_t.in_pos at the time of
      * the send) the descriptor was sent with. See usock_dequeue(). */
     uint32_t at;
@@ -646,6 +660,16 @@ struct _kernel_msghdr {
     int32_t __pad1;
 };
 
+/* The part of msg_control that is used: none when there is no room for a
+ * single header, otherwise at most UNIX_CMSG_MAX_BYTES of it. */
+static uint32_t usock_control_len(const struct _kernel_msghdr *msg) {
+    if (!msg->control || msg->controllen < sizeof(struct _kernel_cmsghdr)) {
+        return 0u;
+    }
+    return msg->controllen > UNIX_CMSG_MAX_BYTES ? UNIX_CMSG_MAX_BYTES
+                                                 : (uint32_t)msg->controllen;
+}
+
 /* Every process currently holding `s`: the ones that may receive what is
  * queued on it. */
 static void usock_grant_to_holders(unix_sock_t *s, int32_t file_fd, int32_t shm) {
@@ -669,6 +693,7 @@ static int usock_capture(int32_t global, unix_sock_t *peer,
         out->kind = USOCK_PASS_UNIX;
         out->h = global - UNIX_SOCK_FD_BASE;
         out->status_flags = 0;
+        out->seals = 0;
         return 0;
     }
     int32_t h = syscall_memfd_shm_handle(global);
@@ -679,6 +704,8 @@ static int usock_capture(int32_t global, unix_sock_t *peer,
         out->h = h;
         int32_t fl = syscall_file_get_status_flags(global);
         out->status_flags = (fl >= 0) ? (uint32_t)fl : FILE_O_RDWR_FLAG;
+        int32_t seals = syscall_memfd_get_seals(global);
+        out->seals = (seals > 0) ? (uint32_t)seals : 0u;
         return 0;
     }
     if (syscall_file_get_status_flags(global) >= 0 || syscall_file_is_dir(global)) {
@@ -686,6 +713,7 @@ static int usock_capture(int32_t global, unix_sock_t *peer,
         out->kind = USOCK_PASS_FILE;
         out->h = global;
         out->status_flags = 0;
+        out->seals = 0;
         return 0;
     }
     return -1;
@@ -702,15 +730,15 @@ int64_t unix_socket_sendmsg(int32_t fd, uint64_t msg_ptr) {
     /* ---- SCM_RIGHTS: capture each named descriptor ---- */
     struct usock_passed objs[UNIX_SOCK_FD_MAX];
     uint32_t nobjs = 0;
-    if (msg->control && msg->controllen >= sizeof(struct _kernel_cmsghdr) &&
-        msg->controllen <= UNIX_CMSG_MAX_BYTES) {
+    uint32_t send_ctl = usock_control_len(msg);
+    if (send_ctl != 0u) {
         uint8_t *cdata = (uint8_t*)(uintptr_t)msg->control;
         uint32_t offset = 0;
-        while (offset + sizeof(struct _kernel_cmsghdr) <= msg->controllen) {
+        while (offset + sizeof(struct _kernel_cmsghdr) <= send_ctl) {
             struct _kernel_cmsghdr *cmsg = (struct _kernel_cmsghdr *)(cdata + offset);
             uint32_t clen = cmsg->cmsg_len;
             if (clen < sizeof(struct _kernel_cmsghdr) ||
-                offset + clen > msg->controllen) break;
+                offset + clen > send_ctl) break;
             if (cmsg->cmsg_level == 1 && cmsg->cmsg_type == SCM_RIGHTS) {
                 int32_t *fds = (int32_t *)(cdata + offset + sizeof(struct _kernel_cmsghdr));
                 int num_fds = (int)((clen - sizeof(struct _kernel_cmsghdr)) / sizeof(int32_t));
@@ -799,7 +827,13 @@ static int32_t usock_adopt(struct usock_passed p) {
     int32_t self = process_get_current_pid();
     if (p.kind == USOCK_PASS_SHM) {
         int32_t g = syscall_memfd_install_shm(p.h, p.status_flags);
-        if (g < 0) (void)shared_memory_release(p.h);
+        if (g < 0) {
+            (void)shared_memory_release(p.h);
+        } else if (p.seals != 0u) {
+            /* A new object has no seals yet, F_SEAL_SEAL included, so this
+             * cannot be refused. */
+            (void)syscall_memfd_add_seals(g, p.seals);
+        }
         return g;
     }
     if (p.kind == USOCK_PASS_UNIX) {
@@ -837,11 +871,11 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
     uint8_t *bounce = cap ? (uint8_t *)malloc((size_t)cap) : NULL;
     if (cap && !bounce) return -12;
 
+    uint32_t recv_ctl = usock_control_len(msg);
     uint32_t ctl_room = 0;
-    if (msg->control && msg->controllen >= sizeof(struct _kernel_cmsghdr) &&
-        msg->controllen <= UNIX_CMSG_MAX_BYTES) {
-        ctl_room = ((uint32_t)msg->controllen -
-                    (uint32_t)sizeof(struct _kernel_cmsghdr)) / sizeof(int32_t);
+    if (recv_ctl != 0u) {
+        ctl_room = (recv_ctl - (uint32_t)sizeof(struct _kernel_cmsghdr)) /
+                   (uint32_t)sizeof(int32_t);
     }
     struct usock_passed objs[UNIX_SOCK_FD_MAX];
     uint32_t nobjs = 0;
@@ -862,10 +896,9 @@ int64_t unix_socket_recvmsg(int32_t fd, uint64_t msg_ptr) {
     }
     free(bounce);
 
-    if (msg->control && msg->controllen >= sizeof(struct _kernel_cmsghdr) &&
-        msg->controllen <= UNIX_CMSG_MAX_BYTES) {
+    if (recv_ctl != 0u) {
         uint8_t *ctl = (uint8_t *)(uintptr_t)msg->control;
-        uint32_t room = (uint32_t)msg->controllen;
+        uint32_t room = recv_ctl;
         uint32_t used = 0;
         process_user_break_cow(ctl, room);
 
@@ -1116,7 +1149,18 @@ uint32_t unix_socket_poll(int32_t fd, uint32_t events) {
     }
     if (s->connected) {
         unix_sock_t *peer = usock_get(s->peer_fd);
-        if (!peer) r |= 0x10u;            /* EPOLLHUP: peer gone */
+        if (!peer) {
+            /* Peer gone: a read returns end-of-file at once, so the socket
+             * is readable as well as hung up -- Linux's unix_poll() reports
+             * EPOLLIN | EPOLLRDHUP | EPOLLHUP. HUP alone was invisible to a
+             * reader that only acts on POLLIN: Chromium's zygote polls its
+             * browser socket for POLLIN, never saw the EOF that tells it the
+             * browser has gone, and spun on poll() at 100% CPU after every
+             * Chromium window was closed. */
+            r |= 0x10u;                               /* EPOLLHUP */
+            if ((events & 0x1u) != 0u) r |= 0x1u;     /* EPOLLIN */
+            if ((events & 0x2000u) != 0u) r |= 0x2000u; /* EPOLLRDHUP */
+        }
     }
     return r;
 }

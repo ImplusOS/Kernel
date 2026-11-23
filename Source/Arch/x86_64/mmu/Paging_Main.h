@@ -32,6 +32,22 @@
 #define PAGING_LEGACY_ET_EXEC_SIZE  0x00400000ULL
 #define PAGING_LEGACY_ET_EXEC_LIMIT (PAGING_LEGACY_ET_EXEC_BASE + PAGING_LEGACY_ET_EXEC_SIZE)
 
+/* The 2 MiB below it: LLVM lld links a non-PIE x86_64 executable at
+ * 0x00200000 by default, and Firefox's launcher stub (Resource/firefox, the
+ * program that execs firefox-bin) is one. Without a reserved window such an
+ * image could only borrow the identity frames when they happened to be free
+ * -- the first launch after boot worked, a later one failed with "paging map
+ * failed (load segment)" once the allocator had handed those frames out.
+ * Withheld at boot like the window above, but only when every frame of it is
+ * still free RAM (the firmware or the boot manager may hold some), so it is
+ * shadowable only once kernel_main has called
+ * paging_low_et_exec_window_set_available(1). */
+#define PAGING_LOW_ET_EXEC_BASE  0x00200000ULL
+#define PAGING_LOW_ET_EXEC_SIZE  0x00200000ULL
+#define PAGING_LOW_ET_EXEC_LIMIT (PAGING_LOW_ET_EXEC_BASE + PAGING_LOW_ET_EXEC_SIZE)
+extern volatile int g_paging_low_et_exec_ready;
+void paging_low_et_exec_window_set_available(int available);
+
 /* Windows' KUSER_SHARED_DATA lives at the fixed address 0x7FFE0000 in every
  * process, and Wine's ntdll exits ("failed to map the shared user data")
  * unless it can map it exactly there. That is inside the low identity map,
@@ -60,6 +76,8 @@ int paging_prepare_compat32_window(uint64_t cr3);
 static inline int paging_is_user_shadow_window(uint64_t va)
 {
     return (va >= PAGING_LEGACY_ET_EXEC_BASE && va < PAGING_LEGACY_ET_EXEC_LIMIT) ||
+           (g_paging_low_et_exec_ready &&
+            va >= PAGING_LOW_ET_EXEC_BASE && va < PAGING_LOW_ET_EXEC_LIMIT) ||
            (va >= PAGING_WIN_SHARED_DATA_BASE && va < PAGING_WIN_SHARED_DATA_LIMIT) ||
            (g_paging_compat32_window_ready &&
             va >= OS_CONFIG_LINUX_I386_WINDOW_BASE &&

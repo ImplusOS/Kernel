@@ -1220,6 +1220,11 @@ static int write_signal_frame_locked(process_t *proc, int32_t signum,
  * slot whose descriptors were still being closed. */
 static volatile uint32_t g_teardown_pending;
 
+/* How long an exiting thread waits for its siblings to leave the CPUs they
+ * are running on before the group's descriptors are closed (see
+ * process_exit_current()). A few timer ticks. */
+#define EXIT_SIBLING_WAIT_NS (20ULL * 1000ULL * 1000ULL)
+
 static void process_signal_kill_locked(process_t *proc, int32_t signum)
 {
     process_t *owner = process_memory_owner_locked(proc);
@@ -4785,6 +4790,17 @@ int32_t process_spawn_user_elf_with_arg(const char *path,
  * The kernel never assembles an application's environment any more: it only
  * appends its own generic defaults for keys the launcher did not name. See
  * the default table further down and Userland/API/Source/LinuxEnv.c. */
+/* A spawn that fails says so: the callers (XSession, the launchers) only see
+ * -1, and a launcher that exits 1 without a word was the whole trail. */
+static void spawn_fail_log(const char *path, const char *why)
+{
+    serial_write_string("[app] spawn failed: ");
+    serial_write_string(path != NULL ? path : "(null)");
+    serial_write_string(": ");
+    serial_write_string(why);
+    serial_write_string("\n");
+}
+
 int32_t process_spawn_user_elf_with_env(const char *path,
                                         const char *launch_argument,
                                         const char *const *user_envp)
@@ -4803,11 +4819,13 @@ int32_t process_spawn_user_elf_with_env(const char *path,
         if (count_user_string_array(user_envp, &user_envc, &env_strtotal) < 0 ||
             user_envc > (uint64_t)SPAWN_ENV_MAX ||
             env_strtotal > (uint64_t)SPAWN_ENV_STRTOTAL_MAX) {
+            spawn_fail_log(path, "environment too large");
             return -1;
         }
         if (user_envc > 0u &&
             copy_user_strings(user_envp, user_envc, env_strings,
                               sizeof(env_strings), env_offsets) < 0) {
+            spawn_fail_log(path, "unreadable environment");
             return -1;
         }
         for (uint64_t i = 0; i < user_envc; ++i) {
@@ -4820,6 +4838,7 @@ int32_t process_spawn_user_elf_with_env(const char *path,
     }
     int32_t pid = process_create_user_internal(USER_CODE_BASE, 0, 0, 0, 0, 0);
     if (pid < 0) {
+        spawn_fail_log(path, "no process slot");
         return -1;
     }
 
@@ -4876,6 +4895,10 @@ int32_t process_spawn_user_elf_with_env(const char *path,
     const char *load_path = translated ? tpath : path;
 
     if (!elf_loader_load_from_path(proc->cr3, pid, load_path, &policy, &image_info)) {
+        {
+            const char *why = elf_loader_last_error();
+            spawn_fail_log(load_path, why != NULL ? why : "ELF load failed");
+        }
         filemap_release_pid(pid);
         ipc_cleanup_process_queue(pid);
         uint64_t irq_flags = irq_save_disable();
@@ -6440,8 +6463,59 @@ void process_exit_current(void)
     }
     /* Claim the teardown before dropping the lock. */
     owner->state = PROCESS_STATE_ZOMBIE;
+
+    /* exit_group() ends every thread of the group before anything they
+     * share is released -- on Linux the descriptors go with the last thread.
+     * process_teardown() closes them right away, so the other threads are
+     * stopped first: marked dead, the scheduler never runs them again, and
+     * one blocked in poll() is not woken by the closing descriptors to read
+     * them. Before this, GLib's gmain thread read its inotify fd after the
+     * main thread's _exit(1) had closed it, turned the EBADF into a fatal
+     * error and died of SIGTRAP: gtk3-widget-factory "crashed" on an
+     * ordinary exit.
+     *
+     * A thread that is executing on another CPU at this moment leaves it at
+     * its next timer tick; wait for that, briefly. The wait is bounded, and
+     * the teardown is never put off past it: a CPU can keep naming a thread
+     * it has stopped running (see process_scheduler_release_stale_pid()), and
+     * a teardown parked until that clears never ran at all -- the parent was
+     * never told, the descriptors never closed, and after a few such exits
+     * /tmp had no file left to give Xorg its lock. */
+    int32_t self_pid = current_pid_get();
+    for (int32_t i = 1; i < g_process_capacity; ++i) {
+        process_t *t = &g_processes[i];
+        if (i != self_pid && i != pid_to_exit && t->is_thread &&
+            t->memory_owner_pid == pid_to_exit &&
+            t->state != PROCESS_STATE_UNUSED) {
+            t->state = PROCESS_STATE_DEAD;
+        }
+    }
     spinlock_unlock(&g_process_table_lock);
     irq_restore(irq_flags);
+
+    const uint64_t wait_until = timer_monotonic_ns() + EXIT_SIBLING_WAIT_NS;
+    for (;;) {
+        bool sibling_on_cpu = false;
+        irq_flags = irq_save_disable();
+        spinlock_lock(&g_process_table_lock);
+        for (int32_t i = 1; i < g_process_capacity && !sibling_on_cpu; ++i) {
+            const process_t *t = &g_processes[i];
+            if (i == self_pid || t->state == PROCESS_STATE_UNUSED) {
+                continue;
+            }
+            if (i != pid_to_exit &&
+                !(t->is_thread && t->memory_owner_pid == pid_to_exit)) {
+                continue;
+            }
+            sibling_on_cpu = process_scheduler_pid_in_use_on_any_cpu(i) != 0;
+        }
+        spinlock_unlock(&g_process_table_lock);
+        irq_restore(irq_flags);
+        if (!sibling_on_cpu || timer_monotonic_ns() >= wait_until) {
+            break;
+        }
+        hal_cpu_pause();
+    }
 
     process_teardown(pid_to_exit);
 }
@@ -6651,7 +6725,9 @@ void process_exit_current_signaled(int32_t signum)
     if (is_valid_pid(current_pid_get())) {
         process_t *owner =
             process_memory_owner_locked(&g_processes[current_pid_get()]);
-        if (owner != NULL) {
+        /* A group that is already exiting keeps the status it exits with:
+         * a straggling thread's fault must not rewrite it. */
+        if (owner != NULL && owner->state != PROCESS_STATE_ZOMBIE) {
             owner->exit_status = 128 + signum;
             owner->exit_by_signal = 1u;
             owner->exit_term_signal = (uint8_t)signum;
@@ -6673,7 +6749,8 @@ void process_exit_current_with_status(int32_t exit_status)
     if (is_valid_pid(current_pid_get())) {
         process_t *owner =
             process_memory_owner_locked(&g_processes[current_pid_get()]);
-        if (owner != NULL) {
+        /* The first exit_group() of a group decides its status. */
+        if (owner != NULL && owner->state != PROCESS_STATE_ZOMBIE) {
             owner->exit_status = exit_status;
         }
     }

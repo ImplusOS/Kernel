@@ -15,6 +15,7 @@ enum {
     OS_STATUS_NOT_SUPPORTED = -95,
     OS_STATUS_WOULD_BLOCK   = -11,
     OS_STATUS_BROKEN_PIPE   = -32,   /* EPIPE: write with no reader */
+    OS_STATUS_ALREADY_EXISTS = -17,  /* EEXIST: the name is taken */
     OS_STATUS_INTERNAL      = -255,
     OS_STATUS_INIT_FAILED   = -256
 };
@@ -65,6 +66,8 @@ static inline const char *os_status_to_string(os_status_t status)
             return "OS_STATUS_WOULD_BLOCK";
         case OS_STATUS_BROKEN_PIPE:
             return "OS_STATUS_BROKEN_PIPE";
+        case OS_STATUS_ALREADY_EXISTS:
+            return "OS_STATUS_ALREADY_EXISTS";
         case OS_STATUS_INTERNAL:
             return "OS_STATUS_INTERNAL";
         case OS_STATUS_INIT_FAILED:
@@ -99,6 +102,8 @@ static inline int32_t os_status_to_errno(os_status_t status)
             return 11;
         case OS_STATUS_BROKEN_PIPE:
             return 32;
+        case OS_STATUS_ALREADY_EXISTS:
+            return 17;
         case OS_STATUS_INTERNAL:
             return 255;
         case OS_STATUS_INIT_FAILED:

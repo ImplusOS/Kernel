@@ -14,10 +14,19 @@
  * at least 224 slots, so 256 left no room for a second profile or a larger
  * cache; once full, file creation fails and the syscall layer reports EIO.
  * (The "Something went wrong when opening your profile" dialog is NOT this:
- * it still appears on boots that peak below 256.) A slot is ~272 bytes with
- * file data allocated separately, so 4096 costs about 1.1 MB, and lookups
- * only compare slots in use. */
-#define TMPFS_MAX_FILES 4096u
+ * it still appears on boots that peak below 256.)
+ *
+ * 4096 did not last a session either: a Firefox profile with its HTTP cache,
+ * a Chromium profile and a Wine prefix (C:\windows\system32 alone is ~750
+ * DLLs) filled it, after which wineboot failed half-way through system32
+ * and Xorg could no longer create /tmp/.tXn-lock -- no X program could start
+ * until reboot. A slot is ~300 bytes with file data allocated separately, so
+ * 16384 cost about 5 MB; lookups go through the path hash below instead of
+ * scanning the table. */
+#define TMPFS_MAX_FILES 16384u
+/* Chains of slot indices keyed by path (tmpfs_find_locked). */
+#define TMPFS_HASH_BUCKETS 4096u
+#define TMPFS_NO_SLOT 0xFFFFFFFFu
 #define TMPFS_PATH_MAX  256u
 #define TMPFS_PREFIX    "/dev/shm"
 
@@ -89,6 +98,10 @@ typedef struct {
      * so read/write and every mapping see the same pages. */
     int32_t shm_handle;
     uint32_t shm_size;
+    /* In the path hash (g_tmpfs_bucket): every in-use slot that has a name.
+     * `hash_next` is the next slot index in the same bucket. */
+    uint8_t hashed;
+    uint32_t hash_next;
 } tmpfs_slot_t;
 
 static const vfs_driver_t g_tmpfs_vfs_driver;
@@ -97,11 +110,82 @@ static tmpfs_slot_t g_tmpfs_slots[TMPFS_MAX_FILES];
 
 static spinlock_t g_tmpfs_lock;
 
+static uint32_t g_tmpfs_bucket[TMPFS_HASH_BUCKETS];
+static bool g_tmpfs_hash_ready;
+/* Where the search for a free slot starts: just past the last one taken. */
+static uint32_t g_tmpfs_free_hint;
+
+static uint32_t tmpfs_hash(const char *path)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < TMPFS_PATH_MAX && path[i] != '\0'; ++i) {
+        h = (h ^ (uint8_t)path[i]) * 16777619u;
+    }
+    return h % TMPFS_HASH_BUCKETS;
+}
+
+static void tmpfs_hash_init_locked(void)
+{
+    if (g_tmpfs_hash_ready) {
+        return;
+    }
+    for (uint32_t b = 0; b < TMPFS_HASH_BUCKETS; ++b) {
+        g_tmpfs_bucket[b] = TMPFS_NO_SLOT;
+    }
+    g_tmpfs_hash_ready = true;
+}
+
+/* Enter a slot whose path has just been set. */
+static void tmpfs_hash_insert_locked(tmpfs_slot_t *slot)
+{
+    tmpfs_hash_init_locked();
+    uint32_t b = tmpfs_hash(slot->path);
+    slot->hash_next = g_tmpfs_bucket[b];
+    g_tmpfs_bucket[b] = (uint32_t)(slot - g_tmpfs_slots);
+    slot->hashed = 1u;
+}
+
+/* Take a slot out before its path is cleared or the slot is freed. */
+static void tmpfs_hash_remove_locked(tmpfs_slot_t *slot)
+{
+    if (!slot->hashed) {
+        return;
+    }
+    uint32_t index = (uint32_t)(slot - g_tmpfs_slots);
+    uint32_t *link = &g_tmpfs_bucket[tmpfs_hash(slot->path)];
+    while (*link != TMPFS_NO_SLOT) {
+        if (*link == index) {
+            *link = slot->hash_next;
+            break;
+        }
+        link = &g_tmpfs_slots[*link].hash_next;
+    }
+    slot->hashed = 0u;
+    slot->hash_next = TMPFS_NO_SLOT;
+}
+
 static tmpfs_slot_t *tmpfs_find_locked(const char *path)
 {
-    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
+    tmpfs_hash_init_locked();
+    for (uint32_t i = g_tmpfs_bucket[tmpfs_hash(path)]; i != TMPFS_NO_SLOT;
+         i = g_tmpfs_slots[i].hash_next) {
         if (g_tmpfs_slots[i].in_use &&
             strncmp(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX) == 0) {
+            return &g_tmpfs_slots[i];
+        }
+    }
+    return NULL;
+}
+
+/* A free slot, wiped, or NULL when the table is full. */
+static tmpfs_slot_t *tmpfs_take_slot_locked(void)
+{
+    for (uint32_t n = 0; n < TMPFS_MAX_FILES; ++n) {
+        uint32_t i = (g_tmpfs_free_hint + n) % TMPFS_MAX_FILES;
+        if (!g_tmpfs_slots[i].in_use) {
+            g_tmpfs_free_hint = (i + 1u) % TMPFS_MAX_FILES;
+            memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
+            g_tmpfs_slots[i].hash_next = TMPFS_NO_SLOT;
             return &g_tmpfs_slots[i];
         }
     }
@@ -367,18 +451,15 @@ static bool tmpfs_vfs_creat(const char *path)
         spinlock_unlock(&g_tmpfs_lock);
         return true; /* Already exists: O_CREAT without O_EXCL is fine. */
     }
-    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
-        if (!g_tmpfs_slots[i].in_use) {
-            memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
-            g_tmpfs_slots[i].in_use = 1;
-            g_tmpfs_slots[i].mode = TMPFS_MODE_FILE;
-            strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
-            spinlock_unlock(&g_tmpfs_lock);
-            return true;
-        }
+    tmpfs_slot_t *slot = tmpfs_take_slot_locked();
+    if (slot != NULL) {
+        slot->in_use = 1;
+        slot->mode = TMPFS_MODE_FILE;
+        strncpy(slot->path, path, TMPFS_PATH_MAX - 1u);
+        tmpfs_hash_insert_locked(slot);
     }
     spinlock_unlock(&g_tmpfs_lock);
-    return false;
+    return slot != NULL;
 }
 
 static bool tmpfs_vfs_mkdir(const char *path)
@@ -394,16 +475,13 @@ static bool tmpfs_vfs_mkdir(const char *path)
     }
     spinlock_lock(&g_tmpfs_lock);
     if (tmpfs_find_locked(path) == NULL) {
-        for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
-            if (g_tmpfs_slots[i].in_use) {
-                continue;
-            }
-            memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
-            g_tmpfs_slots[i].in_use = 1;
-            g_tmpfs_slots[i].is_dir = 1;
-            g_tmpfs_slots[i].mode = TMPFS_MODE_DIR;
-            strncpy(g_tmpfs_slots[i].path, path, TMPFS_PATH_MAX - 1u);
-            break;
+        tmpfs_slot_t *slot = tmpfs_take_slot_locked();
+        if (slot != NULL) {
+            slot->in_use = 1;
+            slot->is_dir = 1;
+            slot->mode = TMPFS_MODE_DIR;
+            strncpy(slot->path, path, TMPFS_PATH_MAX - 1u);
+            tmpfs_hash_insert_locked(slot);
         }
     }
     spinlock_unlock(&g_tmpfs_lock);
@@ -590,6 +668,7 @@ static int32_t tmpfs_vfs_closedir(int32_t handle)
 
 static void tmpfs_free_slot_locked(tmpfs_slot_t *slot)
 {
+    tmpfs_hash_remove_locked(slot);
     if (slot->data != NULL) {
         tmpfs_buf_free(slot->data, slot->capacity);
     }
@@ -734,6 +813,7 @@ static bool tmpfs_vfs_unlink(const char *path)
         /* Still open: drop the name now (lookups and a new file of the same
          * name no longer see this slot), keep the data until the last close. */
         slot->unlinked = 1u;
+        tmpfs_hash_remove_locked(slot);
         slot->path[0] = '\0';
         spinlock_unlock(&g_tmpfs_lock);
         return true;
@@ -762,27 +842,20 @@ static bool tmpfs_vfs_symlink(const char *target, const char *linkpath)
         spinlock_unlock(&g_tmpfs_lock); /* EEXIST -- symlink(2) never replaces */
         return false;
     }
-    for (uint32_t i = 0; i < TMPFS_MAX_FILES; ++i) {
-        if (g_tmpfs_slots[i].in_use) {
-            continue;
-        }
-        memset(&g_tmpfs_slots[i], 0, sizeof(g_tmpfs_slots[i]));
-        if (!tmpfs_ensure_capacity_locked(&g_tmpfs_slots[i],
-                                          (uint32_t)target_len)) {
-            spinlock_unlock(&g_tmpfs_lock);
-            return false;
-        }
-        g_tmpfs_slots[i].in_use = 1;
-        g_tmpfs_slots[i].is_symlink = 1;
-        g_tmpfs_slots[i].mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
-        strncpy(g_tmpfs_slots[i].path, linkpath, TMPFS_PATH_MAX - 1u);
-        memcpy(g_tmpfs_slots[i].data, target, target_len);
-        g_tmpfs_slots[i].size = (uint32_t)target_len;
+    tmpfs_slot_t *slot = tmpfs_take_slot_locked();
+    if (slot == NULL || !tmpfs_ensure_capacity_locked(slot, (uint32_t)target_len)) {
         spinlock_unlock(&g_tmpfs_lock);
-        return true;
+        return false;
     }
+    slot->in_use = 1;
+    slot->is_symlink = 1;
+    slot->mode = 0777u; /* symlinks are lrwxrwxrwx on Linux */
+    strncpy(slot->path, linkpath, TMPFS_PATH_MAX - 1u);
+    memcpy(slot->data, target, target_len);
+    slot->size = (uint32_t)target_len;
+    tmpfs_hash_insert_locked(slot);
     spinlock_unlock(&g_tmpfs_lock);
-    return false;
+    return true;
 }
 
 /* readlink(2): the target is NOT NUL-terminated and the count is the return
